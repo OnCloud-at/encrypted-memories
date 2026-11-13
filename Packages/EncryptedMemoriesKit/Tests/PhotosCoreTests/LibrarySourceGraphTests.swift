@@ -40,7 +40,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         _ source: LibrarySource,
         items: [PhotoItem],
         in graph: inout LibrarySourceGraph
-    ) -> LibrarySourceChange {
+    ) throws -> LibrarySourceChange {
         var sources = graph.inventories()
             .filter { $0.accessState != .accessLost }
             .map(\.source)
@@ -51,8 +51,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         }
         let sourceSetLease = graph.beginSourceSetRefresh()
         _ = graph.commitSourceSet(sources, using: sourceSetLease)
-        let lease = try! XCTUnwrap(graph.beginRefresh(source.id))
-        return try! XCTUnwrap(
+        let lease = try XCTUnwrap(graph.beginRefresh(source.id))
+        return try XCTUnwrap(
             graph.commit(items.map(LibrarySourceItem.complete), validationToken: nil, using: lease)
         )
     }
@@ -63,30 +63,30 @@ final class LibrarySourceGraphTests: XCTestCase {
         var edited = item("0-edited", time: 500)
         edited.timelineOrder = .init(exactCaptureTime: Date(timeIntervalSince1970: 500.8))
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [edited, earlier], in: &graph)
+        _ = try install(firstSource, items: [edited, earlier], in: &graph)
         XCTAssertEqual(graph.snapshot().selectedScope.orderedUIDs, [earlier.uid, edited.uid])
 
         // An overlapping source without order evidence must not erase the refined primary capture order.
-        _ = install(secondSource, items: [item("0-edited", time: 500), item("z-earlier", time: 500)], in: &graph)
+        _ = try install(secondSource, items: [item("0-edited", time: 500), item("z-earlier", time: 500)], in: &graph)
         XCTAssertEqual(graph.snapshot().selectedScope.orderedUIDs, [earlier.uid, edited.uid])
         let merged = LibrarySourceGraph.merge(
             preferred: .complete(edited), fallback: .complete(item("0-edited", time: 500)))
         XCTAssertEqual(merged.item.timelineOrder, edited.timelineOrder)
 
         var fallbackGraph = LibrarySourceGraph()
-        _ = install(
+        _ = try install(
             firstSource, items: [item("0-edited", time: 500), item("z-earlier", time: 500)], in: &fallbackGraph)
-        _ = install(secondSource, items: [edited, earlier], in: &fallbackGraph)
+        _ = try install(secondSource, items: [edited, earlier], in: &fallbackGraph)
         XCTAssertEqual(fallbackGraph.snapshot().selectedScope.orderedUIDs, [earlier.uid, edited.uid])
     }
 
     func testRenewalAfterAMetadataRefreshKeepsTheRouteAndTheSource() throws {
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [item("photo", time: 1)], in: &graph)
+        _ = try install(firstSource, items: [item("photo", time: 1)], in: &graph)
         let uid = item("photo", time: 1).uid
         let lease = try XCTUnwrap(graph.accessLease(for: uid, requiring: .readThumbnail))
 
-        _ = install(firstSource, items: [item("photo", time: 1, tags: [.favorites])], in: &graph)
+        _ = try install(firstSource, items: [item("photo", time: 1, tags: [.favorites])], in: &graph)
 
         XCTAssertFalse(graph.isCurrent(lease), "every changed item invalidates the leases of its source")
         let renewed = try XCTUnwrap(graph.renewed(lease))
@@ -96,14 +96,14 @@ final class LibrarySourceGraphTests: XCTestCase {
 
     func testRenewalFailsWhenThePhotoLeftOrTheSourceLostAccess() throws {
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [item("photo", time: 1)], in: &graph)
+        _ = try install(firstSource, items: [item("photo", time: 1)], in: &graph)
         let uid = item("photo", time: 1).uid
         let lease = try XCTUnwrap(graph.accessLease(for: uid, requiring: .readThumbnail))
 
-        _ = install(firstSource, items: [], in: &graph)
+        _ = try install(firstSource, items: [], in: &graph)
         XCTAssertNil(graph.renewed(lease))
 
-        _ = install(firstSource, items: [item("photo", time: 1)], in: &graph)
+        _ = try install(firstSource, items: [item("photo", time: 1)], in: &graph)
         let readded = try XCTUnwrap(graph.accessLease(for: uid, requiring: .readThumbnail))
         _ = graph.removeSource(firstSource.id)
         XCTAssertNil(graph.renewed(readded))
@@ -112,14 +112,14 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testRenewalNeverMovesALeaseToAnotherSource() throws {
         var graph = LibrarySourceGraph()
         let shared = item("shared", time: 1)
-        _ = install(firstSource, items: [shared], in: &graph)
-        _ = install(secondSource, items: [shared], in: &graph)
+        _ = try install(firstSource, items: [shared], in: &graph)
+        _ = try install(secondSource, items: [shared], in: &graph)
         let lease = try XCTUnwrap(graph.accessLease(for: shared.uid, requiring: .readThumbnail))
 
         // The source that issued the lease drops the photo; another source still lists it.
         let otherID = lease.sourceID == firstSource.id ? secondSource : firstSource
         let issuing = lease.sourceID == firstSource.id ? firstSource : secondSource
-        _ = install(issuing, items: [], in: &graph)
+        _ = try install(issuing, items: [], in: &graph)
 
         XCTAssertEqual(graph.accessLease(for: shared.uid, requiring: .readThumbnail)?.sourceID, otherID.id)
         XCTAssertNil(graph.renewed(lease), "a renewal keeps the route of the original lease")
@@ -128,11 +128,11 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testRenewalReturnsNothingWhenAHigherSourceNowServesThePhoto() throws {
         var graph = LibrarySourceGraph()
         let shared = item("shared", time: 1)
-        _ = install(secondSource, items: [shared], in: &graph)
+        _ = try install(secondSource, items: [shared], in: &graph)
         let lease = try XCTUnwrap(graph.accessLease(for: shared.uid, requiring: .readThumbnail))
         XCTAssertEqual(lease.sourceID, secondSource.id)
 
-        _ = install(firstSource, items: [shared], in: &graph)
+        _ = try install(firstSource, items: [shared], in: &graph)
 
         XCTAssertEqual(graph.accessLease(for: shared.uid, requiring: .readThumbnail)?.sourceID, firstSource.id)
         XCTAssertNil(graph.renewed(lease), "the caller withholds the bytes and requests them again")
@@ -141,7 +141,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testRenewalAuthorizesByTheCurrentStateAfterReactivation() throws {
         var graph = LibrarySourceGraph()
         let photo = item("photo", time: 1)
-        _ = install(firstSource, items: [photo], in: &graph)
+        _ = try install(firstSource, items: [photo], in: &graph)
         let lease = try XCTUnwrap(graph.accessLease(for: photo.uid, requiring: .readThumbnail))
 
         _ = graph.removeSource(firstSource.id)
@@ -149,23 +149,23 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertNil(graph.renewed(lease))
 
         // Access returns and the source lists the photo again: the graph authorizes the same route now.
-        _ = install(firstSource, items: [photo], in: &graph)
+        _ = try install(firstSource, items: [photo], in: &graph)
         XCTAssertNotNil(graph.renewed(lease))
     }
 
     func testRenewalOfASeriesMemberRequiresTheSameSeries() throws {
         var graph = LibrarySourceGraph()
         let member = item("member", time: 3)
-        _ = install(firstSource, items: [item("key", time: 1, burstMemberIDs: ["key", "member"])], in: &graph)
+        _ = try install(firstSource, items: [item("key", time: 1, burstMemberIDs: ["key", "member"])], in: &graph)
         let lease = try XCTUnwrap(
             graph.burstMemberAccessLeases(for: [member.uid], requiring: .readThumbnail)[member.uid])
 
-        _ = install(
+        _ = try install(
             firstSource, items: [item("key", time: 1, tags: [.favorites], burstMemberIDs: ["key", "member"])],
             in: &graph)
         XCTAssertNotNil(graph.renewed(lease), "a refreshed series still lists its member")
 
-        _ = install(
+        _ = try install(
             firstSource,
             items: [
                 item("key", time: 1, burstMemberIDs: ["key"]),
@@ -179,8 +179,8 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testRenewalRejectsALeaseOfAnotherGraph() throws {
         var first = LibrarySourceGraph()
         var second = LibrarySourceGraph()
-        _ = install(firstSource, items: [item("photo", time: 1)], in: &first)
-        _ = install(firstSource, items: [item("photo", time: 1)], in: &second)
+        _ = try install(firstSource, items: [item("photo", time: 1)], in: &first)
+        _ = try install(firstSource, items: [item("photo", time: 1)], in: &second)
         let lease = try XCTUnwrap(first.accessLease(for: item("photo", time: 1).uid, requiring: .readThumbnail))
 
         XCTAssertNil(second.renewed(lease), "a lease never crosses an account or session")
@@ -189,8 +189,8 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testSelectedOrderDeduplicatesResourceIdentityAndKeepsEveryMembership() throws {
         let duplicate = item("same", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [duplicate, item("first-only", time: 20)], in: &graph)
-        _ = install(secondSource, items: [duplicate, item("second-only", time: 30)], in: &graph)
+        _ = try install(firstSource, items: [duplicate, item("first-only", time: 20)], in: &graph)
+        _ = try install(secondSource, items: [duplicate, item("second-only", time: 30)], in: &graph)
 
         let scope = graph.snapshot().selectedScope
 
@@ -234,8 +234,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         // Through the graph, the higher-precedence capture time decides the position, whatever the install order.
         let middle = item("middle", time: 50)
         var graph = LibrarySourceGraph()
-        _ = install(secondSource, items: [fallback, middle], in: &graph)
-        _ = install(firstSource, items: [preferred], in: &graph)
+        _ = try install(secondSource, items: [fallback, middle], in: &graph)
+        _ = try install(firstSource, items: [preferred], in: &graph)
         XCTAssertEqual(graph.snapshot().selectedScope.orderedUIDs.map(\.nodeID), ["same", "middle"])
     }
 
@@ -275,8 +275,8 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testRemovingOneMembershipKeepsResourceReachableUntilLastSourceIsRemoved() throws {
         let duplicate = item("same", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [duplicate], in: &graph)
-        _ = install(secondSource, items: [duplicate], in: &graph)
+        _ = try install(firstSource, items: [duplicate], in: &graph)
+        _ = try install(secondSource, items: [duplicate], in: &graph)
 
         let firstRemoval = try XCTUnwrap(graph.removeSource(firstSource.id))
 
@@ -294,7 +294,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testAccessLossInvalidatesLeaseAndLateCommitCannotResurrectContent() throws {
         let original = item("original", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [original], in: &graph)
+        _ = try install(firstSource, items: [original], in: &graph)
         let staleLease = try XCTUnwrap(graph.beginRefresh(firstSource.id))
 
         let removal = try XCTUnwrap(graph.removeSource(firstSource.id))
@@ -315,7 +315,7 @@ final class LibrarySourceGraphTests: XCTestCase {
             var graph = LibrarySourceGraph()
             let owner = item("owner", time: 10, burstMemberIDs: ["owner", "member"])
             let member = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "member")
-            _ = install(firstSource, items: [owner], in: &graph)
+            _ = try install(firstSource, items: [owner], in: &graph)
             let tokenRefresh = try XCTUnwrap(graph.beginRefresh(firstSource.id))
             _ = try XCTUnwrap(graph.commit([.complete(owner)], validationToken: "old", using: tokenRefresh))
             let oldAccess = try XCTUnwrap(graph.accessLease(for: owner.uid, requiring: .readThumbnail))
@@ -362,13 +362,13 @@ final class LibrarySourceGraphTests: XCTestCase {
         }
     }
 
-    func testUnknownCapabilityCannotAuthorizeAnyRoute() {
+    func testUnknownCapabilityCannotAuthorizeAnyRoute() throws {
         var graph = LibrarySourceGraph()
         let owner = item("owner", time: 1, isLivePhoto: true, relatedVideoID: "motion")
         let motion = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "motion")
         let outside = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "outside")
         let unknown = LibrarySourceCapabilities(rawValue: 1 << 15)
-        _ = install(firstSource, items: [owner], in: &graph)
+        _ = try install(firstSource, items: [owner], in: &graph)
         _ = graph.setIdentitiesOutsideInventory([outside])
         XCTAssertTrue(graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: unknown).isEmpty)
         XCTAssertNil(graph.accessLease(for: owner.uid, requiring: unknown))
@@ -405,7 +405,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testCachedInventoryCannotReplaceAuthoritativeInventory() throws {
         var graph = LibrarySourceGraph()
         let authoritative = item("authoritative", time: 1)
-        _ = install(firstSource, items: [authoritative], in: &graph)
+        _ = try install(firstSource, items: [authoritative], in: &graph)
         let revision = graph.revision
         XCTAssertNil(
             graph.installCachedInventory(
@@ -431,7 +431,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testInvalidSourceDescriptorCannotRevokeExistingInventory() throws {
         var graph = LibrarySourceGraph()
         let resource = item("retained", time: 1)
-        _ = install(firstSource, items: [resource], in: &graph)
+        _ = try install(firstSource, items: [resource], in: &graph)
         let discovery = graph.beginSourceSetRefresh()
         let invalid = LibrarySource(id: SourceID("invalid"), capabilities: .readContent)
         XCTAssertNil(graph.commitSourceSet([invalid], using: discovery))
@@ -442,7 +442,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testDuplicateSourceSetCannotRevokeExistingInventory() throws {
         var graph = LibrarySourceGraph()
         let resource = item("retained", time: 1)
-        _ = install(firstSource, items: [resource], in: &graph)
+        _ = try install(firstSource, items: [resource], in: &graph)
         let discovery = graph.beginSourceSetRefresh()
         XCTAssertNil(graph.commitSourceSet([secondSource, secondSource], using: discovery))
         XCTAssertEqual(graph.inventory(for: firstSource.id)?.items, [.complete(resource)])
@@ -452,7 +452,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testTransientFailureRetainsCachedInventoryButDefersDestructiveReconciliation() throws {
         let cached = item("cached", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [cached], in: &graph)
+        _ = try install(firstSource, items: [cached], in: &graph)
         let lease = try XCTUnwrap(graph.beginRefresh(firstSource.id))
 
         let change = try XCTUnwrap(graph.failRefresh(using: lease))
@@ -466,7 +466,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testInclusionOnlyChangesSelectedScopeAndNeverGlobalRetention() throws {
         let retained = item("retained", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [retained], in: &graph)
+        _ = try install(firstSource, items: [retained], in: &graph)
 
         let change = try XCTUnwrap(graph.setIncluded(false, for: firstSource.id))
 
@@ -479,7 +479,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testCatalogCommitCannotOverwriteConcurrentInclusionPreference() throws {
         let retained = item("retained", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [retained], in: &graph)
+        _ = try install(firstSource, items: [retained], in: &graph)
         let catalogLease = graph.beginSourceSetRefresh()
 
         _ = try XCTUnwrap(graph.setIncluded(false, for: firstSource.id))
@@ -498,8 +498,8 @@ final class LibrarySourceGraphTests: XCTestCase {
             precedence: secondSource.precedence
         )
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [duplicate], in: &graph)
-        _ = install(writableFallback, items: [duplicate], in: &graph)
+        _ = try install(firstSource, items: [duplicate], in: &graph)
+        _ = try install(writableFallback, items: [duplicate], in: &graph)
 
         XCTAssertEqual(graph.accessLease(for: duplicate.uid, requiring: .readContent)?.sourceID, firstSource.id)
         XCTAssertEqual(graph.accessLease(for: duplicate.uid, requiring: .writeContent)?.sourceID, secondSource.id)
@@ -512,12 +512,12 @@ final class LibrarySourceGraphTests: XCTestCase {
         let tieHigh = item("b", time: 2)
 
         var one = LibrarySourceGraph()
-        _ = install(firstSource, items: [tieHigh], in: &one)
-        _ = install(secondSource, items: [tieLow, earlier], in: &one)
+        _ = try install(firstSource, items: [tieHigh], in: &one)
+        _ = try install(secondSource, items: [tieLow, earlier], in: &one)
 
         var two = LibrarySourceGraph()
-        _ = install(secondSource, items: [earlier, tieLow], in: &two)
-        _ = install(firstSource, items: [tieHigh], in: &two)
+        _ = try install(secondSource, items: [earlier, tieLow], in: &two)
+        _ = try install(firstSource, items: [tieHigh], in: &two)
 
         XCTAssertEqual(one.snapshot().selectedScope.orderedUIDs.map(\.nodeID), ["z", "a", "b"])
         XCTAssertEqual(
@@ -534,8 +534,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         let shared = item("shared", time: 10)
         let removedFromFirst = item("first-only", time: 20)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [shared, removedFromFirst], in: &graph)
-        _ = install(secondSource, items: [shared], in: &graph)
+        _ = try install(firstSource, items: [shared, removedFromFirst], in: &graph)
+        _ = try install(secondSource, items: [shared], in: &graph)
         let lease = try XCTUnwrap(graph.beginRefresh(firstSource.id))
 
         let change = try XCTUnwrap(graph.commit([], validationToken: "next", using: lease))
@@ -552,7 +552,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         let a = item("a", time: 1)
         let b = item("b", time: 2)
         var graph = LibrarySourceGraph()
-        let first = install(firstSource, items: [a, b], in: &graph).selectedScope
+        let first = try install(firstSource, items: [a, b], in: &graph).selectedScope
         let refresh = try XCTUnwrap(graph.beginRefresh(firstSource.id))
         let unavailable = try XCTUnwrap(graph.failRefresh(using: refresh)).selectedScope
 
@@ -573,7 +573,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         let a = item("a", time: 1)
         let b = item("b", time: 2)
         var graph = LibrarySourceGraph()
-        let previous = install(firstSource, items: [a, b], in: &graph).selectedScope
+        let previous = try install(firstSource, items: [a, b], in: &graph).selectedScope
         _ = try XCTUnwrap(graph.beginRefresh(firstSource.id))
         let partial = graph.snapshot().selectedScope
 
@@ -643,7 +643,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testFailedSourceSetRefreshRestoresPriorAuthority() throws {
         let retained = item("retained", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [retained], in: &graph)
+        _ = try install(firstSource, items: [retained], in: &graph)
         XCTAssertEqual(graph.sourceSetAuthority, .authoritative)
         XCTAssertTrue(graph.snapshot().retentionScope.isAuthoritative)
 
@@ -663,8 +663,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         var graph = LibrarySourceGraph()
         let initialSet = graph.beginSourceSetRefresh()
         _ = try XCTUnwrap(graph.commitSourceSet([firstSource, secondSource], using: initialSet))
-        _ = install(firstSource, items: [firstOnly], in: &graph)
-        _ = install(secondSource, items: [secondOnly], in: &graph)
+        _ = try install(firstSource, items: [firstOnly], in: &graph)
+        _ = try install(secondSource, items: [secondOnly], in: &graph)
 
         let replacement = graph.beginSourceSetRefresh()
         let change = try XCTUnwrap(graph.commitSourceSet([secondSource], using: replacement))
@@ -678,7 +678,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testSourceSetReplacementDefersOrphansUntilNewSourcesAreHydrated() throws {
         let existing = item("existing", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [existing], in: &graph)
+        _ = try install(firstSource, items: [existing], in: &graph)
 
         let replacement = graph.beginSourceSetRefresh()
         let catalogChange = try XCTUnwrap(
@@ -711,7 +711,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testCatalogLeaseCapturedBeforeAccessLossCannotReactivateSource() throws {
         let resource = item("resource", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [resource], in: &graph)
+        _ = try install(firstSource, items: [resource], in: &graph)
         let staleCatalog = graph.beginSourceSetRefresh()
 
         _ = try XCTUnwrap(graph.removeSource(firstSource.id))
@@ -736,7 +736,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         let original = item("original", time: 10)
         let replacement = item("replacement", time: 20)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [original], in: &graph)
+        _ = try install(firstSource, items: [original], in: &graph)
         let accepted = try XCTUnwrap(graph.beginRefresh(firstSource.id))
 
         _ = try XCTUnwrap(
@@ -855,7 +855,7 @@ final class LibrarySourceGraphTests: XCTestCase {
             isIncluded: false
         )
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [owner], in: &graph)
+        _ = try install(firstSource, items: [owner], in: &graph)
         let sourceSetLease = graph.beginSourceSetRefresh()
         _ = try XCTUnwrap(
             graph.commitSourceSet([firstSource, thumbnailOnly], using: sourceSetLease)
@@ -879,7 +879,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testLossOfContentCapabilityKeepsMembershipAndDisablesContentRoute() throws {
         let resource = item("resource", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [resource], in: &graph)
+        _ = try install(firstSource, items: [resource], in: &graph)
         let incomplete = LibrarySource(
             id: firstSource.id,
             capabilities: [.readMetadata, .readThumbnail],
@@ -898,12 +898,12 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertTrue(change.retentionScope.isAuthoritative)
     }
 
-    func testPartialItemsCanDriveAnalysisButDuplicatesRemainInvalid() {
+    func testPartialItemsCanDriveAnalysisButDuplicatesRemainInvalid() throws {
         let resource = item("invalid-inventory", time: 10)
         var graph = LibrarySourceGraph()
         let sourceSetLease = graph.beginSourceSetRefresh()
         _ = graph.commitSourceSet([firstSource], using: sourceSetLease)
-        let incompleteLease = try! XCTUnwrap(graph.beginRefresh(firstSource.id))
+        let incompleteLease = try XCTUnwrap(graph.beginRefresh(firstSource.id))
         let incomplete = LibrarySourceItem(
             item: resource,
             knownFields: [.captureTime]
@@ -914,7 +914,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertTrue(partialChange?.analysisScope.isAuthoritative == true)
         XCTAssertTrue(partialChange?.selectedScope.orderedUIDs.isEmpty == true)
 
-        let duplicateLease = try! XCTUnwrap(graph.beginRefresh(firstSource.id))
+        let duplicateLease = try XCTUnwrap(graph.beginRefresh(firstSource.id))
         let complete = LibrarySourceItem.complete(resource)
         XCTAssertNil(
             graph.commit([complete, complete], validationToken: nil, using: duplicateLease)
@@ -942,7 +942,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testContentLeaseSurvivesRefreshButNotAccessLoss() throws {
         let resource = item("resource", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [resource], in: &graph)
+        _ = try install(firstSource, items: [resource], in: &graph)
         let contentLease = try XCTUnwrap(graph.accessLease(for: resource.uid, requiring: .readContent))
 
         let refreshLease = try XCTUnwrap(graph.beginRefresh(firstSource.id))
@@ -959,7 +959,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testContentLeaseCannotBecomeCurrentAgainAfterMembershipReappears() throws {
         let resource = item("resource", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [resource], in: &graph)
+        _ = try install(firstSource, items: [resource], in: &graph)
         let oldLease = try XCTUnwrap(graph.accessLease(for: resource.uid, requiring: .readContent))
 
         let removal = try XCTUnwrap(graph.beginRefresh(firstSource.id))
@@ -982,7 +982,7 @@ final class LibrarySourceGraphTests: XCTestCase {
             precedence: firstSource.precedence
         )
         var graph = LibrarySourceGraph()
-        _ = install(writable, items: [resource], in: &graph)
+        _ = try install(writable, items: [resource], in: &graph)
         let oldLease = try XCTUnwrap(graph.accessLease(for: resource.uid, requiring: .writeContent))
 
         let removal = graph.beginSourceSetRefresh()
@@ -1004,8 +1004,8 @@ final class LibrarySourceGraphTests: XCTestCase {
             isIncluded: false
         )
         var graph = LibrarySourceGraph()
-        _ = install(excluded, items: [resource], in: &graph)
-        _ = install(secondSource, items: [resource], in: &graph)
+        _ = try install(excluded, items: [resource], in: &graph)
+        _ = try install(secondSource, items: [resource], in: &graph)
 
         XCTAssertEqual(
             graph.accessLease(for: resource.uid, requiring: .readThumbnail)?.sourceID,
@@ -1029,8 +1029,8 @@ final class LibrarySourceGraphTests: XCTestCase {
             id: firstSource.id, capabilities: firstSource.capabilities,
             precedence: firstSource.precedence, isIncluded: false)
         var graph = LibrarySourceGraph()
-        _ = install(excluded, items: [owner], in: &graph)
-        _ = install(secondSource, items: [owner], in: &graph)
+        _ = try install(excluded, items: [owner], in: &graph)
+        _ = try install(secondSource, items: [owner], in: &graph)
         _ = graph.setIdentitiesOutsideInventory([outside])
 
         XCTAssertEqual(graph.accessLease(for: owner.uid, requiring: .readThumbnail)?.sourceID, excluded.id)
@@ -1065,8 +1065,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         let thumbnailOnly = LibrarySource(id: firstSource.id, capabilities: .readThumbnail, precedence: 10)
         let outside = PhotoUID(volumeID: "volume", nodeID: "outside-capability")
         var graph = LibrarySourceGraph()
-        _ = install(thumbnailOnly, items: [], in: &graph)
-        _ = install(secondSource, items: [], in: &graph)
+        _ = try install(thumbnailOnly, items: [], in: &graph)
+        _ = try install(secondSource, items: [], in: &graph)
         _ = graph.setIdentitiesOutsideInventory([outside])
         XCTAssertEqual(
             graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: .readContent)[outside]?.sourceID,
@@ -1078,7 +1078,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testOutsideInventoryLeaseStopsWhenIdentityIsUnregistered() throws {
         let outside = PhotoUID(volumeID: "volume", nodeID: "outside-removed")
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [], in: &graph)
+        _ = try install(firstSource, items: [], in: &graph)
         _ = graph.setIdentitiesOutsideInventory([outside])
         let lease = try XCTUnwrap(
             graph.identityOutsideInventoryAccessLeases(for: [outside], requiring: .readThumbnail)[outside])
@@ -1092,8 +1092,8 @@ final class LibrarySourceGraphTests: XCTestCase {
         let owner = item("owner", time: 1, isLivePhoto: true, relatedVideoID: "motion")
         let motion = PhotoUID(volumeID: owner.uid.volumeID, nodeID: "motion")
         var graph = LibrarySourceGraph()
-        _ = install(thumbnailOnly, items: [owner], in: &graph)
-        _ = install(secondSource, items: [owner], in: &graph)
+        _ = try install(thumbnailOnly, items: [owner], in: &graph)
+        _ = try install(secondSource, items: [owner], in: &graph)
         XCTAssertEqual(
             graph.relatedAccessLease(
                 for: motion, of: owner.uid, relationship: .livePhotoMotion,
@@ -1107,7 +1107,7 @@ final class LibrarySourceGraphTests: XCTestCase {
     func testSelectedAccessLeaseCannotBecomeCurrentAfterExclusionToggle() throws {
         let resource = item("resource", time: 10)
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [resource], in: &graph)
+        _ = try install(firstSource, items: [resource], in: &graph)
         let selectedLease = try XCTUnwrap(
             graph.accessLease(
                 for: resource.uid,
@@ -1139,8 +1139,8 @@ final class LibrarySourceGraphTests: XCTestCase {
             burstMemberIDs: ["burst-second"]
         )
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [preferred], in: &graph)
-        let change = install(secondSource, items: [fallback], in: &graph)
+        _ = try install(firstSource, items: [preferred], in: &graph)
+        let change = try install(secondSource, items: [fallback], in: &graph)
         let motionFirst = PhotoUID(volumeID: preferred.uid.volumeID, nodeID: "motion-first")
         let motionSecond = PhotoUID(volumeID: preferred.uid.volumeID, nodeID: "motion-second")
         let burstFirst = PhotoUID(volumeID: preferred.uid.volumeID, nodeID: "burst-first")
@@ -1221,7 +1221,7 @@ final class LibrarySourceGraphTests: XCTestCase {
         XCTAssertEqual(change.videoRetentionScope.uids, [owner.uid])
     }
 
-    func testTenThousandRelationshipRoutesDoNotRescanInventories() {
+    func testTenThousandRelationshipRoutesDoNotRescanInventories() throws {
         let count = 10_000
         let items = (0..<count).map { index in
             item(
@@ -1232,7 +1232,7 @@ final class LibrarySourceGraphTests: XCTestCase {
             )
         }
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: items, in: &graph)
+        _ = try install(firstSource, items: items, in: &graph)
 
         let started = ContinuousClock.now
         var resolved = 0
@@ -1257,7 +1257,7 @@ final class LibrarySourceGraphTests: XCTestCase {
 
     func testPersistenceSignatureIgnoresNoOpRefreshChurnButTracksPayloadAndOverlayChanges() throws {
         var graph = LibrarySourceGraph()
-        _ = install(firstSource, items: [item("asset", time: 1)], in: &graph)
+        _ = try install(firstSource, items: [item("asset", time: 1)], in: &graph)
         let initial = graph.persistenceSignature(additionalStateGeneration: 0)
 
         let sourceSetLease = graph.beginSourceSetRefresh()
