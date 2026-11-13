@@ -2628,7 +2628,21 @@ struct ThumbnailFeedCoreTests {
         let initial = await feed.libraryUpdateResolution(for: [uid], enqueueMissing: true)
         #expect(initial.availableUIDs.isEmpty)
         #expect(initial.terminalUIDs.isEmpty)
-        try await Self.waitUntil { await loader.fetched(uid) }
+        enum CompletionDeadline: Error { case timedOut }
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { try await feed.waitForPrefetchToFinish() }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(30))
+                    throw CompletionDeadline.timedOut
+                }
+                defer { group.cancelAll() }
+                _ = try await group.next()
+            }
+        } catch {
+            await feed.stopPrefetch()
+            throw error
+        }
 
         let settled = await feed.libraryUpdateResolution(for: [uid], enqueueMissing: false)
         #expect(settled.availableUIDs == [uid])
