@@ -79,7 +79,7 @@ enum FixtureWorkloads {
         let sync = PhotoLibraryCatalogSync(store: catalog, enumerator: library, now: { now })
         #if !UPGRADE_RECORDING
             try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
-                catalogStore: catalog, queueStore: queue, engine: engine)
+                catalogStore: catalog, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
             try await sync.reconcileMissingSources(engine: engine)
             try await sync.reconcileLateRendersOnce(engine: engine)
             try await sync.runPass(

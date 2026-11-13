@@ -83,6 +83,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                     ) == SQLITE_OK)
             else {
                 answer.unknown = Set(localIdentifiers)
+                answer.readFailed = true
                 return answer
             }
             defer { sqlite3_finalize(stmt) }
@@ -92,13 +93,17 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 sqlite3_clear_bindings(stmt)
                 guard requireBound(bindText(stmt, 1, identifier)) else {
                     answer.unknown.insert(identifier)
+                    answer.readFailed = true
                     continue
                 }
                 let step = sqlite3_step(stmt)
                 if step == SQLITE_DONE { continue }
-                guard requireOperational(step == SQLITE_ROW),
-                    let entry = decodeEntry(stmt, localIdentifier: identifier, valueOffset: 0)
-                else {
+                guard requireOperational(step == SQLITE_ROW) else {
+                    answer.unknown.insert(identifier)
+                    answer.readFailed = true
+                    continue
+                }
+                guard let entry = decodeEntry(stmt, localIdentifier: identifier, valueOffset: 0) else {
                     answer.unknown.insert(identifier)
                     continue
                 }

@@ -664,7 +664,7 @@ final class DeletedPhotoTests: XCTestCase {
             let engine = UploadBackupSyncEngine(preflight: .init(store: state), queue: queue)
             do {
                 try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
-                    catalogStore: catalog, queueStore: queue, engine: engine)
+                    catalogStore: catalog, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
                 XCTFail("An unknown \(route) must stop replay")
             } catch {
                 XCTAssertEqual(error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")))

@@ -180,6 +180,8 @@ public struct PhotoLibraryCatalogPresence: Sendable, Equatable {
     public var present: [String: PhotoLibraryCatalogEntry] = [:]
     /// Identifiers whose own row could not be read.
     public var unknown = Set<String>()
+    /// A prepare, bind or step failed during this read, even if a later health probe recovers the store.
+    public var readFailed = false
 
     public init(present: [String: PhotoLibraryCatalogEntry] = [:], unknown: Set<String> = []) {
         self.present = present
@@ -222,9 +224,9 @@ public struct PhotoLibraryCatalogPage: Sendable, Equatable {
     }
 }
 
-/// The position of one pass over catalog pages that steps past unknown rows (#1160). The pass offers a resume point
-/// to save only while no page so far held an unknown row, so a later pass reads the first such page again and retries
-/// the row. The pass may record itself complete only when no page held an unknown row.
+/// The position of one pass over catalog pages that steps past unknown rows (#1160). Its durable resume point stays
+/// before the first unknown page for the next launch. During this launch, the retry memory limits later passes to
+/// the unknown rows. The pass may record itself complete only when no row stays unknown.
 public struct PhotoLibraryCatalogPassProgress: Sendable, Equatable {
     /// The result of stepping past one page.
     public enum Step: Sendable, Equatable {
@@ -238,9 +240,33 @@ public struct PhotoLibraryCatalogPassProgress: Sendable, Equatable {
     public private(set) var cursor: String?
     /// Whether a page of this pass held a row that could not be decoded.
     public private(set) var sawUnknownRows = false
+    public private(set) var undecodableIdentifiers = Set<String>()
+    private let retryIdentifiers: [String]?
+    private var retryOffset = 0
 
-    public init(after cursor: String? = nil) {
+    public init(after cursor: String? = nil, retrying identifiers: [String]? = nil) {
         self.cursor = cursor
+        retryIdentifiers = identifiers
+    }
+
+    /// A retry reads only remembered rows. Failed reads stay unknown, including after transient recovery.
+    public mutating func readPage(from store: any PhotoLibraryCatalogStore, limit: Int) -> PhotoLibraryCatalogPage? {
+        guard let retryIdentifiers else {
+            return store.presentEntries(afterLocalIdentifier: cursor, limit: limit)
+        }
+        while retryOffset < retryIdentifiers.count {
+            let end = retryOffset + min(retryIdentifiers.count - retryOffset, max(1, limit))
+            let identifiers = Array(retryIdentifiers[retryOffset..<end])
+            let presence = store.presence(for: identifiers)
+            guard !presence.readFailed, store.isOperational() else { return nil }
+            retryOffset = end
+            let page = PhotoLibraryCatalogPage(
+                entries: identifiers.compactMap { presence.present[$0] },
+                undecodableIdentifiers: identifiers.filter { presence.unknown.contains($0) })
+            // An absent batch does not finish a retry that still holds later identifiers.
+            if page.lastLocalIdentifier != nil { return page }
+        }
+        return PhotoLibraryCatalogPage()
     }
 
     /// Steps past `page`. A page of only unknown rows is not the end of the catalog.
@@ -248,7 +274,8 @@ public struct PhotoLibraryCatalogPassProgress: Sendable, Equatable {
         guard let lastKey = page.lastLocalIdentifier else { return .end }
         cursor = lastKey
         sawUnknownRows = sawUnknownRows || !page.undecodableIdentifiers.isEmpty
-        return .advanced(resumePoint: sawUnknownRows ? nil : lastKey)
+        undecodableIdentifiers.formUnion(page.undecodableIdentifiers)
+        return .advanced(resumePoint: sawUnknownRows || retryIdentifiers != nil ? nil : lastKey)
     }
 
     /// Whether the pass may record itself complete. While a row stayed unknown, the pass stays owed, and this call
@@ -257,6 +284,41 @@ public struct PhotoLibraryCatalogPassProgress: Sendable, Equatable {
         guard sawUnknownRows else { return true }
         PhotoDiagnostics.shared.increment(counter)
         return false
+    }
+}
+
+/// Retry rows for the three catalog passes during one controller lifetime. Only a finished walk replaces a set.
+public final class PhotoLibraryCatalogRetryRows: @unchecked Sendable {
+    public enum Pass: Hashable, Sendable { case replay, lateRenders, missingSources }
+    private struct Rows {
+        var identifiers: [String]
+        var generation: Int64?
+    }
+    private let lock = NSLock()
+    private var rows: [Pass: Rows] = [:]
+
+    public init() {}
+
+    public func identifiers(for pass: Pass) -> [String]? {
+        lock.withLock { rows[pass]?.identifiers }
+    }
+
+    /// A new discard generation owes another walk, including the pages before the durable checkpoint.
+    public func needsMissingSourceRestart(for generation: Int64) -> Bool {
+        lock.withLock {
+            guard let saved = rows[.missingSources] else { return false }
+            return saved.generation != generation
+        }
+    }
+
+    public func forgetMissingSources() {
+        lock.withLock { rows[.missingSources] = nil }
+    }
+
+    public func remember(_ progress: PhotoLibraryCatalogPassProgress, for pass: Pass, generation: Int64? = nil) {
+        lock.withLock {
+            rows[pass] = Rows(identifiers: progress.undecodableIdentifiers.sorted(), generation: generation)
+        }
     }
 }
 
@@ -283,6 +345,8 @@ public protocol PhotoLibraryCatalogStore: Sendable {
     /// a failed read for a real absence (#1004). Throws `PhotoLibraryCatalogUndecodableRowError` when the row exists
     /// but its content could not be decoded (#1212).
     func entry(for localIdentifier: String) throws -> PhotoLibraryCatalogEntry?
+    /// Reads present and unknown rows separately. SQL failures also set `readFailed`; they never prove absence.
+    func presence(for localIdentifiers: [String]) -> PhotoLibraryCatalogPresence
     /// Stable keyset page of present inventory rows. Used to rebuild or enrich the durable backup
     /// queue without touching PhotoKit bytes when the queue is incomplete after an app upgrade.
     /// Nil means the page is unknown, not empty; a caller must not treat it as the end of the catalog (#1004).
