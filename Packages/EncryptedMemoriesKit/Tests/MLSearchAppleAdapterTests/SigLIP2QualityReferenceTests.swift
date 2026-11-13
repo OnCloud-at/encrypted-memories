@@ -33,22 +33,47 @@ import Testing
         }
     }
 
-    private struct FileImageSource: CoreMLImageSource {
-        let urlsByUID: [PhotoUID: URL]
-
-        func image(for uid: PhotoUID) async -> CoreMLImageSourceOutcome {
-            guard let url = urlsByUID[uid],
-                let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
-            else {
-                return .permanentFailure(reason: "unreadable reference image")
-            }
-            return .image(CoreMLSourceImage(cgImage: image))
+    @Test func referenceImageSourcesLoadImagesAndClassifyMissingInput() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("reference.png")
+        let context = try #require(
+            CGContext(
+                data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try #require(context.makeImage())
+        let destination = try #require(CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        #expect(CGImageDestinationFinalize(destination))
+        let uid = PhotoUID(volumeID: "fixture", nodeID: "image")
+        let invalidURL = directory.appendingPathComponent("invalid.png")
+        try Data("not an image".utf8).write(to: invalidURL)
+        let invalidUID = PhotoUID(volumeID: "fixture", nodeID: "invalid")
+        let source = FileImageSource(urlsByUID: [uid: url, invalidUID: invalidURL])
+        guard case .image(let loaded) = await source.image(for: uid) else {
+            Issue.record("Expected the reference image to load")
+            return
         }
-    }
-
-    private struct EmptyImageSource: CoreMLImageSource {
-        func image(for uid: PhotoUID) async -> CoreMLImageSourceOutcome { .transientFailure }
+        #expect(loaded.cgImage.width == 2)
+        guard
+            case .permanentFailure(let reason) = await source.image(
+                for: PhotoUID(volumeID: "fixture", nodeID: "missing"))
+        else {
+            Issue.record("Expected an unreadable reference to fail permanently")
+            return
+        }
+        #expect(reason == "unreadable reference image")
+        guard case .permanentFailure(let invalidReason) = await source.image(for: invalidUID) else {
+            Issue.record("Expected an invalid image file to fail permanently")
+            return
+        }
+        #expect(invalidReason == "unreadable reference image")
+        guard case .transientFailure = await EmptyImageSource().image(for: uid) else {
+            Issue.record("Expected the empty source to fail transiently")
+            return
+        }
     }
 
     private static func artifactDirectory() -> URL? {
