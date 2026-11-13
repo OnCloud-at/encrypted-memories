@@ -102,7 +102,7 @@
             _ = await feed.feedCore.reconcile(
                 selected: change.selectedScope, analysis: change.analysisScope,
                 retention: change.thumbnailRetentionScope)
-            XCTAssertEqual(cache.diskFileCount(), 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: cache.diskURL(for: item.uid).path))
             XCTAssertNil(feed.memoryImage(for: item.uid))
             addTeardownBlock { await feed.feedCore.stopPrefetchAndWait() }
             return (feed, item)

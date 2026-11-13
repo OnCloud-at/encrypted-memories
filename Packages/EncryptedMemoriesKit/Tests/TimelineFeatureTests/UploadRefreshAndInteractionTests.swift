@@ -209,13 +209,11 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
 
         let result = await model.refreshAfterUpload(uploadedUID: uploadedUID)
         await feed.stopPrefetch()
-        let status = await feed.prefetchStatus()
         let loaderRequestCount = await loader.requestCount
+        let hasPendingWork = await feed.feedCore.hasPendingThumbnailWork()
 
         XCTAssertEqual(result.failureReason, .scopeAccessLost)
-        XCTAssertEqual(status.currentQueueLength, 0)
-        XCTAssertEqual(status.activeJobs, 0)
-        XCTAssertEqual(status.downloadStarted, 0)
+        XCTAssertFalse(hasPendingWork)
         XCTAssertEqual(loaderRequestCount, 0)
     }
 

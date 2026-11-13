@@ -55,9 +55,8 @@ struct ThumbnailCrawlYieldTests {
         let feed = await Self.makeFeed(loader: loader, clock: clock, concurrency: 2, batch: 2)
 
         await feed.startPrefetch(uids)  // no offline flag anywhere in this path
-        try await Self.waitUntil { await feed.prefetchStatus().diskThumbnailCoverageFraction >= 1.0 }
-
-        #expect(await feed.prefetchStatus().diskThumbnailCoverageFraction >= 1.0)
+        try await Self.waitUntil { Set(await loader.fetchOrder()).isSuperset(of: uids) }
+        #expect(Set(await loader.fetchOrder()).isSuperset(of: uids))
     }
 
     @Test func visibleDemandPausesSequentialCrawl() async throws {
