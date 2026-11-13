@@ -199,11 +199,14 @@ struct ProtonRequestTally: Sendable {
     }
 
     static let maximumKeys = 512
+    static let maximumRateLimitEvents = 32
     static let summaryInterval: TimeInterval = 60
 
     private(set) var counts: [Key: Int] = [:]
     private(set) var overflowRequests = 0
     private(set) var scopes: [ProtonRequestScope: ScopeTotals] = [:]
+    /// The newest `maximumRateLimitEvents` answers with status 429, oldest first.
+    private(set) var rateLimitEvents: [RemoteRequestSupportSnapshot.RateLimitEvent] = []
     private var summaryStart: Date?
     private var summaryCauses: [String: Int] = [:]
     private var summaryStatuses: [ProtonRequestStatusClass: Int] = [:]
@@ -225,16 +228,39 @@ struct ProtonRequestTally: Sendable {
         scopes[scope, default: ScopeTotals()].peakInFlight = max(scopes[scope]?.peakInFlight ?? 0, inFlight)
     }
 
+    /// What the governor set because of one 429, read after it changed the scope.
+    struct RateLimitOutcome: Sendable {
+        let cause: String
+        let offsetMilliseconds: Int64
+        let cooldown: TimeInterval
+        let concurrencyLimit: Int
+        let admissionInterval: TimeInterval
+        let observedRequestsPerSecond: Double
+        let successesLastMinute: Int
+    }
+
     mutating func recordRateLimit(
-        scope: ProtonRequestScope, retryAfter: TimeInterval?, cooldownFrom start: Date, until end: Date
+        scope: ProtonRequestScope, retryAfter: TimeInterval?, cooldownFrom start: Date, until end: Date,
+        outcome: RateLimitOutcome
     ) {
         var totals = scopes[scope] ?? ScopeTotals()
         // A malformed header can parse as infinity, which a JSON report cannot hold; a negative wait means nothing.
-        if let retryAfter, retryAfter.isFinite, retryAfter >= 0 {
-            totals.maximumRetryAfter = max(totals.maximumRetryAfter ?? 0, retryAfter)
+        let usableRetryAfter = retryAfter.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        if let usableRetryAfter {
+            totals.maximumRetryAfter = max(totals.maximumRetryAfter ?? 0, usableRetryAfter)
         }
         totals.cooldownSeconds += max(0, end.timeIntervalSince(start))
         scopes[scope] = totals
+
+        if rateLimitEvents.count == Self.maximumRateLimitEvents { rateLimitEvents.removeFirst() }
+        rateLimitEvents.append(
+            RemoteRequestSupportSnapshot.RateLimitEvent(
+                scope: scope.supportName, offsetMilliseconds: outcome.offsetMilliseconds, cause: outcome.cause,
+                retryAfterSeconds: usableRetryAfter, cooldownSeconds: outcome.cooldown,
+                concurrencyLimit: outcome.concurrencyLimit,
+                admissionIntervalMilliseconds: Int((outcome.admissionInterval * 1_000).rounded()),
+                observedRequestsPerSecond: outcome.observedRequestsPerSecond,
+                successesLastMinute: outcome.successesLastMinute))
     }
 
     /// At most one line per minute, written by the first request after the window: the requests of the window by cause

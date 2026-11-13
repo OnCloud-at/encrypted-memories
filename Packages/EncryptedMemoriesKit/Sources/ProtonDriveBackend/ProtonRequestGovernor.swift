@@ -339,12 +339,17 @@ actor ProtonRequestGovernor {
             let cooldown = max(1, min(retryAfter ?? fallback, 120))
             let previousCooldownEnd = max(state.cooldownUntil, timestamp)
             state.cooldownUntil = max(state.cooldownUntil, timestamp.addingTimeInterval(cooldown))
-            tally.recordRateLimit(
-                scope: permit.scope, retryAfter: retryAfter,
-                cooldownFrom: previousCooldownEnd, until: state.cooldownUntil)
             let observedInterval = 1 / max(0.1, state.successfulRequestsPerSecondBeforeLastLimit * 0.8)
             state.admissionInterval = max(0.025, min(2, max(state.admissionInterval * 2, observedInterval)))
             state.lastRecoveryAt = timestamp
+            tally.recordRateLimit(
+                scope: permit.scope, retryAfter: retryAfter,
+                cooldownFrom: previousCooldownEnd, until: state.cooldownUntil,
+                outcome: ProtonRequestTally.RateLimitOutcome(
+                    cause: permit.cause, offsetMilliseconds: record.endMilliseconds, cooldown: cooldown,
+                    concurrencyLimit: state.concurrencyLimit, admissionInterval: state.admissionInterval,
+                    observedRequestsPerSecond: state.successfulRequestsPerSecondBeforeLastLimit,
+                    successesLastMinute: successesLastMinute))
             DebugLog.log(
                 "[RequestGovernor] 429 scope=\(permit.scope) cooldownMs=\(Int(cooldown * 1_000)) "
                     + "limit=\(state.concurrencyLimit) intervalMs=\(Int(state.admissionInterval * 1_000)) "
@@ -437,7 +442,7 @@ actor ProtonRequestGovernor {
         return RemoteRequestSupportSnapshot(
             counts: counts, overflowRequests: tally.overflowRequests, scopes: scopes,
             recentRequests: trace.snapshot, droppedRequestRecords: trace.dropped,
-            traceCapturedAtMilliseconds: traceNow())
+            traceCapturedAtMilliseconds: traceNow(), rateLimitEvents: tally.rateLimitEvents)
     }
 
     private func cancel(id: UUID, scope: ProtonRequestScope) {
