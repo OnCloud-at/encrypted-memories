@@ -508,7 +508,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         let message = app.staticTexts["duplicates.differing.message"]
         XCTAssertTrue(message.waitForExistence(timeout: 10))
 
-        app.navigationBars.firstMatch.buttons.element(boundBy: 0).tap()
+        app.backButton(to: "Duplicates").tap()
 
         waitUntilGone(message, "Back shows the duplicates")
         XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay")
