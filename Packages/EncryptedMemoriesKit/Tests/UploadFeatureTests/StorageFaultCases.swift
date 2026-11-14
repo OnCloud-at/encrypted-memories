@@ -11,7 +11,8 @@ let storageFaultCases: [any StorageFaultCase] = [
     CatalogUpsertBatchCase(),
     CatalogScanCase(id: "catalog.fullScan", identifiers: nil),
     CatalogScanCase(id: "catalog.changeScan", identifiers: ["asset-2", "asset-3", "asset-4"]),
-    EditReplacementJournalUpdateCase(),
+    EditReplacementJournalUpdateCase(id: "journal.editReplacement.update", seededChanges: 2),
+    EditReplacementJournalUpdateCase(id: "journal.editReplacement.compact", seededChanges: 1_000),
     EditReplacementJournalCreateCase(),
 ]
 
@@ -150,15 +151,18 @@ struct CatalogScanCase: StorageFaultCase {
 }
 
 /// One change of the edit replacement journal (`EditReplacementJournalFileStore.addSuperseded`): one line appended to
-/// its log through the durable file writer (#1149). The state is the journal as a new store reads it, so a log that a
-/// restart rewrote compares by its entries, not by its line order.
+/// its log through the durable file writer (#1149). With 1,000 seeded changes the run's change crosses the line limit,
+/// and its compaction runs at once after the change, so its replacement is a point too. The state is the journal as a
+/// new store reads it, so a log that a compaction or a restart rewrote compares by its entries, not by its lines.
 struct EditReplacementJournalUpdateCase: StorageFaultCase {
     struct World {
         let journal: EditReplacementJournalFileStore
         let files: StorageFaultFiles
     }
 
-    let id = "journal.editReplacement.update"
+    let id: String
+    /// The changes before the run: one of the second photo, the others of the first.
+    let seededChanges: Int
     let atomicity = StorageFaultAtomicity.allOrNothing
     private static let sources = ["asset-1", "asset-2"].map {
         UploadSourceIdentity(kind: .photoLibraryAsset, identifier: $0)
@@ -166,14 +170,18 @@ struct EditReplacementJournalUpdateCase: StorageFaultCase {
 
     func seed(in directory: URL, remote: StorageFaultRemote) async throws {
         let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
-        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "a"), for: Self.sources[0])
         try journal.recordUpload(edited: true, for: Self.sources[1])
+        for index in 0..<(seededChanges - 1) {
+            try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "a\(index)"), for: Self.sources[0])
+        }
     }
 
     func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
         let files = StorageFaultFiles()
         return World(
-            journal: try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory, fileSystem: files)),
+            journal: try XCTUnwrap(
+                EditReplacementJournalFileStore(
+                    accountDataDirectory: directory, fileSystem: files, scheduleCompaction: { $0() })),
             files: files)
     }
 

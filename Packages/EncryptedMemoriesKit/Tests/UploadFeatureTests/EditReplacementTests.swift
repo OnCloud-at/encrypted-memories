@@ -285,6 +285,9 @@ final class EditReplacementTests: XCTestCase {
     }
 
     func testTheLogIsRewrittenWhenItHoldsManyMoreLinesThanEntries() throws {
+        // Each compaction runs at once after its change here; the app runs it away from the caller.
+        journal = try XCTUnwrap(
+            EditReplacementJournalFileStore(accountDataDirectory: directory, scheduleCompaction: { $0() }))
         for round in 0..<1_500 {
             try journal.recordUpload(edited: round % 2 == 0, for: asset)
             try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "old-\(round)"), for: asset)
@@ -417,6 +420,32 @@ final class EditReplacementTests: XCTestCase {
         let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
 
         try assertRewrittenLog([asset: reopened.entry(for: asset), other: reopened.entry(for: other)])
+    }
+
+    /// The change whose line makes the log hold more than 1,000 lines, and more than twice its entries, rewrites the log
+    /// as one sorted line per entry; the next change appends after that.
+    func testTheChangeThatCrossesTheLineLimitRewritesTheLogAsOneSortedLinePerEntry() throws {
+        // The compaction runs at once after the change here; the app runs it away from the caller.
+        journal = try XCTUnwrap(
+            EditReplacementJournalFileStore(accountDataDirectory: directory, scheduleCompaction: { $0() }))
+        let other = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-0")
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "other"), for: other)
+        for index in 0..<999 {
+            try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "n\(index)"), for: asset)
+        }
+        XCTAssertEqual(try lineCount(), 1_000, "1,000 lines do not cross the limit")
+
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "n999"), for: asset)
+        try assertRewrittenLog([asset: journal.entry(for: asset), other: journal.entry(for: other)])
+
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "later"), for: other)
+        let lines = try Data(contentsOf: logURL).split(separator: UInt8(ascii: "\n"))
+        XCTAssertEqual(lines.count, 3, "the next change is appended to the rewritten log")
+        try assertLine(Data(lines[2]), is: LogLine(key: logKey(other), entry: journal.entry(for: other)))
+    }
+
+    private func lineCount() throws -> Int {
+        try Data(contentsOf: logURL).split(separator: UInt8(ascii: "\n")).count
     }
 
     func testAnEarlierBuildFileBecomesOneSortedLinePerEntryBehindTheBarrier() throws {

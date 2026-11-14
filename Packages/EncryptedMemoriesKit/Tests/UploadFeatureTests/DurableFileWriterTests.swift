@@ -252,4 +252,189 @@ final class DurableFileWriterTests: XCTestCase {
         XCTAssertEqual(reopened.entry(for: other), journal.entry(for: other))
         XCTAssertEqual(try Data(contentsOf: logURL).last, UInt8(ascii: "\n"), "the cut-off line is gone")
     }
+
+    // MARK: Compaction away from the caller
+
+    private let otherAsset = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "asset-2")
+    private var logURL: URL { directory.appendingPathComponent(EditReplacementJournalFileStore.logFileName) }
+
+    private func logLines() throws -> [Data] {
+        try Data(contentsOf: logURL).split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: false)
+            .dropLast().map { Data($0) }
+    }
+
+    private func journal(holding held: HeldCompactions) throws -> EditReplacementJournalFileStore {
+        try XCTUnwrap(
+            EditReplacementJournalFileStore(
+                accountDataDirectory: directory, fileSystem: files, scheduleCompaction: held.schedule))
+    }
+
+    /// Writes 1,000 lines: one change of the other photo and 999 of `asset`. The next change crosses the line limit.
+    private func fillToTheLineLimit(_ journal: EditReplacementJournalFileStore) throws {
+        try journal.recordUpload(edited: true, for: otherAsset)
+        for index in 0..<999 {
+            try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "n\(index)"), for: asset)
+        }
+    }
+
+    private func assertReopenedEntriesEqual(
+        _ journal: EditReplacementJournalFileStore, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let reopened = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        XCTAssertEqual(reopened.entry(for: asset), journal.entry(for: asset), file: file, line: line)
+        XCTAssertEqual(reopened.entry(for: otherAsset), journal.entry(for: otherAsset), file: file, line: line)
+    }
+
+    func testTheChangeThatCrossesTheLineLimitLeavesTheCompactionToTheScheduler() throws {
+        let held = HeldCompactions()
+        let journal = try journal(holding: held)
+        try fillToTheLineLimit(journal)
+        failWrites([])
+
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "crossing"), for: asset)
+
+        XCTAssertEqual(writes, ["append \(EditReplacementJournalFileStore.logFileName)"], "the caller only appends")
+        XCTAssertEqual(held.count, 1, "one compaction waits for its turn")
+        XCTAssertEqual(try logLines().count, 1_001)
+    }
+
+    func testLinesWrittenWhileACompactionWaitsFollowItsSortedLinesInTheirOrder() throws {
+        let held = HeldCompactions()
+        let journal = try journal(holding: held)
+        try fillToTheLineLimit(journal)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "crossing"), for: asset)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "later-1"), for: otherAsset)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "later-2"), for: asset)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "later-3"), for: otherAsset)
+        XCTAssertEqual(held.count, 1, "one compaction at a time")
+        let laterLines = Array(try logLines().suffix(3))
+        failWrites([])
+
+        held.runAll()
+
+        XCTAssertEqual(writes, ["replace \(EditReplacementJournalFileStore.logFileName)"])
+        let lines = try logLines()
+        XCTAssertEqual(lines.count, 5, "one line per entry of the snapshot, then the three later lines")
+        XCTAssertEqual(Array(lines.suffix(3)), laterLines, "the later lines keep their bytes and their order")
+        try assertReopenedEntriesEqual(journal)
+
+        // The compacted log counts its later lines: the next compaction starts at line 1,001 of the file.
+        for index in 0..<995 {
+            try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "after-\(index)"), for: asset)
+        }
+        XCTAssertEqual(try logLines().count, 1_000)
+        XCTAssertEqual(held.count, 0, "1,000 lines do not cross the limit")
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "crossing-again"), for: asset)
+        XCTAssertEqual(held.count, 1, "line 1,001 starts the next compaction")
+    }
+
+    func testAChangeDuringTheCompactionWaitsForItsReplacementAndKeepsItsOrder() throws {
+        let held = HeldCompactions()
+        let journal = try journal(holding: held)
+        try fillToTheLineLimit(journal)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "crossing"), for: asset)
+        let changed = DispatchSemaphore(value: 0)
+        let finishedDuringReplacement = LockedFlag()
+        let other = otherAsset
+        files.watch(
+            failing: [],
+            onStart: { write in
+                guard write == "replace \(EditReplacementJournalFileStore.logFileName)" else { return }
+                DispatchQueue.global().async {
+                    try? journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "during"), for: other)
+                    changed.signal()
+                }
+                if changed.wait(timeout: .now() + 0.2) == .success {
+                    finishedDuringReplacement.set()
+                    changed.signal()
+                }
+            })
+
+        held.runAll()
+
+        XCTAssertEqual(changed.wait(timeout: .now() + 5), .success, "the change finishes after the replacement")
+        XCTAssertFalse(finishedDuringReplacement.value, "the change waits while the log is replaced")
+        XCTAssertEqual(journal.entry(for: otherAsset).superseded.map(\.nodeID), ["during"])
+        XCTAssertEqual(try logLines().count, 3, "two compacted lines, then the change")
+        try assertReopenedEntriesEqual(journal)
+    }
+
+    func testAFailedCompactionKeepsTheLogAndTheNextChangeStartsAnother() throws {
+        let held = HeldCompactions()
+        let journal = try journal(holding: held)
+        try fillToTheLineLimit(journal)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "crossing"), for: asset)
+        let before = try Data(contentsOf: logURL)
+        failWrites([1])
+
+        held.runAll()
+
+        XCTAssertEqual(writes, ["replace \(EditReplacementJournalFileStore.logFileName)"])
+        XCTAssertEqual(try Data(contentsOf: logURL), before, "the failed compaction keeps the log")
+        try assertReopenedEntriesEqual(journal)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "next"), for: asset)
+        XCTAssertEqual(held.count, 1, "the next change starts another compaction")
+    }
+
+    func testACompactionThatRunsAfterCloseWritesNothing() throws {
+        let held = HeldCompactions()
+        let journal = try journal(holding: held)
+        try fillToTheLineLimit(journal)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "crossing"), for: asset)
+        journal.close()
+        failWrites([])
+
+        held.runAll()
+
+        XCTAssertEqual(writes, [], "the account's stores are closed")
+        XCTAssertEqual(try logLines().count, 1_001)
+    }
+
+    func testTheAppRunsTheCompactionOnAUtilityQueueAwayFromTheCaller() {
+        let ran = expectation(description: "the compaction runs")
+        EditReplacementJournalFileStore.onUtilityQueue {
+            XCTAssertFalse(Thread.isMainThread)
+            XCTAssertEqual(qos_class_self(), QOS_CLASS_UTILITY)
+            ran.fulfill()
+        }
+        wait(for: [ran], timeout: 5)
+    }
+
+    func testAStoppedLogIsNotCompacted() throws {
+        let held = HeldCompactions()
+        let journal = try journal(holding: held)
+        try fillToTheLineLimit(journal)
+        try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "crossing"), for: asset)
+        failWrites([1, 2])
+        XCTAssertThrowsError(try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "half"), for: asset))
+        failWrites([])
+
+        held.runAll()
+
+        XCTAssertEqual(writes, [], "a log that keeps a half line is not replaced")
+    }
+}
+
+/// Holds the compaction jobs of a journal until the test runs them.
+private final class HeldCompactions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var jobs: [@Sendable () -> Void] = []
+    var count: Int { lock.withLock { jobs.count } }
+
+    func schedule(_ job: @escaping @Sendable () -> Void) { lock.withLock { jobs.append(job) } }
+
+    func runAll() {
+        let waiting = lock.withLock {
+            defer { jobs = [] }
+            return jobs
+        }
+        for job in waiting { job() }
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSet = false
+    var value: Bool { lock.withLock { isSet } }
+    func set() { lock.withLock { isSet = true } }
 }
