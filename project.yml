@@ -78,7 +78,6 @@ targets:
       - App
       - Shared/PrivacyInfo.xcprivacy
       - Shared/AppIntents.xcstrings
-      - Shared/InfoPlist.xcstrings
     dependencies:
       - package: EncryptedMemoriesKit
         product: PhotosCore
@@ -145,7 +144,6 @@ targets:
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
         INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Encrypted Memories contributors"
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Encrypted Memories backs up the photos and videos in your Photos library to Proton Drive, end-to-end encrypted."
-        INFOPLIST_KEY_NSFaceIDUsageDescription: "The app uses Face ID to unlock your library."
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
         CODE_SIGN_ENTITLEMENTS: App/EncryptedMemories.entitlements
         ENABLE_HARDENED_RUNTIME: YES
@@ -168,7 +166,6 @@ targets:
       - iOSApp
       - Shared/PrivacyInfo.xcprivacy
       - Shared/AppIntents.xcstrings
-      - Shared/InfoPlist.xcstrings
     dependencies:
       - package: EncryptedMemoriesKit
         product: PhotosCore
@@ -246,7 +243,6 @@ targets:
         APP_DISPLAY_NAME: "Memories"
         PRODUCT_NAME: EncryptedMemoriesMobile
         INFOPLIST_FILE: iOSApp/Info.plist
-        INFOPLIST_KEY_NSFaceIDUsageDescription: "The app uses Face ID to unlock your library."
         ENCRYPTED_MEMORIES_BUILD_COMMIT: unknown
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO

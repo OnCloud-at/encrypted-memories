@@ -4,6 +4,27 @@ import XCTest
 @testable import PrivacyFeature
 
 final class AppLockCopyTests: XCTestCase {
+    func testTheDisabledSwitchNamesThePlatformCredential() {
+        #if os(macOS)
+            XCTAssertEqual(
+                AppLockCopy.switchTitle(for: .noDeviceLock),
+                AppLockCopy.switchTitle(for: .available(.accountPassword)))
+        #else
+            XCTAssertEqual(
+                AppLockCopy.switchTitle(for: .noDeviceLock),
+                AppLockCopy.switchTitle(for: .available(.devicePasscode)))
+        #endif
+    }
+
+    func testTheUnreachableOpticIDCaseUsesTheApprovedPasscodeLabel() {
+        XCTAssertEqual(
+            AppLockCopy.switchTitle(for: .available(.opticID)),
+            AppLockCopy.switchTitle(for: .available(.devicePasscode)))
+        XCTAssertEqual(
+            AppLockCopy.unlockTitle(for: .available(.opticID)),
+            AppLockCopy.unlockTitle(for: .available(.devicePasscode)))
+    }
+
     func testUnsupportedLanguagesUseEnglishDurationUnits() {
         let formatter = Duration.UnitsFormatStyle(
             allowedUnits: [.minutes, .seconds], width: .wide, maximumUnitCount: 1)
