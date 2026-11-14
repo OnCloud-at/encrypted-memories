@@ -1110,6 +1110,49 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await orchestration.value
         }
 
+        /// A pass whose instant work outlasts the bounded retirement wait still owns its lock, and its final state is not
+        /// projected yet: it has settled only when its completion ran (#1108).
+        func testARunSettlesOnlyAfterItsRetiredInstantWorkCompletedIt() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-run-settles-after-retirement")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            XCTAssertTrue(controller.installSyncRunForTesting(runID: "carried", task: Task {}))
+            let writer = NonCooperativeWriterLatch()
+            let writerTask = makeNonCooperativeWriter(writer)
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(writerTask))
+            await writer.waitUntilStarted()
+            await writer.waitUntilBlocked()
+
+            await controller.finishSyncForTesting(runID: "carried")
+            XCTAssertTrue(controller.isRetiringInstantWorkForTesting, "the writer outlasted the bounded wait")
+            XCTAssertEqual(
+                controller.activeExecutionRunID, "carried", "the run keeps its lock while its writer retires")
+
+            let settled = CompletionLatch()
+            let waiter = Task {
+                await controller.waitUntilRunSettled("carried")
+                await settled.markCompleted()
+            }
+            try await Task.sleep(for: PhotoLibraryBackupController.instantWorkRetirementTimeout + .milliseconds(100))
+            let settledWhileRetiring = await settled.isCompleted()
+            XCTAssertFalse(settledWhileRetiring, "the run has not settled while its writer retires")
+
+            await writer.release()
+            await writerTask.value
+            await waiter.value
+            XCTAssertNil(controller.activeExecutionRunID, "the run settled: its completion released the lock")
+            XCTAssertFalse(controller.isRetiringInstantWorkForTesting)
+            await controller.shutdown()
+        }
+
+        func testWaitingForARunThatIsNeitherActiveNorSettlingReturnsAtOnce() async throws {
+            let fixture = try makeControllerFixture(prefix: "photo-backup-run-settled-unknown")
+            defer { fixture.cleanup() }
+            await fixture.controller.waitUntilRunSettled("never-started")
+            XCTAssertNil(fixture.controller.activeExecutionRunID)
+            await fixture.controller.shutdown()
+        }
+
         func testExpirationTracksEveryConcurrentWriterAndRetiresUntilBothReturn() async throws {
             let suite = "photo-backup-controller-retirement-\(UUID().uuidString)"
             let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -1320,36 +1363,6 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(returnedAfterRelease)
         }
     #endif
-
-    func testBackgroundExecutionCompositionReservesDiscoveryAndQueuePhases() throws {
-        let catalog = BackupExecutionProgress(completedUnitCount: 50, totalUnitCount: 100)
-        let queue = BackupExecutionProgress(completedUnitCount: 20, totalUnitCount: 100)
-
-        let scanOnly = try XCTUnwrap(
-            PhotoLibraryBackupExecutionProgress.combined(
-                catalog: catalog,
-                queue: nil,
-                isScanning: true
-            ))
-        XCTAssertEqual(scanOnly.completedUnitCount, 125_000)
-        XCTAssertEqual(scanOnly.totalUnitCount, 1_000_000)
-
-        let combined = try XCTUnwrap(
-            PhotoLibraryBackupExecutionProgress.combined(
-                catalog: catalog,
-                queue: queue,
-                isScanning: true
-            ))
-        XCTAssertEqual(combined.completedUnitCount, 275_000)
-
-        let finishedWithoutQueue = try XCTUnwrap(
-            PhotoLibraryBackupExecutionProgress.combined(
-                catalog: BackupExecutionProgress(completedUnitCount: 100, totalUnitCount: 100),
-                queue: nil,
-                isScanning: false
-            ))
-        XCTAssertEqual(finishedWithoutQueue.completedUnitCount, 1_000_000)
-    }
 
     func testLivePhotoLibraryChangesAreAvailableBeforePersistentHistoryCatchesUp() {
         var buffer = PhotoLibraryLiveChangeBuffer()
@@ -2012,7 +2025,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
         private func assertManualRetryResumesAfterWiFiWait(
             networkDetermined: Bool, returnsDuringScan: Bool, returnsInBackgroundWindow: Bool = false,
-            enablesMobileData: Bool = false, windowInBackground: Bool = false, observerFirst: Bool = false
+            enablesMobileData: Bool = false, windowInBackground: Bool = false, observerFirst: Bool = false,
+            windowOwner: BackupExecutionOwner = .iOSBackgroundTask
         ) async throws {
             let signals = FakeBackupRuntimeSignals(waitsForWiFi: true, networkDetermined: networkDetermined)
             let fixture = try makeWiFiWaitFixture(
@@ -2077,7 +2091,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                     XCTAssertTrue(controller.isManualWiFiRetryPendingForTesting, "the retry waits for the window")
                 }
                 let windowRuns = PassCounter()
-                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { _ in _ = windowRuns.increment() }
+                await controller.backgroundCatchUp(owner: windowOwner) { _ in _ = windowRuns.increment() }
                 if windowInBackground {
                     XCTAssertEqual(windowRuns.count, 1, "the window runs the pass and holds it until it ends")
                     XCTAssertEqual(
@@ -2090,7 +2104,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                     await controller.shutdown()
                     return
                 }
-                XCTAssertEqual(windowRuns.count, 0, "A window cannot expire the resumed manual retry")
+                if windowOwner == .iOSContinuedTask {
+                    XCTAssertEqual(windowRuns.count, 1, "the continued task carries the person's resumed retry")
+                } else {
+                    XCTAssertEqual(windowRuns.count, 0, "A window cannot expire the resumed manual retry")
+                }
             } else if enablesMobileData {
                 controller.mobileDataSettingDidChange()
             } else {
@@ -3550,6 +3568,394 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await controller.shutdown()
         }
 
+        /// The person's own pass, started by "Back up now" in the foreground, runs while the person accepts the continued
+        /// processing task. The task carries that pass instead of standing aside (#1108).
+        private func makeRunningManualPass(
+            prefix: String
+        ) async throws -> (fixture: LaunchResumeFixture, runtime: LibraryRuntimeState, runID: String) {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .foregroundActive
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeLaunchResumeFixture(prefix: prefix, source: .mobileDataOff(runtime))
+            await fixture.controller.retryFailedAndSync()
+            _ = await waitUntil { fixture.scan.starts.count == 1 }
+            XCTAssertEqual(fixture.scan.owners.values, [.manual], "the person's tap runs its own pass")
+            return (fixture, runtime, try XCTUnwrap(fixture.controller.activeExecutionRunID))
+        }
+
+        func testAContinuedTaskCarriesThePersonsPassInTheForeground() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-carries-manual")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let scan = manual.fixture.scan
+            let task = startWindow(controller, scan: scan, owner: .iOSContinuedTask)
+
+            let carried = await waitUntil(timeout: .seconds(2)) { task.record.runIDs.count == 1 }
+            XCTAssertTrue(carried, "the task carries the running pass")
+            XCTAssertEqual(task.record.runIDs, [manual.runID])
+            XCTAssertFalse(task.record.hasEnded, "the task stays open while the pass runs")
+
+            scan.open.value = true
+            let ended = await waitUntil(timeout: .seconds(5)) { task.record.hasEnded }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(task.record.completedScansAtEnd, 1, "the task ends only after the pass")
+            XCTAssertEqual(scan.owners.values, [.manual], "the pass keeps its owner; no second pass starts")
+            await task.task.value
+            await controller.shutdown()
+        }
+
+        func testAnExpiredContinuedTaskStopsItsPassOnlyWhileTheAppIsInTheBackground() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-expiry-stop")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+
+            // The person watches the app: the pass continues as theirs.
+            controller.stopBackgroundWindowRun(runID: manual.runID, for: .iOSContinuedTask)
+            XCTAssertFalse(controller.isRunnerStopPendingForTesting, "a pass the person sees keeps going")
+
+            manual.runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            controller.stopBackgroundWindowRun(runID: manual.runID, for: .iOSContinuedTask)
+            XCTAssertTrue(controller.isRunnerStopPendingForTesting, "in the background the expiry stops the pass")
+            XCTAssertEqual(controller.runnerStopRunIDForTesting, manual.runID)
+
+            manual.fixture.scan.open.value = true
+            _ = await waitUntil(timeout: .seconds(5)) { !controller.isSyncing }
+            await controller.shutdown()
+        }
+
+        /// One continued processing task over a real controller: the card updates, the device log lines and the one result
+        /// that the OS hears, in the order in which they happened.
+        /// The device log events and the results that the OS heard, in their order.
+        private final class ContinuedTaskEvents: @unchecked Sendable {
+            private let lock = NSLock()
+            private var log: [String] = []
+            private var heard: [(success: Bool, settled: Bool)] = []
+
+            var events: [String] { lock.withLock { log } }
+            var results: [Bool] { lock.withLock { heard.map(\.success) } }
+            var settledAtResult: [Bool] { lock.withLock { heard.map(\.settled) } }
+
+            func record(_ event: String) { lock.withLock { log.append(event) } }
+            func heard(_ success: Bool, settled: Bool) {
+                lock.withLock {
+                    log.append("completed")
+                    heard.append((success, settled))
+                }
+            }
+        }
+
+        /// One continued processing task over a real controller.
+        @MainActor
+        private final class ContinuedTaskProbe {
+            let session: PhotoLibraryContinuedBackupSession
+            let protection = BackgroundBackupRunProtection()
+            let ledger: BackgroundWindowLedger
+            let recorded = ContinuedTaskEvents()
+            var task: Task<Void, Never>?
+
+            var events: [String] { recorded.events }
+            /// The cards, as "title units", in the order the session reported them.
+            var cards: [String] { recorded.events.filter { $0.hasPrefix("card ") }.map { String($0.dropFirst(5)) } }
+            var results: [Bool] { recorded.results }
+            var settledAtResult: [Bool] { recorded.settledAtResult }
+
+            init(controller: PhotoLibraryBackupController, directory: URL, settlementWait: Duration = .seconds(5)) {
+                ledger = BackgroundWindowLedger(
+                    fileURL: directory.appendingPathComponent("continued-windows.json"), isPurgePending: { false })
+                let recorded = recorded
+                let completion = BackgroundWindowCompletion(kind: .continuedBackup, ledger: ledger) {
+                    [weak controller] success in
+                    let settled = MainActor.assumeIsolated { controller?.activeExecutionRunID == nil }
+                    recorded.heard(success, settled: settled)
+                }
+                session = PhotoLibraryContinuedBackupSession(
+                    controller: controller, completion: completion, protection: protection, endShortGrace: {},
+                    log: BackgroundWorkLog { _, line in recorded.record(String(line.prefix { $0 != " " })) },
+                    settlementWait: settlementWait, progressInterval: .milliseconds(1),
+                    report: { card in
+                        recorded.record("card \(card.title) \(card.progress.completedUnitCount)")
+                    })
+            }
+
+            func start() { task = Task { await session.run() } }
+        }
+
+        func testAContinuedTaskChoosesItsResultOnlyAfterTheCarriedPassSettled() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-result-after-settlement")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            let carried = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+            XCTAssertTrue(carried, "the task protects the person's pass from the short grace")
+            XCTAssertTrue(probe.results.isEmpty, "no result while the pass runs")
+
+            // Instant work outlasts the bounded retirement wait, so the pass ends before it settles.
+            let writer = NonCooperativeWriterLatch()
+            let writerTask = makeNonCooperativeWriter(writer)
+            XCTAssertTrue(controller.installInstantWorkTaskForTesting(writerTask))
+            await writer.waitUntilBlocked()
+            manual.fixture.scan.open.value = true
+            _ = await waitUntil { controller.isRetiringInstantWorkForTesting }
+            try await Task.sleep(for: PhotoLibraryBackupController.instantWorkRetirementTimeout + .milliseconds(150))
+            XCTAssertTrue(probe.results.isEmpty, "no result while the pass has not settled")
+
+            await writer.release()
+            await writerTask.value
+            let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(probe.results.count, 1, "the OS hears one result")
+            XCTAssertEqual(probe.settledAtResult, [true], "the result is chosen after the pass settled")
+            XCTAssertEqual(manual.fixture.scan.starts.count, 1, "a pass without backed-up photos starts no next pass")
+            XCTAssertFalse(probe.protection.isProtected(owner: controller, runID: manual.runID), "protection released")
+            XCTAssertEqual(probe.ledger.records().map(\.kind), [.continuedBackup])
+            probe.task?.cancel()
+            await controller.shutdown()
+        }
+
+        func testAnExpiredContinuedTaskInTheBackgroundStopsItsPassAndReportsAStopOnce() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-expiry")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+
+            manual.runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            probe.session.expire()
+            probe.session.expire()
+            XCTAssertTrue(controller.isRunnerStopPendingForTesting, "the expiry stops the pass in the background")
+            XCTAssertFalse(probe.protection.isProtected(owner: controller, runID: manual.runID))
+
+            manual.fixture.scan.open.value = true
+            await probe.task?.value
+            XCTAssertEqual(probe.results, [false], "work was left: a stop, reported once")
+            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.expired])
+            let endLogged = await waitUntil { probe.events.contains("continued.end") }
+            XCTAssertTrue(endLogged)
+            XCTAssertLessThan(
+                try XCTUnwrap(probe.events.firstIndex(of: "continued.end")),
+                try XCTUnwrap(probe.events.firstIndex(of: "completed")),
+                "the end is logged before the OS hears the result")
+            await controller.shutdown()
+        }
+
+        func testAContinuedTaskEndsAtTheBoundWhenItsStoppedPassDoesNotSettle() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-bound")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let stopRelease = LockedFlag(false)
+            controller.installRunnerStopOperationForTesting {
+                while !stopRelease.value { try? await Task.sleep(for: .milliseconds(5)) }
+            }
+            let probe = ContinuedTaskProbe(
+                controller: controller, directory: manual.fixture.fixture.directory, settlementWait: .milliseconds(200))
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+            manual.runtime.update { $0.executionOpportunity = .backgroundPermitted }
+            manual.fixture.scan.open.value = true
+            probe.session.expire()
+
+            let ended = await waitUntil(timeout: .seconds(3)) { !probe.results.isEmpty }
+            XCTAssertTrue(ended, "the task ends at the bound although the stop has not returned")
+            XCTAssertEqual(probe.results, [false])
+            XCTAssertEqual(probe.settledAtResult, [false], "the pass had not settled at the bound")
+
+            stopRelease.value = true
+            await probe.task?.value
+            _ = await waitUntil { !controller.isSyncing }
+            XCTAssertEqual(probe.results, [false], "a late settlement adds no second result")
+            await controller.shutdown()
+        }
+
+        func testPausingDuringAContinuedTaskEndsItWithoutSuccess() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-pause")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+
+            controller.pauseBackup()
+            manual.fixture.scan.open.value = true
+            await probe.task?.value
+            XCTAssertEqual(probe.results, [false])
+            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.notNeeded], "a paused backup ends the task")
+            XCTAssertEqual(manual.fixture.scan.starts.count, 1, "no further pass starts")
+            await controller.shutdown()
+        }
+
+        /// Over two rounds: the task carries the running pass, then starts its own pass for the work that is still owed,
+        /// and reports success with a full ring and the app's own headline once nothing is owed (#1108).
+        func testAContinuedTaskCarriesTheNextRoundUntilNothingIsOwedAndReportsSuccess() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .foregroundActive
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeLaunchResumeFixture(
+                prefix: "backup-continued-two-rounds", source: .mobileDataOff(runtime))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.fixture.directory.appendingPathComponent(
+                        PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            func row(_ identifier: String, _ state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry {
+                UploadBackupSyncQueueEntry(
+                    source: .init(kind: .fileURL, identifier: identifier), revision: .init(rawValue: 1),
+                    originalFilename: "\(identifier).jpg", state: state, lastError: nil, updatedAt: Date())
+            }
+            XCTAssertTrue(queue.upsertBatch([row("first-photo", .discovered), row("second-photo", .discovered)]))
+            let firstRelease = LockedFlag(false)
+            let firstRun = Task { while !firstRelease.value { try? await Task.sleep(for: .milliseconds(5)) } }
+            XCTAssertTrue(controller.installSyncRunForTesting(runID: "first", task: firstRun))
+            let probe = ContinuedTaskProbe(controller: controller, directory: fixture.fixture.directory)
+            probe.start()
+            let carried = await waitUntil { probe.protection.isProtected(owner: controller, runID: "first") }
+            XCTAssertTrue(carried)
+
+            // The first pass backs up two photos; one is still owed.
+            XCTAssertTrue(queue.upsertBatch([row("waiting-photo", .completed), row("first-photo", .completed)]))
+            firstRelease.value = true
+            await controller.finishSyncForTesting(runID: "first")
+            let secondRound = await waitUntil { fixture.scan.starts.count == 1 }
+            XCTAssertTrue(secondRound, "the task starts the next pass itself")
+            XCTAssertEqual(fixture.scan.owners.values, [.iOSContinuedTask])
+
+            // The last photo was deleted in Proton Drive: its deletion is respected, so no work is owed.
+            XCTAssertTrue(queue.upsertBatch([row("second-photo", .skippedRemoteDeletion)]))
+            fixture.scan.open.value = true
+            let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(probe.results, [true], "nothing is owed and nothing needs attention")
+            try await Task.sleep(for: .milliseconds(50))
+            let final = try XCTUnwrap(probe.cards.last)
+            XCTAssertEqual(
+                final, "\(BackupStatusPresentation(controller.status).localizedHeadline) 1000000",
+                "the last card is the app's own headline with a full ring, also for a respected deletion; no running card "
+                    + "follows it")
+            await probe.task?.value
+            await controller.shutdown()
+        }
+
+        func testShuttingDownDuringAContinuedTaskEndsItAsIncomplete() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-shutdown")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+
+            manual.fixture.scan.open.value = true
+            await controller.shutdown()
+            let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(probe.results, [false])
+            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.notNeeded], "a sign-out ends the task")
+            XCTAssertTrue(
+                try XCTUnwrap(probe.cards.last).hasPrefix(L10n.string("backup.phase_waiting")),
+                "the card says that the backup is incomplete")
+        }
+
+        func testTurningBackupOffDuringAContinuedTaskEndsItAsIncomplete() async throws {
+            let manual = try await makeRunningManualPass(prefix: "backup-continued-off")
+            defer { manual.fixture.cleanup() }
+            let controller = manual.fixture.controller
+            let probe = ContinuedTaskProbe(controller: controller, directory: manual.fixture.fixture.directory)
+            probe.start()
+            _ = await waitUntil { probe.protection.isProtected(owner: controller, runID: manual.runID) }
+
+            controller.disableBackup()
+            manual.fixture.scan.open.value = true
+            let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
+            XCTAssertTrue(ended)
+            XCTAssertEqual(probe.results, [false])
+            XCTAssertTrue(try XCTUnwrap(probe.cards.last).hasPrefix(L10n.string("backup.phase_waiting")))
+            await probe.task?.value
+            await controller.shutdown()
+        }
+
+        /// Owner table rows 2 and 4: a task that starts before the first network path waits like a window. When the
+        /// path starts the person's deferred pass instead, the task carries that pass rather than ending.
+        func testAContinuedTaskBeforeTheFirstPathCarriesThePersonsPassThatThePathStarts() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update { $0.executionOpportunity = .foregroundActive }
+            let fixture = try makeWiFiWaitFixture(
+                prefix: "backup-continued-first-path", source: .mobileDataOff(runtime),
+                firstNetworkPathWait: .seconds(60))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            let scan = HeldScan()
+            scan.install(on: controller)
+            await controller.retryUserResolvableWork()
+            XCTAssertFalse(controller.isSyncing, "the person's pass waits for the first path")
+            let probe = ContinuedTaskProbe(controller: controller, directory: fixture.directory)
+            probe.start()
+            _ = await waitUntil { controller.deferredStartWaiterCountForTesting == 1 }
+
+            runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: false) }
+
+            let carried = await waitUntil {
+                controller.activeExecutionRunID.map { probe.protection.isProtected(owner: controller, runID: $0) }
+                    ?? false
+            }
+            XCTAssertTrue(carried, "the task carries the pass that the path started")
+            XCTAssertEqual(scan.owners.values, [.manual])
+            XCTAssertTrue(probe.results.isEmpty, "the task does not end while the pass runs")
+            scan.open.value = true
+            _ = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
+            await probe.task?.value
+            await controller.shutdown()
+        }
+
+        /// Owner table row 5: the person's Wi-Fi retry resumes in the foreground as their own pass, and the task carries it.
+        func testAContinuedTaskCarriesThePersonsResumedWiFiRetryInTheForeground() async throws {
+            try await assertManualRetryResumesAfterWiFiWait(
+                networkDetermined: true, returnsDuringScan: false, returnsInBackgroundWindow: true,
+                windowOwner: .iOSContinuedTask)
+        }
+
+        /// Owner table row 6: the task's own passes honor the remote-index backoff like a window; only the person's
+        /// pass may skip it.
+        func testAContinuedTaskHonorsTheRemoteIndexBackoff() async throws {
+            let runtime = LibraryRuntimeState.makeProcessState()
+            runtime.update {
+                $0.executionOpportunity = .foregroundActive
+                $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+            }
+            let fixture = try makeWiFiWaitFixture(prefix: "backup-continued-backoff", source: .mobileDataOff(runtime))
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            try holdAutomaticPasses(in: fixture)
+            let scan = HeldScan()
+            scan.install(on: controller)
+            scan.open.value = true
+            let runs = PassCounter()
+
+            await controller.backgroundCatchUp(owner: .iOSContinuedTask) { _ in _ = runs.increment() }
+            XCTAssertEqual(runs.count, 0, "the backoff holds the task's own pass")
+            XCTAssertEqual(scan.starts.count, 0)
+
+            await controller.retryUserResolvableWork()
+            _ = await waitUntil { scan.starts.count == 1 }
+            XCTAssertEqual(scan.owners.values, [.manual], "the person's pass skips the backoff")
+            await controller.shutdown()
+        }
+
+        /// A pass of the continued processing task runs for the person who accepted it, so resource limits treat it like
+        /// the person's own pass. Windows stay automatic work.
+        func testAContinuedTaskPassIsThePersonsWork() {
+            XCTAssertEqual(PhotoLibraryBackupController.workIntent(for: .iOSContinuedTask), .userInitiated)
+            XCTAssertEqual(PhotoLibraryBackupController.workIntent(for: .manual), .userInitiated)
+            for owner: BackupExecutionOwner in [.foreground, .iOSBackgroundTask, .iOSRefreshTask, .background] {
+                XCTAssertEqual(PhotoLibraryBackupController.workIntent(for: owner), .automatic)
+            }
+        }
+
         func testAnExpiredWindowStopsTheResumeAtLaunchItTookOverWhileTheAppStaysInTheBackground() async throws {
             let launch = try await makeRunningLaunchResume(prefix: "backup-launch-resume-window-expired")
             defer { launch.fixture.cleanup() }
@@ -3945,10 +4351,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let record: BackgroundWindowRecord
         }
 
-        private func startWindow(_ controller: PhotoLibraryBackupController, scan: HeldScan) -> BackgroundWindowProbe {
+        private func startWindow(
+            _ controller: PhotoLibraryBackupController, scan: HeldScan, owner: BackupExecutionOwner = .iOSBackgroundTask
+        ) -> BackgroundWindowProbe {
             let record = BackgroundWindowRecord()
             let task = Task { @MainActor in
-                await controller.backgroundCatchUp(owner: .iOSBackgroundTask) { record.received($0) }
+                await controller.backgroundCatchUp(owner: owner) { record.received($0) }
                 record.end(completedScans: scan.completions.count)
             }
             return BackgroundWindowProbe(task: task, record: record)
@@ -4870,6 +5278,42 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
         }
+    }
+
+    /// The continued backup prompt estimates a short backlog by the catalog rows of the photos that still send bytes;
+    /// settled rows and rows whose bytes are committed already do not count (#1108).
+    func testTheOutstandingVolumeComesFromTheCatalogRowsOfThePhotosThatStillSendBytes() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-continued-volume", enabled: true)
+        defer { fixture.cleanup() }
+        let catalog = try XCTUnwrap(
+            PhotoLibraryCatalogManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.catalogDatabaseFileName)))
+        let photo = PhotoBackupAssetInfo(
+            localIdentifier: "catalogued-photo", creationDate: nil, modificationDate: Date(timeIntervalSince1970: 200),
+            pixelWidth: 4_000, pixelHeight: 3_000, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+            resources: [.init(role: .originalPhoto, originalFilename: "photo.heic", mimeType: "image/heic")])
+        XCTAssertTrue(catalog.upsertBatch([PhotoLibraryCatalogMapper.entry(for: photo, observedAt: Date())]))
+        catalog.close()
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+        func row(_ identifier: String, _ state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry {
+            UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: identifier), revision: .init(rawValue: 1),
+                originalFilename: "\(identifier).heic", state: state, lastError: nil, updatedAt: Date())
+        }
+        XCTAssertTrue(
+            queue.upsertBatch([
+                row("catalogued-photo", .discovered), row("uncatalogued-photo", .uploading),
+                row("committed-photo", .needsRemoteReconciliation), row("done-photo", .completed),
+            ]))
+        queue.close()
+
+        let bytes = await fixture.controller.estimatedOutstandingBytes(limit: 99)
+        XCTAssertEqual(bytes, 12_000_000, "a 12 MP photo of the catalog and an unknown item count as 6 MB each")
+        let tooMany = await fixture.controller.estimatedOutstandingBytes(limit: 1)
+        XCTAssertNil(tooMany, "more photos than the limit: the count decides")
+        await fixture.controller.shutdown()
     }
 
     func testBackupThatIsOffAtLaunchOrTurnedOffReportsThatNoIndexBuildIsNeeded() async throws {

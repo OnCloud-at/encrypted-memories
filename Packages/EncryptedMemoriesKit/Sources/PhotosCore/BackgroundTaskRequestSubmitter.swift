@@ -20,11 +20,12 @@ public final class BackgroundTaskRequestSubmitter {
     private var newestSentGeneration: Int?
 
     /// `cancelRequest` removes the pending request of the task from the scheduler. `onErrorAfterCancel` gets the error of
-    /// a request that a cancel overtook, which reports to nobody else. A request waits for the one before it until
-    /// `predecessorDeadline` at the latest, by default `endOfWindowWaitLimit`.
+    /// a request that a cancel overtook, which reports to nobody else. A submitter whose owner never cancels needs
+    /// neither. A request waits for the one before it until `predecessorDeadline` at the latest, by default
+    /// `endOfWindowWaitLimit`.
     public init(
-        cancelRequest: @escaping @MainActor () -> Void,
-        onErrorAfterCancel: @escaping @MainActor (any Error) -> Void,
+        cancelRequest: @escaping @MainActor () -> Void = {},
+        onErrorAfterCancel: @escaping @MainActor (any Error) -> Void = { _ in },
         predecessorDeadline: @escaping @Sendable () async -> Void = BackgroundTaskRequestSubmitter.defaultDeadline,
         diagnostics: PhotoDiagnostics = .shared
     ) {

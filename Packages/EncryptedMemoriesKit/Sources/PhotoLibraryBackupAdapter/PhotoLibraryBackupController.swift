@@ -324,10 +324,11 @@ public final class PhotoLibraryBackupController {
         private var launchResumeGateForTesting: (@Sendable () async -> Void)?
         /// The resume at launch returned.
         internal private(set) var launchResumeEndedForTesting = false
-        /// Ended passes whose completion (status projection and the next wake) still runs.
-        private var completingSyncRuns = 0
-        private var syncRunCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     #endif
+    /// Ended passes whose completion (lock release, final status projection and the next wake) still runs, and the
+    /// callers that wait for the settlement of a pass, by its run ID.
+    private var settlingRunIDs: Set<String> = []
+    private var settlementWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 
     /// Platform hook: invoked with `true` when a backup pass is actively running (so the host app may
     /// keep the display awake / request background time) and `false` the moment backup goes idle,
@@ -1162,8 +1163,12 @@ public final class PhotoLibraryBackupController {
             backgroundLog.notice(.photoBackup, "window.waitsForFirstPath", [(.init("owner"), Self.logValue(owner))])
             started = await waitForDeferredStart(onAdmitted: onRunAdmitted)
             if started == nil, waitsForFirstNetworkPath { return .noNetworkPath }
-        } else if started == nil, let run = automaticRunInTheBackground() {
-            // Nobody watches this automatic pass, so it runs on the window's time until it ends or the window ends.
+        }
+        // A pass that runs already, or one that the first network path started for the person instead of this window, is
+        // carried when this window may carry it.
+        if started == nil, let run = runToCarry(for: owner) {
+            // The pass runs on the window's time until it ends or the window ends: nobody watches an automatic pass in the
+            // background, and the person accepted the continued task for the pass that runs.
             backgroundLog.notice(.photoBackup, "window.tookOver", [(.init("owner"), Self.logValue(owner))])
             onRunStarted?(run.runID)
             await waitForAdoptedRun(run)
@@ -1415,7 +1420,7 @@ public final class PhotoLibraryBackupController {
             self?.beginScanPhase()
             let scanDone = BackupScanSignal()
             var scanFinished = false
-            let workIntent: LibraryWorkIntent = owner == .manual ? .userInitiated : .automatic
+            let workIntent = Self.workIntent(for: owner)
             #if DEBUG
                 self?.reconcileStartsForTesting += 1
             #endif
@@ -1718,6 +1723,42 @@ public final class PhotoLibraryBackupController {
             ])
     }
 
+    /// The queue states whose photos still send bytes: rows that wait for their turn and rows in work. A row whose
+    /// bytes are committed remotely only reconciles.
+    nonisolated private static func sendsBytes(_ state: UploadBackupSyncQueueState) -> Bool {
+        state.isActive || state == .discovered || state == .queuedForUpload
+    }
+
+    /// The estimated bytes that the photos still to back up will send, from their catalog rows, read off the main actor
+    /// (#1108). Nil when the queue read fails or more than `limit` photos are left: the continued backup prompt then
+    /// decides by the count alone. A photo whose catalog row is missing or unreadable counts as an unknown item.
+    public func estimatedOutstandingBytes(limit: Int) async -> Int64? {
+        guard let queueStore, let catalogStore else { return nil }
+        return await Task.detached(priority: .utility) {
+            guard let rows = try? queueStore.decisionUnsettledRows() else { return nil }
+            let identifiers = Set(
+                rows.lazy
+                    .filter { $0.source.kind == .photoLibraryAsset && Self.sendsBytes($0.state) }
+                    .map(\.source.identifier))
+            guard identifiers.count <= limit else { return nil }
+            let presence = catalogStore.presence(for: Array(identifiers))
+            return PhotoLibraryContinuedBackupVolume.bytes(of: identifiers.map { presence.present[$0] })
+        }.value
+    }
+
+    /// Returns when the pass `runID` has settled: its completion released the lock and projected the final state, or
+    /// ended early at a shutdown. A pass whose instant work outlasts the bounded retirement wait settles only when that
+    /// work returned, so `run.task.value` alone does not prove it (#1108). Returns at once for a run that is neither
+    /// active nor settling. The wait ignores cancellation: a caller that needs a bound, such as the continued backup
+    /// session after an expiry, ends its own wait.
+    public func waitUntilRunSettled(_ runID: String) async {
+        guard activeRunID == runID || settlingRunIDs.contains(runID) else { return }
+        await withCheckedContinuation { settlementWaiters[runID, default: []].append($0) }
+    }
+
+    /// The controller shut down for a sign-out or teardown; it starts no pass any more.
+    public var isShutDown: Bool { isShuttingDown }
+
     /// Stops only the active run identified by the caller. OS expiration handlers must use this
     /// overload so an expired attempt cannot cancel a foreground run or a later replacement run.
     public func stopSync(runID: String) {
@@ -1725,12 +1766,21 @@ public final class PhotoLibraryBackupController {
         stopCurrentSync()
     }
 
-    /// Stops the run of an expired OS background window. A run that the window took over from an automatic pass keeps
-    /// going when a scene is in the foreground again, because the person now watches it.
-    public func stopBackgroundWindowRun(runID: String) {
+    /// Stops the run of an expired OS background window of `owner`. While a scene is in the foreground, the person
+    /// watches the backup: a window keeps a run that it took over from an automatic pass, and a continued processing
+    /// task keeps every run it carries, because the person accepted it for that backup (#1108).
+    public func stopBackgroundWindowRun(runID: String, for owner: BackupExecutionOwner = .iOSBackgroundTask) {
         guard activeRunID == runID else { return }
-        if activeRunOwner == .foreground, !runtimeSignals.current().isAppInBackground { return }
+        if !runtimeSignals.current().isAppInBackground, owner == .iOSContinuedTask || activeRunOwner == .foreground {
+            return
+        }
         stopCurrentSync()
+    }
+
+    /// The person's own pass and a pass of the continued processing task that the person accepted are the person's work;
+    /// resource limits treat every other pass as automatic work.
+    static func workIntent(for owner: BackupExecutionOwner) -> LibraryWorkIntent {
+        owner == .manual || owner == .iOSContinuedTask ? .userInitiated : .automatic
     }
 
     /// Explicit user actions may stop whichever run is currently active.
@@ -1854,6 +1904,38 @@ public final class PhotoLibraryBackupController {
             return true
         }
 
+        /// A first backup that checks 120 waiting photos in a pass that holds until the app ends, so the continued backup
+        /// question can come (#1108). It uses the real queue, catalog and pass start.
+        public func installContinuedBackupPromptFixtureForTesting() -> Bool {
+            guard let queueStore, let catalogStore, pendingRecorder != nil else { return false }
+            let date = Date(timeIntervalSince1970: 1_781_352_000)
+            let infos = (1...120).map { index in
+                PhotoBackupAssetInfo(
+                    localIdentifier: "fixture-continued-photo-\(index)", creationDate: date, modificationDate: date,
+                    pixelWidth: 160, pixelHeight: 160, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                    resources: [
+                        .init(role: .originalPhoto, originalFilename: "Waiting \(index).heic", mimeType: "image/heic")
+                    ])
+            }
+            let rows = infos.map { info in
+                UploadBackupSyncQueueEntry(
+                    source: .init(kind: .photoLibraryAsset, identifier: info.localIdentifier),
+                    revision: .init(rawValue: 1), originalFilename: info.resources[0].originalFilename,
+                    state: .discovered, updatedAt: date)
+            }
+            guard catalogStore.upsertBatch(infos.map { PhotoLibraryCatalogMapper.entry(for: $0, observedAt: date) }),
+                queueStore.upsertBatch(rows)
+            else { return false }
+            passBodyForTesting = {
+                while !Task.isCancelled { try? await Task.sleep(for: .seconds(1)) }
+            }
+            isEnabled = true
+            isUserPaused = false
+            accessState = .full
+            refreshFromQueue()
+            return startSync(owner: .manual) != nil || lastStartWasDeferred
+        }
+
         /// Open problem lists that wait for the start or end of a pass.
         internal var passStateWakeCountForTesting: Int { passStateWakes.count }
 
@@ -1910,8 +1992,7 @@ public final class PhotoLibraryBackupController {
 
         /// Returns when every ended pass has finished its completion, including the decision about its next wake.
         internal func waitForSyncRunCompletionForTesting() async {
-            guard completingSyncRuns > 0 else { return }
-            await withCheckedContinuation { syncRunCompletionWaiters.append($0) }
+            while let runID = settlingRunIDs.first { await waitUntilRunSettled(runID) }
         }
 
         /// Background windows that wait for their deferred pass.
@@ -2223,6 +2304,15 @@ public final class PhotoLibraryBackupController {
         }
     }
 
+    /// The running pass that a window of `owner` carries. A continued processing task carries every pass except a refresh
+    /// scan, also in the foreground and also the person's own: the person accepted it for the backup that runs (#1108).
+    /// Its start may also have been taken by a pass of the controller, such as the person's pending Wi-Fi retry.
+    private func runToCarry(for owner: BackupExecutionOwner) -> StartedBackupRun? {
+        guard owner == .iOSContinuedTask else { return automaticRunInTheBackground() }
+        guard activeRefreshScan == nil, let activeRunID, let syncTask else { return nil }
+        return StartedBackupRun(runID: activeRunID, task: syncTask)
+    }
+
     /// The running automatic pass, while no scene is in the foreground. An explicit pass is never returned: a window
     /// must not own or stop it.
     private func automaticRunInTheBackground() -> StartedBackupRun? {
@@ -2405,6 +2495,7 @@ public final class PhotoLibraryBackupController {
         case .foreground: .word("foreground")
         case .iOSBackgroundTask: .word("iosBackgroundTask")
         case .iOSRefreshTask: .word("iosRefreshTask")
+        case .iOSContinuedTask: .word("iosContinuedTask")
         case .macOSBackgroundActivity: .word("macosBackgroundActivity")
         case .background: .word("background")
         case .manual: .word("manual")
@@ -2668,6 +2759,11 @@ public final class PhotoLibraryBackupController {
         await completeSyncRun(runID: runID)
     }
 
+    private func endSettlement(of runID: String) {
+        settlingRunIDs.remove(runID)
+        for waiter in settlementWaiters.removeValue(forKey: runID) ?? [] { waiter.resume() }
+    }
+
     private func completeSyncRun(runID: String) async {
         let stopTask = runnerStopRunID == runID ? runnerStopTask : nil
         await stopTask?.value
@@ -2692,17 +2788,8 @@ public final class PhotoLibraryBackupController {
         activeRunOwner = nil
         activeRefreshScan = nil
         isSyncing = false
-        #if DEBUG
-            completingSyncRuns += 1
-            defer {
-                completingSyncRuns -= 1
-                if completingSyncRuns == 0 {
-                    let waiters = syncRunCompletionWaiters
-                    syncRunCompletionWaiters.removeAll()
-                    for waiter in waiters { waiter.resume() }
-                }
-            }
-        #endif
+        settlingRunIDs.insert(runID)
+        defer { endSettlement(of: runID) }
         updateIdleTimerIfNeeded()
         isScanning = false
         syncTask = nil

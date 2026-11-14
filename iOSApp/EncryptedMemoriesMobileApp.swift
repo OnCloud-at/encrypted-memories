@@ -457,6 +457,8 @@ private struct MobileMainTabView: View {
                     openSettings: { sceneContext.settingsPresented = true }
                 )
             )
+            // The continued backup question, asked only while nothing covers the root (#1108).
+            .continuedBackupPrompt(controller: libraryModel.photoBackup)
             // Settings is a scene-level presentation so the toolbar button and the command open it over any tab.
             .sheet(isPresented: $sceneContext.settingsPresented) {
                 MobileSettingsScreen(showsDismissButton: true)
