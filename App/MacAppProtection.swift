@@ -16,11 +16,11 @@ final class MacAppProtection: NSObject {
     private var refreshing = false
     private var observing = true
     private var hiding = false
-    private var suspending: Set<ObjectIdentifier> = []
 
     @MainActor private final class WeakWindow {
         weak var window: NSWindow?
         var presentation: ProtectedScopePresentation
+        var suspended = false
         init(_ window: NSWindow, presentation: ProtectedScopePresentation) {
             self.window = window
             self.presentation = presentation
@@ -97,13 +97,13 @@ final class MacAppProtection: NSObject {
     /// Runs before a retained window orders in, so expired admission never reaches its first visible frame.
     func prepareToShow(window: NSWindow) {
         gate.appWillEnterForeground(at: .now)
-        suspending.remove(ObjectIdentifier(window))
+        roots.first(where: { $0.window === window })?.suspended = false
         register(window: window)
     }
 
     /// Draws the snapshot before AppKit orders out or captures a minimized window.
     func prepareToHide(window: NSWindow) {
-        suspending.insert(ObjectIdentifier(window))
+        roots.first(where: { $0.window === window })?.suspended = true
         refresh()
         window.contentView?.needsLayout = true
         window.contentView?.layoutSubtreeIfNeeded()
@@ -138,13 +138,14 @@ final class MacAppProtection: NSObject {
         guard !refreshing, observing else { return }
         refreshing = true
         defer { refreshing = false }
-        roots.removeAll { $0.window == nil }
-        suspending.formIntersection(roots.compactMap(\.window).map { ObjectIdentifier($0) })
+        let liveRoots = roots.compactMap { root in
+            root.window.map { (root: root, window: $0) }
+        }
+        roots = liveRoots.map(\.root)
         let foreground =
             !hiding && !NSApp.isHidden
-            && roots.contains {
-                guard let window = $0.window else { return false }
-                return window.isVisible && !window.isMiniaturized && !suspending.contains(ObjectIdentifier(window))
+            && liveRoots.contains {
+                $0.window.isVisible && !$0.window.isMiniaturized && !$0.root.suspended
             }
         if foreground != wasForeground {
             wasForeground = foreground
@@ -157,18 +158,18 @@ final class MacAppProtection: NSObject {
             for child in window.childWindows ?? [] { collect(child) }
             if let sheet = window.attachedSheet { collect(sheet) }
         }
-        roots.compactMap(\.window).forEach(collect)
+        liveRoots.forEach { collect($0.window) }
         if let modal = NSApp.modalWindow { collect(modal) }
         for key in Array(covers.keys) where targets[key] == nil {
             covers.removeValue(forKey: key)?.hide()
         }
         for (key, source) in targets {
+            let root = liveRoots.first { $0.window === source }?.root
             let foregroundWindow =
                 !hiding && !NSApp.isHidden && source.isVisible
-                && !source.isMiniaturized && !suspending.contains(key)
+                && !source.isMiniaturized && !(root?.suspended ?? false)
             let active = applicationIsActive() && foregroundWindow
             let snapshot = !active && gate.isEnabled(.app)
-            let root = roots.first { $0.window === source }
             let presentation = root?.presentation ?? covers[key]?.presentation ?? ProtectedScopePresentation(gate: gate)
             presentation.snapshot = snapshot
             presentation.phase = active ? .active : .inactive
@@ -193,10 +194,10 @@ final class MacAppProtection: NSObject {
     @objc private func windowChanged(_ note: Notification) {
         if note.name == NSApplication.didUnhideNotification { hiding = false }
         if note.name == NSWindow.didDeminiaturizeNotification || note.name == NSWindow.didBecomeKeyNotification,
-            let window = note.object as? NSWindow, roots.contains(where: { $0.window === window })
+            let window = note.object as? NSWindow, let root = roots.first(where: { $0.window === window })
         {
             gate.appWillEnterForeground(at: .now)
-            suspending.remove(ObjectIdentifier(window))
+            root.suspended = false
         }
         refresh()
     }

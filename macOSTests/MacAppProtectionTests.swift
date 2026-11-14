@@ -97,10 +97,7 @@ final class MacAppProtectionTests: XCTestCase {
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
         fixture.controller.prepareToHide(window: fixture.window)
         fixture.window.orderOut(nil)
-        let other = NSWindow(
-            contentRect: .init(x: -10_000, y: -10_000, width: 100, height: 100),
-            styleMask: [.borderless], backing: .buffered, defer: false)
-        other.isReleasedWhenClosed = false
+        let other = makeWindow(size: .init(width: 100, height: 100))
         defer { other.close() }
         fixture.controller.register(window: other)
         fixture.gate.appWillEnterForeground(at: .now + .seconds(120))
@@ -124,13 +121,14 @@ final class MacAppProtectionTests: XCTestCase {
     }
 
     func testAnInactiveWindowKeepsItsSnapshotUntilItBecomesActive() async throws {
-        let fixture = try Fixture(active: false)
+        let activity = Activity(active: false)
+        let fixture = try Fixture(applicationIsActive: { activity.isActive })
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
         let covered = await fixture.waitForCover(visible: true)
         XCTAssertTrue(covered)
         XCTAssertTrue(fixture.presentation.snapshot)
-        fixture.activity.isActive = true
+        activity.isActive = true
         NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
         let revealed = await fixture.waitForCover(visible: false)
         XCTAssertTrue(revealed)
@@ -180,7 +178,7 @@ final class MacAppProtectionTests: XCTestCase {
     }
 
     func testTheDefaultActivityQueryUsesTheApplicationActivity() async throws {
-        let fixture = try Fixture(useSystemActivity: true)
+        let fixture = try Fixture(applicationIsActive: nil)
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
         NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
@@ -192,10 +190,7 @@ final class MacAppProtectionTests: XCTestCase {
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
         fixture.controller.prepareToHide(window: fixture.window)
-        let child = NSWindow(
-            contentRect: CGRect(x: -10_000, y: -10_000, width: 80, height: 80),
-            styleMask: [.borderless], backing: .buffered, defer: false)
-        child.isReleasedWhenClosed = false
+        let child = makeWindow()
         fixture.window.addChildWindow(child, ordered: .above)
         child.close()
         XCTAssertTrue(fixture.presentation.snapshot)
@@ -204,29 +199,38 @@ final class MacAppProtectionTests: XCTestCase {
         fixture.window.removeChildWindow(child)
     }
 
-    func testRefreshPrunesSuspensionEntriesOfDeallocatedRoots() async throws {
+    func testSuspensionBelongsToTheWeakRootAndCannotReachANewRoot() async throws {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.setEnabled(false, for: .app, reason: "Confirm")
         weak var released: NSWindow?
-        var identifier: ObjectIdentifier?
-        autoreleasepool {
-            let window = NSWindow(
-                contentRect: .init(x: -10_000, y: -10_000, width: 80, height: 80),
-                styleMask: [.borderless], backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
+        try autoreleasepool {
+            let window = makeWindow()
             released = window
-            identifier = ObjectIdentifier(window)
             fixture.controller.register(window: window)
             fixture.controller.prepareToHide(window: window)
+            XCTAssertEqual(try suspension(of: window, in: fixture.controller), true)
             window.close()
         }
-        XCTAssertNil(released, "The root must deallocate for the lifetime control to be valid")
-        fixture.controller.register(window: fixture.window)
-        let entries = try XCTUnwrap(
-            Mirror(reflecting: fixture.controller).children.first { $0.label == "suspending" }?.value
-                as? Set<ObjectIdentifier>)
-        XCTAssertFalse(entries.contains(try XCTUnwrap(identifier)), "Refresh must release stale suspension identities")
+        XCTAssertNil(released, "The old root must deallocate before a new root registers")
+        let replacement = makeWindow()
+        defer { replacement.close() }
+        fixture.controller.register(window: replacement)
+        XCTAssertEqual(try suspension(of: replacement, in: fixture.controller), false)
+        XCTAssertNil(
+            Mirror(reflecting: fixture.controller).children.first { $0.label == "suspending" },
+            "A parallel identity set can transfer a stale suspension to a reused address")
+    }
+
+    func testExplicitShowClearsSuspensionWithinGrace() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        fixture.controller.prepareToHide(window: fixture.window)
+        XCTAssertTrue(fixture.presentation.snapshot)
+        fixture.controller.prepareToShow(window: fixture.window)
+        XCTAssertFalse(fixture.presentation.snapshot)
+        XCTAssertNil(fixture.cover)
     }
 
     func testSnapshotDrawsInsideTheSourceBeforeMiniaturization() async throws {
@@ -242,34 +246,50 @@ final class MacAppProtectionTests: XCTestCase {
 }
 
 @MainActor
+private func makeWindow(
+    size: NSSize = .init(width: 80, height: 80), styleMask: NSWindow.StyleMask = [.borderless]
+) -> NSWindow {
+    let window = NSWindow(
+        contentRect: .init(origin: .init(x: -10_000, y: -10_000), size: size),
+        styleMask: styleMask, backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    return window
+}
+
+@MainActor
+private func suspension(of window: NSWindow, in controller: MacAppProtection) throws -> Bool? {
+    let roots = try XCTUnwrap(
+        Mirror(reflecting: controller).children.first { $0.label == "roots" }?.value as? [AnyObject])
+    let root = try XCTUnwrap(
+        roots.first { candidate in
+            (Mirror(reflecting: candidate).children.first { $0.label == "window" }?.value as? NSWindow) === window
+        })
+    return Mirror(reflecting: root).children.first { $0.label == "suspended" }?.value as? Bool
+}
+
+@MainActor
 private final class Fixture {
     let window: NSWindow
     let gate: AccessGate
     let controller: MacAppProtection
     let presentation: ProtectedScopePresentation
-    let activity: Activity
     private let defaults: UserDefaults
     private let suite = "MacAppProtectionTests.\(UUID().uuidString)"
 
     var cover: NSPanel? { window.childWindows?.compactMap { $0 as? NSPanel }.first { $0.isVisible } }
 
-    init(active: Bool = true, useSystemActivity: Bool = false) throws {
+    init(applicationIsActive: (@MainActor () -> Bool)? = { true }) throws {
         _ = NSApplication.shared
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
         gate = AccessGate(authenticator: Owner(), defaults: defaults)
-        activity = Activity(active: active)
-        let activity = activity
-        if useSystemActivity {
-            controller = MacAppProtection(gate: gate)
+        if let applicationIsActive {
+            controller = MacAppProtection(gate: gate, applicationIsActive: applicationIsActive)
         } else {
-            controller = MacAppProtection(gate: gate, applicationIsActive: { activity.isActive })
+            controller = MacAppProtection(gate: gate)
         }
         presentation = ProtectedScopePresentation(gate: gate)
-        window = NSWindow(
-            contentRect: CGRect(x: -10_000, y: -10_000, width: 320, height: 240),
-            styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
+        window = makeWindow(size: .init(width: 320, height: 240), styleMask: [.titled, .closable])
         window.contentView = NSHostingView(rootView: SourceContent(presentation: presentation))
         window.orderFront(nil)
         controller.register(window: window, presentation: presentation)
