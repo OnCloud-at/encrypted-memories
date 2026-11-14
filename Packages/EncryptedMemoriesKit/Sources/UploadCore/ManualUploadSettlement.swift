@@ -241,7 +241,8 @@ public protocol UploadManualSettlementStoreProtocol: Sendable {
 public final class UploadManualSettlementStore: UploadManualSettlementStoreProtocol, @unchecked Sendable {
     public static let databaseFileName = "upload-manual-settlement-v1.sqlite"
 
-    private static let schemaVersion = 1
+    private static let schemaVersionRow = SQLiteInfoTableVersion(
+        table: "manual_upload_settlement_info", version: 1, stampReplacesExistingRow: true)
     private let connection: SQLiteStoreConnection
     private var db: OpaquePointer? { connection.database }
     private let encoder = JSONEncoder()
@@ -481,38 +482,9 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
             at: url,
             schemaSQL: schema,
             policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: schemaVersionRow.verify,
+            stampVersion: schemaVersionRow.stamp
         )
-    }
-
-    private static func verifyVersion(_ db: OpaquePointer?) -> Bool {
-        var statement: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(
-                db,
-                "SELECT value FROM manual_upload_settlement_info WHERE key='schema';",
-                -1,
-                &statement,
-                nil
-            ) == SQLITE_OK
-        else { return false }
-        var onDisk: Int?
-        let result = sqlite3_step(statement)
-        if result == SQLITE_ROW { onDisk = Int(sqlite3_column_int(statement, 0)) }
-        sqlite3_finalize(statement)
-        return result == SQLITE_ROW && onDisk == schemaVersion
-    }
-
-    private static func stampVersion(_ db: OpaquePointer?) -> Bool {
-        return sqlite3_exec(
-            db,
-            "INSERT INTO manual_upload_settlement_info(key, value) VALUES('schema', \(schemaVersion)) "
-                + "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-            nil,
-            nil,
-            nil
-        ) == SQLITE_OK
     }
 
     private func columnText(_ statement: OpaquePointer?, _ index: Int32) -> String? {
