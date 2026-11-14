@@ -51,6 +51,24 @@ private enum ViewerShareSample {
 /// states a real account can: in flight, failed, and loaded.
 @MainActor
 final class MobileViewerShareWiringTests: XCTestCase {
+    func testDescendantsIncludesRootAndNestedViewsInDepthFirstOrder() {
+        let root = UIView()
+        let first = UIView()
+        let nested = UIView()
+        let second = UIView()
+        root.addSubview(first)
+        first.addSubview(nested)
+        root.addSubview(second)
+
+        let result = descendants(root)
+        XCTAssertEqual(result.count, 4)
+        guard result.count == 4 else { return }
+        XCTAssertTrue(result[0] === root)
+        XCTAssertTrue(result[1] === first)
+        XCTAssertTrue(result[2] === nested)
+        XCTAssertTrue(result[3] === second)
+    }
+
     func testShareWaitsForTheInFlightReadAndThenOffersTheWholeSeries() async throws {
         let gate = AsyncGate()
         let fixture = try await Fixture(
@@ -495,10 +513,6 @@ final class MobileViewerShareWiringTests: XCTestCase {
         }
 
         private var activationFailures = 0
-
-        private func descendants(_ view: UIView) -> [UIView] {
-            [view] + view.subviews.flatMap(descendants)
-        }
 
         /// Every view controller in the presented chain, including embedded children, so toolbar
         /// items that SwiftUI mounts on a hosting controller surface in diagnostics.
