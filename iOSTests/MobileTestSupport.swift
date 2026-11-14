@@ -15,6 +15,17 @@ import XCTest
     [view] + view.subviews.flatMap(descendants)
 }
 
+/// Every item of the window's navigation bars, in all groups. A vertical bar (iPhone Duo) keeps a prominent action,
+/// such as Done in selection mode, in the pinned trailing group.
+@MainActor func navigationBarItems(in window: UIWindow) -> [UIBarButtonItem] {
+    descendants(window).compactMap { $0 as? UINavigationBar }.flatMap { $0.items ?? [] }.flatMap { item in
+        let groups =
+            item.leadingItemGroups + item.centerItemGroups + item.trailingItemGroups
+            + [item.pinnedTrailingGroup].compactMap { $0 }
+        return (item.leftBarButtonItems ?? []) + (item.rightBarButtonItems ?? []) + groups.flatMap(\.barButtonItems)
+    }
+}
+
 /// Checks `condition` every `interval` until it holds or `timeout` has passed, then checks it once more.
 /// Returns whether it held at the last check. The condition runs on the caller's isolation.
 func pollUntil(

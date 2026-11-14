@@ -24,7 +24,7 @@ final class MobileMapClusterBarTests: XCTestCase {
         XCTAssertTrue(state.readEdge)
         let previous = L10n.string("map.previous_page")
         let next = L10n.string("map.next_page")
-        let items = barItems(in: window)
+        let items = navigationBarItems(in: window)
         let detail =
             "edge=\(String(describing: state.edge)) items=\(items.map { ($0.title, $0.accessibilityLabel, $0.isEnabled) })"
         let attachment = XCTAttachment(string: detail)
@@ -39,14 +39,14 @@ final class MobileMapClusterBarTests: XCTestCase {
             try activate(nextItem)
             try await Task.sleep(for: .milliseconds(500))
             XCTAssertEqual(state.pageIndex, 1)
-            XCTAssertTrue(try XCTUnwrap(barItems(in: window).first { label(of: $0) == previous }).isEnabled)
-            XCTAssertFalse(try XCTUnwrap(barItems(in: window).first { label(of: $0) == next }).isEnabled)
+            XCTAssertTrue(try XCTUnwrap(navigationBarItems(in: window).first { label(of: $0) == previous }).isEnabled)
+            XCTAssertFalse(try XCTUnwrap(navigationBarItems(in: window).first { label(of: $0) == next }).isEnabled)
             state.isBusy = true
             try await Task.sleep(for: .milliseconds(500))
-            XCTAssertFalse(try XCTUnwrap(barItems(in: window).first { label(of: $0) == previous }).isEnabled)
+            XCTAssertFalse(try XCTUnwrap(navigationBarItems(in: window).first { label(of: $0) == previous }).isEnabled)
             state.isBusy = false
             try await Task.sleep(for: .milliseconds(500))
-            try activate(try XCTUnwrap(barItems(in: window).first { label(of: $0) == previous }))
+            try activate(try XCTUnwrap(navigationBarItems(in: window).first { label(of: $0) == previous }))
             try await Task.sleep(for: .milliseconds(500))
             XCTAssertEqual(state.pageIndex, 0)
         } else {
@@ -55,19 +55,6 @@ final class MobileMapClusterBarTests: XCTestCase {
                 "Horizontal page arrows keep their existing image presentation")
             XCTAssertEqual(items.filter { $0.image != nil }.count, 2)
         }
-    }
-
-    @MainActor private func barItems(in window: UIWindow) -> [UIBarButtonItem] {
-        var items: [UIBarButtonItem] = []
-        for bar in descendants(window).compactMap({ $0 as? UINavigationBar }) {
-            for navigationItem in bar.items ?? [] {
-                items += navigationItem.leftBarButtonItems ?? []
-                items += navigationItem.rightBarButtonItems ?? []
-                items += navigationItem.leadingItemGroups.flatMap(\.barButtonItems)
-                items += navigationItem.trailingItemGroups.flatMap(\.barButtonItems)
-            }
-        }
-        return items
     }
 
     @MainActor private func label(of item: UIBarButtonItem) -> String? {
