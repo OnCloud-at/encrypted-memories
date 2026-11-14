@@ -173,6 +173,133 @@ final class DragOutTests: XCTestCase {
         await stager.finishAndCleanup()
     }
 
+    /// A dragged Live Photo leaves as its still and its motion; the motion takes the name its still was staged under,
+    /// so two stills with one name keep their own motions.
+    func testALivePhotoMotionIsStagedUnderTheNameOfItsStill() async throws {
+        let directory = stagingDirectory
+        func live(_ node: String) -> PhotoItem {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "vol", nodeID: node), captureTime: Date(timeIntervalSince1970: 1_700_000_000),
+                mediaType: "image/heic", isLivePhoto: true, relatedVideoID: "\(node)-motion")
+        }
+        let items = OutboundMedia.files(for: [live("a"), live("b")]).map(\.item)
+        let provider = FakeOriginalProvider(
+            payloads: Dictionary(uniqueKeysWithValues: items.map { ($0.uid, Data($0.uid.nodeID.utf8)) }),
+            metadata: Dictionary(
+                uniqueKeysWithValues: items.map {
+                    ($0.uid, PhotoMetadata(filename: $0.isVideo ? "FullSizeRender.mov" : "IMG_1.HEIC"))
+                }))
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
+
+        _ = await stager.beginPrefetch(items: items)
+        var staged: [String: String] = [:]
+        for item in items {
+            let url = try await stager.awaitStaged(uid: item.uid).get()
+            staged[item.uid.nodeID] = url.lastPathComponent
+        }
+
+        XCTAssertEqual(Set(staged.values), ["IMG_1.HEIC", "IMG_1 2.HEIC", "IMG_1.mov", "IMG_1 2.mov"])
+        for still in ["a", "b"] {
+            let stillBase = (try XCTUnwrap(staged[still]) as NSString).deletingPathExtension
+            XCTAssertEqual(staged["\(still)-motion"], "\(stillBase).mov")
+        }
+        await stager.finishAndCleanup()
+    }
+
+    private func livePair(_ node: String) -> PhotoItem {
+        PhotoItem(
+            uid: PhotoUID(volumeID: "vol", nodeID: node), captureTime: Date(timeIntervalSince1970: 1_700_000_000),
+            mediaType: "image/heic", isLivePhoto: true, relatedVideoID: "\(node)-motion")
+    }
+
+    /// Two downloads run and six wait when the drag stops. A stop that suspends lets the cancelled downloads finish into
+    /// the stager; none of them may start a waiting download then.
+    func testCancelAllStartsNoQueuedDownloadAfterTheStop() async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let provider = CancellingFileProvider()
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
+
+        _ = await stager.beginPrefetch(items: (20..<28).map(item))
+        for _ in 0..<400 where provider.writes < 2 { try await Task.sleep(for: .milliseconds(5)) }
+        let writesBeforeStop = provider.writes
+        // A stop at low priority lets the cancelled downloads finish into the stager before the stop resumes.
+        await Task.detached(priority: .background) { await stager.cancelAll() }.value
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(writesBeforeStop, 2)
+        XCTAssertEqual(provider.writes, writesBeforeStop, "no download starts after the stop began")
+        XCTAssertEqual(stagedFiles(in: directory), Set<String>())
+    }
+
+    func testAMotionWhoseStillFailsStagesUnderItsOwnName() async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let items = OutboundMedia.files(for: [livePair("broken")]).map(\.item)
+        let provider = FakeOriginalProvider(
+            payloads: [items[1].uid: Data("motion".utf8)],
+            metadata: [
+                items[0].uid: PhotoMetadata(filename: "IMG_1.HEIC"),
+                items[1].uid: PhotoMetadata(filename: "FullSizeRender.mov"),
+            ],
+            failing: [items[0].uid])
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
+        _ = await stager.beginPrefetch(items: items)
+
+        let staged = expectation(description: "the motion stages")
+        Task {
+            let result = await stager.awaitStaged(uid: items[1].uid)
+            XCTAssertEqual(try? result.get().lastPathComponent, "FullSizeRender.mov")
+            staged.fulfill()
+        }
+        await fulfillment(of: [staged], timeout: 5)
+        if case .success = await stager.awaitStaged(uid: items[0].uid) { XCTFail("the still failed") }
+        await stager.finishAndCleanup()
+    }
+
+    func testCancelAllEndsTheWaitOfAMotionWhoseStillIgnoresTheStop() async throws {
+        try await assertAStopEndsTheWaitOfAMotion { await $0.cancelAll() }
+    }
+
+    func testFinishAndCleanupEndsTheWaitOfAMotionWhoseStillIgnoresTheStop() async throws {
+        try await assertAStopEndsTheWaitOfAMotion { await $0.finishAndCleanup() }
+    }
+
+    /// The still's download ignores cancellation, so only the stop can release its waiting motion. The motion then
+    /// stages nothing and ends its transfer.
+    private func assertAStopEndsTheWaitOfAMotion(stop: (DragOutStager) async -> Void) async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let items = OutboundMedia.files(for: [livePair("held")]).map(\.item)
+        let provider = HeldStillProvider(still: items[0].uid)
+        let runtimeState = LibraryRuntimeState()
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0, runtimeState: runtimeState,
+            removeLocationWhenSharing: { false })
+        _ = await stager.beginPrefetch(items: items)
+        await provider.waitUntilBothStarted()
+
+        await stop(stager)
+        for _ in 0..<400 where runtimeState.snapshot().activeUserTransferCount > 1 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(runtimeState.snapshot().activeUserTransferCount, 1, "only the held still still transfers")
+
+        provider.release()
+        for _ in 0..<400 where runtimeState.snapshot().activeUserTransferCount > 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(runtimeState.snapshot().activeUserTransferCount, 0)
+        XCTAssertEqual(
+            stagedFiles(in: directory).filter { !$0.hasSuffix(".download") }, Set<String>(), "no file after the stop")
+    }
+
     func testProgressHandlerReachesOneMonotonically() async throws {
         let directory = stagingDirectory
         let provider = FakeFileProvider(bytes: 64 * 1024)
@@ -351,5 +478,62 @@ private final class SlowFileProvider: OriginalFileProvider, @unchecked Sendable 
         startedContinuation.finish()
         try await Task.sleep(nanoseconds: 60_000_000_000)  // hangs until cancelled
         throw CocoaError(.fileWriteUnknown)
+    }
+}
+
+/// Downloads until cancelled and counts the downloads that started.
+private final class CancellingFileProvider: OriginalFileProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var writes: Int { lock.withLock { count } }
+
+    func writeOriginal(
+        for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        lock.withLock { count += 1 }
+        try Data(uid.nodeID.utf8).write(to: destination)
+        try await Task.sleep(for: .seconds(60))
+    }
+}
+
+/// Holds the download of one still until `release`, ignoring cancellation; every other file downloads at once.
+private final class HeldStillProvider: OriginalFileProvider, @unchecked Sendable {
+    private let still: PhotoUID
+    private let lock = NSLock()
+    private var started = 0
+    private var held: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    init(still: PhotoUID) { self.still = still }
+
+    func writeOriginal(
+        for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        try Data(uid.nodeID.utf8).write(to: destination)
+        lock.withLock { started += 1 }
+        guard uid == still else { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                if released { return true }
+                held = continuation
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func waitUntilBothStarted() async {
+        for _ in 0..<400 where lock.withLock({ started < 2 }) { try? await Task.sleep(for: .milliseconds(5)) }
+        // The motion downloads at once and then waits for its still's name.
+        try? await Task.sleep(for: .milliseconds(50))
+    }
+
+    func release() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            defer { held = nil }
+            return held
+        }
+        continuation?.resume()
     }
 }
