@@ -22,6 +22,21 @@ final class OriginalFileNamingTests: XCTestCase {
     private var tiff: Data { Data([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00]) }
     private var webp: Data { Data("RIFF".utf8) + Data([0x24, 0x00, 0x00, 0x00]) + Data("WEBP".utf8) }
 
+    func testALivePhotoMotionTakesTheBaseNameThatItsStillReceived() {
+        XCTAssertEqual(
+            OriginalFileNaming.livePhotoMotionFilename("FullSizeRender.mov", stillName: "IMG_1.heic"), "IMG_1.mov")
+        XCTAssertEqual(OriginalFileNaming.livePhotoMotionFilename("IMG_2.MOV", stillName: "IMG_2.HEIC"), "IMG_2.MOV")
+        XCTAssertEqual(
+            OriginalFileNaming.livePhotoMotionFilename("FullSizeRender.mov", stillName: "IMG_1 2.heic"), "IMG_1 2.mov",
+            "a still renamed for uniqueness renames its motion the same way")
+        XCTAssertEqual(
+            OriginalFileNaming.livePhotoMotionFilename("FullSizeRender.mov", stillName: "Beach"), "Beach.mov")
+        XCTAssertEqual(OriginalFileNaming.livePhotoMotionFilename("clip", stillName: "IMG_3.heic"), "IMG_3")
+        XCTAssertEqual(
+            OriginalFileNaming.livePhotoMotionFilename("FullSizeRender.mov", stillName: ".heic"), "FullSizeRender.mov",
+            "a still without a base name leaves the motion's own name")
+    }
+
     func testHeaderSniffDistinguishesFormats() {
         XCTAssertEqual(OriginalFileNaming.extensionForHeader(jpeg), "jpg")
         XCTAssertEqual(OriginalFileNaming.extensionForHeader(png), "png")

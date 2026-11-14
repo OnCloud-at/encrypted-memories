@@ -81,6 +81,9 @@ public struct TemporaryOriginalExporter: Sendable {
         // so concurrent exports cannot overwrite each other.
         let names = UniqueNames()
         let removesLocation = removeLocationWhenSharing()
+        // A Live Photo motion leaves under the name that its still received in this job.
+        let stillOfMotion = OutboundMedia.stillsByMotion(in: items)
+        let stillNames = OutboundStillNames()
 
         let maxConcurrent = 2
         var exported: [URL] = []
@@ -101,10 +104,17 @@ public struct TemporaryOriginalExporter: Sendable {
                 }
                 let item = items[index]
                 index += 1
+                let still = stillOfMotion[item.uid]
                 group.addTask {
-                    await Self.export(
-                        item, backend: backend, names: names, into: directory,
+                    let outcome = await Self.export(
+                        item, still: still, stillNames: stillNames, backend: backend, names: names, into: directory,
                         removeLocationWhenSharing: removesLocation)
+                    if case .exported(let url) = outcome {
+                        await stillNames.record(url.lastPathComponent, for: item.uid)
+                    } else {
+                        await stillNames.record(nil, for: item.uid)
+                    }
+                    return outcome
                 }
             }
             for _ in 0..<min(maxConcurrent, items.count) { addNext() }
@@ -136,8 +146,11 @@ public struct TemporaryOriginalExporter: Sendable {
         case failed
     }
 
+    /// `still` is the photo whose Live Photo motion `item` is, or nil; `stillNames` gives the name it received.
     private static func export(
         _ item: PhotoItem,
+        still: PhotoUID?,
+        stillNames: OutboundStillNames,
         backend: any OriginalFileProvider & PhotoMetadataProvider,
         names: UniqueNames,
         into directory: URL,
@@ -153,9 +166,12 @@ public struct TemporaryOriginalExporter: Sendable {
             // generated fallback if metadata lookup fails.
             let meta = try? await backend.metadata(for: item.uid)
             // Derive a missing extension from the bounded header, then use the link MIME as a secondary signal.
-            let desired = try OriginalExportWriter.exportFilename(
+            var desired = try OriginalExportWriter.exportFilename(
                 forDownloadedOriginal: staging, item: item, metadata: meta, fallbackBase: Self.fallbackBase(for: item)
             )
+            if let still, let stillName = await stillNames.name(of: still) {
+                desired = OriginalFileNaming.livePhotoMotionFilename(desired, stillName: stillName)
+            }
             // A location-free copy of a RAW photo is a JPEG; reserve that name so it never replaces another file.
             let name =
                 removeLocationWhenSharing ? LocationSanitizedCopy.outputFilename(forOriginalName: desired) : desired

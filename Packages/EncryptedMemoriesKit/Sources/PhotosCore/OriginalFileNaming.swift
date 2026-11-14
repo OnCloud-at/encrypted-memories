@@ -115,6 +115,16 @@ public enum OriginalFileNaming {
         return "\(fallbackBase).\(ext)"
     }
 
+    /// The export name of a Live Photo motion: the base name that its still received in the same export, with the
+    /// motion's own extension. Receivers that pair a Live Photo by name keep the pair: the motion of an edited Live
+    /// Photo is the rendered `FullSizeRender.mov`, and two stills of one export can share a name.
+    public static func livePhotoMotionFilename(_ motionName: String, stillName: String) -> String {
+        let base = (stillName as NSString).deletingPathExtension
+        guard !base.isEmpty, !base.hasPrefix(".") else { return motionName }
+        let ext = (motionName as NSString).pathExtension
+        return ext.isEmpty ? base : "\(base).\(ext)"
+    }
+
     /// A filesystem-safe rendering of a real original filename, or `nil` when there is nothing usable.
     /// Reduces the name to its last path component and strips NUL/trailing whitespace so a hostile or
     /// edge-case Proton link name (`../evil`, `a/b/IMG.HEIC`) can never escape the export directory or

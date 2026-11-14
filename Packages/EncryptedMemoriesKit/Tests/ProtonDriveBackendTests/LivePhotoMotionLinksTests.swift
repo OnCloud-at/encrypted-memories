@@ -7,7 +7,7 @@ import Testing
 @testable import ProtonDriveBackend
 
 /// The listing names the related files of a Live Photo newest first and without a type. An edited Live Photo names its
-/// adjustment data, its edited motion, its paired video, and its original photo.
+/// paired video, its adjustment data, its edited motion (`FullSizeRender.mov`), and its original photo.
 @Suite
 struct LivePhotoMotionLinksTests {
     private let types = [
@@ -17,40 +17,219 @@ struct LivePhotoMotionLinksTests {
         "original": "image/heic",
         "other": "application/octet-stream",
         "motion": "video/quicktime",
+        "render": "image/heic",
     ]
+    private let names = [
+        "plist": "Adjustments.plist", "paired": "IMG_2000.MOV", "edited": "FullSizeRender.mov",
+        "original": "IMG_2000.HEIC", "render": "FullSizeRender.heic",
+    ]
+
+    /// An answer of the metadata read: each requested file with its type, and its name when it was asked for.
+    private func answer(
+        _ linkIDs: [String], _ nameLinkIDs: Set<String>, types: [String: String], names: [String: String]
+    ) -> LivePhotoMotionLinks.Answer {
+        LivePhotoMotionLinks.Answer(
+            files: Dictionary(
+                uniqueKeysWithValues: linkIDs.map { linkID in
+                    (linkID, .init(mimeType: types[linkID], name: nameLinkIDs.contains(linkID) ? names[linkID] : nil))
+                }))
+    }
 
     @Test
     func aLivePhotoWithOneRelatedFileTakesItAsMotionOnlyWhenItIsAVideo() async throws {
-        #expect(LivePhotoMotionLinks.motion(among: [], mimeTypes: [:]) == .unknown)
+        #expect(LivePhotoMotionLinks.motion(among: [], mimeTypes: [:], names: [:]) == .unknown)
         var reads: [[String]] = []
+        var nameReads: [Set<String>] = []
         let answer = try await LivePhotoMotionLinks().motions(
             of: ["video": ["motion"], "edited": ["plist"], "none": []], stored: [:], evidence: [:]
-        ) { linkIDs in
+        ) { linkIDs, nameLinkIDs in
             reads.append(linkIDs)
-            return types
+            nameReads.append(nameLinkIDs)
+            return self.answer(linkIDs, nameLinkIDs, types: types, names: names)
         }
         #expect(reads == [["plist", "motion"]], "one read, also for a single related file")
+        #expect(nameReads == [[]], "a photo with one related file reads no name")
         #expect(answer.motions == ["video": .video("motion"), "edited": .noVideo, "none": .unknown])
         #expect(!LivePhotoMotion.noVideo.showsLiveControl, "only adjustment data: no Live control")
         #expect(LivePhotoMotion.video("motion").showsLiveControl)
     }
 
     @Test
-    func anEditedLivePhotoPlaysItsFirstVideoInsteadOfItsNewestRelatedFile() {
+    func anEditedLivePhotoPlaysItsEditedMotionWhereverTheListingNamesIt() {
         #expect(
-            LivePhotoMotionLinks.motion(among: ["plist", "paired", "edited", "original"], mimeTypes: types)
-                == .video("paired"))
-        #expect(
-            LivePhotoMotionLinks.motion(among: ["other", "plist", "paired", "original"], mimeTypes: types)
-                == .video("paired"))
-        #expect(
-            LivePhotoMotionLinks.motion(among: ["plist", "other", "original"], mimeTypes: types) == .noVideo,
-            "a Live Photo without a video has no motion")
+            LivePhotoMotionLinks.motion(
+                among: ["paired", "plist", "edited", "original"], mimeTypes: types, names: names)
+                == .video("edited"))
+        let upperCase = LivePhotoMotionLinks.motion(
+            among: ["edited", "paired", "original"], mimeTypes: types, names: ["edited": "FULLSIZERENDER.MOV"])
+        #expect(upperCase == .video("edited"), "the name compares without case")
     }
 
     @Test
-    func anUnknownTypeBeforeTheFirstVideoLeavesTheMotionUnknown() {
-        #expect(LivePhotoMotionLinks.motion(among: ["plist", "unknown", "paired"], mimeTypes: types) == .unknown)
+    func aLivePhotoWithoutAnEditedMotionPlaysItsFirstVideoInsteadOfItsNewestRelatedFile() {
+        #expect(
+            LivePhotoMotionLinks.motion(among: ["other", "plist", "paired", "original"], mimeTypes: types, names: [:])
+                == .video("paired"), "one video needs no name")
+        #expect(
+            LivePhotoMotionLinks.motion(
+                among: ["plist", "paired", "motion", "original"], mimeTypes: types,
+                names: ["paired": "IMG_2000.MOV", "motion": "IMG_2000 (1).MOV"]) == .video("paired"))
+        #expect(
+            LivePhotoMotionLinks.motion(among: ["plist", "other", "original"], mimeTypes: types, names: [:])
+                == .noVideo, "a Live Photo without a video has no motion")
+    }
+
+    @Test
+    func anImageNamedLikeTheEditedRenderIsNeverTheMotion() {
+        #expect(
+            LivePhotoMotionLinks.motion(
+                among: ["render", "paired", "motion"], mimeTypes: types,
+                names: ["render": "FullSizeRender.heic", "paired": "IMG_2000.MOV", "motion": "IMG_2000 (1).MOV"])
+                == .video("paired"))
+    }
+
+    @Test
+    func theEditedMotionWinsAmongThreeVideosInTheMiddleOrAtTheEnd() {
+        let three = ["paired": "IMG_2000.MOV", "motion": "IMG_2000 (1).MOV", "edited": "FullSizeRender.mov"]
+        #expect(
+            LivePhotoMotionLinks.motion(among: ["paired", "edited", "motion"], mimeTypes: types, names: three)
+                == .video("edited"))
+        #expect(
+            LivePhotoMotionLinks.motion(among: ["paired", "motion", "plist", "edited"], mimeTypes: types, names: three)
+                == .video("edited"))
+    }
+
+    /// Photos lists one rendered motion per Live Photo. Two videos named like the render are not documented; the first
+    /// in listing order, the newest upload, plays.
+    @Test
+    func twoVideosNamedLikeTheRenderPlayTheFirstInListingOrderAsUndocumentedBehavior() {
+        #expect(
+            LivePhotoMotionLinks.motion(
+                among: ["paired", "motion", "edited"], mimeTypes: types,
+                names: ["paired": "IMG_2000.MOV", "motion": "FullSizeRender.MOV", "edited": "FullSizeRender.mov"])
+                == .video("motion"))
+    }
+
+    @Test
+    func aNameWithAPathSeparatorIsNeverTheRender() {
+        // The backup never uploads such a name: Proton name correction removes path separators.
+        #expect(
+            LivePhotoMotionLinks.motion(
+                among: ["paired", "edited"], mimeTypes: types,
+                names: ["paired": "IMG_2000.MOV", "edited": "Edits/FullSizeRender.mov"]) == .video("paired"))
+    }
+
+    @Test
+    func aReadWithoutNamesKeepsItsTypesAndLeavesOnlyThePhotosThatNeedANameUndecided() async throws {
+        var links = LivePhotoMotionLinks()
+        let photos = ["edited": ["paired", "plist", "edited"], "single": ["motion"]]
+        let first = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs in
+            var answer = self.answer(linkIDs, [], types: types, names: names)
+            answer.namesRead = false
+            return answer
+        }
+        links.record(first.read)
+        #expect(first.read.names.isEmpty)
+        #expect(
+            first.read.types == [
+                "paired": "video/quicktime", "plist": "application/xml", "edited": "video/quicktime",
+                "motion": "video/quicktime",
+            ])
+        #expect(first.motions == ["edited": .unknown, "single": .video("motion")])
+
+        var reads: [[String]] = []
+        let second = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs in
+            reads.append(linkIDs)
+            return self.answer(linkIDs, nameLinkIDs, types: types, names: names)
+        }
+        #expect(reads == [["paired", "edited"]], "only the names; the types stay read for the session")
+        #expect(second.motions == ["edited": .video("edited"), "single": .video("motion")])
+    }
+
+    @Test
+    func aNameThatDoesNotDecryptPlaysTheFirstVideoAndAnUnreadNameLeavesTheMotionUnknown() {
+        // An empty name is a read whose name did not decrypt: the read is final, so the first video plays.
+        #expect(
+            LivePhotoMotionLinks.motion(
+                among: ["paired", "edited"], mimeTypes: types, names: ["paired": "", "edited": ""])
+                == .video("paired"))
+        // A name that was not read yet can be the edited motion.
+        #expect(
+            LivePhotoMotionLinks.motion(
+                among: ["paired", "edited"], mimeTypes: types, names: ["paired": "IMG_2000.MOV"]) == .unknown)
+    }
+
+    @Test
+    func anUnknownTypeLeavesTheMotionUnknownBecauseItCanBeTheEditedMotion() {
+        #expect(
+            LivePhotoMotionLinks.motion(among: ["plist", "unknown", "paired"], mimeTypes: types, names: names)
+                == .unknown)
+        #expect(
+            LivePhotoMotionLinks.motion(among: ["paired", "unknown"], mimeTypes: types, names: names) == .unknown)
+    }
+
+    @Test
+    func oneReadAsksForTheNamesOfThePossibleVideosOfPhotosWithTwoOrMore() async throws {
+        let evidence = [
+            "plist": "application/xml", "paired": "video/quicktime", "edited": "video/quicktime",
+            "plist-3": "application/xml", "paired-3": "video/quicktime",
+        ]
+        var links = LivePhotoMotionLinks()
+        var reads: [[String]] = []
+        var nameReads: [Set<String>] = []
+        let photos = [
+            "edited": ["paired", "plist", "edited"], "one-video": ["plist-3", "paired-3"], "single": ["motion"],
+            "unread": ["x", "y"],
+        ]
+        let allTypes = types.merging(["x": "video/quicktime", "y": "image/heic"]) { first, _ in first }
+        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, nameLinkIDs in
+            reads.append(linkIDs)
+            nameReads.append(nameLinkIDs)
+            let allNames = names.merging(["x": "x.mov"]) { name, _ in name }
+            return self.answer(linkIDs, nameLinkIDs, types: allTypes, names: allNames)
+        }
+        links.record(first.read)
+        #expect(reads == [["paired", "edited", "motion", "x", "y"]], "one read; known types of videos join it")
+        #expect(
+            nameReads == [["paired", "edited", "x", "y"]],
+            "names only of the files that are or can be videos, in photos with two or more of them")
+        #expect(first.read.names == ["paired": "IMG_2000.MOV", "edited": "FullSizeRender.mov", "x": "x.mov", "y": ""])
+        #expect(
+            first.motions == [
+                "edited": .video("edited"), "one-video": .video("paired-3"), "single": .video("motion"),
+                "unread": .video("x"),
+            ])
+
+        let second = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, nameLinkIDs in
+            reads.append(linkIDs)
+            return .init(files: [:])
+        }
+        #expect(reads.count == 1, "read names stay valid for the session")
+        #expect(second.motions == first.motions)
+    }
+
+    @Test
+    func aMotionThatTheEarlierRuleStoredIsNotTrustedAndOneMarkedSaveTrustsTheNewRule() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("live-motion-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
+        defer { store.close() }
+        let photos = ["live": ["paired", "plist", "edited"]]
+
+        // The earlier rule played the first video, the original motion of an edited Live Photo.
+        #expect(store.save(items(["live": "paired"])).succeeded)
+        #expect(store.markRelatedVideosChosen(by: "liveMotion.firstRelatedVideo.2"))
+        #expect(LivePhotoMotionLinks.rule != "liveMotion.firstRelatedVideo.2")
+        #expect(!store.relatedVideosChosen(by: LivePhotoMotionLinks.rule), "the next load lists once")
+        #expect(LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store).isEmpty)
+
+        // The load that saves its timeline marks the new rule; later loads trust it and do not list for it.
+        #expect(store.save(items(["live": "edited"])).succeeded)
+        #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        #expect(store.relatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        #expect(LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store) == ["live": "edited"])
     }
 
     @Test
@@ -60,19 +239,20 @@ struct LivePhotoMotionLinksTests {
         let evidence = ["plist": "application/xml"]
         var reads: [[String]] = []
 
-        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs in
+        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, _ in
             reads.append(linkIDs)
-            return ["motion": "video/quicktime", "paired": "video/quicktime", "plist": "text/plain"]
+            return self.answer(
+                linkIDs, [], types: ["motion": "video/quicktime", "paired": "video/quicktime", "plist": "text/plain"],
+                names: [:])
         }
         links.record(first.read)
         #expect(reads == [["motion", "paired", "edited"]])
-        #expect(first.complete)
-        #expect(first.read == ["motion": "video/quicktime", "paired": "video/quicktime", "edited": ""])
+        #expect(first.read.types == ["motion": "video/quicktime", "paired": "video/quicktime", "edited": ""])
         #expect(first.motions == ["a": .video("motion"), "b": .video("paired"), "c": .video("paired")])
 
-        let second = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs in
+        let second = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, _ in
             reads.append(linkIDs)
-            return [:]
+            return .init(files: [:])
         }
         #expect(reads.count == 1, "a read type stays valid for the session")
         #expect(second.motions == first.motions)
@@ -84,23 +264,21 @@ struct LivePhotoMotionLinksTests {
         var links = LivePhotoMotionLinks()
         let photos = ["live": ["plist", "paired"]]
 
-        let failed = try await links.motions(of: photos, stored: [:], evidence: [:]) { _ in throw Offline() }
+        let failed = try await links.motions(of: photos, stored: [:], evidence: [:]) { _, _ in throw Offline() }
         links.record(failed.read)
-        #expect(!failed.complete)
-        #expect(failed.read.isEmpty)
+        #expect(failed.read == .init())
         #expect(failed.motions == ["live": .unknown])
 
         var reads = 0
-        let retried = try await links.motions(of: photos, stored: [:], evidence: [:]) { _ in
+        let retried = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs in
             reads += 1
-            return types
+            return self.answer(linkIDs, nameLinkIDs, types: types, names: names)
         }
-        #expect(reads == 1)
-        #expect(retried.complete)
+        #expect(reads == 1, "the next refresh reads the failed files again")
         #expect(retried.motions == ["live": .video("paired")])
 
         await #expect(throws: CancellationError.self) {
-            _ = try await LivePhotoMotionLinks().motions(of: photos, stored: [:], evidence: [:]) { _ in
+            _ = try await LivePhotoMotionLinks().motions(of: photos, stored: [:], evidence: [:]) { _, _ in
                 throw CancellationError()
             }
         }
@@ -159,7 +337,7 @@ struct LivePhotoMotionLinksTests {
         // The read of "failed" fails: its motion stays unknown, and the timeline and its token are still saved.
         let motions = try await LivePhotoMotionLinks().motions(
             of: photos, stored: ["known": "paired-1"], evidence: [:]
-        ) { _ in throw URLError(.timedOut) }
+        ) { _, _ in throw URLError(.timedOut) }
         #expect(motions.motions == ["known": .video("paired-1"), "failed": .unknown])
         let saved = photos.keys.sorted().enumerated().map { index, linkID in
             PhotoItem(
@@ -219,13 +397,12 @@ struct LivePhotoMotionLinksTests {
         var requests = 0
         let answer = try await LivePhotoMotionLinks().motions(
             of: photos, stored: stored, evidence: evidence.types, allowFetch: evidence.canRefine
-        ) { _ in
+        ) { _, _ in
             requests += 1
             throw URLError(.timedOut)
         }
         #expect(requests == 0)
-        #expect(!answer.complete, "the skipped refinement remains incomplete")
-        #expect(answer.read.isEmpty)
+        #expect(answer.read == .init(), "the skipped refinement reads nothing and keeps nothing")
         #expect(answer.motions["known"] == .video("paired"))
         let entries = [
             PhotosListEntry(
@@ -263,12 +440,15 @@ struct LivePhotoMotionLinksTests {
     ) async throws -> (motions: [String: LivePhotoMotion], reads: [String]) {
         var reads: [String] = []
         let stored = LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store)
-        let answer = try await LivePhotoMotionLinks().motions(of: photos, stored: stored, evidence: [:]) { linkIDs in
+        let answer = try await LivePhotoMotionLinks().motions(of: photos, stored: stored, evidence: [:]) {
+            linkIDs, nameLinkIDs in
             reads += linkIDs
-            return Dictionary(
-                uniqueKeysWithValues: linkIDs.map {
-                    ($0, $0.hasPrefix("paired") || $0.hasPrefix("edited") ? "video/quicktime" : "image/heic")
-                })
+            let videos = linkIDs.filter { $0.hasPrefix("paired") || $0.hasPrefix("edited") }
+            return self.answer(
+                linkIDs, nameLinkIDs,
+                types: Dictionary(
+                    uniqueKeysWithValues: linkIDs.map { ($0, videos.contains($0) ? "video/quicktime" : "image/heic") }),
+                names: Dictionary(uniqueKeysWithValues: linkIDs.map { ($0, "\($0).mov") }))
         }
         return (answer.motions, reads)
     }
@@ -321,7 +501,7 @@ struct LivePhotoMotionLinksTests {
                 "unread": ["x", "y"], "adjusted": ["plist"],
             ],
             stored: [:], evidence: types
-        ) { _ in throw URLError(.notConnectedToInternet) }
+        ) { _, _ in throw URLError(.notConnectedToInternet) }
         let items = DriveSDKBridge.group(entries, volumeID: "v", motions: motions.motions).flatMap(\.items)
         let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.uid.nodeID, $0) })
 

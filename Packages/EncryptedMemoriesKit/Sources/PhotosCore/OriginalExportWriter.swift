@@ -88,7 +88,10 @@ public enum OriginalExportWriter {
         let writer = try ZipStreamWriter(url: stagedArchive)
         var success = false
         defer { if !success { writer.abort() } }
-        var used = Set<String>()
+        var used = UniqueNameSet()
+        // A Live Photo motion takes the entry name that its still received in this archive.
+        let stillOfMotion = OutboundMedia.stillsByMotion(in: items)
+        var entryNames: [PhotoUID: String] = [:]
         for (index, item) in items.enumerated() {
             try Task.checkCancellation()
             let metadata = try? await provider.metadata(for: item.uid)
@@ -131,7 +134,12 @@ public enum OriginalExportWriter {
             } else {
                 archiveSource = sidecar
             }
-            try writer.addFile(name: uniqueArchiveName(archiveName, used: &used), fileURL: archiveSource)
+            if let still = stillOfMotion[item.uid], let stillName = entryNames[still] {
+                archiveName = OriginalFileNaming.livePhotoMotionFilename(archiveName, stillName: stillName)
+            }
+            let entryName = used.unique(archiveName)
+            entryNames[item.uid] = entryName
+            try writer.addFile(name: entryName, fileURL: archiveSource)
             onProgress(Double(index + 1) / total)
         }
         try writer.finish()
@@ -188,26 +196,6 @@ public enum OriginalExportWriter {
             _ = try fileManager.replaceItemAt(destination, withItemAt: stagedFile)
         } else {
             try fileManager.moveItem(at: stagedFile, to: destination)
-        }
-    }
-
-    /// Returns `name`, or `name 2`, `name 3` and so on before the extension, so archive entries never collide.
-    static func uniqueArchiveName(_ name: String, used: inout Set<String>) -> String {
-        guard used.contains(name) else {
-            used.insert(name)
-            return name
-        }
-        let url = URL(fileURLWithPath: name)
-        let stem = url.deletingPathExtension().lastPathComponent
-        let ext = url.pathExtension
-        var suffix = 2
-        while true {
-            let candidate = ext.isEmpty ? "\(stem) \(suffix)" : "\(stem) \(suffix).\(ext)"
-            if !used.contains(candidate) {
-                used.insert(candidate)
-                return candidate
-            }
-            suffix += 1
         }
     }
 }

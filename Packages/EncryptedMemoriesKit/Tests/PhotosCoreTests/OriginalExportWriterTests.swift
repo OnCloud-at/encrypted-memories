@@ -86,13 +86,13 @@ import Testing
         #expect(name == "fallback.heic")
     }
 
-    @Test func archiveNamesNeverCollide() {
-        var used = Set<String>()
-        #expect(OriginalExportWriter.uniqueArchiveName("IMG.HEIC", used: &used) == "IMG.HEIC")
-        #expect(OriginalExportWriter.uniqueArchiveName("IMG.HEIC", used: &used) == "IMG 2.HEIC")
-        #expect(OriginalExportWriter.uniqueArchiveName("IMG.HEIC", used: &used) == "IMG 3.HEIC")
-        #expect(OriginalExportWriter.uniqueArchiveName("README", used: &used) == "README")
-        #expect(OriginalExportWriter.uniqueArchiveName("README", used: &used) == "README 2")
+    @Test func exportNamesNeverCollideIgnoringCase() {
+        var used = UniqueNameSet()
+        #expect(used.unique("IMG.HEIC") == "IMG.HEIC")
+        #expect(used.unique("IMG.HEIC") == "IMG 2.HEIC")
+        #expect(used.unique("img.heic") == "img 3.heic", "an archive extracts on a case-insensitive volume")
+        #expect(used.unique("README") == "README")
+        #expect(used.unique("README") == "README 2")
     }
 
     // MARK: - Destination writes
@@ -152,6 +152,33 @@ import Testing
         #expect(try archiveEntries(destination) == ["IMG_0001.HEIC", "IMG_0001 2.HEIC", "cccccccc.jpg"])
         #expect(progress.values.last == 1)
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["Export.zip"])
+    }
+
+    /// A Live Photo leaves as its still and its motion; the motion entry takes the name its still received, so two
+    /// stills with one name keep their own motions.
+    @Test func archiveNamesEachLivePhotoMotionAfterTheEntryOfItsStill() async throws {
+        let restorePreference = keepLocationForThisTest()
+        defer { restorePreference() }
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("Export.zip")
+        func live(_ node: String) -> PhotoItem {
+            PhotoItem(
+                uid: PhotoUID(volumeID: "volume", nodeID: node),
+                captureTime: Date(timeIntervalSince1970: 1_700_000_000), mediaType: "image/heic", isLivePhoto: true,
+                relatedVideoID: "\(node)-motion")
+        }
+        let items = OutboundMedia.files(for: [live("aaaaaaaa"), live("bbbbbbbb")]).map(\.item)
+        let provider = FakeOriginalProvider(
+            payloads: Dictionary(uniqueKeysWithValues: items.map { ($0.uid, Self.heicHeader) }),
+            metadata: Dictionary(
+                uniqueKeysWithValues: items.map {
+                    ($0.uid, PhotoMetadata(filename: $0.isVideo ? "FullSizeRender.mov" : "IMG_1.HEIC"))
+                }))
+
+        try await OriginalExportWriter.writeArchive(items: items, to: destination, provider: provider) { _ in }
+
+        #expect(try archiveEntries(destination) == ["IMG_1.HEIC", "IMG_1.mov", "IMG_1 2.HEIC", "IMG_1 2.mov"])
     }
 
     @Test func writeDataWritesTheBytesAndReplacesAnExistingFile() throws {
@@ -222,44 +249,6 @@ import Testing
 
         #expect(provider.writeCount == 0)
         #expect(!FileManager.default.fileExists(atPath: destination.path))
-    }
-}
-
-private final class FakeOriginalProvider: OriginalFileProvider, PhotoMetadataProvider, @unchecked Sendable {
-    struct Failure: Error {}
-
-    private let lock = NSLock()
-    private let payloads: [PhotoUID: Data]
-    private let metadataByUID: [PhotoUID: PhotoMetadata]
-    private let failing: Set<PhotoUID>
-    private var writes = 0
-
-    init(
-        payloads: [PhotoUID: Data],
-        metadata: [PhotoUID: PhotoMetadata] = [:],
-        failing: Set<PhotoUID> = []
-    ) {
-        self.payloads = payloads
-        self.metadataByUID = metadata
-        self.failing = failing
-    }
-
-    var writeCount: Int { lock.withLock { writes } }
-
-    func writeOriginal(
-        for uid: PhotoUID,
-        to destination: URL,
-        onProgress: @escaping @Sendable (Double) -> Void
-    ) async throws {
-        lock.withLock { writes += 1 }
-        guard !failing.contains(uid), let payload = payloads[uid] else { throw Failure() }
-        try payload.write(to: destination)
-        onProgress(1)
-    }
-
-    func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
-        guard let metadata = metadataByUID[uid] else { throw Failure() }
-        return metadata
     }
 }
 

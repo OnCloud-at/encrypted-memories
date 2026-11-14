@@ -19,6 +19,66 @@ import UniformTypeIdentifiers
         return root
     }
 
+    /// A Live Photo leaves as its still and its motion. The motion of an edited Live Photo is the rendered
+    /// `FullSizeRender.mov`; it leaves under the base name of its still, so tools that pair by name keep the pair.
+    private func live(_ id: String) -> PhotoItem {
+        PhotoItem(
+            uid: PhotoUID(volumeID: "export-tests", nodeID: id),
+            captureTime: Date(timeIntervalSince1970: 1_700_000_000), mediaType: "image/heic", isLivePhoto: true,
+            relatedVideoID: "\(id)-motion")
+    }
+
+    @Test func aLivePhotoMotionLeavesUnderTheBaseNameOfItsStill() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TemporaryExportBackend(filenames: [
+            "edited": "IMG_1.heic", "edited-motion": "FullSizeRender.mov",
+            "unedited": "IMG_2.HEIC", "unedited-motion": "IMG_2.MOV",
+            "renamed": "Beach.HEIC", "renamed-motion": "FullSizeRender.mov",
+        ])
+        let items = OutboundMedia.files(for: [live("edited"), live("unedited"), live("renamed")]).map(\.item)
+        let result = await TemporaryOriginalExporter(exportRoot: root).exportOriginals(
+            items, backend: backend, removeLocationWhenSharing: { false })
+
+        #expect(result.failed == 0)
+        #expect(
+            Set(result.urls.map(\.lastPathComponent))
+                == ["IMG_1.heic", "IMG_1.mov", "IMG_2.HEIC", "IMG_2.MOV", "Beach.HEIC", "Beach.mov"])
+    }
+
+    /// Two stills of one share can carry the same name; each motion follows the name its own still received.
+    @Test func twoStillsWithOneNameKeepEachMotionWithItsOwnStill() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TemporaryExportBackend(filenames: [
+            "a": "IMG_1.heic", "a-motion": "FullSizeRender.mov", "b": "IMG_1.heic", "b-motion": "FullSizeRender.mov",
+        ])
+        let result = await TemporaryOriginalExporter(exportRoot: root).exportOriginals(
+            OutboundMedia.files(for: [live("a"), live("b")]).map(\.item), backend: backend,
+            removeLocationWhenSharing: { false })
+
+        let contents = Dictionary(
+            uniqueKeysWithValues: try result.urls.map {
+                ($0.lastPathComponent, String(decoding: try Data(contentsOf: $0), as: UTF8.self))
+            })
+        #expect(Set(contents.keys) == ["IMG_1.heic", "IMG_1.mov", "IMG_1 2.heic", "IMG_1 2.mov"])
+        for still in ["IMG_1", "IMG_1 2"] {
+            #expect(contents["\(still).mov"] == "\(contents["\(still).heic"] ?? "")-motion")
+        }
+    }
+
+    @Test func aMotionWhoseStillDidNotLeaveKeepsItsOwnName() async throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let backend = TemporaryExportBackend(filenames: ["fail-motion": "FullSizeRender.mov"])
+        let result = await TemporaryOriginalExporter(exportRoot: root).exportOriginals(
+            OutboundMedia.files(for: [live("fail")]).map(\.item), backend: backend,
+            removeLocationWhenSharing: { false })
+
+        #expect(result.failed == 1)
+        #expect(result.urls.map(\.lastPathComponent) == ["FullSizeRender.mov"])
+    }
+
     @Test func duplicateNamesKeepEveryOriginal() async throws {
         let root = try root()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -268,6 +328,7 @@ import UniformTypeIdentifiers
 
 private actor TemporaryExportBackend: OriginalFileProvider, PhotoMetadataProvider {
     let filename: String
+    let filenames: [String: String]
     let metadataFails: Bool
     let payload: Data?
     let blocked: Set<String>
@@ -275,8 +336,12 @@ private actor TemporaryExportBackend: OriginalFileProvider, PhotoMetadataProvide
     private var released = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(filename: String = "same.jpg", metadataFails: Bool = false, payload: Data? = nil, blocked: Set<String> = []) {
+    init(
+        filename: String = "same.jpg", filenames: [String: String] = [:], metadataFails: Bool = false,
+        payload: Data? = nil, blocked: Set<String> = []
+    ) {
         self.filename = filename
+        self.filenames = filenames
         self.metadataFails = metadataFails
         self.payload = payload
         self.blocked = blocked
@@ -296,7 +361,7 @@ private actor TemporaryExportBackend: OriginalFileProvider, PhotoMetadataProvide
 
     func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
         if metadataFails { throw CocoaError(.fileReadUnknown) }
-        return PhotoMetadata(filename: filename, mimeType: "image/jpeg")
+        return PhotoMetadata(filename: filenames[uid.nodeID] ?? filename, mimeType: "image/jpeg")
     }
 
     func waitForWrites(_ count: Int) async -> Bool {
