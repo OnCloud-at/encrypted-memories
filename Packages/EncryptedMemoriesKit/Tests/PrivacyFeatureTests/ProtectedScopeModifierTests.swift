@@ -6,6 +6,24 @@ import XCTest
 
 @MainActor
 final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
+    func testLockedContentCannotDrawOutsideItsLayoutFrame() throws {
+        defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
+        let gate = AccessGate(authenticator: PendingDeviceOwner(), defaults: defaults)
+        let protected = Color.red.frame(width: 80, height: 80)
+            .offset(x: 240)
+            .frame(width: 120, height: 240)
+            .protectedScope(
+                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")
+        let cover = ProtectedScopeCover(
+            unlockTitle: "Unlock", accessibilityLabel: "Locked", isAuthenticating: false
+        ) {}
+        .frame(width: 120, height: 240)
+        XCTAssertEqual(
+            try pixels(protected.frame(width: 500, height: 240, alignment: .leading), width: 500),
+            try pixels(cover.frame(width: 500, height: 240, alignment: .leading), width: 500),
+            "An offset photo must not remain visible beside the lock cover")
+    }
+
     func testADisabledAreaKeepsItsContentVisible() throws {
         let gate = AccessGate(authenticator: PendingDeviceOwner(), defaults: defaults)
         XCTAssertEqual(
@@ -64,9 +82,9 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
             ProtectedScopeCover(unlockTitle: "Unlock", accessibilityLabel: "Locked", isAuthenticating: false) {})
     }
 
-    private func pixels(_ view: some View) throws -> Data {
+    private func pixels(_ view: some View, width: CGFloat = 320) throws -> Data {
         let renderer = ImageRenderer(
-            content: view.frame(width: 320, height: 240).environment(\.colorScheme, .light))
+            content: view.frame(width: width, height: 240).environment(\.colorScheme, .light))
         renderer.scale = 1
         let image = try XCTUnwrap(renderer.cgImage)
         return try XCTUnwrap(image.dataProvider?.data) as Data

@@ -32,6 +32,7 @@ private struct ProtectedScopeModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            .opacity(isCovered ? 0 : 1)
             .disabled(isCovered)
             .allowsHitTesting(!isCovered)
             .accessibilityHidden(isCovered)
@@ -43,6 +44,7 @@ private struct ProtectedScopeModifier: ViewModifier {
                     ) {
                         Task { await gate.unlock(scope, reason: reason) }
                     }
+                    .transition(.identity)
                     .task(
                         id: Activity(
                             identity: identity, scenePhase: scenePhase,
@@ -65,6 +67,7 @@ private struct ProtectedScopeModifier: ViewModifier {
                 presence?.release()
                 presence = nil
             }
+            .animation(nil, value: isCovered)
     }
 
     private struct Identity: Equatable {
