@@ -12,18 +12,16 @@ struct BackendErrorView: View {
     @State private var confirmSignOut = false
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "exclamationmark.icloud")
-                .font(.system(size: 42))
-                .foregroundStyle(ProtonColor.warning)
-            Text("error.library_open_failed")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(ProtonColor.textNorm)
+        ContentUnavailableView {
+            Label {
+                Text("error.library_open_failed")
+            } icon: {
+                Image(systemName: "exclamationmark.icloud")
+                    .foregroundStyle(ProtonColor.warning)
+            }
+        } description: {
             Text(message)
-                .font(.system(size: 12))
-                .foregroundStyle(ProtonColor.textWeak)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
+        } actions: {
             HStack(spacing: 10) {
                 if isRetryable {
                     RetryButton(.prominent, action: retry).frame(minWidth: 120)
