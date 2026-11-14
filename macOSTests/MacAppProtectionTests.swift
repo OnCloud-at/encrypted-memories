@@ -213,6 +213,8 @@ final class MacAppProtectionTests: XCTestCase {
             window.close()
         }
         XCTAssertNil(released, "The old root must deallocate before a new root registers")
+        let replacement = makeWindow()
+        defer { replacement.close() }
         XCTAssertTrue(
             try windowRoots(in: fixture.controller).contains { root in
                 guard let field = Mirror(reflecting: root).children.first(where: { $0.label == "window" }) else {
@@ -221,8 +223,6 @@ final class MacAppProtectionTests: XCTestCase {
                 return (field.value as? NSWindow) == nil
             },
             "The dead root must still be registered before replacement registration")
-        let replacement = makeWindow()
-        defer { replacement.close() }
         fixture.controller.register(window: replacement)
         XCTAssertEqual(try suspension(of: replacement, in: fixture.controller), false)
     }
