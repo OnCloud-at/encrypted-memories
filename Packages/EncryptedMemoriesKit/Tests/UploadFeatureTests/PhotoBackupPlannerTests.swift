@@ -518,29 +518,13 @@ final class PhotoBackupPlannerTests: XCTestCase {
     }
 
     func testMetadataOnlyChangeClassifiesAlreadyBackedUpWithoutRecheck() async throws {
-        final class MemoryStore: UploadBackupStateStore, @unchecked Sendable {
-            private let lock = NSLock()
-            private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-            func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-                lock.withLock { rows[source]?[revision] }
-            }
-            func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-                lock.withLock { !(rows[source]?.isEmpty ?? true) }
-            }
-            func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-                lock.withLock { rows[record.source, default: [:]][record.revision] = record }
-                return true
-            }
-            func count() -> Int { lock.withLock { rows.values.reduce(0) { $0 + $1.count } } }
-        }
-
         let resources: [PhotoBackupAssetInfo.Resource] = [
             .init(role: .originalPhoto, originalFilename: "IMG_1.HEIC", mimeType: nil)
         ]
         let original = info(resources: resources)
         let favorited = info(modified: Date(timeIntervalSince1970: 1_700_050_000), resources: resources)
 
-        let index = UploadBackupPreflightIndex(store: MemoryStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         let originalSnapshot = PhotoBackupAssetPlanner.candidate(for: original)!.snapshot
         try await index.markBackedUp(originalSnapshot)
 

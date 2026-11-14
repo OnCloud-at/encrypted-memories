@@ -23,55 +23,6 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
 
     public func close() { connection.close() }
 
-    public func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-        connection.withLock {
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    SELECT resource_count, pending_resources, updated_at
-                    FROM backup_asset_state
-                    WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { return nil }
-            defer { sqlite3_finalize(stmt) }
-            // A failed bind leaves its parameter NULL; it records the failure, and the read answers nil (#1194).
-            guard connection.bindUploadSource(source, to: stmt, from: 1) else { return nil }
-            sqlite3_bind_int64(stmt, 4, revision.rawValue)
-            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-            return UploadBackupAssetRecord(
-                source: source,
-                revision: revision,
-                resourceCount: Int(sqlite3_column_int(stmt, 0)),
-                pendingResourceCount: Int(sqlite3_column_int(stmt, 1)),
-                updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))
-            )
-        }
-    }
-
-    public func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-        connection.withLock {
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    SELECT 1 FROM backup_asset_state
-                    WHERE source_kind=? AND source_id=? AND resource=?
-                    LIMIT 1;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else { return false }
-            defer { sqlite3_finalize(stmt) }
-            guard connection.bindUploadSource(source, to: stmt, from: 1) else { return false }
-            return sqlite3_step(stmt) == SQLITE_ROW
-        }
-    }
-
     public func lookupBatch(_ snapshots: [UploadBackupAssetSnapshot]) -> [UploadBackupStateLookup] {
         guard !snapshots.isEmpty else { return [] }
         return connection.withLock {
@@ -220,17 +171,6 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
                 return false
             }
             return true
-        }
-    }
-
-    public func count() -> Int {
-        connection.withLock {
-            var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM backup_asset_state;", -1, &stmt, nil) == SQLITE_OK else {
-                return 0
-            }
-            defer { sqlite3_finalize(stmt) }
-            return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
         }
     }
 

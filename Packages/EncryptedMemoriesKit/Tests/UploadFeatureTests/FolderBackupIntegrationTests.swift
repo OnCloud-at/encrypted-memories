@@ -19,28 +19,6 @@ private struct PartialFailureCatalog: UploadBackupAssetCatalog {
 /// Folder sync uses real temporary files, the SQLite queue, streaming hashing, and file resolution.
 /// A file that vanishes during scan, check, or upload becomes `sourceMissing` without re-uploading.
 final class FolderBackupIntegrationTests: XCTestCase {
-    private final class MemoryBackupStateStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { rows[record.source, default: [:]][record.revision] = record }
-            return true
-        }
-
-        func count() -> Int {
-            lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
-        }
-    }
-
     private var tempDir: URL!
     private var folder: URL!
     private var queueStore: UploadBackupSyncQueueManifestStore!
@@ -59,7 +37,7 @@ final class FolderBackupIntegrationTests: XCTestCase {
             UploadBackupSyncQueueManifestStore(
                 url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
             ))
-        preflight = UploadBackupPreflightIndex(store: MemoryBackupStateStore())
+        preflight = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         engine = UploadBackupSyncEngine(preflight: preflight, queue: queueStore)
         checker = FakeChecker()
         pipeline = UploadDedupePipeline(store: FakeIdentityStore(), checker: checker)

@@ -83,6 +83,8 @@ final class UploadBackupStateBindingFailureTests: XCTestCase {
         XCTAssertEqual(
             lookups.first?.succeeded, false,
             "A key that does not bind is no proof that the photo has no backup state")
+        XCTAssertNil(lookups.first?.directRecord)
+        XCTAssertEqual(lookups.first?.hasAnyRecord, false)
         try assertBindFailureRecorded()
     }
 
@@ -108,18 +110,6 @@ final class UploadBackupStateBindingFailureTests: XCTestCase {
         try lowerLengthLimit()
         XCTAssertFalse(store.upsertBatch([record("a"), record(long)]))
         XCTAssertEqual(try storedRows(), [], "The first row must roll back with the failed second one")
-        try assertBindFailureRecorded()
-    }
-
-    func testRecordWithAnIdentifierLongerThanTheLimitRecordsTheFailure() throws {
-        try lowerLengthLimit()
-        XCTAssertNil(store.record(for: source(long), revision: UploadBackupRevision(rawValue: 10)))
-        try assertBindFailureRecorded()
-    }
-
-    func testHasAnyRecordWithAnIdentifierLongerThanTheLimitRecordsTheFailure() throws {
-        try lowerLengthLimit()
-        XCTAssertFalse(store.hasAnyRecord(for: source(long)))
         try assertBindFailureRecorded()
     }
 

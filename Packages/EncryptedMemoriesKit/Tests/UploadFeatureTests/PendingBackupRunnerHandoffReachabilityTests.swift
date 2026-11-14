@@ -157,16 +157,11 @@ private final class ChainStateBoundary: UploadBackupStateStore, @unchecked Senda
         return result
     }
 
-    func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-        base.record(for: source, revision: revision)
-    }
-    func hasAnyRecord(for source: UploadSourceIdentity) -> Bool { base.hasAnyRecord(for: source) }
     func upsert(_ record: UploadBackupAssetRecord) -> Bool { base.upsert(record) }
     func upsertBatch(_ records: [UploadBackupAssetRecord]) -> Bool { base.upsertBatch(records) }
     func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
         base.removeRecords(for: source, keeping: revisions)
     }
-    func count() -> Int { base.count() }
 }
 
 private final class ChainClock: @unchecked Sendable {

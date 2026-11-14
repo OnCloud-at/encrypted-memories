@@ -25,7 +25,7 @@ final class BackupReceiptRevisionTests: XCTestCase {
         queueStore = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(
                 url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
-        preflight = UploadBackupPreflightIndex(store: MemoryStateStore(), now: { [clock] in clock!.now })
+        preflight = UploadBackupPreflightIndex(store: MemoryBackupStateStore(), now: { [clock] in clock!.now })
         identityStore = FakeIdentityStore()
         hasher = FakeHasher()
         checker = FakeChecker()
@@ -418,32 +418,5 @@ final class BackupReceiptRevisionTests: XCTestCase {
         func exclusion(of source: UploadSourceIdentity) -> BackupSourceExclusion? { .included }
 
         func reportProgress(source: UploadSourceIdentity, revision: UploadBackupRevision, step: Int?) {}
-    }
-
-    private final class MemoryStateStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { rows[record.source, default: [:]][record.revision] = record }
-            return true
-        }
-
-        func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
-            lock.withLock { rows[source] = rows[source]?.filter { revisions.contains($0.key) } }
-            return true
-        }
-
-        func count() -> Int {
-            lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
-        }
     }
 }

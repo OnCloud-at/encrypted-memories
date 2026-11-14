@@ -145,7 +145,7 @@ final class PhotoBurstUploadPlannerTests: XCTestCase {
             ).contentFingerprint,
             "the catalog must report the asset as changed although PhotoKit did not move its dates")
 
-        let index = UploadBackupPreflightIndex(store: MemoryStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         try await index.markBackedUp(uploadedAlone.snapshot)
         let decision = try await index.classify(asSeries.snapshot)
         XCTAssertEqual(
@@ -158,26 +158,10 @@ final class PhotoBurstUploadPlannerTests: XCTestCase {
         let plan = try XCTUnwrap(PhotoBurstUploadPlanner.plan(for: assets))
         let series = try XCTUnwrap(
             PhotoBackupAssetPlanner.candidate(for: PhotoBurstUploadPlanner.applying(plan, to: assets[0].info)))
-        let index = UploadBackupPreflightIndex(store: MemoryStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         try await index.markBackedUp(series.snapshot)
 
         let decision = try await index.classify(series.snapshot)
         XCTAssertEqual(decision, .alreadyBackedUp)
-    }
-
-    private final class MemoryStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { rows[record.source, default: [:]][record.revision] = record }
-            return true
-        }
-        func count() -> Int { lock.withLock { rows.values.reduce(0) { $0 + $1.count } } }
     }
 }

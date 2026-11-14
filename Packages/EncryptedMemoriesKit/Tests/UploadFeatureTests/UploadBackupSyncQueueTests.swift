@@ -58,36 +58,6 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         }
     }
 
-    private final class MemoryBackupStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-        private var writes = 0
-        private let onWrite: @Sendable (UploadBackupAssetRecord) -> Void
-        init(onWrite: @escaping @Sendable (UploadBackupAssetRecord) -> Void = { _ in }) { self.onWrite = onWrite }
-        var upsertCount: Int { lock.withLock { writes } }
-
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock {
-                writes += 1
-                rows[record.source, default: [:]][record.revision] = record
-            }
-            onWrite(record)
-            return true
-        }
-
-        func count() -> Int {
-            lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
-        }
-    }
-
     private var tempDir: URL!
 
     override func setUpWithError() throws {
@@ -138,7 +108,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             let observer = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
             defer { observer.close() }
             let photo = candidate(id: route, revision: 42)
-            let state = MemoryBackupStore()
+            let state = MemoryBackupStateStore(removesRecords: false)
             let index = UploadBackupPreflightIndex(store: state)
             if route == "restore" || route == "late-main" { try await index.markBackedUp(photo.snapshot) }
             let previous = state.record(for: photo.snapshot.source, revision: photo.snapshot.revision)
@@ -207,7 +177,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 source: photo.snapshot.source, revision: photo.snapshot.revision,
                 originalFilename: photo.originalFilename, state: .completed,
                 updatedAt: Date(timeIntervalSince1970: 1_000))
-            let state = MemoryBackupStore { record in
+            let state = MemoryBackupStateStore(removesRecords: false) { record in
                 guard !record.isComplete else { return }
                 if change == "removed" {
                     XCTAssertTrue(queue.remove(source: row.source, revision: row.revision))
@@ -288,7 +258,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                     url: tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")))
             defer { queue.close() }
             let photo = candidate(id: "photo", revision: 42)
-            let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+            let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
             try await index.markBackedUp(photo.snapshot)
             XCTAssertTrue(
                 queue.upsert(
@@ -1614,7 +1584,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
     }
 
     func testSyncEngineScansIntoSharedQueueWithSafeDecisions() async throws {
-        let backupStore = MemoryBackupStore()
+        let backupStore = MemoryBackupStateStore(removesRecords: false)
         let queueURL = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
         let now = Date(timeIntervalSince1970: 123)
@@ -1643,7 +1613,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
     }
 
     func testExactRemoteAssetProofSkipsBytesAndResourceMismatchFallsBack() async throws {
-        let backupStore = MemoryBackupStore()
+        let backupStore = MemoryBackupStateStore(removesRecords: false)
         let queue = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(
                 url: tempDir.appendingPathComponent("remote-proof-queue.sqlite")
@@ -1750,7 +1720,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             protected.append(committed)
         }
         XCTAssertTrue(queue.upsertBatch(obsolete + protected))
-        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         let proof = UploadRemoteAssetIndexRecord(
             externalIdentity: identity, resourceCount: 1, remoteLinkIDs: ["fixture-link"], hashKeyEpoch: "fixture-epoch"
         )
@@ -1797,7 +1767,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
     func testMixedDiscoveryCleansOnlyTheBackedUpCandidates() async throws {
         let queue = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("mixed-cleanup.sqlite")))
-        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         let known = candidate(id: "locally-proven", revision: 10)
         let identity = UploadBackupExternalIdentity(identifier: "fixture-remote", revision: revision(200))
         let remote = candidate(id: "remotely-proven", revision: 200, externalIdentity: identity)
@@ -1859,7 +1829,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("read-failure.sqlite")))
         queue.close()
         let engine = UploadBackupSyncEngine(
-            preflight: UploadBackupPreflightIndex(store: MemoryBackupStore()), queue: queue)
+            preflight: UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false)), queue: queue)
         do {
             _ = try await engine.enqueue(candidate(id: "unreadable", revision: 10))
             XCTFail("An unreadable queue must stop discovery")
@@ -1888,7 +1858,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 "CREATE TRIGGER fixture_source_check_failure BEFORE UPDATE ON backup_sync_queue BEGIN SELECT RAISE(ABORT, 'fixture source check failure'); END;",
                 nil, nil, nil), SQLITE_OK)
         let engine = UploadBackupSyncEngine(
-            preflight: UploadBackupPreflightIndex(store: MemoryBackupStore()), queue: queue)
+            preflight: UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false)), queue: queue)
         do {
             _ = try await engine.enqueue(item)
             XCTFail("An unsuccessful recheck write must stop discovery")
@@ -2006,7 +1976,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 updatedAt: Date(timeIntervalSince1970: 500))
         }
         XCTAssertTrue(queue.upsertBatch(old))
-        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         try await index.markBackedUpBatch(items.map(\.snapshot))
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
@@ -2052,7 +2022,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 state: .failedPermanent, updatedAt: Date(timeIntervalSince1970: 500))
         }
         XCTAssertTrue(queue.upsertBatch(old))
-        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         try await index.markBackedUpBatch(items.map(\.snapshot))
         let engine = UploadBackupSyncEngine(preflight: index, queue: queue)
         let start = DispatchTime.now().uptimeNanoseconds
@@ -2117,7 +2087,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 "CREATE TRIGGER fixture_cleanup_failure BEFORE DELETE ON backup_sync_queue BEGIN SELECT RAISE(ABORT, 'fixture cleanup failure'); END;",
                 nil, nil, nil),
             SQLITE_OK)
-        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         if path == .preflight { try await index.markBackedUp(latest.snapshot) }
         let engine = UploadBackupSyncEngine(preflight: index, queue: queue)
 
@@ -2162,7 +2132,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             externalIdentity: identity, resourceCount: 1, remoteLinkIDs: ["fixture-link"], hashKeyEpoch: "fixture-epoch"
         )
         let engine = UploadBackupSyncEngine(
-            preflight: UploadBackupPreflightIndex(store: MemoryBackupStore()), queue: queue,
+            preflight: UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false)), queue: queue,
             remoteProofResolver: RemoteProofResolver(proofs: [identity: proof]))
 
         let result = try await engine.enqueue(latest)
@@ -2185,7 +2155,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                     UploadBackupSyncQueueManifestStore(
                         url: tempDir.appendingPathComponent(UUID().uuidString + ".sqlite")))
                 defer { queue.close() }
-                let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+                let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
                 let asset = candidate(
                     id: "cancel", revision: 10,
                     externalIdentity: .init(identifier: "cloud-cancel", revision: revision(10)))
@@ -2231,7 +2201,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             UploadBackupSyncQueueManifestStore(
                 url: tempDir.appendingPathComponent("cancelled-proof-queue.sqlite")
             ))
-        let index = UploadBackupPreflightIndex(store: MemoryBackupStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
         let engine = UploadBackupSyncEngine(
             preflight: index,
             queue: queue,
@@ -2269,7 +2239,7 @@ extension UploadBackupSyncQueueTests {
         XCTAssertTrue(inner.upsert(row))
         let log = BackupEventLog()
         let queue: any UploadBackupSyncQueueStore = SpyQueueStore(inner: inner, log: log)
-        let state = MemoryBackupStore()
+        let state = MemoryBackupStateStore(removesRecords: false)
         let engine = UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue)
 
         XCTAssertNil(queue.restoredCompoundReopener, "A store must explicitly supply the atomic capability")
@@ -2302,7 +2272,7 @@ extension UploadBackupSyncQueueTests {
             if let row { XCTAssertTrue(inner.upsert(row)) }
             let log = BackupEventLog()
             let queue: any UploadBackupSyncQueueStore = SpyQueueStore(inner: inner, log: log)
-            let state = MemoryBackupStore()
+            let state = MemoryBackupStateStore(removesRecords: false)
             let engine = UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue)
 
             let admitted = try await engine.reopenRestoredCompound(photo, isCurrent: { true })
@@ -2327,7 +2297,7 @@ extension UploadBackupSyncQueueTests {
             lastError: "kept", updatedAt: Date(timeIntervalSince1970: 1_000))
         XCTAssertTrue(inner.upsert(row))
         let queue: any UploadBackupSyncQueueStore = inner
-        let state = MemoryBackupStore()
+        let state = MemoryBackupStateStore(removesRecords: false)
         let engine = UploadBackupSyncEngine(
             preflight: UploadBackupPreflightIndex(store: state), queue: queue,
             now: { Date(timeIntervalSince1970: 2_000) })

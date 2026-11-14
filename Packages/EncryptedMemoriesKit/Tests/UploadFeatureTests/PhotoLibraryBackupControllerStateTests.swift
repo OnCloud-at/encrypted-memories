@@ -5941,21 +5941,6 @@ private final class PassCounter: @unchecked Sendable {
 }
 
 extension PhotoLibraryBackupControllerStateTests {
-    private final class RestoreAdmissionStateSpy: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var writes = 0
-        var upsertCount: Int { lock.withLock { writes } }
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            nil
-        }
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool { false }
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { writes += 1 }
-            return true
-        }
-        func count() -> Int { 0 }
-    }
-
     func testRestoreAdmissionDistinguishesUnsupportedStoreFromOwnedWorkWithoutWrites() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -5977,7 +5962,7 @@ extension PhotoLibraryBackupControllerStateTests {
             XCTAssertTrue(inner.upsert(row))
             let log = BackupEventLog()
             let queue: any UploadBackupSyncQueueStore = SpyQueueStore(inner: inner, log: log)
-            let state = RestoreAdmissionStateSpy()
+            let state = MemoryBackupStateStore(removesRecords: false)
             let engine = UploadBackupSyncEngine(preflight: UploadBackupPreflightIndex(store: state), queue: queue)
             let before = Date()
 

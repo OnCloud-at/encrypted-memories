@@ -2011,11 +2011,10 @@ private final class StubExclusions: UploadBackupExclusionFiltering, @unchecked S
     }
 }
 
-private final class EmptyStateStore: UploadBackupStateStore, @unchecked Sendable {
+private final class EmptyStateStore: UploadBackupStateTestStore, @unchecked Sendable {
     func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? { nil }
     func hasAnyRecord(for source: UploadSourceIdentity) -> Bool { false }
     func upsert(_ record: UploadBackupAssetRecord) -> Bool { true }
-    func count() -> Int { 0 }
 }
 
 extension PendingBackupStoreTests {
