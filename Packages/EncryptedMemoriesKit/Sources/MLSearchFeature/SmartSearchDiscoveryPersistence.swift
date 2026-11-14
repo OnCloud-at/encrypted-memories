@@ -22,7 +22,8 @@ struct SmartSearchDiscoveryPersistence: Codable, Sendable {
         guard item.durationSeconds != nil else { return item }
         return PhotoItem(
             uid: item.uid, captureTime: item.captureTime, mediaType: item.mediaType,
-            isLivePhoto: item.isLivePhoto, relatedVideoID: item.relatedVideoID,
+            isLivePhoto: item.isLivePhoto, isLoopingLivePhoto: item.isLoopingLivePhoto,
+            relatedVideoID: item.relatedVideoID,
             tags: item.tags, burstMemberIDs: item.burstMemberIDs)
     }
 

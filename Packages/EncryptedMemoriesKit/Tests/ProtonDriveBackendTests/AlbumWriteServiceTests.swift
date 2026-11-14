@@ -182,6 +182,8 @@ extension DriveSessionStubSuite {
                 (#"{"Camera":{"CaptureTime":123},"iOS.photos":{"ICloudID":4,"PlaybackStyle":"videoLooping"}}"#, true),
                 (#"{"iOS.photos":{"ICloudID":"legacy"}}"#, false),
                 (#"{"iOS.photos":{"PlaybackStyle":"futureStyle"}}"#, false),
+                (#"{"iOS.photos":{"PlaybackStyle":true}}"#, false),
+                (#"{"iOS.photos":[]}"#, false),
             ]
             for (payload, expected) in payloads {
                 let encrypted = try fixture.crypto.encrypt(text: payload, to: node)
@@ -199,7 +201,6 @@ extension DriveSessionStubSuite {
                         try LivePhotoMotionLinks.isLoopingPlayback(of: link, parent: parent, crypto: fixture.crypto)
                     })
                 #expect(result.playback == ["main": expected])
-                #expect(result.unreadPlayback.isEmpty)
             }
         }
 

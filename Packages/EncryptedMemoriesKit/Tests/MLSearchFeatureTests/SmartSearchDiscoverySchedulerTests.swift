@@ -548,6 +548,17 @@ import TimelineCore
         #expect(second.discovery.hasComputed)
     }
 
+    @Test func removingSuggestionDurationPreservesLoopingPlayback() {
+        let item = PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "loop"), captureTime: .distantPast, mediaType: "image/heic",
+            isLivePhoto: true, isLoopingLivePhoto: true, relatedVideoID: "edited", durationSeconds: 3)
+        let normalized = SmartSearchDiscoveryPersistence.suggestionItem(item)
+        #expect(normalized.isLoopingLivePhoto)
+        #expect(normalized.isLivePhoto)
+        #expect(normalized.relatedVideoID == item.relatedVideoID)
+        #expect(normalized.durationSeconds == nil)
+    }
+
     @Test func contentFingerprintIgnoresTimelineOrderingButDetectsDeletion() throws {
         let now = Date()
         let items = (0..<8).map {

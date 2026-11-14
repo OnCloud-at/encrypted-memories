@@ -2401,7 +2401,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     try LivePhotoMotionLinks.isLoopingPlayback(of: link, parent: parent, crypto: crypto)
                 })
             DebugLog.log(
-                "timeline: read Live Photo metadata for \(linkIDs.count) files in \(batches.count) requests, "
+                "timeline: read the type of \(linkIDs.count) Live Photo related files in \(batches.count) requests, "
                     + "\(Int(Date().timeIntervalSince(start) * 1000)) ms, names read \(answer.namesRead); "
                     + "\(stored.count) stored motions held")
             return answer

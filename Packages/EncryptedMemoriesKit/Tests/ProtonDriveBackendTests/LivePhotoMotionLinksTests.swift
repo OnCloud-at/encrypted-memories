@@ -53,6 +53,7 @@ struct LivePhotoMotionLinksTests {
         #expect(first.motions["loop"] == .loopingVideo("edited"))
         #expect(first.motions["single"] == .video("motion"))
         #expect(first.read.playback == ["loop": true])
+        #expect(first.read.types.isEmpty, "a name read cannot replace already-known MIME types")
         links.record(first.read)
         let second = try await links.motions(of: photos, stored: [:], evidence: types) { _, _, _ in
             requests += 1
@@ -67,9 +68,7 @@ struct LivePhotoMotionLinksTests {
         var links = LivePhotoMotionLinks()
         let photos = ["live": ["paired", "edited"]]
         let first = try await links.motions(of: photos, stored: [:], evidence: types) { ids, nameIDs, _ in
-            var result = answer(ids, nameIDs, types: types, names: names)
-            result.unreadPlayback = ["live"]
-            return result
+            return answer(ids, nameIDs, types: types, names: names)
         }
         #expect(first.motions["live"] == .unknown, "an unread marker is not known ordinary playback")
         #expect(first.read.playback.isEmpty)
@@ -119,6 +118,54 @@ struct LivePhotoMotionLinksTests {
     }
 
     @Test
+    func anAOnlyStoredMotionRereadsOnceUnderTheLoopingRule() async throws {
+        #expect(LivePhotoMotionLinks.rule == "liveMotion.editedOrFirstVideo.4")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a-motion-upgrade-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("timeline.sqlite")))
+        defer { store.close() }
+        let uid = PhotoUID(volumeID: "v", nodeID: "loop")
+        #expect(
+            store.save([
+                PhotoItem(
+                    uid: uid, captureTime: .distantPast, mediaType: "image/heic",
+                    isLivePhoto: true, relatedVideoID: "edited")
+            ]).succeeded)
+        #expect(store.markRelatedVideosChosen(by: "liveMotion.editedOrFirstVideo.3"))
+        let photos = ["loop": ["paired", "edited"]]
+        var requests = 0
+        let first = try await LivePhotoMotionLinks().motions(
+            of: photos, stored: LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store),
+            evidence: types
+        ) { ids, nameIDs, mainIDs in
+            requests += 1
+            #expect(mainIDs == ["loop"])
+            var result = answer(ids, nameIDs, types: types, names: names)
+            result.playback = ["loop": true]
+            return result
+        }
+        #expect(first.motions["loop"] == .loopingVideo("edited"))
+        #expect(requests == 1)
+        let motion = try #require(first.motions["loop"])
+        #expect(
+            store.save([
+                PhotoItem(
+                    uid: uid, captureTime: .distantPast, mediaType: "image/heic", isLivePhoto: motion.isLivePhoto,
+                    isLoopingLivePhoto: motion.isLooping, relatedVideoID: motion.linkID)
+            ]).succeeded)
+        #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        let again = try await LivePhotoMotionLinks().motions(
+            of: photos, stored: LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store), evidence: [:]
+        ) { _, _, _ in
+            requests += 1
+            return .init(files: [:])
+        }
+        #expect(again.motions["loop"] == .loopingVideo("edited"))
+        #expect(requests == 1, "the rule upgrade does not repeat the metadata read")
+    }
+
+    @Test
     func aStoredLoopSurvivesReopenWithoutAnotherMetadataRequest() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("stored-loop-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -162,7 +209,7 @@ struct LivePhotoMotionLinksTests {
                 playbackPhotoIDs: mainIDs,
                 decryptPlayback: { link, _ in
                     let xattr = try #require(LivePhotoMotionLinks.playbackXAttr(of: link))
-                    return try LivePhotoMotionLinks.isLoopingPlayback(in: Data(xattr.utf8))
+                    return LivePhotoMotionLinks.isLoopingPlayback(in: Data(xattr.utf8))
                 })
         }
         for (count, looping) in [
@@ -302,9 +349,11 @@ struct LivePhotoMotionLinksTests {
         #expect(first.motions == ["edited": .unknown, "single": .video("motion")])
 
         var reads: [[String]] = []
-        let second = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs, _ in
+        let second = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs, mainIDs in
             reads.append(linkIDs)
-            return self.answer(linkIDs, nameLinkIDs, types: types, names: names)
+            var result = self.answer(linkIDs, nameLinkIDs, types: types, names: names)
+            result.playback = Dictionary(uniqueKeysWithValues: mainIDs.map { ($0, false) })
+            return result
         }
         #expect(reads == [["paired", "edited"]], "only the names; the types stay read for the session")
         #expect(second.motions == ["edited": .video("edited"), "single": .video("motion")])
@@ -346,11 +395,14 @@ struct LivePhotoMotionLinksTests {
             "unread": ["x", "y"],
         ]
         let allTypes = types.merging(["x": "video/quicktime", "y": "image/heic"]) { first, _ in first }
-        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, nameLinkIDs, _ in
+        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) {
+            linkIDs, nameLinkIDs, mainIDs in
             reads.append(linkIDs)
             nameReads.append(nameLinkIDs)
             let allNames = names.merging(["x": "x.mov"]) { name, _ in name }
-            return self.answer(linkIDs, nameLinkIDs, types: allTypes, names: allNames)
+            var result = self.answer(linkIDs, nameLinkIDs, types: allTypes, names: allNames)
+            result.playback = Dictionary(uniqueKeysWithValues: mainIDs.map { ($0, false) })
+            return result
         }
         links.record(first.read)
         #expect(

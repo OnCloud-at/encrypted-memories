@@ -49,12 +49,11 @@ struct LivePhotoMotionLinks: Sendable {
 
     /// The answer of one metadata read: each read file with its type and, where the read decrypted it, its name.
     /// `namesRead` is false when the names could not be decrypted; the types still hold.
-    /// `unreadPlayback` distinguishes missing or failed primary metadata from a known absent marker.
+    /// An absent `playback` entry is unread; false is known non-looping playback.
     struct Answer: Sendable {
         var files: [String: BurstFrameVerdicts.RelatedFile]
         var namesRead = true
         var playback: [String: Bool] = [:]
-        var unreadPlayback: Set<String> = []
     }
 
     /// The answer for the `links` of one metadata read whose names `nameLinkIDs` asks for. Only a video can be the
@@ -64,8 +63,8 @@ struct LivePhotoMotionLinks: Sendable {
     static func answer<Key>(
         links: [AlbumPhotoLinkBody], nameLinkIDs: Set<String>, rootKey: () async throws -> Key,
         decrypt: (_ armoredName: String, _ rootKey: Key) throws -> String,
-        playbackPhotoIDs: Set<String> = [],
-        decryptPlayback: ((_ link: AlbumPhotoLinkBody, _ rootKey: Key) throws -> Bool)? = nil
+        playbackPhotoIDs: Set<String>,
+        decryptPlayback: (_ link: AlbumPhotoLinkBody, _ rootKey: Key) throws -> Bool
     ) async throws -> Answer {
         var key: Key?
         var keyFailure: (any Error)?
@@ -102,23 +101,16 @@ struct LivePhotoMotionLinks: Sendable {
         for id in playbackPhotoIDs.sorted() {
             try Task.checkCancellation()
             guard let link = byID[id], link.state == nil || link.state == 1 else {
-                answer.unreadPlayback.insert(id)
                 continue
             }
             guard playbackXAttr(of: link) != nil else {
                 answer.playback[id] = false
                 continue
             }
-            guard let decryptPlayback else {
-                answer.unreadPlayback.insert(id)
-                continue
-            }
             do {
                 answer.playback[id] = try decryptPlayback(link, try await sharedRootKey())
             } catch {
                 if FailureCancellation.isCancellation(error) { throw error }
-                answer.unreadPlayback.insert(id)
-                PhotoDiagnostics.shared.increment("timeline.liveMotion.playbackUnread")
             }
         }
         return answer
@@ -136,9 +128,9 @@ struct LivePhotoMotionLinks: Sendable {
         }
     }
 
-    static func isLoopingPlayback(in data: Data) throws -> Bool {
-        let style = try JSONDecoder().decode(Playback.self, from: data).style
-        return style == PhotoUploadMetadataEncoder.IOSPhotos.loopingPlaybackStyle
+    static func isLoopingPlayback(in data: Data) -> Bool {
+        guard let playback = try? JSONDecoder().decode(Playback.self, from: data) else { return false }
+        return playback.style == PhotoUploadMetadataEncoder.IOSPhotos.loopingPlaybackStyle
     }
 
     static func isLoopingPlayback(
@@ -148,7 +140,7 @@ struct LivePhotoMotionLinks: Sendable {
             throw DriveCryptoError.keyRing
         }
         let node = try crypto.unlockNode(key: key, passphrase: passphrase, parent: parent)
-        return try isLoopingPlayback(in: crypto.decryptXAttr(xattr, node: node))
+        return isLoopingPlayback(in: try crypto.decryptXAttr(xattr, node: node))
     }
 
     /// The motion is the edited motion when the Live Photo has one, otherwise its first video in listing order.
@@ -190,7 +182,7 @@ struct LivePhotoMotionLinks: Sendable {
 
     /// Names this motion rule in the stored timeline. A change of the rule changes the name, so the next refresh reads
     /// the types and names again instead of trusting motions that an earlier rule chose.
-    static let rule = "liveMotion.editedOrFirstVideo.3"
+    static let rule = "liveMotion.editedOrFirstVideo.4"
 
     /// The motions in the stored timeline that still hold for these Live Photos (link ID to related files): this rule
     /// chose them, and the stored video is still one of the related files of the photo. An edit uploads a new photo, so
@@ -250,8 +242,8 @@ struct LivePhotoMotionLinks: Sendable {
                 if answer.namesRead {
                     for linkID in nameLinkIDs { read.names[linkID] = answer.files[linkID]?.name ?? "" }
                 }
-                for linkID in playbackPhotoIDs where !answer.unreadPlayback.contains(linkID) {
-                    read.playback[linkID] = answer.playback[linkID] ?? false
+                for linkID in playbackPhotoIDs {
+                    if let known = answer.playback[linkID] { read.playback[linkID] = known }
                 }
             } catch {
                 if FailureCancellation.isCancellation(error) { throw error }
