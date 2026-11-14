@@ -1,0 +1,21 @@
+# Decision reads that still turn a failed read into absence (#1148). Each line: count, rule, file. The count allows
+# that many sites of the rule in the file, wherever they are. `scripts/lint-swift.sh` fails when a file has more sites
+# than its line allows, and when a change raises the total of a rule compared with its merge base; a line may move to
+# a renamed or split file. Lower a count, or remove a line, when a site moves to StoreLookup or handles its error
+# (#1153, #1154); the style check prints a notice for a linted file below its count.
+1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLSmartSearchLifecycle.swift
+1 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PendingGridSession.swift
+1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryBackupController.swift
+3 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryBackupController.swift
+1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/PhotosCore/BackgroundWindowLedger.swift
+2 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/DriveSDKBridge.swift
+1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupStatusProjector.swift
+2 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupSyncRunner.swift
+2 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupSyncRunner.swift
+1 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/PhotoLibraryCatalog.swift
+1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/UploadBackupSyncEngine.swift
+1 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/UploadBackupSyncQueue.swift
+1 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/UploadBackupSyncQueueObservation.swift
+6 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/UploadBackupSyncQueueStore.swift
+3 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Pending/PendingBackupCoordinator.swift
+1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Pending/PendingBackupEventRecorder.swift

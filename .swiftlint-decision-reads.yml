@@ -1,0 +1,59 @@
+# Decision reads (#1140, #1148): a read whose answer changes what the app writes, deletes, uploads, retries or shows
+# as a result must not turn a failed read into absence. `scripts/lint-swift.sh` runs these rules in a second pass and
+# allows only the sites that `.swiftlint-decision-reads-baseline` lists for a file and rule.
+#
+# Scope: the two store-read rules check every core module source below `Packages/EncryptedMemoriesKit/Sources/`. They
+# skip the app hosts (`App/`, `iOSApp/`; the host decision gate is #1157), tests and their doubles, and the frozen
+# upgrade-test payloads below `scripts/upgrade-test/`. The exception is `no_try_optional_in_store_lookup`: it checks
+# every linted file, hosts, tests and payloads included.
+#
+# A regex cannot see types, so the store-read rules name what a store read looks like:
+# - a receiver whose name is, or ends in, queue, store, catalog, journal, repository, manifest or ledger (camel case,
+#   for example `queueStore`; `restore` is no receiver), reached through any `a.b?.c` chain, also across lines;
+# - or no receiver (`entry(for:)` inside a store type, or after `self.`);
+# - one of these read methods: entry, entries, decision…, containsAny, count, problemEntries, runnableDate, summary,
+#   earliest…, nextRunnable…, runtimeIssue, present…, sourceState(s), handoff(s), read, readOutcome, readAllOutcome,
+#   load, rows.
+# A display read uses a `display…` name, which no rule matches. A declaration whose type is StoreLookup is no
+# StoreLookup closure: a function result `-> StoreLookup<…> {`, a property `var name: StoreLookup<…> {` or `let`, and
+# `extension StoreLookup {`.
+#
+# What a regex cannot see, so these forms are not reported:
+# - a store read through another receiver name or a stored closure, and a read whose result reaches `try?` or `??`
+#   through a local variable;
+# - arguments with more than two levels of nested parentheses;
+# - a `try?` more than two closures or blocks deep inside StoreLookup, and a `try?` that follows a closure with three
+#   nested levels at the top of the StoreLookup closure, or with two nested levels inside a nested closure;
+# - a site after `//` on the same line, also when the `//` sits in a string; a `{` or `}` in a string inside StoreLookup.
+# `scripts/decision-read-canary/Allowed.swift.txt` shows each gap. Code in a string literal or a `/* … */` comment is
+# reported: the rules check no syntax kinds, because SwiftLint checks them over the whole match, so a string or
+# comment inside a matched range would hide a site.
+#
+# Each rule starts at fixed text (`StoreLookup`, `try?`, a read method) and checks what precedes it with bounded
+# lookbehinds; identifier runs are bounded to 64 characters. This keeps the pass linear. Each rule reports the
+# position of `try?` or `??` (capture group 1).
+
+only_rules:
+  - custom_rules
+
+custom_rules:
+  no_try_optional_in_store_lookup:
+    name: Strict read in StoreLookup
+    regex: 'StoreLookup(?<!//[^\n]{0,300}StoreLookup)(?<!->\s{0,9}StoreLookup)(?<!\bextension\s{1,9}StoreLookup)(?<!\b(?:var|let)\s{1,9}\w{1,64}\s{0,9}:\s{0,9}StoreLookup)(?:<(?:[^<>]|<[^<>]*>)*>)?\s*(?:\(\s*catching:\s*)?\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*?(?:\{(?:[^{}]|\{[^{}]*\})*?(?:\{[^{}]*?)?)?(try\?)'
+    capture_group: 1
+    message: "Put the throwing read itself into StoreLookup(catching:); try? turns a failed read into absent."
+    severity: error
+  no_try_optional_store_read_in_decision_code:
+    name: Strict store read in decision code
+    included: &core_sources 'Packages/EncryptedMemoriesKit/Sources/'
+    regex: '(try\?)(?<!//[^\n]{0,300}try\?)\s*(?:await\s+)?(?:(?:\b\w{1,64}\??\s*\.\s*)*(?:\b\w{0,64}[a-z0-9](?:Queue|Store|Catalog|Journal|Repository|Manifest|Ledger)|\b(?:queue|store|catalog|journal|repository|manifest|ledger))\b\??\s*\.\s*|(?:self\s*\.\s*)?)(?:entry|entries|decision[A-Z]\w{0,64}|containsAny|count|problemEntries|runnableDate|summary|earliest[A-Z]\w{0,64}|nextRunnable[A-Z]\w{0,64}|runtimeIssue|present[A-Z]\w{0,64}|sourceStates?|handoffs?|read|readOutcome|readAllOutcome|load|rows)\s*\('
+    capture_group: 1
+    message: "A decision read must not drop its failure with try?; use StoreLookup or handle the error."
+    severity: error
+  no_default_for_store_read_in_decision_code:
+    name: No default for a store read in decision code
+    included: *core_sources
+    regex: '\b(?:entry|entries|decision[A-Z]\w{0,64}|containsAny|count|problemEntries|runnableDate|summary|earliest[A-Z]\w{0,64}|nextRunnable[A-Z]\w{0,64}|runtimeIssue|present[A-Z]\w{0,64}|sourceStates?|handoffs?|read|readOutcome|readAllOutcome|load|rows)(?<!//[^\n]{0,400})(?:(?<=(?:\b\w{0,64}[a-z0-9](?:Queue|Store|Catalog|Journal|Repository|Manifest|Ledger)|\b(?:queue|store|catalog|journal|repository|manifest|ledger))\??\s{0,40}\.\s{0,40}\w{1,64})|(?<!\.\s{0,40}\w{1,64})|(?<=\bself\s{0,40}\.\s{0,40}\w{1,64}))\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)(?:\s*\??\s*\.\s*\b\w{1,64}(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?)*\s*(\?\?)'
+    capture_group: 1
+    message: "A decision read must not replace a failed read with a default; use StoreLookup or handle the nil."
+    severity: error

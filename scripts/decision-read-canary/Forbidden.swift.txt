@@ -1,0 +1,53 @@
+// Decision-read canary (#1148). `scripts/verify-swift-style.sh` copies this file below a decision path and lints it.
+// Each `expect` comment names the rule that must report the next line; no other line may be reported.
+func forbidden() async throws {
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup { try? lookUp() }
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup(catching: { log("x"); return try? lookUp() })
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup<Result<Int, ReadError>> { try? lookUp() }
+    _ = StoreLookup<[String: Set<Int>]>(catching: {
+        // A comment inside the closure, and two levels of nested closures.
+        let ids = rows.map { $0.filter { $0 > 0 } }
+        // expect: no_try_optional_in_store_lookup
+        return try? lookUp(ids)
+    })
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup { ids.compactMap { try? lookUp($0) } }
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup { if flag { return try? lookUp() }; return nil }
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup { a.map { b.map { try? lookUp($0) } } }
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup { guard flag else { return try? lookUp() }; return nil }
+    // expect: no_try_optional_in_store_lookup
+    _ = StoreLookup { do { return try? lookUp() } }
+    // expect: no_try_optional_in_store_lookup
+    record(label: StoreLookup { try? lookUp() })
+    // expect: no_try_optional_store_read_in_decision_code
+    _ = try? queue.entry(for: source)
+    // expect: no_try_optional_store_read_in_decision_code
+    _ = try? await self.queueStore.decisionRows(kind: kind, identifiers: ids)
+    // expect: no_try_optional_store_read_in_decision_code
+    _ = try? manifestStore
+        .readOutcome(for: id)
+    // expect: no_try_optional_store_read_in_decision_code
+    _ = (try? entry(for: source)) ?? nil
+    // expect: no_default_for_store_read_in_decision_code
+    _ = queue.summary() ?? summary
+    // expect: no_default_for_store_read_in_decision_code
+    _ = try queue.entry(for: source)?.state ?? fallback
+    // expect: no_default_for_store_read_in_decision_code
+    _ = queue.read(key: "k") ?? 0
+    // expect: no_default_for_store_read_in_decision_code
+    _ = queue.read(key: /* c */ k) ?? 0
+    // expect: no_default_for_store_read_in_decision_code
+    _ = journal.load() ?? .empty
+    // expect: no_default_for_store_read_in_decision_code
+    _ = repository.entries(in: state) ?? []
+    // expect: no_default_for_store_read_in_decision_code
+    _ = ledger.read(id)?.value ?? 0
+    // expect: no_default_for_store_read_in_decision_code
+    _ = catalogStore.presentEntries(for: [key(of: item(at: 0))]) ?? [:]
+}

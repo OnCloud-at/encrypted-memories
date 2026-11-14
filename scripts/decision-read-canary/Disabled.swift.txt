@@ -1,0 +1,5 @@
+// Decision-read canary (#1148): a comment that turns off a decision-read rule must fail the style check.
+func disabled() {
+    // swiftlint:disable:next no_try_optional_store_read_in_decision_code
+    _ = try? queue.entry(for: source)
+}
