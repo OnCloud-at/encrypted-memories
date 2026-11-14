@@ -1,5 +1,4 @@
 import Foundation
-import PhotosCore
 
 /// Replays only durable local manifest settlement for uploads that already committed remotely.
 /// It deliberately has no uploader or normal dedupe-decision dependency, so recovery cannot send
@@ -160,25 +159,14 @@ public struct UploadRemoteCommitRecovery: Sendable {
         entry: UploadBackupSyncQueueEntry
     ) async throws {
         // The pending grid needs the handoff before the receipt disappears; a failed write keeps the receipt.
-        if reconciliation.source == entry.source,
-            events?.recordHandoff(
-                source: entry.source,
-                revision: entry.revision,
-                remote: PhotoUID(
-                    volumeID: reconciliation.receipt.remoteVolumeID,
-                    nodeID: reconciliation.receipt.remoteLinkID
-                ),
-                kind: .uploaded
-            ) == .failed
-        {
+        guard
+            try await UploadRemoteCommitRecording.record(
+                reconciliation, for: entry, events: events, identityResolver: identityResolver,
+                descriptorOrPark: { descriptor },
+                onHandoffFailure: { throw UploadRemoteCommitRecoveryError.storeUnavailable })
+        else {
             throw UploadRemoteCommitRecoveryError.storeUnavailable
         }
-        try await identityResolver.recordUploaded(
-            descriptor,
-            identity: reconciliation.identity,
-            remoteVolumeID: reconciliation.receipt.remoteVolumeID,
-            remoteLinkID: reconciliation.receipt.remoteLinkID
-        )
         try Task.checkCancellation()
         guard queue.remove(source: entry.source, revision: entry.revision), queue.isOperational() else {
             throw UploadRemoteCommitRecoveryError.receiptRemovalFailed(entry.source, entry.revision)
