@@ -34,7 +34,12 @@ public struct ProtectedScopeCoverage {
     public init(gate: AccessGate, isActive: Bool, foregroundVisible: Bool? = nil) {
         snapshot = !(foregroundVisible ?? isActive) && gate.isEnabled(.app)
         phase = isActive ? .active : .inactive
-        isCovered = snapshot || !gate.admits(.app)
+        isCovered = Self.covers(snapshot: snapshot, gate: gate, scope: .app)
+    }
+
+    /// The one cover decision for any protected area: a snapshot, or an area the gate does not admit.
+    static func covers(snapshot: Bool, gate: AccessGate, scope: ProtectedScope) -> Bool {
+        snapshot || !gate.admits(scope)
     }
 }
 

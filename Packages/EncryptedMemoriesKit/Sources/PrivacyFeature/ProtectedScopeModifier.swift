@@ -31,7 +31,7 @@ private struct ProtectedScopeModifier: ViewModifier {
     @State private var presence: ProtectedScopePresence?
 
     private var identity: Identity { Identity(scope: scope, gate: ObjectIdentifier(gate)) }
-    private var isCovered: Bool { snapshot || gate.state(of: scope) != .unlocked }
+    private var isCovered: Bool { ProtectedScopeCoverage.covers(snapshot: snapshot, gate: gate, scope: scope) }
 
     func body(content: Content) -> some View {
         content

@@ -121,10 +121,16 @@ final class MacAppProtection: NSObject {
         roots = []
     }
 
-    /// A window shows protected content when it is on screen, not minimized and not prepared to leave.
+    /// AppKit shows the window: ordered in and not minimized.
+    private static func isOnScreen(_ window: NSWindow) -> Bool { window.isVisible && !window.isMiniaturized }
+
+    /// A window shows protected content when it is on screen and not prepared to leave.
     private static func showsContent(_ window: NSWindow, root: WeakWindow?) -> Bool {
-        window.isVisible && !window.isMiniaturized && !(root?.suspended ?? false)
+        isOnScreen(window) && !(root?.suspended ?? false)
     }
+
+    /// The app itself is shown: not hiding and not hidden.
+    private var appIsShown: Bool { !hiding && !NSApp.isHidden }
 
     private func refresh() {
         guard !refreshing, observing else { return }
@@ -134,8 +140,7 @@ final class MacAppProtection: NSObject {
             root.window.map { (root: root, window: $0) }
         }
         roots = liveRoots.map(\.root)
-        let foreground =
-            !hiding && !NSApp.isHidden && liveRoots.contains { Self.showsContent($0.window, root: $0.root) }
+        let foreground = appIsShown && liveRoots.contains { Self.showsContent($0.window, root: $0.root) }
         if foreground != wasForeground {
             wasForeground = foreground
             if foreground { gate.appWillEnterForeground(at: .now) } else { gate.appDidEnterBackground(at: .now) }
@@ -154,7 +159,7 @@ final class MacAppProtection: NSObject {
         }
         for (key, source) in targets {
             let root = liveRoots.first { $0.window === source }?.root
-            let foregroundWindow = !hiding && !NSApp.isHidden && Self.showsContent(source, root: root)
+            let foregroundWindow = appIsShown && Self.showsContent(source, root: root)
             let active = applicationIsActive() && foregroundWindow
             let presentation = root?.presentation ?? covers[key]?.presentation ?? ProtectedScopePresentation(gate: gate)
             guard presentation.update(isActive: active, foregroundVisible: foregroundWindow) else {
@@ -168,7 +173,8 @@ final class MacAppProtection: NSObject {
             if cover.window.frame != source.frame { cover.window.setFrame(source.frame, display: true) }
             if cover.window.parent !== source { source.addChildWindow(cover.window, ordered: .above) }
             // Keep the relationship while hidden: AppKit carries the covered child through ordering and snapshots.
-            if source.isVisible && !source.isMiniaturized && !NSApp.isHidden && !cover.window.isVisible {
+            // A suspended or hiding source still gets its cover ordered while AppKit shows it.
+            if Self.isOnScreen(source) && !NSApp.isHidden && !cover.window.isVisible {
                 cover.window.order(.above, relativeTo: source.windowNumber)
             }
             if active && source.isKeyWindow && !gate.isAuthenticating { cover.window.makeKey() }

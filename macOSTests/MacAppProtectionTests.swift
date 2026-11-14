@@ -190,6 +190,20 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertFalse(fixture.presentation.snapshot)
     }
 
+    func testUnhidingAfterTheGracePeriodRelocksBeforeUncovering() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        let revealed = await fixture.waitForCover(visible: false)
+        XCTAssertTrue(revealed)
+        XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+        NotificationCenter.default.post(name: NSApplication.willHideNotification, object: NSApp)
+        NotificationCenter.default.post(name: NSApplication.didUnhideNotification, object: NSApp)
+        XCTAssertFalse(fixture.gate.admits(.app), "A normal unhide after the grace period must relock")
+        XCTAssertNotNil(fixture.cover, "The window must stay covered in the same turn")
+        XCTAssertEqual(try fixture.redSamples(), 0)
+    }
+
     func testTheDefaultActivityQueryUsesTheApplicationActivity() async throws {
         let fixture = try Fixture(applicationIsActive: nil)
         defer { fixture.close() }

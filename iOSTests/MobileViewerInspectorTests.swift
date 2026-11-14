@@ -1,7 +1,9 @@
 import AVFoundation
 import AVKit
+import Observation
 import PhotoViewerCore
 import PhotosCore
+import PrivacyFeature
 import SwiftUI
 import UIKit
 import XCTest
@@ -66,11 +68,8 @@ final class MobileViewerInspectorTests: XCTestCase {
         viewer.view.setNeedsLayout()
         viewer.view.layoutIfNeeded()
         try await Task.sleep(for: .seconds(1))
-        func findPlayer(_ controller: UIViewController) -> AVPlayerViewController? {
-            if let player = controller as? AVPlayerViewController { return player }
-            return controller.children.lazy.compactMap { findPlayer($0) }.first
-        }
-        let player = try XCTUnwrap(findPlayer(viewer), "SETUP: native video player must be mounted")
+        let player = try XCTUnwrap(
+            firstViewController(AVPlayerViewController.self, in: viewer), "SETUP: native video player must be mounted")
         XCTAssertEqual(player.player?.currentItem?.status, .readyToPlay, "SETUP: the local clip must be playable")
         let safe = viewer.view.safeAreaLayoutGuide.layoutFrame
         let frame = player.view.convert(player.view.bounds, to: viewer.view)
@@ -78,6 +77,70 @@ final class MobileViewerInspectorTests: XCTestCase {
         print("issue924 video frame=\(frame) safe=\(safe)")
         XCTAssertLessThanOrEqual(frame.maxX, safe.maxX + 1, "Video must remain inside the horizontal safe area")
         XCTAssertGreaterThanOrEqual(frame.minX, safe.minX - 1)
+    }
+
+    /// The production route: the app lock conceals the root, and the viewer is a full-screen presentation below it
+    /// whose pages live in their own hosting controllers. The cover flag must still reach the native video surface.
+    @MainActor func testTheAppCoverPausesAndDetachesTheVideoInsideThePresentedViewer() async throws {
+        let clip = try await makeVideoClip(frameCount: 60)
+        defer { try? FileManager.default.removeItem(at: clip) }
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 2, includesVideo: true)
+        defer { fixture.removeCache() }
+        var backend = fixture.backend
+        backend.streamingAssetLoader = { _ in
+            let asset = AVURLAsset(url: clip)
+            return StreamingVideoAsset(asset: asset, retaining: asset)
+        }
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model, backend: backend, sections: fixture.sections, thumbnailFeed: fixture.feed,
+            thumbnailCache: fixture.cache)
+        let router = MobileViewerRouter()
+        let cover = ViewerCoverState()
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = scene.coordinateSpace.bounds
+        let root = UIHostingController(rootView: CoveredViewerHost(cover: cover, router: router, libraryModel: model))
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer {
+            root.presentedViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+            previous?.makeKey()
+        }
+        let videoIndex = try XCTUnwrap(fixture.items.firstIndex(where: \.isVideo))
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            router.presentation = MobileViewerPresentation(
+                index: videoIndex, items: fixture.items, context: ViewerCollectionContext(filter: .all),
+                showsInfoInitially: false)
+        }
+        var surface: AVPlayerViewController?
+        let mounted = try await pollUntil(timeout: .seconds(10), every: .milliseconds(50)) {
+            surface = firstViewController(AVPlayerViewController.self, in: root.presentedViewController)
+            return surface?.player?.currentItem?.status == .readyToPlay
+        }
+        XCTAssertTrue(mounted, "SETUP: the presented viewer must mount the playable video")
+        let controller = try XCTUnwrap(surface)
+        let player = try XCTUnwrap(controller.player)
+        player.play()
+        let playing = try await pollUntil(timeout: .seconds(5), every: .milliseconds(20)) { player.rate != 0 }
+        XCTAssertTrue(playing, "SETUP: playback must start before the cover")
+
+        cover.isCovered = true
+        let concealed = try await pollUntil(timeout: .seconds(5), every: .milliseconds(20)) {
+            controller.player == nil && player.rate == 0
+        }
+        XCTAssertTrue(concealed, "The cover must pause the video and detach it from the presented viewer")
+        cover.isCovered = false
+        let returned = try await pollUntil(timeout: .seconds(5), every: .milliseconds(20)) {
+            controller.player === player
+        }
+        XCTAssertTrue(returned, "Uncovering must attach the same player again")
+        XCTAssertEqual(player.rate, 0, "Uncovering alone must not resume playback")
     }
 
     @MainActor func testPausedVideoKeepsPlayerStreamAndSeekTimeAcrossResizes() async throws {
@@ -568,6 +631,23 @@ private final class ViewerVideoLifetimeProbe: VideoStreamLifetime, @unchecked Se
 
     func recordLoad(_ uid: PhotoUID) { lock.withLock { loads.append(uid) } }
     func close() { lock.withLock { closes += 1 } }
+}
+
+@MainActor @Observable
+private final class ViewerCoverState {
+    var isCovered = false
+}
+
+/// The app root conceals its content the way `MobileSupportedAppRoot` does, above the viewer's presentation.
+private struct CoveredViewerHost: View {
+    let cover: ViewerCoverState
+    let router: MobileViewerRouter
+    let libraryModel: MobileLibraryModel
+
+    var body: some View {
+        ViewerPresentationHost(router: router, libraryModel: libraryModel)
+            .protectedContent(isCovered: cover.isCovered)
+    }
 }
 
 /// The production viewer presentation: one `.fullScreenCover(item:)` bound to the viewer router, the way
