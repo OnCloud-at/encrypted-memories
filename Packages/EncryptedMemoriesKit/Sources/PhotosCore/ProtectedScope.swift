@@ -152,6 +152,9 @@ public final class ProtectedScopePresence {
 public final class AccessGate {
     public private(set) var availability: DeviceOwnerAuthAvailability
 
+    /// Every window observes the same prompt, including authentication before a settings change.
+    public var isAuthenticating: Bool { inFlight != nil }
+
     private let authenticator: any DeviceOwnerAuthenticating
     private let defaults: UserDefaults
     /// Registration happens inside reads, so these two never notify observers; `revision` does instead.
@@ -161,7 +164,7 @@ public final class AccessGate {
     /// Areas opened by their own successful authentication since they last locked.
     private var unlocked: Set<ProtectedScopeID> = []
     private var authenticatingScope: ProtectedScopeID?
-    @ObservationIgnored private var inFlight: Task<DeviceOwnerAuthResult, Never>?
+    private var inFlight: Task<DeviceOwnerAuthResult, Never>?
     /// Grow when an area relocks (a relock also relocks every area inside it), and when the app leaves the foreground
     /// or the system locks. An authentication whose area relocked meanwhile does not open anything; a relock of an
     /// unrelated area does not affect it.
