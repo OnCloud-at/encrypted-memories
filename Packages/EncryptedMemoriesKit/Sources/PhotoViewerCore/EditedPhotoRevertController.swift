@@ -21,6 +21,8 @@ public final class EditedPhotoRevertController {
     @ObservationIgnored package private(set) var current: Task<Void, Never>?
     /// The viewer's reaction to a finished revert. It is dropped by `detach` and after it ran.
     @ObservationIgnored private var onSuccess: (@MainActor () -> Void)?
+    /// True from `detach` until the next `request`: no viewer shows this controller's phases.
+    @ObservationIgnored private var isDetached = false
 
     public init() {}
 
@@ -46,6 +48,8 @@ public final class EditedPhotoRevertController {
     /// Opens the confirmation. Nothing is written until `confirm`.
     public func request() {
         guard phase == .idle else { return }
+        // The command comes from a viewer on screen, so this revert reports its failure there.
+        isDetached = false
         phase = .confirming
     }
 
@@ -71,23 +75,26 @@ public final class EditedPhotoRevertController {
     public func confirm(
         main: PhotoItem, original: PhotoItem, reverter: any EditedPhotoReverting,
         onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)? = nil,
-        onSuccess: @escaping @MainActor () -> Void
+        onSuccess: @escaping @MainActor () -> Void,
+        onFailureAfterClose: (@MainActor () -> Void)? = nil
     ) {
         confirm(
             perform: {
                 try await reverter.revertToOriginal(of: main, original: original)
                 await onReverted?(main)
             },
-            onSuccess: onSuccess)
+            onSuccess: onSuccess, onFailureAfterClose: onFailureAfterClose)
     }
 
     /// Starts the revert once. Only the first call after `request` starts it: a repeated tap meets `running` and does
     /// nothing. `onSuccess` runs only while the controller still exists, so a revert that ends after the viewer closed
     /// never acts on another photo that the person opened meanwhile. Work that must happen in every case belongs into
-    /// `perform`.
+    /// `perform`. A revert that fails after the viewer closed calls `onFailureAfterClose` once, because no viewer is
+    /// left to show the failure; it must not capture the viewer. A failure in an open viewer shows there instead.
     public func confirm(
         perform: @escaping @MainActor @Sendable () async throws -> Void,
-        onSuccess: @escaping @MainActor () -> Void
+        onSuccess: @escaping @MainActor () -> Void,
+        onFailureAfterClose: (@MainActor () -> Void)? = nil
     ) {
         guard phase == .confirming else { return }
         phase = .running
@@ -106,8 +113,14 @@ public final class EditedPhotoRevertController {
                 self?.onSuccess = nil
                 self?.phase = .idle
             } catch {
-                self?.onSuccess = nil
-                self?.phase = .failed
+                guard let self, !self.isDetached else {
+                    // The viewer is gone: the host shows the failure, and this controller shows none.
+                    self?.phase = .idle
+                    onFailureAfterClose?()
+                    return
+                }
+                self.onSuccess = nil
+                self.phase = .failed
             }
         }
     }
@@ -117,6 +130,7 @@ public final class EditedPhotoRevertController {
     /// A weak reference cannot do this: the callback captures the viewer, the viewer keeps its model, and the model
     /// keeps this controller, so the controller outlives the viewer until the revert ends.
     public func detach() {
+        isDetached = true
         onSuccess = nil
         cancel()
     }

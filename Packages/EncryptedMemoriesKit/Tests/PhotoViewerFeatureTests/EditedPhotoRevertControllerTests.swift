@@ -302,6 +302,111 @@ final class EditedPhotoRevertControllerTests: XCTestCase {
         XCTAssertEqual(count, 0, "a revert that ends after its controller went away runs no success callback")
     }
 
+    // MARK: - A failure after the viewer closed
+
+    /// The viewer closes while the revert runs and the revert fails: the host hears of it once, and nothing waits to
+    /// show a second time. The controller shows no failure of its own, because no viewer is left to draw it.
+    func testAFailureAfterTheViewerClosedReachesTheHostOnce() async {
+        let controller = EditedPhotoRevertController()
+        let gate = Gate()
+        var hostCalls = 0
+        var successes = 0
+        controller.request()
+        controller.confirm(
+            perform: {
+                await gate.wait()
+                throw Boom()
+            }, onSuccess: { successes += 1 }, onFailureAfterClose: { hostCalls += 1 })
+        let started = await gate.waitUntilEntered()
+        XCTAssertTrue(started, "the revert did not start")
+
+        controller.detach()
+        await gate.open()
+        await controller.current?.value
+        for _ in 0..<20 { await Task.yield() }
+
+        XCTAssertEqual(hostCalls, 1, "the closed viewer's failure reaches the host once")
+        XCTAssertEqual(successes, 0)
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertFalse(controller.showsFailure, "no viewer is left to show the failure again")
+    }
+
+    /// The viewer went away without a `detach`, so the controller itself is gone when the revert fails: the host still
+    /// hears of it, because the failure belongs to the person and not to the viewer.
+    func testAFailureAfterTheControllerWentAwayReachesTheHostOnce() async {
+        var controller: EditedPhotoRevertController? = EditedPhotoRevertController()
+        let gate = Gate()
+        var hostCalls = 0
+        controller?.request()
+        controller?.confirm(
+            perform: {
+                await gate.wait()
+                throw Boom()
+            }, onSuccess: {}, onFailureAfterClose: { hostCalls += 1 })
+        let started = await gate.waitUntilEntered()
+        XCTAssertTrue(started, "the revert did not start")
+        let task = controller?.current
+
+        controller = nil
+        await gate.open()
+        await task?.value
+        for _ in 0..<20 { await Task.yield() }
+
+        XCTAssertEqual(hostCalls, 1)
+    }
+
+    /// While the viewer is open its own alert shows the failure; the host is not asked a second time.
+    func testAFailureInAnOpenViewerShowsInTheViewerAndNotInTheHost() async {
+        let controller = EditedPhotoRevertController()
+        var hostCalls = 0
+        controller.request()
+        controller.confirm(perform: { throw Boom() }, onSuccess: {}, onFailureAfterClose: { hostCalls += 1 })
+        await controller.current?.value
+
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertTrue(controller.showsFailure)
+        XCTAssertEqual(hostCalls, 0)
+    }
+
+    /// A viewer that was only covered comes back and the person starts a new revert: its failure shows in that viewer.
+    func testARevertStartedAfterTheViewerCameBackFailsInTheViewer() async {
+        let controller = EditedPhotoRevertController()
+        var hostCalls = 0
+        controller.detach()
+        controller.request()
+        controller.confirm(perform: { throw Boom() }, onSuccess: {}, onFailureAfterClose: { hostCalls += 1 })
+        await controller.current?.value
+
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertEqual(hostCalls, 0)
+    }
+
+    /// Only a failure that the person could learn about reaches the host: a success and a cancellation after the
+    /// viewer closed stay silent.
+    func testASuccessOrACancellationAfterTheViewerClosedLeavesTheHostSilent() async {
+        for outcome in [nil, CancellationError()] as [Error?] {
+            let controller = EditedPhotoRevertController()
+            let gate = Gate()
+            var hostCalls = 0
+            controller.request()
+            controller.confirm(
+                perform: {
+                    await gate.wait()
+                    if let outcome { throw outcome }
+                }, onSuccess: {}, onFailureAfterClose: { hostCalls += 1 })
+            let started = await gate.waitUntilEntered()
+            XCTAssertTrue(started, "the revert did not start")
+
+            controller.detach()
+            await gate.open()
+            await controller.current?.value
+            for _ in 0..<20 { await Task.yield() }
+
+            XCTAssertEqual(hostCalls, 0, "outcome \(String(describing: outcome)) is silent")
+            XCTAssertEqual(controller.phase, .idle)
+        }
+    }
+
     // MARK: - Availability
 
     /// The revert belongs to the own library only: the viewer's mutation there is "Move to Trash". The Trash restores

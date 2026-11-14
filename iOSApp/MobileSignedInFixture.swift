@@ -807,9 +807,16 @@ import os
         }
     }
 
-    /// The fixture reverts at once, or refuses every revert when the UI test passes `revertFixtureFails`.
+    /// The fixture reverts at once, refuses every revert when the UI test passes `revertFixtureFails`, or refuses it
+    /// only after the UI test created the gate file (`revertFixtureGateFile`).
     extension MobileFixtureBackend: EditedPhotoReverting {
         func revertToOriginal(of main: PhotoItem, original: PhotoItem) async throws {
+            if let gate = MobileUITestLaunch.revertFixtureGateFile {
+                while !FileManager.default.fileExists(atPath: gate.path) {
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                throw MobileFixtureRevertRefused()
+            }
             if MobileUITestLaunch.revertFixtureFails { throw MobileFixtureRevertRefused() }
         }
     }

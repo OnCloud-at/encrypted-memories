@@ -34,6 +34,18 @@ import SwiftUI
             isRequested && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesRevertFixtureFails")
         }
 
+        /// With `-EncryptedMemoriesRevertFixtureFailsAfterFile <path>` the fixture backend holds every revert until a
+        /// file exists at the path and then refuses it. A UI test closes the viewer first and creates the file
+        /// afterwards, so the failure arrives after the viewer closed.
+        nonisolated static var revertFixtureGateFile: URL? {
+            guard isRequested else { return nil }
+            let arguments = ProcessInfo.processInfo.arguments
+            guard let index = arguments.firstIndex(of: "-EncryptedMemoriesRevertFixtureFailsAfterFile"),
+                arguments.indices.contains(index + 1)
+            else { return nil }
+            return URL(fileURLWithPath: arguments[index + 1])
+        }
+
         static var libraryLoadScenario: String? {
             let arguments = ProcessInfo.processInfo.arguments
             guard let index = arguments.firstIndex(of: "-EncryptedMemoriesLibraryLoadFixture"),

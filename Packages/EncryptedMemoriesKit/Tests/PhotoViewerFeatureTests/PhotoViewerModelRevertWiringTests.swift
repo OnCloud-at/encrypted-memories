@@ -21,7 +21,8 @@ final class PhotoViewerModelRevertWiringTests: XCTestCase {
 
     private func makeModel(
         mutationAction: ViewerMutationAction?, reverter: (any EditedPhotoReverting)?, provesOriginal: Bool = true,
-        onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)? = nil
+        onReverted: (@MainActor @Sendable (PhotoItem) async -> Void)? = nil,
+        onRevertFailedAfterClose: (@MainActor () -> Void)? = nil
     ) async -> PhotoViewerModel {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("revert-wiring-\(UUID().uuidString)", isDirectory: true)
@@ -35,7 +36,7 @@ final class PhotoViewerModelRevertWiringTests: XCTestCase {
             media: MetadataFailingMediaProvider(),
             editedOriginalProvider: StaticOriginals(answer: provesOriginal ? original : nil),
             editedPhotoReverter: reverter, mutationAction: mutationAction, onReverted: onReverted,
-            editedOriginalLookup: lookup)
+            onRevertFailedAfterClose: onRevertFailedAfterClose, editedOriginalLookup: lookup)
         model.start()
         await lookup.pending?.value
         return model
@@ -112,7 +113,52 @@ final class PhotoViewerModelRevertWiringTests: XCTestCase {
         let order = await events.all
         XCTAssertEqual(order, ["reverted"], "the host work ran and nothing closed the next viewer")
     }
+
+    /// The viewer closes while the revert runs and the revert fails: the host shows the failure once, and the closed
+    /// viewer's controller shows none.
+    func testAFailureAfterTheViewerClosedReachesTheHostOnce() async {
+        let gate = Gate()
+        let reverter = SpyReverter(gate: gate, failure: RevertFailure())
+        let events = Events()
+        let model = await makeModel(
+            mutationAction: .moveToTrash, reverter: reverter,
+            onReverted: { _ in await events.add("reverted") },
+            onRevertFailedAfterClose: { Task { await events.add("host failure") } })
+        model.requestRevertToOriginal()
+        model.confirmRevertToOriginal(onSuccess: { Task { await events.add("closed") } })
+        let started = await gate.waitUntilEntered()
+        XCTAssertTrue(started, "the revert did not start")
+
+        model.stop()
+        await gate.open()
+        await model.revert.current?.value
+        for _ in 0..<20 { await Task.yield() }
+
+        let order = await events.all
+        XCTAssertEqual(order, ["host failure"], "a failed revert runs no host work and no close, and reports once")
+        XCTAssertEqual(model.revert.phase, .idle)
+    }
+
+    /// A failure in a viewer that stays open shows in the viewer, and the host stays out of it.
+    func testAFailureInAnOpenViewerStaysInTheViewer() async {
+        let reverter = SpyReverter(failure: RevertFailure())
+        let events = Events()
+        let model = await makeModel(
+            mutationAction: .moveToTrash, reverter: reverter,
+            onRevertFailedAfterClose: { Task { await events.add("host failure") } })
+        model.requestRevertToOriginal()
+        model.confirmRevertToOriginal(onSuccess: {})
+        await model.revert.current?.value
+        for _ in 0..<20 { await Task.yield() }
+
+        XCTAssertEqual(model.revert.phase, .failed)
+        let order = await events.all
+        XCTAssertEqual(order, [])
+        model.stop()
+    }
 }
+
+private struct RevertFailure: Error {}
 
 private struct StaticOriginals: EditedPhotoOriginalProviding {
     let answer: PhotoItem?
@@ -126,12 +172,17 @@ private actor SpyReverter: EditedPhotoReverting {
     }
     private(set) var calls: [Call] = []
     private let gate: Gate?
+    private let failure: (any Error)?
 
-    init(gate: Gate? = nil) { self.gate = gate }
+    init(gate: Gate? = nil, failure: (any Error)? = nil) {
+        self.gate = gate
+        self.failure = failure
+    }
 
     func revertToOriginal(of main: PhotoItem, original: PhotoItem) async throws {
         calls.append(Call(main: main, original: original))
         await gate?.wait()
+        if let failure { throw failure }
     }
 }
 
