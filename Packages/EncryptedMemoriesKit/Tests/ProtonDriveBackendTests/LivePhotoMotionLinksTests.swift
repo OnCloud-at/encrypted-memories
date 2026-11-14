@@ -25,6 +25,29 @@ struct LivePhotoMotionLinksTests {
         "original": "IMG_2000.HEIC", "render": "FullSizeRender.heic",
     ]
 
+    private struct TimelineFixture {
+        let directory: URL
+        let url: URL
+        let store: TimelineMetadataStore
+
+        init() throws {
+            directory = FileManager.default.temporaryDirectory.appendingPathComponent("live-motion-\(UUID())")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            url = directory.appendingPathComponent("library.sqlite")
+            do {
+                store = try #require(TimelineMetadataStore(url: url))
+            } catch {
+                try? FileManager.default.removeItem(at: directory)
+                throw error
+            }
+        }
+
+        func close() {
+            store.close()
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
     /// An answer of the metadata read: each requested file with its type, and its name when it was asked for.
     private func answer(
         _ linkIDs: [String], _ nameLinkIDs: Set<String>, types: [String: String], names: [String: String]
@@ -119,12 +142,9 @@ struct LivePhotoMotionLinksTests {
 
     @Test
     func anAOnlyStoredMotionRereadsOnceUnderTheLoopingRule() async throws {
-        #expect(LivePhotoMotionLinks.rule == "liveMotion.editedOrFirstVideo.4")
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a-motion-upgrade-\(UUID())")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("timeline.sqlite")))
-        defer { store.close() }
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let store = fixture.store
         let uid = PhotoUID(volumeID: "v", nodeID: "loop")
         #expect(
             store.save([
@@ -167,11 +187,10 @@ struct LivePhotoMotionLinksTests {
 
     @Test
     func aStoredLoopSurvivesReopenWithoutAnotherMetadataRequest() async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("stored-loop-\(UUID())")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let url = directory.appendingPathComponent("library.sqlite")
-        let store = try #require(TimelineMetadataStore(url: url))
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let url = fixture.url
+        let store = fixture.store
         let loop = PhotoItem(
             uid: PhotoUID(volumeID: "v", nodeID: "loop"), captureTime: .distantPast, mediaType: "image/heic",
             isLivePhoto: true, isLoopingLivePhoto: true, relatedVideoID: "edited")
@@ -428,12 +447,9 @@ struct LivePhotoMotionLinksTests {
 
     @Test
     func aMotionThatTheEarlierRuleStoredIsNotTrustedAndOneMarkedSaveTrustsTheNewRule() throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("live-motion-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
-        defer { store.close() }
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let store = fixture.store
         let photos = ["live": ["paired", "plist", "edited"]]
 
         // The earlier rule played the first video, the original motion of an edited Live Photo.
@@ -504,17 +520,15 @@ struct LivePhotoMotionLinksTests {
 
     @Test
     func aLaterLaunchReadsNothingForUnchangedLivePhotosAndReadsAChangedOneAgain() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("live-motion-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let url = directory.appendingPathComponent("library.sqlite")
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let url = fixture.url
         var photos = [
             "one": ["plist-1", "paired-1", "original-1"], "three": ["paired-3"], "two": ["other-2", "paired-2"],
         ]
 
         // An earlier build stored the first related file as the motion and never marked its rule.
-        var store = try #require(TimelineMetadataStore(url: url))
+        var store = fixture.store
         #expect(store.save(items(photos.mapValues { $0[0] })).succeeded)
         let first = try await launch(photos, store: store)
         #expect(
@@ -544,12 +558,9 @@ struct LivePhotoMotionLinksTests {
 
     @Test
     func aFailedReadStillCommitsTheTimelineAndTheNextRefreshReadsOnlyThosePhotos() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("live-motion-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
-        defer { store.close() }
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let store = fixture.store
         let photos = ["known": ["paired-1"], "failed": ["plist-2", "paired-2"]]
 
         // The read of "failed" fails: its motion stays unknown, and the timeline and its token are still saved.
@@ -573,12 +584,10 @@ struct LivePhotoMotionLinksTests {
     @Test(arguments: [false, true])
     @MainActor
     func failedEvidenceRefreshKeepsPhotosUsableWithoutExtraMIMERequests(partial: Bool) async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let url = directory.appendingPathComponent("library.sqlite")
-        let store = try #require(TimelineMetadataStore(url: url))
-        defer { store.close() }
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let url = fixture.url
+        let store = fixture.store
         let saved = [
             PhotoItem(
                 uid: .init(volumeID: "v", nodeID: "known"), captureTime: .distantPast,

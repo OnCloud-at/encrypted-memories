@@ -48,6 +48,11 @@ struct RelatedFileReadTests {
             [AlbumPhotoLinkBody].self, from: JSONSerialization.data(withJSONObject: body))
     }
 
+    private func decodedPlayback(of link: AlbumPhotoLinkBody) -> Bool {
+        LivePhotoMotionLinks.isLoopingPlayback(
+            in: Data((LivePhotoMotionLinks.playbackXAttr(of: link) ?? "").utf8))
+    }
+
     @Test func playbackIgnoresUnrelatedIdentityAndDateFields() {
         let data = Data(
             #"{"Camera":{"CaptureTime":123},"iOS.photos":{"ICloudID":4,"ModificationTime":[],"PlaybackStyle":"videoLooping"}}"#
@@ -77,8 +82,7 @@ struct RelatedFileReadTests {
                 links: metadata, nameLinkIDs: nameIDs, rootKey: crypto.rootKey, decrypt: crypto.decrypt,
                 playbackPhotoIDs: mainIDs,
                 decryptPlayback: { link, _ in
-                    LivePhotoMotionLinks.isLoopingPlayback(
-                        in: Data((LivePhotoMotionLinks.playbackXAttr(of: link) ?? "").utf8))
+                    decodedPlayback(of: link)
                 })
         }
         var reader = LivePhotoMotionLinks()
@@ -108,8 +112,7 @@ struct RelatedFileReadTests {
             decryptPlayback: { link, key in
                 #expect(key == "root")
                 decrypted.append(link.linkID ?? "")
-                return LivePhotoMotionLinks.isLoopingPlayback(
-                    in: Data((LivePhotoMotionLinks.playbackXAttr(of: link) ?? "").utf8))
+                return decodedPlayback(of: link)
             })
         #expect(result.playback == ["main": true])
         #expect(crypto.keyReads == 1)

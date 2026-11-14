@@ -107,6 +107,17 @@ private struct AlbumCryptoFixture {
         try crypto.decryptArmored(armored, with: [key]).getString()
     }
 
+    func playbackLink(xattr: String, missingField: String? = nil) throws -> AlbumPhotoLinkBody {
+        var fields: [String: Any] = [
+            "LinkID": "main", "State": 1, "NodeKey": photoKeyArmored,
+            "NodePassphrase": photoPassphraseMessage,
+            "FileProperties": ["ActiveRevision": ["XAttr": xattr]],
+        ]
+        if let missingField { fields.removeValue(forKey: missingField) }
+        return try JSONDecoder().decode(
+            AlbumPhotoLinkBody.self, from: JSONSerialization.data(withJSONObject: fields))
+    }
+
     func photoMetadata(
         id: String,
         relatedPhotoLinkIDs: [String] = [],
@@ -187,13 +198,7 @@ extension DriveSessionStubSuite {
             ]
             for (payload, expected) in payloads {
                 let encrypted = try fixture.crypto.encrypt(text: payload, to: node)
-                let link = try JSONDecoder().decode(
-                    AlbumPhotoLinkBody.self,
-                    from: JSONSerialization.data(withJSONObject: [
-                        "LinkID": "main", "State": 1, "NodeKey": fixture.photoKeyArmored,
-                        "NodePassphrase": fixture.photoPassphraseMessage,
-                        "FileProperties": ["ActiveRevision": ["XAttr": encrypted]],
-                    ]))
+                let link = try fixture.playbackLink(xattr: encrypted)
                 let result = try await LivePhotoMotionLinks.answer(
                     links: [link], nameLinkIDs: [], rootKey: { fixture.rootKey },
                     decrypt: { try fixture.crypto.decryptName($0, parent: $1) }, playbackPhotoIDs: ["main"],
@@ -202,6 +207,45 @@ extension DriveSessionStubSuite {
                     })
                 #expect(result.playback == ["main": expected])
             }
+        }
+
+        @Test(arguments: ["missing-key", "missing-passphrase", "decrypt"])
+        func realPlaybackKeyAndDecryptionFailuresStayUnread(path: String) async throws {
+            let fixture = try AlbumCryptoFixture()
+            let node = UnlockableKey(armored: fixture.photoKeyArmored, passphrase: fixture.photoPassphraseClear)
+            let encrypted = try fixture.crypto.encrypt(
+                text: #"{"iOS.photos":{"PlaybackStyle":"videoLooping"}}"#, to: node)
+            let missingField = path == "missing-key" ? "NodeKey" : path == "missing-passphrase" ? "NodePassphrase" : nil
+            let link = try fixture.playbackLink(
+                xattr: path == "decrypt" ? "not an encrypted xattr" : encrypted, missingField: missingField)
+            if path == "decrypt" {
+                let unlocked = try fixture.crypto.unlockNode(
+                    key: fixture.photoKeyArmored, passphrase: fixture.photoPassphraseMessage, parent: fixture.rootKey)
+                #expect(throws: (any Error).self) {
+                    try fixture.crypto.decryptXAttr("not an encrypted xattr", node: unlocked)
+                }
+            }
+            #expect(throws: (any Error).self) {
+                try LivePhotoMotionLinks.isLoopingPlayback(of: link, parent: fixture.rootKey, crypto: fixture.crypto)
+            }
+            let result = try await LivePhotoMotionLinks.answer(
+                links: [link], nameLinkIDs: [], rootKey: { fixture.rootKey },
+                decrypt: { try fixture.crypto.decryptName($0, parent: $1) }, playbackPhotoIDs: ["main"],
+                decryptPlayback: { link, parent in
+                    try LivePhotoMotionLinks.isLoopingPlayback(of: link, parent: parent, crypto: fixture.crypto)
+                })
+            #expect(result.playback.isEmpty, "real key/decrypt failure must remain unread")
+            let selection = try await LivePhotoMotionLinks().motions(
+                of: ["main": ["paired", "edited"]], stored: [:],
+                evidence: ["paired": "video/quicktime", "edited": "video/quicktime"]
+            ) { _, _, _ in
+                var answer = result
+                answer.files["paired"] = .init(mimeType: "video/quicktime", name: "IMG.MOV")
+                answer.files["edited"] = .init(mimeType: "video/quicktime", name: "FullSizeRender.mov")
+                return answer
+            }
+            #expect(selection.motions["main"] == .unknown, "unread playback cannot become a stored ordinary motion")
+            #expect(selection.read.playback.isEmpty)
         }
 
         @Test func createAlbumSendsProtonCompatibleCryptoMaterial() async throws {
