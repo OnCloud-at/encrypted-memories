@@ -159,7 +159,7 @@ import UploadCore
 
         let merge = Task { await duplicates.merge(groupID: "fixture-copies-0") }
         try await Task.sleep(for: .milliseconds(300))
-        // The removal would advance the mutation generation and reject the load in flight.
+        // A removal advances the shared publication fence and would supersede the first listing in flight.
         #expect(shows(members[1], in: model), "the library keeps the photo until the initial load settles")
 
         open.yield()

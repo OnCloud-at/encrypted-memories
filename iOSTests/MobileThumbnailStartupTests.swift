@@ -15,33 +15,26 @@ import UIKit
 
 @MainActor @Suite struct MobileThumbnailStartupTests {
     @Test func authoritativeEmptyMetadataWakesTheLibraryPresentation() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let remote = ThumbnailLoaderProbe(data: [:])
-        let coordinator = LibrarySourceCoordinator(remote: remote, thumbnailLoader: remote, inventoryStore: nil)
-        await coordinator.prepare()
-        let cache = ThumbnailCache(rootDirectory: root)
-        cache.configure(accountUID: "fixture-account", key: SymmetricKey(size: .bits256))
-        let feed = UIKitThumbnailFeed(cache: cache, loader: coordinator, concurrency: 1, batch: 1)
-        let runtime = LibrarySourceAnalysisRuntime(
-            coordinator: coordinator, feed: feed.feedCore, assets: MLAssetUniverse(),
-            initiallyActive: false, onAssetsChanged: {})
-        #expect(await runtime.start(primaryItems: [], authority: .authoritative, generation: 0) == .accepted)
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         model.applyIsolatedLibraryLoadEventsForTesting([
             .authoritativeInventoryResolved(count: 0, requiresNewFrame: false)
         ])
-        #expect(!model.isCompletelyEmpty)
+        #expect(!model.isCompletelyEmpty, "Without an authoritative inventory the library is not proven empty")
         let changes = EmptyLibraryObservationProbe()
         withObservationTracking {
             _ = model.isCompletelyEmpty
         } onChange: {
             changes.markChanged()
         }
-        model.installIsolatedSourceAnalysisForTests(runtime)
+        // The account's timeline model publishes an authoritative, empty library.
+        fixture.install(
+            into: model, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
+            thumbnailCache: fixture.cache)
         #expect(model.isCompletelyEmpty)
         #expect(changes.wasChanged, "The empty screen must update when authoritative metadata arrives")
-        await runtime.shutdown()
+        await fixture.feed.stopPrefetch()
     }
 
     @Test func metadataChangeDoesNotRestartCompletedStartupCrawl() async throws {
@@ -130,7 +123,7 @@ import UIKit
         await feed.stopPrefetch()
     }
 
-    @Test func sourceBoundCacheClearAdmitsTheVisibleInventoryBeforeRestarting() async throws {
+    @Test func sourceBoundCacheClearRestartsTheAdmittedInventory() async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -155,15 +148,21 @@ import UIKit
         #expect(removedCalls > 0)
 
         let model = MobileLibraryModel()
-        // Reproduce the production interval after visible publication but before its async source update.
+        let backend = MobileFixtureBackend(sections: [section(items: [item(added)])], thumbnails: [:])
         fixture.install(
-            into: model, backend: fixture.backend, sections: [section(items: [item(added)])],
-            thumbnailFeed: feed, thumbnailCache: cache)
+            into: model, backend: backend, sections: [], thumbnailFeed: feed, thumbnailCache: cache)
         model.installIsolatedSourceAnalysisForTests(runtime)
+        // The shipping first load admits this listing before it publishes it. Clear cache uses the bound scope.
+        await model.loadIsolatedInitialTimelineForTesting(repository: backend)
+        await model.timeline?.waitForWholeLibraryCrawlStart()
+        try await feed.waitForPrefetchToFinish()
+        let admittedCalls = await loader.requests(for: added)
+        #expect(admittedCalls > 0)
+
         await model.clearCache()
         try await feed.waitForPrefetchToFinish()
 
-        #expect(await loader.requests(for: added) > 0)
+        #expect(await loader.requests(for: added) > admittedCalls)
         #expect(await loader.requests(for: removed) == removedCalls)
         #expect(cache.hasUsableDiskData(added))
         #expect(!cache.hasUsableDiskData(removed))

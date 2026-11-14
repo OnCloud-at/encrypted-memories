@@ -34,9 +34,8 @@ import TimelineCore
             into: mobile, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         let runtime = await installSourceRuntime(into: mobile, fixture: fixture)
-        await #expect(throws: CacheReadStartupRepository.ServerFailure.self) {
-            try await mobile.loadIsolatedInitialTimelineForTesting(repository: repository)
-        }
+        await mobile.loadIsolatedInitialTimelineForTesting(repository: repository)
+        #expect(mobile.loadState.failure != nil, "The failed server read fails the first load")
         #expect(mobile.isolatedInventoryAuthorityForTesting != .authoritative)
         #expect(!mobile.isCompletelyEmpty)
         #expect(repository.serverCalls == 2)
@@ -62,7 +61,7 @@ import TimelineCore
             into: mobile, backend: fixture.backend, sections: [], thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         let runtime = await installSourceRuntime(into: mobile, fixture: fixture)
-        try await mobile.loadIsolatedInitialTimelineForTesting(repository: repository)
+        await mobile.loadIsolatedInitialTimelineForTesting(repository: repository)
         #expect(mobile.isolatedInventoryAuthorityForTesting == .authoritative)
         #expect(mobile.isCompletelyEmpty)
         #expect(repository.serverCalls == 0)

@@ -30,7 +30,7 @@ import UIKit
             thumbnailCache: fixture.cache)
         model.setApplicationActive(false)
         let runtime = await installSourceRuntime(into: model, fixture: fixture)
-        let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
+        let loading = Task { await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
         do {
             try #require(await repository.waitForPage(), "SETUP: the listing reached its held second page")
             let expected = Set(items.map(\.uid))
@@ -48,7 +48,7 @@ import UIKit
             #expect(model.items.isEmpty)
             #expect(model.isolatedInventoryAuthorityForTesting == .hydrating)
             await repository.release()
-            try await loading.value
+            await loading.value
             #expect(Set(model.gridItems.map(\.uid)) == expected)
             #expect(Set(model.items.map(\.uid)) == expected)
             #expect(Set(model.selectedItems(expected).map(\.uid)) == expected)
@@ -82,7 +82,7 @@ import UIKit
         let screen = try mountScreen(model: model)
         let window = screen.window
         defer { screen.close() }
-        let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
+        let loading = Task { await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
         do {
             try #require(await repository.waitForPage())
             try await waitUntil {
@@ -99,7 +99,7 @@ import UIKit
             #expect(model.items.isEmpty)
             #expect(model.isolatedInventoryAuthorityForTesting == .hydrating)
             await repository.release()
-            try await loading.value
+            await loading.value
             try await waitUntil { host.onOpenPhoto != nil && model.items.count == 10 }
             #expect(host.scrollView.isScrollEnabled)
             #expect(host.onOpenPhoto != nil)
@@ -136,12 +136,12 @@ import UIKit
             into: model, backend: fixture.backend, sections: [], thumbnailFeed: feed, thumbnailCache: cache)
         model.setApplicationActive(false)
         let runtime = await installSourceRuntime(into: model, fixture: fixture, feed: feed)
-        let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
+        let loading = Task { await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
         do {
             if listingCompleted {
                 try #require(await repository.waitForPage())
                 await repository.release()
-                try await loading.value
+                await loading.value
             }
             let screen = try mountScreen(model: model)
             defer { screen.close() }
@@ -170,7 +170,7 @@ import UIKit
             #expect((host.onToggleSelection != nil) == listingCompleted)
             if !listingCompleted {
                 await repository.release()
-                try await loading.value
+                await loading.value
             }
             #expect(model.loadState == .contentReady(count: 10), "Qualification keeps the already visible grid")
             #expect(model.loadState.hasSettled)
@@ -202,7 +202,7 @@ import UIKit
         let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let screen = try mountScreen(model: model)
         defer { screen.close() }
-        let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
+        let loading = Task { await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
         do {
             try #require(await repository.waitForPage())
             try await waitUntil {
@@ -231,7 +231,7 @@ import UIKit
                 #expect(host.onToggleSelection == nil)
             }
             await repository.release()
-            try await loading.value
+            await loading.value
             try await waitUntil { host.onOpenPhoto != nil }
             let completed = try #require(host.currentScrollAnchor())
             #expect(completed.itemID == anchor.itemID)
@@ -264,7 +264,7 @@ import UIKit
         let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let screen = try mountScreen(model: model)
         defer { screen.close() }
-        let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
+        let loading = Task { await model.loadIsolatedInitialTimelineForTesting(repository: repository) }
         do {
             try #require(await repository.waitForPage())
             try await waitUntil { model.loadState.isContentReady }
@@ -290,7 +290,7 @@ import UIKit
                 await repository.publish(items: items)
                 #expect(model.gridItems == [replacement], "A late provisional callback cannot enter another account")
                 await repository.release()
-                try await loading.value
+                await loading.value
                 #expect(model.items == [replacement], "A late old page cannot overwrite the replacement account")
                 #expect(model.gridItems == [replacement])
                 #expect(model.loadState == replacementState, "Old cleanup cannot reset the replacement presentation")
@@ -299,7 +299,7 @@ import UIKit
             } else {
                 loading.cancel()
                 await repository.release()
-                await #expect(throws: CancellationError.self) { try await loading.value }
+                await loading.value
                 #expect(model.gridItems.isEmpty)
                 #expect(model.items.isEmpty)
                 #expect(model.sections.isEmpty)
@@ -336,14 +336,14 @@ import UIKit
         let runtime = await installSourceRuntime(into: model, fixture: fixture)
         let screen = try mountScreen(model: model)
         defer { screen.close() }
-        let loading = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: first) }
-        var retry: Task<Void, any Error>?
+        let loading = Task { await model.loadIsolatedInitialTimelineForTesting(repository: first) }
+        var retry: Task<Void, Never>?
         do {
             try #require(await first.waitForPage())
             try await waitUntil { model.loadState.isContentReady }
             #expect(Set(model.gridItems.map(\.uid)) == Set(failedItems.map(\.uid)))
             await first.release(failing: true)
-            await #expect(throws: URLError.self) { try await loading.value }
+            await loading.value
             #expect(model.gridItems.isEmpty)
             #expect(model.items.isEmpty)
             #expect(model.sections.isEmpty)
@@ -355,7 +355,7 @@ import UIKit
             #expect(!model.isCompletelyEmpty)
             #expect(model.isolatedInventoryAuthorityForTesting == .hydrating)
             try await waitUntil { !descendants(screen.window).contains { $0 is UIKitTimelineGridHostView } }
-            let next = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: second) }
+            let next = Task { await model.loadIsolatedInitialTimelineForTesting(repository: second) }
             retry = next
             try #require(await second.waitForPage())
             try await waitUntil { model.loadState.isContentReady }
@@ -366,7 +366,7 @@ import UIKit
             #expect(model.sections.isEmpty)
             #expect(model.isolatedInventoryAuthorityForTesting == .hydrating)
             await second.release()
-            try await next.value
+            await next.value
             #expect(Set(model.items.map(\.uid)) == Set(retryItems.map(\.uid)))
             #expect(model.isolatedInventoryAuthorityForTesting == .authoritative)
         } catch {
