@@ -7,7 +7,7 @@
 
     @testable import AlbumsFeature
 
-    /// Keeps the shared album form's native Mac presentation visible while mobile bar policy changes.
+    /// Checks the shared album form and destination picker through their native Mac presentation.
     final class AlbumToolbarRenderingTests: XCTestCase {
         @MainActor func testAlbumSheetKeepsItsTextActionsOnMac() async throws {
             _ = NSApplication.shared
@@ -60,6 +60,48 @@
                     try data.write(to: url.appendingPathComponent("album-\(appearance.rawValue).png"))
                 }
             }
+        }
+
+        @MainActor func testEmptyDestinationUsesTheSurroundingTextSize() async throws {
+            _ = NSApplication.shared
+            try requireVisionOCR()
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let coordinator = AlbumActionCoordinator(repository: repository(backend))
+            await coordinator.refresh()
+            let title = L10n.string("albums.none_available")
+            let font = Font.system(size: 24)
+            let reference = NSHostingView(rootView: Text(title).font(font))
+            let host = NSHostingController(
+                rootView: AlbumDestinationPicker(coordinator: coordinator, photoUIDs: [], onCompleted: { _ in })
+                    .font(font))
+            let window = NSWindow(contentViewController: host)
+            window.orderFrontRegardless()
+            defer { window.orderOut(nil) }
+            try await Task.sleep(for: .milliseconds(500))
+            let view = try XCTUnwrap(window.contentView)
+            view.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let image = try XCTUnwrap(bitmap.cgImage)
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["de-DE", "en-US"]
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            let emptyText = try XCTUnwrap(
+                request.results?.first { $0.topCandidates(1).first?.string == title },
+                "The real destination picker must draw its existing empty text")
+            let textWidth = emptyText.boundingBox.width * view.bounds.width
+            let referenceWidth = reference.fittingSize.width
+            XCTAssertGreaterThan(referenceWidth, 100, "The reference must measure the actual text")
+            print("[Album empty row] textWidth=\(textWidth), referenceWidth=\(referenceWidth)")
+            if let directory = ProcessInfo.processInfo.environment["ALBUM_TOOLBAR_SCREENSHOT_DIR"] {
+                let url = URL(fileURLWithPath: directory, isDirectory: true)
+                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                try data.write(to: url.appendingPathComponent("album-empty-row.png"))
+            }
+            // OCR excludes the glyph bearings; allow that small difference from the native text's width.
+            XCTAssertGreaterThan(textWidth, referenceWidth * 0.9)
         }
 
         @MainActor private func requireVisionOCR() throws {
