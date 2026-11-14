@@ -230,15 +230,12 @@ private struct MobileAlbumPickerSheet: View {
                     ProgressView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .accessDenied:
-                    ContentUnavailableView(
-                        String(localized: "settings.photos_backup_denied_ios"),
-                        systemImage: "lock.rectangle.stack"
-                    )
-                case .empty:
-                    ContentUnavailableView(
-                        L10n.string("settings.albumsync_picker_empty"),
-                        systemImage: "rectangle.stack"
-                    )
+                    AlbumPickerUnavailableView(
+                        accessDeniedMessage: String(localized: "settings.photos_backup_denied_ios"))
+                case .noAlbums:
+                    AlbumPickerUnavailableView()
+                case .noMatches:
+                    AlbumPickerUnavailableView(searchText: searchText)
                 case .list(let albums):
                     List(albums) { album in
                         let isSelected = draft.contains(album.id)

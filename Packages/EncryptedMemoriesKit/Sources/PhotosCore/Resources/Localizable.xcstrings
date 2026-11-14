@@ -5638,13 +5638,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Übernehmen" } }
       }
     },
-    "settings.albumsync_picker_empty": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "No albums match." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Keine passenden Alben." } }
-      }
-    },
     "settings.albumsync_picker_search": {
       "extractionState": "manual",
       "comment": "Placeholder of the picker's search field.",
