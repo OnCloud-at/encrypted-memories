@@ -4920,6 +4920,49 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             "the same build never reopens a photo twice")
     }
 
+    func testAFailedReopenWriteKeepsTheUpdateRetry() throws {
+        for failedWrite in [1, 2] {
+            let (fixture, queue) = try reopenFixture(prefix: "refusal-reopen-write", build: "200")
+            defer { fixture.cleanup() }
+            let entries = try [seedRefusal(queue, "first"), seedRefusal(queue, "second")]
+            var writes = 0
+            let fault = try SQLiteStatementFaults(in: queue, failures: 1) { sql in
+                guard sql.contains("UPDATE backup_sync_queue SET state = 'discovered', attempts = ") else {
+                    return false
+                }
+                writes += 1
+                return writes == failedWrite
+            }
+            defer { fault.stop() }
+
+            fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+
+            XCTAssertEqual(fault.firedCount, 1, "The reopen write really failed")
+            fault.stop()
+            XCTAssertNil(fixture.defaults.string(forKey: PhotoLibraryBackupController.refusalReopenBuildDefaultsKey))
+            let afterFailure = try entries.map { entry in
+                try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+            }
+            XCTAssertEqual(afterFailure.filter { $0.state == .discovered }.count, failedWrite - 1)
+            XCTAssertEqual(afterFailure.filter { $0.state == .failedPermanent }.count, 3 - failedWrite)
+            for (entry, stored) in zip(entries, afterFailure) {
+                XCTAssertEqual(stored.lastError, entry.lastError)
+                XCTAssertEqual(stored.attempts, stored.state == .discovered ? 0 : entry.attempts)
+            }
+
+            fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+
+            XCTAssertEqual(
+                fixture.defaults.string(forKey: PhotoLibraryBackupController.refusalReopenBuildDefaultsKey), "200")
+            for entry in entries {
+                let stored = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+                XCTAssertEqual(stored.state, .discovered)
+                XCTAssertEqual(stored.attempts, 0)
+                XCTAssertEqual(stored.lastError, entry.lastError)
+            }
+        }
+    }
+
     func testAFailedReadKeepsTheReopenForTheNextLaunch() throws {
         let (fixture, queue) = try reopenFixture(prefix: "refusal-reopen-failed", build: "200")
         defer { fixture.cleanup() }

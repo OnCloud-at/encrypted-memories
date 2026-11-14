@@ -50,9 +50,8 @@ extension BackupIssueKind: FailureClassifiable {
         case .remoteDeletion, .deletedElsewhere: .userDecision
         case .accountStorage: .accountStorage
         case .remoteDraftStale: .permanent
-        // BackupSyncRunner.issueKind(for:) also maps generic backend and album errors to remoteService, so that
-        // persisted reason remains unknown even though UploadError.retryableBackend identifies temporary or
-        // rate-limited failures.
+        // UploadError.serviceRejected maps separately to protonRestriction. The persisted remoteService kind cannot
+        // prove a refusal: generic backend, album, temporary and rate-limited failures also use it, so it remains unknown.
         case .remoteDraft, .sourceMissing, .remoteService, .unknown: .unknown
         }
     }

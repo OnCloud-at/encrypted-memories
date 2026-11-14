@@ -17,8 +17,9 @@ import UploadCore
     }
 
     @Test func aParkWithinADayStaysInItsRound() {
-        let result = Self.rounds(parkingAt: [0, 1, 23.9])
-        #expect(result.map(\.rounds) == [1, 1, 1])
+        let result = Self.rounds(parkingAt: [0, -48, -1, 1, 23.9])
+        #expect(result.map(\.rounds) == [1, 1, 1, 1, 1])
+        #expect(result.last?.firstRoundAt == Self.start)
         #expect(result.last?.lastRoundAt == Self.start)
         #expect(!result.contains { $0.stopsRetrying })
     }
