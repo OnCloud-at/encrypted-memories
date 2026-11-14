@@ -1,4 +1,5 @@
 import SQLite3
+import SQLiteTestSupport
 import XCTest
 
 @testable import PhotosCore
@@ -99,13 +100,6 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
             receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
     }
 
-    /// Fails the binds of the next statement that contains `statement`; see `BindFailureUntilStep`.
-    private func failBinds(untilStepOf statement: String, after earlier: String? = nil) throws -> BindFailureUntilStep {
-        let fault = BindFailureUntilStep(on: try connection(), statement: statement, after: earlier, limit: Self.limit)
-        if earlier == nil { XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply") }
-        return fault
-    }
-
     private func issue(_ kind: BackupIssueKind = .network) -> String {
         BackupIssueRecord(kind: kind, detail: "detail").persistedValue
     }
@@ -114,7 +108,9 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
 
     func testUpsertWithAReceiptLongerThanTheLimitFailsAndStoresNoRowWithoutItsReceipt() throws {
         // The upsert first reads the prior row; that read must run without the limit.
-        let fault = try failBinds(untilStepOf: "INSERT INTO backup_sync_queue(", after: "SELECT state IN (")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "INSERT INTO backup_sync_queue(", after: "SELECT state IN (",
+            limit: Self.limit)
         defer { fault.remove() }
         XCTAssertFalse(store.upsert(entry(receipt: true)), "A receipt that does not bind must fail the write")
         XCTAssertTrue(fault.lowered, "The lowered length limit must apply to the write's binds")
@@ -124,7 +120,9 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
     }
 
     func testInsertMissingSourcesWithAReceiptLongerThanTheLimitFailsAndStoresNoRowWithoutItsReceipt() throws {
-        let fault = try failBinds(untilStepOf: "INSERT INTO backup_sync_queue(")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "INSERT INTO backup_sync_queue(", after: nil, limit: Self.limit)
+        XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
         defer { fault.remove() }
         XCTAssertFalse(store.insertMissingSources([entry(receipt: true)]))
         XCTAssertEqual(try storedRows(), [], "No row may be stored without its receipt")
@@ -136,7 +134,9 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
         let row = entry()
         XCTAssertTrue(store.upsert(row))
         let before = try storedRows()
-        let fault = try failBinds(untilStepOf: "state='needsRemoteReconciliation'")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "state='needsRemoteReconciliation'", after: nil, limit: Self.limit)
+        XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
         defer { fault.remove() }
         XCTAssertFalse(
             store.markNeedsRemoteReconciliation(
@@ -205,7 +205,9 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
         let row = entry()
         XCTAssertTrue(store.upsert(row))
         let before = try storedRows()
-        let fault = try failBinds(untilStepOf: "attempts=COALESCE(?, attempts)")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "attempts=COALESCE(?, attempts)", after: nil, limit: Self.limit)
+        XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
         defer { fault.remove() }
         XCTAssertFalse(
             store.updateState(
@@ -222,7 +224,9 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
         let second = entry(revision: 20)
         XCTAssertTrue(store.upsertBatch([first, second]))
         let before = try storedRows()
-        let fault = try failBinds(untilStepOf: "attempts=COALESCE(?, attempts)")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "attempts=COALESCE(?, attempts)", after: nil, limit: Self.limit)
+        XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
         defer { fault.remove() }
         XCTAssertFalse(
             store.updateStates(
@@ -297,7 +301,10 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
         let outside = entry("/other/b.heic", kind: .fileURL)
         XCTAssertTrue(store.upsertBatch([inside, outside]))
         let before = try storedRows()
-        let fault = try failBinds(untilStepOf: "DELETE FROM backup_sync_queue WHERE source_kind=?")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "DELETE FROM backup_sync_queue WHERE source_kind=?", after: nil,
+            limit: Self.limit)
+        XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
         defer { fault.remove() }
         XCTAssertEqual(store.removeFileSources(outsideRootPaths: [root]), 0)
         XCTAssertEqual(try storedRows(), before)
@@ -342,7 +349,9 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
     func testClaimRunnableOfARowWithAnIdentifierLongerThanTheLimitFailsAndKeepsTheRow() throws {
         XCTAssertTrue(store.upsert(entry(long)))
         let before = try storedRows()
-        let fault = try failBinds(untilStepOf: "SET state='checking', updated_at=?", after: "AND updated_at <= ?")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "SET state='checking', updated_at=?", after: "AND updated_at <= ?",
+            limit: Self.limit)
         defer { fault.remove() }
         XCTAssertNil(
             store.claimRunnable(limit: 10, claimedAt: Date(timeIntervalSince1970: 200), excludingSourcesOf: []))
@@ -364,7 +373,9 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
     func testDecisionProblemEntriesWithAPrefixLongerThanTheLimitThrow() throws {
         XCTAssertGreaterThan(BackupIssueRecord.storagePrefix.utf8.count, Int(Self.limit), "The prefix must not bind")
         XCTAssertTrue(store.upsertBatch([entry("failed", state: .failed), entry("waiting", lastError: issue())]))
-        let fault = try failBinds(untilStepOf: "substr(last_error, 1, ?) = ?")
+        let fault = BindFailureUntilStep(
+            on: try connection(), statement: "substr(last_error, 1, ?) = ?", after: nil, limit: Self.limit)
+        XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
         defer { fault.remove() }
         var delivered: [String] = []
         XCTAssertThrowsError(

@@ -1,4 +1,5 @@
 import SQLite3
+import SQLiteTestSupport
 import XCTest
 
 @testable import PhotosCore
