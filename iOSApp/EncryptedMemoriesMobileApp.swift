@@ -90,6 +90,7 @@ private struct MobileSupportedAppRoot: View {
             .environmentObject(runtime.sessionModel)
             .environment(runtime.libraryModel)
             .environment(sceneContext)
+            .opacity(MobileAppProtection.gate.admits(.app) ? 1 : 0)
             .disabled(!MobileAppProtection.gate.admits(.app))
             .allowsHitTesting(MobileAppProtection.gate.admits(.app))
             .accessibilityHidden(!MobileAppProtection.gate.admits(.app))
@@ -101,6 +102,7 @@ private struct MobileSupportedAppRoot: View {
                         MobilePrivacyPreviewShieldCenter.shared.register(window: window)
                     }
                 }
+                if let window = sceneContext.window { MobileAppLockCenter.shared.register(window: window) }
                 updatePrivacyPreviewShield()
             }
             .onChange(of: scenePhase) { _, _ in updatePrivacyPreviewShield() }

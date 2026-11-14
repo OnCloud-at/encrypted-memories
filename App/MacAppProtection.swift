@@ -1,5 +1,4 @@
 import AppKit
-import DesignSystemCore
 import Observation
 import PhotosCore
 import PrivacyFeature
@@ -22,12 +21,10 @@ final class MacAppProtection: NSObject {
     }
 
     @MainActor private final class Cover {
-        weak var source: NSWindow?
         let window: MacAppLockPanel
         let presentation: MacAppLockPresentation
 
         init(source: NSWindow, gate: AccessGate) {
-            self.source = source
             presentation = MacAppLockPresentation(gate: gate)
             window = MacAppLockPanel(
                 contentRect: source.frame, styleMask: [.borderless], backing: .buffered, defer: false)
