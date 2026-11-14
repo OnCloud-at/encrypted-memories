@@ -278,9 +278,9 @@ public final class AccessGate {
 
     /// A window returns. Areas lock when the app stayed in the background for their grace period.
     public func appWillEnterForeground(at instant: ContinuousClock.Instant) {
-        automaticPromptTaken = []
         refreshAvailability()
         guard let since = backgroundSince else { return }
+        automaticPromptTaken = []
         backgroundSince = nil
         let elapsed = since.duration(to: instant)
         for scope in scopes.values where elapsed >= scope.policy.backgroundGracePeriod.duration(in: defaults) {

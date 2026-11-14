@@ -214,6 +214,7 @@ struct MainView: View {
                 libraryReady: !timelineModel.initialLibraryLoadState.isLoading,
                 presentationBlocked: viewerModel != nil || duplicateViewerGroup != nil
                     || libraryWindow?.attachedSheet != nil || NSApp.modalWindow != nil
+                    || !MacAppProtection.shared.gate.admits(.app)
             )
             if let route {
                 selection = route.photoFilter
@@ -353,6 +354,7 @@ struct MainView: View {
                 SidebarPersistence.saveVisible(visible)
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesToggleSidebar)) { _ in
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
                 toggleSidebar()
             }
             .onAppear {
@@ -369,18 +371,23 @@ struct MainView: View {
             .task { await uploadCoordinator.start() }
             .task { await startLibraryChangeMonitor() }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesUploadPhotos)) { notification in
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
                 performUploadUIAction(.uploadPhotos, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesUploadFolder)) { notification in
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
                 performUploadUIAction(.uploadFolder, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesShowUploadQueue)) { notification in
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
                 performUploadUIAction(.showQueue, trigger: uploadTrigger(from: notification))
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesNewAlbum)) { _ in
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
                 presentCreateAlbum()
             }
             .onReceive(NotificationCenter.default.publisher(for: .encryptedMemoriesRefreshLibrary)) { _ in
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
                 refreshLibraryManually()
             }
             .onChange(of: uploadCoordinator.completedUploadRevision) { _, _ in

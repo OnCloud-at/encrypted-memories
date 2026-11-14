@@ -189,7 +189,7 @@ struct MobileSettingsScreen: View {
     private var privacySection: some View {
         Section {
             NavigationLink {
-                Form { PrivacySettingsContent() }
+                Form { PrivacySettingsContent(gate: MobileAppProtection.gate) }
                     .navigationTitle(L10n.string("settings.privacy_tab"))
             } label: {
                 Label(L10n.string("settings.privacy_tab"), systemImage: "hand.raised")

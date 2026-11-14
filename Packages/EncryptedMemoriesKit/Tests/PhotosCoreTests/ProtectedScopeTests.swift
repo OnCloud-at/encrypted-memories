@@ -248,6 +248,17 @@ final class ProtectedScopeTests: XCTestCase {
         XCTAssertEqual(authenticator.reasons, ["launch", "foreground"])
     }
 
+    func testAnotherForegroundWindowDoesNotRepeatACancelledPrompt() async {
+        defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
+        let authenticator = ScriptedAuthenticator(results: [.cancelled, .cancelled])
+        let gate = makeGate(authenticator)
+        await gate.unlockAutomatically(app, reason: "launch")
+        gate.appWillEnterForeground(at: .now)
+        await gate.unlockAutomatically(app, reason: "another window")
+        XCTAssertEqual(authenticator.reasons, ["launch"])
+        XCTAssertFalse(gate.admits(app))
+    }
+
     func testTheUnlockButtonStillAsksAfterTheAutomaticPrompt() async {
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
         let authenticator = ScriptedAuthenticator(results: [.cancelled, .success])

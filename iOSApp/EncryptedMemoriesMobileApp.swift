@@ -36,6 +36,8 @@ struct EncryptedMemoriesMobileApp: App {
         MobileBuildProvenanceLog.noteCurrentBuild()
         guard metal3Supported else { return }
 
+        _ = MobileAppLockCenter.shared
+
         AppleLibraryRuntimeAdapter.shared.install()
         AppleMetricKitCollector.shared.install()
         // A background launch may connect no scene; its windows start the account through this one start.
@@ -88,10 +90,16 @@ private struct MobileSupportedAppRoot: View {
             .environmentObject(runtime.sessionModel)
             .environment(runtime.libraryModel)
             .environment(sceneContext)
+            .disabled(!MobileAppProtection.gate.admits(.app))
+            .allowsHitTesting(MobileAppProtection.gate.admits(.app))
+            .accessibilityHidden(!MobileAppProtection.gate.admits(.app))
             .mobileSceneWindowAnchor(sceneContext)
             .onAppear {
                 sceneContext.onWindowChange = { window in
-                    if let window { MobilePrivacyPreviewShieldCenter.shared.register(window: window) }
+                    if let window {
+                        MobileAppLockCenter.shared.register(window: window)
+                        MobilePrivacyPreviewShieldCenter.shared.register(window: window)
+                    }
                 }
                 updatePrivacyPreviewShield()
             }
@@ -362,6 +370,7 @@ private struct MobileMainTabView: View {
                 libraryReady: !libraryModel.loadState.isLoading && !libraryModel.isRecoveringScope,
                 presentationBlocked: viewerRouter.presentation != nil
                     || sceneContext.window?.rootViewController?.presentedViewController != nil
+                    || !MobileAppProtection.gate.admits(.app)
             )
             if let route {
                 show(route)
@@ -452,9 +461,13 @@ private struct MobileMainTabView: View {
                 \.mobileSceneCommands,
                 MobileSceneCommandTarget(
                     selectTab: { tab in
+                        guard MobileAppProtection.gate.admits(.app) else { return }
                         if tab != .map || mapAndPlacesEnabled { selection = tab }
                     },
-                    openSettings: { sceneContext.settingsPresented = true }
+                    openSettings: {
+                        guard MobileAppProtection.gate.admits(.app) else { return }
+                        sceneContext.settingsPresented = true
+                    }
                 )
             )
             // The continued backup question, asked only while nothing covers the root (#1108).
@@ -779,7 +792,7 @@ private struct MobileNavigationCommands: Commands {
                 target?.openSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
-            .disabled(target == nil)
+            .disabled(target == nil || !MobileAppProtection.gate.admits(.app))
         }
         CommandMenu(String(localized: "menu.go")) {
             ForEach(Array(MobileTab.allCases.filter { $0 != .map || mapAndPlacesEnabled }.enumerated()), id: \.element)
@@ -788,14 +801,14 @@ private struct MobileNavigationCommands: Commands {
                     target?.selectTab(tab)
                 }
                 .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
-                .disabled(target == nil)
+                .disabled(target == nil || !MobileAppProtection.gate.admits(.app))
             }
             Divider()
             Button(MobileTab.search.title) {
                 target?.selectTab(.search)
             }
             .keyboardShortcut("f", modifiers: .command)
-            .disabled(target == nil)
+            .disabled(target == nil || !MobileAppProtection.gate.admits(.app))
         }
     }
 }
