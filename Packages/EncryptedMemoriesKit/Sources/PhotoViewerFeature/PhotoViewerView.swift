@@ -588,7 +588,7 @@ private struct ViewerStillImage: View {
                 onForceClick: {
                     if LivePhotoMotionPolicy.acceptsPress(item: model.current) { model.playMotion() }
                 },
-                onForceClickEnded: { model.stopMotion() },  // Release stops motion and fades to still.
+                onForceClickEnded: { model.stopMotion() },  // An ordinary release stops motion and fades to still.
                 onMotionStart: LivePhotoMotionPolicy.acceptsPress(item: model.current) ? { model.playMotion() } : nil,
                 onMotionStop: LivePhotoMotionPolicy.acceptsPress(item: model.current) ? { model.stopMotion() } : nil,
                 onPageSwipe: onPageSwipe,

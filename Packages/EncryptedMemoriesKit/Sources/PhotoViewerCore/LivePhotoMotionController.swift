@@ -14,15 +14,14 @@ public enum LivePhotoMotionLoadState: Equatable, Sendable {
 /// asset, and the play/stop state the viewer crossfades on. Shared by the macOS and iOS viewers so Live Photo
 /// motion behaves identically on both.
 ///
-/// E2EE-safe: the clip uses the encrypted resource-loader path as regular video
+/// Cloud clips use the same encrypted resource-loader path as regular video
 /// (`makeStreamingAsset` using `protonvideo://`). Encrypted blocks are cached locally and decrypted only in
 /// RAM, so plaintext motion-video files are never written. Unlike timeline videos, the clip is fully
 /// pre-downloaded when its photo becomes current, before `player` is exposed. Without a `player` (still loading), an active play intent
-/// is retained until preparation finishes; `stop()` cancels that intent.
+/// is retained until preparation finishes. An ordinary release cancels its press intent. Loops request playback
+/// automatically and keep playing through presses and releases; teardown ends either mode.
 ///
-/// Deliberately carries no audio-session configuration: on macOS a plain `AVPlayer` mixes with system audio and
-/// never ducks; on iOS the default (`.soloAmbient`) session already gives Live-Photo-correct behavior (obeys the
-/// silence switch, plays through the speaker). Adding a category here is the one thing that would cause ducking.
+/// Loops set the player's mute flag. This controller does not change the audio session.
 @MainActor
 @Observable
 public final class LivePhotoMotionController {
@@ -46,17 +45,15 @@ public final class LivePhotoMotionController {
     private var looper: AVPlayerLooper?
     private var endObserver: NSObjectProtocol?
     private var preparationGeneration: UInt = 0
-    /// Retains a press that began while the encrypted clip was still being prepared. Without this intent,
-    /// `play()` was a permanent no-op until `player` existed, so pressing during the normal preload window
-    /// could never start motion even when the player became ready while the finger was still down.
+    /// Retains an ordinary press during preload. A looping photo requests playback automatically.
     public private(set) var isPlayRequested = false
 
     public init() {}
 
     /// Preloads the paired motion clip for a Live Photo. No-op for non-Live items / when no streamer is
     /// available (per `LivePhotoMotionPolicy`). `isStillCurrent` lets the caller abort if the user paged away
-    /// mid-load. Repeated preparation of the same clip reuses its in-flight or ready player; a different clip
-    /// tears down its predecessor first.
+    /// mid-load. Repeated preparation of the same clip and playback style reuses its in-flight or ready player.
+    /// A clip or playback-style change tears down its predecessor first.
     public func prepare(
         for item: PhotoItem, streamer: VideoStreamProvider?,
         isStillCurrent: @escaping @MainActor () -> Bool
@@ -139,8 +136,7 @@ public final class LivePhotoMotionController {
         }
     }
 
-    /// Plays the motion clip once from the start, with sound. Idempotent while already playing. `isMuted`/`volume`
-    /// are reset every call (they persist on the `AVPlayer`), so a prior `stop()` can never leave the next play muted.
+    /// Requests ordinary motion once, with sound. An active playback stays active; automatic loops ignore presses.
     public func play() {
         guard !isLooping else { return }
         isPlayRequested = true
@@ -176,7 +172,7 @@ public final class LivePhotoMotionController {
         }
     }
 
-    /// Stops the motion clip and lets the viewer crossfade back to the still (release, or auto at end-of-clip).
+    /// Stops ordinary motion on release or at its end. Automatic loops keep playing until teardown.
     public func stop() {
         guard !isLooping else { return }
         isPlayRequested = false
