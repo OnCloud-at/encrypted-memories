@@ -2019,7 +2019,8 @@ extension DriveSessionStubSuite {
             let startLimit = StartLimitHold(then: Self.neverFires)
             let gate = TimelineMetadataStartGate(startLimit: .seconds(1), limit: .seconds(60), sleep: startLimit.sleep)
             let service = makeService(content: content, lineage: lineage, firstBuildGate: gate)
-            let reconciliation = TimelineMetadataReconciliation(startGate: gate)
+            let reconciliation = TimelineMetadataReconciliation(
+                startGate: gate, runtimeState: LibraryRuntimeState(), taskPriority: .userInitiated)
             let events = BuildOrderLog()
             reconciliation.schedule(timelineInventory) { _ in await events.append("metadata pass") }
 
