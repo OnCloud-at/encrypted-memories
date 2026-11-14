@@ -15,6 +15,21 @@ final class LocalizationTests: XCTestCase {
             ),
             ("settings.privacy_app_lock_change_reason", "Confirm this change.", "Bestätige diese Änderung."),
             ("settings.privacy_app_lock_after", "Lock After", "Sperren nach"),
+            ("settings.privacy_app_lock_require_method %@", "Require %@", "%@ anfordern"),
+            ("settings.privacy_app_lock_unlock_method %@", "Unlock with %@", "Mit %@ entsperren"),
+            ("settings.privacy_app_lock_passcode", "Passcode", "Code"),
+            ("settings.privacy_app_lock_password", "Password", "Passwort"),
+            ("settings.privacy_app_lock_immediately", "Immediately", "Sofort"),
+            ("settings.privacy_app_lock_unlock_reason", "Unlock your library.", "Entsperre deine Mediathek."),
+            ("settings.privacy_app_lock_locked", "Locked", "Gesperrt"),
+            (
+                "settings.privacy_app_lock_no_passcode", "Set a device passcode to use this.",
+                "Lege einen Gerätecode fest, um dies zu nutzen."
+            ),
+            (
+                "settings.privacy_app_lock_no_password", "Set a login password to use this.",
+                "Lege ein Anmeldepasswort fest, um dies zu nutzen."
+            ),
         ]
         for (language, index) in [("en", 1), ("de", 2)] {
             let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)

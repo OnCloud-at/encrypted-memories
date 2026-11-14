@@ -6,20 +6,7 @@ import SwiftUI
 import XCTest
 
 @MainActor
-final class ProtectedScopeSettingsTests: XCTestCase {
-    private var suite = ""
-    private var defaults: UserDefaults!
-
-    override func setUp() async throws {
-        suite = "ProtectedScopeSettingsTests.\(UUID().uuidString)"
-        defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-    }
-
-    override func tearDown() async throws {
-        defaults.removePersistentDomain(forName: suite)
-        defaults = nil
-    }
-
+final class ProtectedScopeSettingsTests: ProtectedScopeTestCase {
     func testTheSwitchWaitsForAuthenticationBeforeItChanges() async {
         let owner = PendingDeviceOwner()
         let gate = AccessGate(authenticator: owner, defaults: defaults)
@@ -197,34 +184,4 @@ final class ProtectedScopeSettingsTests: XCTestCase {
         owner.answer(result)
         await fulfillment(of: [finished], timeout: 5)
     }
-}
-
-@MainActor
-private final class PendingDeviceOwner: DeviceOwnerAuthenticating {
-    let requested = XCTestExpectation(description: "The system authentication was requested")
-    private(set) var reasons: [String] = []
-    private var reply: CheckedContinuation<DeviceOwnerAuthResult, Never>?
-    private let currentAvailability: DeviceOwnerAuthAvailability
-
-    init(availability: DeviceOwnerAuthAvailability = .available(.faceID)) {
-        currentAvailability = availability
-    }
-
-    func availability() -> DeviceOwnerAuthAvailability { currentAvailability }
-
-    func authenticate(reason: String) async -> DeviceOwnerAuthResult {
-        reasons.append(reason)
-        return await withCheckedContinuation {
-            reply = $0
-            requested.fulfill()
-        }
-    }
-
-    func answer(_ result: DeviceOwnerAuthResult) {
-        XCTAssertNotNil(reply, "No authentication is waiting for an answer")
-        reply?.resume(returning: result)
-        reply = nil
-    }
-
-    func cancel() { answer(.cancelled) }
 }
