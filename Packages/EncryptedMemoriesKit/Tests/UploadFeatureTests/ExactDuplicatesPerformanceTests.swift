@@ -110,19 +110,19 @@
                 let listBefore = list.contentView.bounds.origin.y
                 let rowBefore = row.contentView.bounds.origin
                 // A trackpad gesture: continuous events with a began, changed, and ended phase.
-                let phases: [NSEvent.Phase] = [.began, .changed, .changed, .changed, .changed, .ended]
-                for phase in phases {
-                    let event = try XCTUnwrap(
-                        CGEvent(
-                            scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
-                            wheel1: phase == .ended ? 0 : -40, wheel2: 0, wheel3: 0))
-                    event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-                    event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue))
-                    row.scrollWheel(with: try XCTUnwrap(NSEvent(cgEvent: event)))
+                var deliveredPhases: [NSEvent.Phase] = []
+                for phase in ExactDuplicateScrollTestSupport.phases {
+                    let event = try ExactDuplicateScrollTestSupport.event(
+                        deltaX: 0, deltaY: phase == .ended ? 0 : -40, phase: phase)
+                    deliveredPhases.append(event.phase)
+                    row.scrollWheel(with: event)
                     try await Task.sleep(for: .milliseconds(30))
                     XCTAssertEqual(
                         row.contentView.bounds.origin.y, rowBefore.y, "\(name): the row does not move up or down")
                 }
+                XCTAssertEqual(
+                    deliveredPhases, [.began, .changed, .changed, .changed, .changed, .ended],
+                    "\(name): the native gesture keeps every intended phase")
                 XCTAssertGreaterThan(list.contentView.bounds.origin.y, listBefore, "\(name): the list scrolls")
                 XCTAssertEqual(
                     row.contentView.bounds.origin.y, rowBefore.y, "\(name): the row does not move up or down")
