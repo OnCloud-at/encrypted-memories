@@ -139,6 +139,7 @@ final class MacAppProtection: NSObject {
         refreshing = true
         defer { refreshing = false }
         roots.removeAll { $0.window == nil }
+        suspending.formIntersection(roots.compactMap(\.window).map { ObjectIdentifier($0) })
         let foreground =
             !hiding && !NSApp.isHidden
             && roots.contains {

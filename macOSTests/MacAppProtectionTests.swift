@@ -21,10 +21,9 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let expectedCover = !fixture.activity.isActive
-        let settled = await fixture.waitForCover(visible: expectedCover)
+        let settled = await fixture.waitForCover(visible: false)
         XCTAssertTrue(settled)
-        XCTAssertEqual(fixture.presentation.snapshot, expectedCover)
+        XCTAssertFalse(fixture.presentation.snapshot)
         XCTAssertTrue(fixture.gate.admits(.app))
     }
 
@@ -41,7 +40,7 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let settled = await fixture.waitForCover(visible: !fixture.activity.isActive)
+        let settled = await fixture.waitForCover(visible: false)
         XCTAssertTrue(settled)
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidSleepNotification, object: nil)
         XCTAssertFalse(fixture.gate.admits(.app))
@@ -61,7 +60,7 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        _ = await fixture.waitForCover(visible: !fixture.activity.isActive)
+        _ = await fixture.waitForCover(visible: false)
         fixture.window.orderOut(nil)
         NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: fixture.window)
         XCTAssertTrue(fixture.window.childWindows?.contains { $0 is MacAppLockPanel } == true)
@@ -74,7 +73,7 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        _ = await fixture.waitForCover(visible: !fixture.activity.isActive)
+        _ = await fixture.waitForCover(visible: false)
         NotificationCenter.default.post(name: NSWindow.willMiniaturizeNotification, object: fixture.window)
         XCTAssertNotNil(fixture.cover, "The cover must precede the minimized Dock snapshot")
         XCTAssertTrue(fixture.window.childWindows?.contains { $0 is MacAppLockPanel } == true)
@@ -180,6 +179,56 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertFalse(fixture.presentation.snapshot)
     }
 
+    func testTheDefaultActivityQueryUsesTheApplicationActivity() async throws {
+        let fixture = try Fixture(useSystemActivity: true)
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
+        XCTAssertEqual(fixture.presentation.snapshot, !NSApp.isActive)
+    }
+
+    func testClosingAChildKeepsItsSuspendedRootCovered() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        fixture.controller.prepareToHide(window: fixture.window)
+        let child = NSWindow(
+            contentRect: CGRect(x: -10_000, y: -10_000, width: 80, height: 80),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        child.isReleasedWhenClosed = false
+        fixture.window.addChildWindow(child, ordered: .above)
+        child.close()
+        XCTAssertTrue(fixture.presentation.snapshot)
+        XCTAssertNotNil(fixture.cover)
+        XCTAssertTrue(fixture.window.childWindows?.contains { $0 is MacAppLockPanel } == true)
+        fixture.window.removeChildWindow(child)
+    }
+
+    func testRefreshPrunesSuspensionEntriesOfDeallocatedRoots() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.setEnabled(false, for: .app, reason: "Confirm")
+        weak var released: NSWindow?
+        var identifier: ObjectIdentifier?
+        autoreleasepool {
+            let window = NSWindow(
+                contentRect: .init(x: -10_000, y: -10_000, width: 80, height: 80),
+                styleMask: [.borderless], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            released = window
+            identifier = ObjectIdentifier(window)
+            fixture.controller.register(window: window)
+            fixture.controller.prepareToHide(window: window)
+            window.close()
+        }
+        XCTAssertNil(released, "The root must deallocate for the lifetime control to be valid")
+        fixture.controller.register(window: fixture.window)
+        let entries = try XCTUnwrap(
+            Mirror(reflecting: fixture.controller).children.first { $0.label == "suspending" }?.value
+                as? Set<ObjectIdentifier>)
+        XCTAssertFalse(entries.contains(try XCTUnwrap(identifier)), "Refresh must release stale suspension identities")
+    }
+
     func testSnapshotDrawsInsideTheSourceBeforeMiniaturization() async throws {
         let fixture = try Fixture()
         defer { fixture.close() }
@@ -204,14 +253,18 @@ private final class Fixture {
 
     var cover: NSPanel? { window.childWindows?.compactMap { $0 as? NSPanel }.first { $0.isVisible } }
 
-    init(active: Bool = true) throws {
+    init(active: Bool = true, useSystemActivity: Bool = false) throws {
         _ = NSApplication.shared
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
         gate = AccessGate(authenticator: Owner(), defaults: defaults)
         activity = Activity(active: active)
         let activity = activity
-        controller = MacAppProtection(gate: gate, applicationIsActive: { activity.isActive })
+        if useSystemActivity {
+            controller = MacAppProtection(gate: gate)
+        } else {
+            controller = MacAppProtection(gate: gate, applicationIsActive: { activity.isActive })
+        }
         presentation = ProtectedScopePresentation(gate: gate)
         window = NSWindow(
             contentRect: CGRect(x: -10_000, y: -10_000, width: 320, height: 240),
