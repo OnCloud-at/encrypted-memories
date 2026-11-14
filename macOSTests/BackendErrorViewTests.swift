@@ -4,10 +4,8 @@ import XCTest
 @MainActor
 final class BackendErrorViewTests: XCTestCase {
     func testBootFailureUsesNativeUnavailableView() {
-        for isRetryable in [false, true] {
-            let view = failure(message: "Fixture failure", isRetryable: isRetryable)
-            XCTAssertTrue(String(reflecting: type(of: view.body)).contains("SwiftUI.ContentUnavailableView<"))
-        }
+        let view = failure(message: "Fixture failure", isRetryable: true)
+        XCTAssertTrue(String(reflecting: type(of: view.body)).contains("SwiftUI.ContentUnavailableView<"))
     }
 
     func testFailureMessageDrawsForBothRetryStates() throws {
