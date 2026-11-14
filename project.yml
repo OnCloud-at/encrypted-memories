@@ -46,8 +46,14 @@ targets:
     type: bundle.unit-test
     platform: macOS
     deploymentTarget: "26.0"
-    sources: [App/Offline/OfflineLibraryManager.swift, macOSTests/ThumbnailSupportHostTests.swift]
+    sources:
+      - App/Offline/OfflineLibraryManager.swift
+      - App/Views/BackendErrorView.swift
+      - macOSTests/ThumbnailSupportHostTests.swift
+      - macOSTests/BackendErrorViewTests.swift
+      - Packages/EncryptedMemoriesKit/Tests/DesignSystemCoreTests/RenderedInk.swift
     dependencies:
+      - {package: EncryptedMemoriesKit, product: DesignSystemCore}
       - {package: EncryptedMemoriesKit, product: MapFeature}
       - {package: EncryptedMemoriesKit, product: MediaByteCache}
       - {package: EncryptedMemoriesKit, product: MediaCache}
