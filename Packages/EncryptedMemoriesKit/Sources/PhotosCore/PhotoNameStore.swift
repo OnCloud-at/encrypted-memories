@@ -125,7 +125,7 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
                 else { return .failed }
                 sealed.append((uid, combined))
             }
-            let written = transaction(db) {
+            let written = SQLiteTransaction.immediate(db) {
                 var stmt: OpaquePointer?
                 guard
                     sqlite3_prepare_v2(
@@ -157,7 +157,7 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
         guard !uids.isEmpty else { return true }
         return lock.withLock {
             guard let db else { return false }
-            let removed = transaction(db) { deleteRows(db, uids) }
+            let removed = SQLiteTransaction.immediate(db) { deleteRows(db, uids) }
             guard removed else { return false }
             revision &+= 1
             forgetCount &+= 1
@@ -198,7 +198,7 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
                 }
             }
             sqlite3_finalize(stmt)
-            if !unreadable.isEmpty, transaction(db, { deleteRows(db, unreadable) }) {
+            if !unreadable.isEmpty, SQLiteTransaction.immediate(db, { deleteRows(db, unreadable) }) {
                 PhotoDiagnostics.shared.increment("photoNames.unreadableRowRemoved", by: unreadable.count)
             }
             let index = PhotoNameIndex(normalizedNames: names, revision: revision)
@@ -238,15 +238,6 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
                 SQLiteBinding.text(stmt, 2, uid.nodeID) == SQLITE_OK,
                 sqlite3_step(stmt) == SQLITE_DONE
             else { return false }
-        }
-        return true
-    }
-
-    private func transaction(_ db: OpaquePointer, _ body: () -> Bool) -> Bool {
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-        guard body(), sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return false
         }
         return true
     }

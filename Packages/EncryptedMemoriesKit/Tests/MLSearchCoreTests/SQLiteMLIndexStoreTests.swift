@@ -456,6 +456,44 @@ struct TestMLVectorCipher: MLVectorCipher {
         #expect(!store.removeAll(for: descriptorV1))
     }
 
+    /// A batch whose generation bump fails after the loop stores nothing. Every record that the loop did not reject
+    /// then counts as a transient failure; the record with the wrong dimension, rejected in the loop before the
+    /// failure, stays a permanent failure.
+    @Test func aFailedUpsertTransactionStoresNothingAndReportsEveryConsistentRecordAsTransient() throws {
+        try withStore { store, url in
+            var handle: OpaquePointer?
+            #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+            #expect(
+                sqlite3_exec(
+                    handle,
+                    """
+                    CREATE TRIGGER reject_generation_insert BEFORE INSERT ON ml_epoch_state
+                    BEGIN
+                      SELECT RAISE(ABORT, 'injected generation failure');
+                    END;
+                    CREATE TRIGGER reject_generation_update BEFORE UPDATE ON ml_epoch_state
+                    BEGIN
+                      SELECT RAISE(ABORT, 'injected generation failure');
+                    END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            sqlite3_close(handle)
+
+            let report = store.upsert([
+                record("a", descriptorV1, [1, 0, 0, 0]),
+                record("b", descriptorV1, [0, 1, 0, 0]),
+                record("wrong-dimension", descriptorV1, [1, 0]),
+            ])
+
+            #expect(report.total == 3)
+            #expect(report.indexed == 0)
+            #expect(report.skippedAlreadyIndexed == 0)
+            #expect(report.permanentFailure == 1)
+            #expect(report.transientFailure == 2)
+            let storedA = try store.contains(uid: uid("a"), descriptor: descriptorV1)
+            #expect(!storedA, "the failed transaction stored nothing")
+        }
+    }
+
     @Test func removeAllRollsBackEmbeddingsFailuresAndGenerationTogether() throws {
         let url = makeTempURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

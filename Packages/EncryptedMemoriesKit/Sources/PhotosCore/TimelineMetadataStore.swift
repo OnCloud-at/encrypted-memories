@@ -540,7 +540,7 @@ public final class TimelineMetadataStore {
             case .preserve:
                 tokenWriteSucceeded = true
             case .replace(let token):
-                tokenWriteSucceeded = updateValidationTokenInTransaction(token)
+                tokenWriteSucceeded = SQLiteTransaction.immediate(db) { writeValidationToken(token) }
             }
             PhotoDiagnostics.shared.recordDBQuery(
                 queryName: tokenWriteSucceeded
@@ -561,9 +561,7 @@ public final class TimelineMetadataStore {
         let newGeneration = generation + 1
         // The anti-join sweep reads from a connection-scoped scratch key set; make sure it exists
         // before opening the write transaction (its DDL lives in the TEMP store, off the WAL).
-        guard ensureIncomingKeyTable(),
-            sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
-        else {
+        guard ensureIncomingKeyTable() else {
             return TimelineSaveResult(
                 skippedUnchanged: false, generation: generation, upsertedRows: 0, sweptRows: 0, succeeded: false
             )
@@ -571,7 +569,10 @@ public final class TimelineMetadataStore {
 
         var upserted = 0
         var swept = 0
-        let ok: Bool = {
+        // Only a transaction that began and then failed records the rolled-back save.
+        var began = false
+        let committed = SQLiteTransaction.immediate(db) {
+            began = true
             // Record every incoming key, then upsert only the rows whose persisted content actually
             // changed (unchanged rows write nothing - no page churn, no WAL frames).
             guard sqlite3_exec(db, "DELETE FROM \(Self.incomingKeyTable);", nil, nil, nil) == SQLITE_OK,
@@ -594,15 +595,16 @@ public final class TimelineMetadataStore {
                 applyValidationTokenUpdate(validationTokenUpdate)
             else { return false }
             return true
-        }()
+        }
 
-        guard ok, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            PhotoDiagnostics.shared.recordDBQuery(
-                queryName: "timeline.save.failedRolledBack",
-                durationMs: Date().timeIntervalSince(start) * 1000,
-                rowsReturned: 0
-            )
+        guard committed else {
+            if began {
+                PhotoDiagnostics.shared.recordDBQuery(
+                    queryName: "timeline.save.failedRolledBack",
+                    durationMs: Date().timeIntervalSince(start) * 1000,
+                    rowsReturned: 0
+                )
+            }
             return TimelineSaveResult(
                 skippedUnchanged: false, generation: generation, upsertedRows: 0, sweptRows: 0, succeeded: false
             )
@@ -631,16 +633,6 @@ public final class TimelineMetadataStore {
             durationMs: Date().timeIntervalSince(start) * 1000,
             rowsReturned: rowWrites
         )
-    }
-
-    private func updateValidationTokenInTransaction(_ token: String?) -> Bool {
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-        let ok = writeValidationToken(token)
-        guard ok, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return false
-        }
-        return true
     }
 
     private func applyValidationTokenUpdate(_ update: ValidationTokenUpdate) -> Bool {
@@ -921,16 +913,9 @@ public final class TimelineMetadataStore {
     /// the end rather than jump on every 150-link batch.
     @discardableResult
     public func publishMediaTypeEvidenceRevision() -> Bool {
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-        let wrote = writeMeta(
-            Self.metaMediaTypeEvidenceRevisionKey,
-            String(mediaTypeEvidenceRevision() + 1)
-        )
-        guard wrote, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return false
+        SQLiteTransaction.immediate(db) {
+            writeMeta(Self.metaMediaTypeEvidenceRevisionKey, String(mediaTypeEvidenceRevision() + 1))
         }
-        return true
     }
 
     /// Persists authoritative image/video MIME types and immediately repairs matching hot timeline
@@ -950,10 +935,6 @@ public final class TimelineMetadataStore {
         guard !classified.isEmpty else {
             return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: true)
         }
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
-            return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false)
-        }
-
         var evidenceStmt: OpaquePointer?
         var photoStmt: OpaquePointer?
         var insertVideoTagStmt: OpaquePointer?
@@ -966,75 +947,66 @@ public final class TimelineMetadataStore {
         let photoSQL = "UPDATE photos SET mime=? WHERE vol=? AND node=? AND mime IS NOT ?;"
         let insertTagSQL = "INSERT OR IGNORE INTO photo_tags(vol,node,tag) VALUES(?,?,?);"
         let deleteTagSQL = "DELETE FROM photo_tags WHERE vol=? AND node=? AND tag=?;"
-        guard sqlite3_prepare_v2(db, evidenceSQL, -1, &evidenceStmt, nil) == SQLITE_OK,
-            sqlite3_prepare_v2(db, photoSQL, -1, &photoStmt, nil) == SQLITE_OK,
-            sqlite3_prepare_v2(db, insertTagSQL, -1, &insertVideoTagStmt, nil) == SQLITE_OK,
-            sqlite3_prepare_v2(db, deleteTagSQL, -1, &deleteVideoTagStmt, nil) == SQLITE_OK
-        else {
-            sqlite3_finalize(evidenceStmt)
-            sqlite3_finalize(photoStmt)
-            sqlite3_finalize(insertVideoTagStmt)
-            sqlite3_finalize(deleteVideoTagStmt)
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false)
-        }
+        // The statements end after the transaction. After a failed prepare they end after the rollback; they had not
+        // run. A statement that did not prepare finalizes as a no-op.
         defer {
             sqlite3_finalize(evidenceStmt)
             sqlite3_finalize(photoStmt)
             sqlite3_finalize(insertVideoTagStmt)
             sqlite3_finalize(deleteVideoTagStmt)
         }
-
         var changedEvidenceRows = 0
-        var presentationChanged = false
-        for (uid, mime) in classified {
-            sqlite3_reset(evidenceStmt)
-            sqlite3_clear_bindings(evidenceStmt)
-            sqlite3_bind_text(evidenceStmt, 1, uid.volumeID, -1, transient)
-            sqlite3_bind_text(evidenceStmt, 2, uid.nodeID, -1, transient)
-            sqlite3_bind_text(evidenceStmt, 3, mime, -1, transient)
-            guard sqlite3_step(evidenceStmt) == SQLITE_DONE else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false)
-            }
-            changedEvidenceRows += Int(sqlite3_changes(db))
+        let committed = SQLiteTransaction.immediate(db) {
+            guard sqlite3_prepare_v2(db, evidenceSQL, -1, &evidenceStmt, nil) == SQLITE_OK,
+                sqlite3_prepare_v2(db, photoSQL, -1, &photoStmt, nil) == SQLITE_OK,
+                sqlite3_prepare_v2(db, insertTagSQL, -1, &insertVideoTagStmt, nil) == SQLITE_OK,
+                sqlite3_prepare_v2(db, deleteTagSQL, -1, &deleteVideoTagStmt, nil) == SQLITE_OK
+            else { return false }
 
-            sqlite3_reset(photoStmt)
-            sqlite3_clear_bindings(photoStmt)
-            sqlite3_bind_text(photoStmt, 1, mime, -1, transient)
-            sqlite3_bind_text(photoStmt, 2, uid.volumeID, -1, transient)
-            sqlite3_bind_text(photoStmt, 3, uid.nodeID, -1, transient)
-            sqlite3_bind_text(photoStmt, 4, mime, -1, transient)
-            guard sqlite3_step(photoStmt) == SQLITE_DONE else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false)
-            }
-            presentationChanged = presentationChanged || sqlite3_changes(db) > 0
+            var presentationChanged = false
+            for (uid, mime) in classified {
+                sqlite3_reset(evidenceStmt)
+                sqlite3_clear_bindings(evidenceStmt)
+                sqlite3_bind_text(evidenceStmt, 1, uid.volumeID, -1, transient)
+                sqlite3_bind_text(evidenceStmt, 2, uid.nodeID, -1, transient)
+                sqlite3_bind_text(evidenceStmt, 3, mime, -1, transient)
+                guard sqlite3_step(evidenceStmt) == SQLITE_DONE else {
+                    return false
+                }
+                changedEvidenceRows += Int(sqlite3_changes(db))
 
-            let tagStmt = mime.hasPrefix("video/") ? insertVideoTagStmt : deleteVideoTagStmt
-            sqlite3_reset(tagStmt)
-            sqlite3_clear_bindings(tagStmt)
-            sqlite3_bind_text(tagStmt, 1, uid.volumeID, -1, transient)
-            sqlite3_bind_text(tagStmt, 2, uid.nodeID, -1, transient)
-            sqlite3_bind_int(tagStmt, 3, Int32(PhotoTag.videos.rawValue))
-            guard sqlite3_step(tagStmt) == SQLITE_DONE else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false)
-            }
-            presentationChanged = presentationChanged || sqlite3_changes(db) > 0
-        }
+                sqlite3_reset(photoStmt)
+                sqlite3_clear_bindings(photoStmt)
+                sqlite3_bind_text(photoStmt, 1, mime, -1, transient)
+                sqlite3_bind_text(photoStmt, 2, uid.volumeID, -1, transient)
+                sqlite3_bind_text(photoStmt, 3, uid.nodeID, -1, transient)
+                sqlite3_bind_text(photoStmt, 4, mime, -1, transient)
+                guard sqlite3_step(photoStmt) == SQLITE_DONE else {
+                    return false
+                }
+                presentationChanged = presentationChanged || sqlite3_changes(db) > 0
 
-        if publishRevision && (changedEvidenceRows > 0 || presentationChanged) {
-            let revision = mediaTypeEvidenceRevision() + 1
-            guard writeMeta(Self.metaMediaTypeEvidenceRevisionKey, String(revision)) else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false)
+                let tagStmt = mime.hasPrefix("video/") ? insertVideoTagStmt : deleteVideoTagStmt
+                sqlite3_reset(tagStmt)
+                sqlite3_clear_bindings(tagStmt)
+                sqlite3_bind_text(tagStmt, 1, uid.volumeID, -1, transient)
+                sqlite3_bind_text(tagStmt, 2, uid.nodeID, -1, transient)
+                sqlite3_bind_int(tagStmt, 3, Int32(PhotoTag.videos.rawValue))
+                guard sqlite3_step(tagStmt) == SQLITE_DONE else {
+                    return false
+                }
+                presentationChanged = presentationChanged || sqlite3_changes(db) > 0
             }
+
+            if publishRevision && (changedEvidenceRows > 0 || presentationChanged) {
+                let revision = mediaTypeEvidenceRevision() + 1
+                guard writeMeta(Self.metaMediaTypeEvidenceRevisionKey, String(revision)) else {
+                    return false
+                }
+            }
+            return true
         }
-        guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false)
-        }
+        guard committed else { return TimelineMediaTypeEvidenceUpdateResult(changedRows: 0, succeeded: false) }
         return TimelineMediaTypeEvidenceUpdateResult(changedRows: changedEvidenceRows, succeeded: true)
     }
 
@@ -1048,34 +1020,25 @@ public final class TimelineMetadataStore {
         let valid = batch.filter { $0.value.isFinite && $0.value > 0 }
         guard !valid.isEmpty else { return TimelineDurationUpdateResult(updatedRows: 0, succeeded: true) }
         let start = Date()
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
-            return TimelineDurationUpdateResult(updatedRows: 0, succeeded: false)
-        }
         let sql = "UPDATE photos SET dur=?1 WHERE vol=?2 AND node=?3 AND dur IS NOT ?1;"
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return TimelineDurationUpdateResult(updatedRows: 0, succeeded: false)
-        }
+        // The statement ends after the transaction; one that did not prepare finalizes as a no-op.
         defer { sqlite3_finalize(stmt) }
-
         var updated = 0
-        for (uid, duration) in valid {
-            sqlite3_reset(stmt)
-            sqlite3_clear_bindings(stmt)
-            sqlite3_bind_double(stmt, 1, duration)
-            sqlite3_bind_text(stmt, 2, uid.volumeID, -1, transient)
-            sqlite3_bind_text(stmt, 3, uid.nodeID, -1, transient)
-            guard sqlite3_step(stmt) == SQLITE_DONE else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return TimelineDurationUpdateResult(updatedRows: 0, succeeded: false)
+        let committed = SQLiteTransaction.immediate(db) {
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+            for (uid, duration) in valid {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                sqlite3_bind_double(stmt, 1, duration)
+                sqlite3_bind_text(stmt, 2, uid.volumeID, -1, transient)
+                sqlite3_bind_text(stmt, 3, uid.nodeID, -1, transient)
+                guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+                updated += Int(sqlite3_changes(db))
             }
-            updated += Int(sqlite3_changes(db))
+            return true
         }
-        guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return TimelineDurationUpdateResult(updatedRows: 0, succeeded: false)
-        }
+        guard committed else { return TimelineDurationUpdateResult(updatedRows: 0, succeeded: false) }
         PhotoDiagnostics.shared.recordDBQuery(
             queryName: "timeline.durations.update",
             durationMs: Date().timeIntervalSince(start) * 1000,
@@ -1151,13 +1114,12 @@ public final class TimelineMetadataStore {
     @discardableResult
     public func remove(_ uids: [PhotoUID]) -> Bool {
         guard !uids.isEmpty else { return true }
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
         let statements = [
             "DELETE FROM photos WHERE vol=? AND node=?;",
             "DELETE FROM photo_tags WHERE vol=? AND node=?;",
             "DELETE FROM burst_members WHERE anchor_vol=? AND anchor_node=?;",
         ]
-        let ok: Bool = {
+        return SQLiteTransaction.immediate(db) {
             for sql in statements {
                 var stmt: OpaquePointer?
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
@@ -1170,12 +1132,7 @@ public final class TimelineMetadataStore {
                 }
             }
             return deleteMeta(Self.metaDigestKey)
-        }()
-        guard ok, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return false
         }
-        return true
     }
 
     // MARK: Digest

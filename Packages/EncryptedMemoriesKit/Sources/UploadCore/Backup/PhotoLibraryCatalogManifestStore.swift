@@ -212,7 +212,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                 return false
             }
             defer { sqlite3_finalize(stmt) }
-            return immediateTransaction {
+            return connection.immediateTransaction {
                 for entry in entries {
                     sqlite3_reset(stmt)
                     sqlite3_clear_bindings(stmt)
@@ -249,7 +249,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
             }
             defer { sqlite3_finalize(stmt) }
             var changed = 0
-            let committed = immediateTransaction {
+            let committed = connection.immediateTransaction {
                 for id in present {
                     sqlite3_reset(stmt)
                     sqlite3_clear_bindings(stmt)
@@ -376,7 +376,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     @discardableResult
     public func markLateRendersReconciled() -> Bool {
         connection.withLock {
-            immediateTransaction {
+            connection.immediateTransaction {
                 writeInfoValue64(Self.reconciledLateRendersKey, 1)
                     && deleteInfoValue(Self.lateRenderSweepResumePointKey)
             }
@@ -406,7 +406,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     public func recordMissingSourceSweepProgress(_ progress: PhotoLibraryMissingSourceSweepProgress) -> Bool {
         connection.withLock {
-            immediateTransaction {
+            connection.immediateTransaction {
                 let cursorSaved: Bool
                 if let cursor = progress.afterLocalIdentifier {
                     cursorSaved = writeInfoText(Self.missingSourceSweepResumePointKey, cursor)
@@ -420,7 +420,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
 
     public func completeMissingSourceSweep(generation: Int64) -> Bool {
         connection.withLock {
-            immediateTransaction {
+            connection.immediateTransaction {
                 writeInfoValue64(Self.reconciledMissingSourceGenerationKey, generation)
                     && deleteInfoValue(Self.missingSourceSweepGenerationKey)
                     && deleteInfoValue(Self.missingSourceSweepResumePointKey)
@@ -443,7 +443,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     @discardableResult
     public func recordFullScanProgress(_ progress: PhotoLibraryFullScanProgress) -> Bool {
         connection.withLock {
-            immediateTransaction {
+            connection.immediateTransaction {
                 writeInfoValue64(
                     Self.fullScanEpochStartKey,
                     Int64(bitPattern: progress.epochStart.timeIntervalSince1970.bitPattern)
@@ -457,13 +457,15 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     @discardableResult
     public func completeFullScan() -> Bool {
         connection.withLock {
-            immediateTransaction { writeInfoValue64(Self.completedFullScanKey, 1) && clearFullScanResumePointLocked() }
+            connection.immediateTransaction {
+                writeInfoValue64(Self.completedFullScanKey, 1) && clearFullScanResumePointLocked()
+            }
         }
     }
 
     @discardableResult
     public func clearFullScanResumePoint() -> Bool {
-        connection.withLock { immediateTransaction { clearFullScanResumePointLocked() } }
+        connection.withLock { connection.immediateTransaction { clearFullScanResumePointLocked() } }
     }
 
     /// Clears the in-progress epoch and its snapshot, inside the caller's transaction. Only `completeFullScan` also
@@ -480,7 +482,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     @discardableResult
     public func beginFullScanSnapshot(epochStart: Date) -> Bool {
         connection.withLock {
-            immediateTransaction {
+            connection.immediateTransaction {
                 requireOperational(
                     sqlite3_exec(db, "DELETE FROM photo_full_scan_snapshot;", nil, nil, nil) == SQLITE_OK
                 )
@@ -512,7 +514,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
                     ) == SQLITE_OK)
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            return immediateTransaction {
+            return connection.immediateTransaction {
                 for identifier in present {
                     sqlite3_reset(stmt)
                     sqlite3_clear_bindings(stmt)
@@ -530,7 +532,7 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
     @discardableResult
     public func finishFullScanSnapshot() -> Bool {
         connection.withLock {
-            immediateTransaction {
+            connection.immediateTransaction {
                 writeInfoValue64(Self.fullScanCursorKey, 0)
                     && writeInfoValue64(Self.fullScanSnapshotReadyKey, 1)
             }
@@ -769,17 +771,6 @@ public final class PhotoLibraryCatalogManifestStore: PhotoLibraryCatalogStore, @
         if result == SQLITE_DONE { return nil }
         guard requireOperational(result == SQLITE_ROW) else { throw SQLiteStoreUnknownReadError() }
         return sqlite3_column_int64(stmt, 0)
-    }
-
-    /// Runs `body` in one `BEGIN IMMEDIATE` transaction, under the connection lock that the caller holds. A body that
-    /// returns false, or a commit that fails, rolls the transaction back. Each step records its failure as before.
-    private func immediateTransaction(_ body: () -> Bool) -> Bool {
-        guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else { return false }
-        guard body(), requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-            connection.rollBack()
-            return false
-        }
-        return true
     }
 
     /// Markers whose unknown value only causes more work (a rescan or a sweep from the start) read nil on failure.

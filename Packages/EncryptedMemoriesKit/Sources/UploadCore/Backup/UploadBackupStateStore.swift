@@ -200,26 +200,19 @@ public final class UploadBackupStateManifestStore: UploadBackupStateStore, @unch
         guard !records.isEmpty else { return true }
         return connection.withLock {
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK,
-                sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
-            else {
+            guard sqlite3_prepare_v2(db, Self.upsertSQL, -1, &stmt, nil) == SQLITE_OK else {
                 sqlite3_finalize(stmt)
                 return false
             }
             defer { sqlite3_finalize(stmt) }
-            for record in records {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                guard (try? bind(record, to: stmt)) != nil, sqlite3_step(stmt) == SQLITE_DONE else {
-                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    return false
+            return SQLiteTransaction.immediate(db) {
+                for record in records {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    guard (try? bind(record, to: stmt)) != nil, sqlite3_step(stmt) == SQLITE_DONE else { return false }
                 }
+                return true
             }
-            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
         }
     }
 

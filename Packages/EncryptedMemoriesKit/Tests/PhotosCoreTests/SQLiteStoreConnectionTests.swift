@@ -437,6 +437,54 @@ final class SQLiteStoreConnectionTests: XCTestCase {
         connection.withLock { XCTAssertFalse(connection.operationFailed) }
     }
 
+    func testATransactionThatCannotBeginRunsNoBodyAndWritesNothing() throws {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(sqlite3_exec(handle, "CREATE TABLE t(v INTEGER);", nil, nil, nil), SQLITE_OK)
+        // An open transaction on the same handle makes BEGIN IMMEDIATE fail.
+        XCTAssertEqual(sqlite3_exec(handle, "BEGIN;", nil, nil, nil), SQLITE_OK)
+        var ranBody = false
+        let committed = SQLiteTransaction.immediate(handle) {
+            ranBody = true
+            return sqlite3_exec(handle, "INSERT INTO t VALUES(1);", nil, nil, nil) == SQLITE_OK
+        }
+        XCTAssertFalse(committed)
+        XCTAssertFalse(ranBody, "a transaction that cannot begin runs no body")
+        XCTAssertEqual(
+            sqlite3_exec(handle, "ROLLBACK;", nil, nil, nil), SQLITE_OK, "the open transaction stays the caller's")
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM t;", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 0, "nothing was written")
+    }
+
+    func testATransactionWhoseCommitFailsReportsFailureAndRollsBack() throws {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                """
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                """, nil, nil, nil), SQLITE_OK)
+        // A deferred foreign key is checked at COMMIT, so the body succeeds and the commit fails.
+        let committed = SQLiteTransaction.immediate(handle) {
+            sqlite3_exec(handle, "INSERT INTO child VALUES(1);", nil, nil, nil) == SQLITE_OK
+        }
+        XCTAssertFalse(committed, "a failed commit is no success")
+        XCTAssertEqual(sqlite3_get_autocommit(handle), 1, "the failed transaction is rolled back")
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM child;", -1, &statement, nil), SQLITE_OK)
+        defer { sqlite3_finalize(statement) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(statement, 0), 0, "nothing was written")
+    }
+
     private func makeConnection() throws -> SQLiteStoreConnection {
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open(":memory:", &handle), SQLITE_OK)

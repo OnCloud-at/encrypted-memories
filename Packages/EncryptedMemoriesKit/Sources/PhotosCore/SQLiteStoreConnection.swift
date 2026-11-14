@@ -22,6 +22,21 @@ public enum SQLiteBinding {
     }
 }
 
+/// The `BEGIN IMMEDIATE` transaction frame for the SQLite stores that record no failure on their handle.
+/// `SQLiteStoreConnection.immediateTransaction` is the frame for the stores that record their failures.
+public enum SQLiteTransaction {
+    /// Runs `body` in one `BEGIN IMMEDIATE` transaction on `db`. A transaction that cannot begin runs no body. A body
+    /// that returns false, or a commit that fails, rolls the transaction back. Returns true only after a commit.
+    public static func immediate(_ db: OpaquePointer?, _ body: () -> Bool) -> Bool {
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
+        guard body(), sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            return false
+        }
+        return true
+    }
+}
+
 /// Owns an already-verified store handle. Opening and connection tuning stay in SQLiteStoreSchemaGate.
 /// Access the handle and failure state only inside `withLock`. Finalize each statement before that closure returns.
 /// `close` and `isOperational` take the same nonrecursive lock; do not call them inside `withLock`.
@@ -201,6 +216,21 @@ public final class SQLiteStoreConnection: @unchecked Sendable {
             }
             return true
         }
+    }
+
+    /// Call inside `withLock`. Runs `body` in one `BEGIN IMMEDIATE` transaction. A transaction that cannot begin runs
+    /// no body. A body that returns false, or a commit that fails, rolls the transaction back (`rollBack`). A failed
+    /// begin or commit is recorded with its extended code. Returns true only after a commit.
+    public func immediateTransaction(_ body: () -> Bool) -> Bool {
+        let began = sqlite3_exec(database, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
+        guard requireOperationalRecordingSQLiteError(began) else { return false }
+        guard body(),
+            requireOperationalRecordingSQLiteError(sqlite3_exec(database, "COMMIT;", nil, nil, nil) == SQLITE_OK)
+        else {
+            rollBack()
+            return false
+        }
+        return true
     }
 
     public func close() {
