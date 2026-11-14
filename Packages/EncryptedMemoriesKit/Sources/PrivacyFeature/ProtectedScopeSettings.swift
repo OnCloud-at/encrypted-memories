@@ -13,7 +13,10 @@ public final class ProtectedScopeSettings {
     private let reason: String
     public private(set) var isChanging = false
 
-    public init(gate: AccessGate, scope: ProtectedScope, reason: String) {
+    public init(
+        gate: AccessGate, scope: ProtectedScope,
+        reason: String = L10n.string("settings.privacy_app_lock_change_reason")
+    ) {
         self.gate = gate
         self.scope = scope
         self.reason = reason

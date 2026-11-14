@@ -7,6 +7,26 @@ import XCTest
 /// *translations that ship*, not whatever language the test process happens to run in. The runtime
 /// checks additionally prove the package bundle advertises both languages and falls back to English.
 final class LocalizationTests: XCTestCase {
+    func testAppLockCopyResolvesInEnglishAndGerman() throws {
+        let copy = [
+            (
+                "settings.privacy_app_lock_footer", "Backup continues while the app is locked.",
+                "Das Backup läuft weiter, während die App gesperrt ist."
+            ),
+            ("settings.privacy_app_lock_change_reason", "Confirm this change.", "Bestätige diese Änderung."),
+            ("settings.privacy_app_lock_after", "Lock After", "Sperren nach"),
+        ]
+        for (language, index) in [("en", 1), ("de", 2)] {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            for (key, english, german) in copy {
+                XCTAssertEqual(
+                    bundle.localizedString(forKey: key, value: nil, table: nil), index == 1 ? english : german,
+                    "\(language): \(key)")
+            }
+        }
+    }
+
     private var repoRoot: URL {
         var url = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { url.deleteLastPathComponent() }

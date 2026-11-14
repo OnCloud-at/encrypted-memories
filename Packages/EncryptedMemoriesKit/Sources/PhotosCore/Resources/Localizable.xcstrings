@@ -6048,6 +6048,57 @@
         "de": { "stringUnit": { "state": "translated", "value": "Ausgeschaltet kontaktieren Karten und Ortsnamen Apple nicht mehr. Koordinaten bleiben verschlüsselt auf diesem Gerät." } }
       }
     },
+    "settings.privacy_app_lock_after": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lock After"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sperren nach"
+          }
+        }
+      }
+    },
+    "settings.privacy_app_lock_change_reason": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Confirm this change."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bestätige diese Änderung."
+          }
+        }
+      }
+    },
+    "settings.privacy_app_lock_footer": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup continues while the app is locked."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Backup läuft weiter, während die App gesperrt ist."
+          }
+        }
+      }
+    },
     "settings.privacy_blur_preview": {
       "extractionState": "manual",
       "localizations": {

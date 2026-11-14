@@ -43,6 +43,20 @@ final class ProtectedScopeSettingsTests: XCTestCase {
         await assertSwitchResult(initial: false, result: .cancelled, expected: false)
     }
 
+    func testSettingsChangesUseTheLocalizedConfirmationReason() async {
+        let owner = PendingDeviceOwner()
+        let gate = AccessGate(authenticator: owner, defaults: defaults)
+        let settings = ProtectedScopeSettings(gate: gate, scope: .app)
+        settings.enabled.wrappedValue = true
+        await fulfillment(of: [owner.requested], timeout: 5)
+        XCTAssertEqual(owner.reasons.count, 1)
+        XCTAssertTrue(
+            ["Confirm this change.", "Bestätige diese Änderung."].contains(owner.reasons.first ?? ""),
+            "The system prompt must describe confirming the settings change in the app's language")
+        await answer(.cancelled, owner: owner, settings: settings)
+        XCTAssertFalse(settings.enabled.wrappedValue)
+    }
+
     func testFailingEnableLeavesTheSwitchOff() async {
         await assertSwitchResult(initial: false, result: .failed, expected: false)
     }
