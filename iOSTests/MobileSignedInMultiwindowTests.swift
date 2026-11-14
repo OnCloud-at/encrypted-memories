@@ -449,15 +449,7 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
     }
 
     @MainActor private func barButtonItem(labelled label: String, in window: UIWindow) -> UIBarButtonItem? {
-        for bar in descendants(window).compactMap({ $0 as? UINavigationBar }) {
-            for navigationItem in bar.items ?? [] {
-                var items = (navigationItem.leftBarButtonItems ?? []) + (navigationItem.rightBarButtonItems ?? [])
-                items += navigationItem.leadingItemGroups.flatMap(\.barButtonItems)
-                items += navigationItem.centerItemGroups.flatMap(\.barButtonItems)
-                items += navigationItem.trailingItemGroups.flatMap(\.barButtonItems)
-                for item in items where matches(item, label: label) { return item }
-            }
-        }
+        for item in navigationBarItems(in: window) where matches(item, label: label) { return item }
         for toolbar in descendants(window).compactMap({ $0 as? UIToolbar }) {
             for item in toolbar.items ?? [] where matches(item, label: label) { return item }
         }
@@ -497,19 +489,12 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
 
     @MainActor private func hierarchyDiagnostics(in window: UIWindow) -> String {
         var lines: [String] = ["voiceOver=\(UIAccessibility.isVoiceOverRunning)"]
-        for bar in descendants(window).compactMap({ $0 as? UINavigationBar }) {
-            for navigationItem in bar.items ?? [] {
-                let items =
-                    (navigationItem.leftBarButtonItems ?? []) + (navigationItem.rightBarButtonItems ?? [])
-                    + navigationItem.trailingItemGroups.flatMap(\.barButtonItems)
-                for item in items {
-                    let custom = item.customView.map { String(describing: type(of: $0)) } ?? "-"
-                    let count = item.customView?.accessibilityElements?.count ?? -1
-                    lines.append(
-                        "bar item title=\(item.title ?? "-") a11y=\(item.accessibilityLabel ?? "-") custom=\(custom) a11yElements=\(count) action=\(item.action.map(String.init(describing:)) ?? "-")"
-                    )
-                }
-            }
+        for item in navigationBarItems(in: window) {
+            let custom = item.customView.map { String(describing: type(of: $0)) } ?? "-"
+            let count = item.customView?.accessibilityElements?.count ?? -1
+            lines.append(
+                "bar item title=\(item.title ?? "-") a11y=\(item.accessibilityLabel ?? "-") custom=\(custom) a11yElements=\(count) action=\(item.action.map(String.init(describing:)) ?? "-")"
+            )
         }
         let controls = descendants(window).compactMap { $0 as? UIControl }
         lines.append(

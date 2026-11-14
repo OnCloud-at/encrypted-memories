@@ -384,20 +384,6 @@ final class MobileTimelineChromeTests: XCTestCase {
 
     // MARK: - Helpers
 
-    @MainActor private func barItems(in window: UIWindow) -> [UIBarButtonItem] {
-        var items: [UIBarButtonItem] = []
-        for bar in descendants(window).compactMap({ $0 as? UINavigationBar }) {
-            for navigationItem in bar.items ?? [] {
-                items += (navigationItem.leftBarButtonItems ?? []) + (navigationItem.rightBarButtonItems ?? [])
-                items += navigationItem.leadingItemGroups.flatMap(\.barButtonItems)
-                items += navigationItem.centerItemGroups.flatMap(\.barButtonItems)
-                items += navigationItem.trailingItemGroups.flatMap(\.barButtonItems)
-                items += navigationItem.pinnedTrailingGroup?.barButtonItems ?? []
-            }
-        }
-        return items
-    }
-
     @MainActor private func label(of item: UIBarButtonItem) -> String? {
         if let title = item.title, !title.isEmpty { return title }
         if let label = item.accessibilityLabel, !label.isEmpty { return label }
@@ -411,11 +397,11 @@ final class MobileTimelineChromeTests: XCTestCase {
     }
 
     @MainActor private func barItemLabels(in window: UIWindow) -> [String] {
-        barItems(in: window).compactMap(label(of:))
+        navigationBarItems(in: window).compactMap(label(of:))
     }
 
     @MainActor private func barItem(labelled label: String, in window: UIWindow) -> UIBarButtonItem? {
-        barItems(in: window).first { item in
+        navigationBarItems(in: window).first { item in
             if item.title == label || item.accessibilityLabel == label { return true }
             guard let custom = item.customView else { return false }
             if custom.accessibilityLabel == label { return true }
