@@ -18,12 +18,14 @@
             defer { host.close() }
             await fulfillment(of: [probe.appeared], timeout: 5)
             XCTAssertEqual(probe.isEnabled, false)
+            XCTAssertEqual(probe.isCovered, true)
             XCTAssertFalse(host.hitReachesProtectedContent())
 
             await unlock(child, gate: gate, owner: owner)
             host.layout()
             await fulfillment(of: [probe.enabled], timeout: 5)
             XCTAssertEqual(probe.isEnabled, true)
+            XCTAssertEqual(probe.isCovered, false)
             XCTAssertTrue(host.hitReachesProtectedContent())
         }
 
@@ -62,6 +64,31 @@
             guard owner.reasons.count == 1 else { return }
             owner.answer(.cancelled)
             XCTAssertEqual(probe.appearances, 1)
+        }
+
+        func testASnapshotDoesNotAskUntilForegroundCoverageEnds() async throws {
+            defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
+            let owner = PendingDeviceOwner()
+            owner.requested.isInverted = true
+            let gate = AccessGate(authenticator: owner, defaults: defaults)
+            let state = HostState(gate: gate, scope: .app, phase: .active)
+            state.snapshot = true
+            let probe = Probe()
+            let host = makeHost(state: state, probe: probe)
+            defer { host.close() }
+            await fulfillment(of: [probe.appeared], timeout: 5)
+            await fulfillment(of: [owner.requested], timeout: 0.1)
+            XCTAssertTrue(owner.reasons.isEmpty, "A snapshot must never start authentication")
+            guard owner.reasons.isEmpty else {
+                owner.answer(.cancelled)
+                return
+            }
+            owner.requested = expectation(description: "The foreground cover asks")
+            state.snapshot = false
+            host.layout()
+            await fulfillment(of: [owner.requested], timeout: 5)
+            guard owner.reasons.count == 1 else { return }
+            owner.answer(.cancelled)
         }
 
         func testAParentUnlockStartsTheChildPromptWithoutAPhaseChange() async throws {
@@ -255,6 +282,7 @@
             var scope: ProtectedScope
             var phase: ScenePhase
             var isPresented = true
+            var snapshot = false
             init(gate: AccessGate, scope: ProtectedScope, phase: ScenePhase = .inactive) {
                 self.gate = gate
                 self.scope = scope
@@ -267,6 +295,7 @@
             let disappeared = XCTestExpectation(description: "The content disappears")
             var appearances = 0
             var isEnabled: Bool?
+            var isCovered: Bool?
             weak var button: NSButton?
             let enabled = XCTestExpectation(description: "The protected content becomes enabled")
         }
@@ -285,10 +314,15 @@
 
         private struct EnabledProbe: View {
             @Environment(\.isEnabled) private var isEnabled
+            @Environment(\.protectedContentIsCovered) private var isCovered
             let probe: Probe
             var body: some View {
                 Color.clear
-                    .onAppear { probe.isEnabled = isEnabled }
+                    .onAppear {
+                        probe.isEnabled = isEnabled
+                        probe.isCovered = isCovered
+                    }
+                    .onChange(of: isCovered) { _, covered in probe.isCovered = covered }
                     .onChange(of: isEnabled) { _, enabled in
                         probe.isEnabled = enabled
                         if enabled { probe.enabled.fulfill() }
@@ -314,7 +348,7 @@
                             .onDisappear { probe.disappeared.fulfill() }
                             .protectedScope(
                                 state.scope, gate: state.gate, unlockTitle: "Unlock", accessibilityLabel: "Locked",
-                                reason: "Unlock")
+                                reason: "Unlock", snapshot: state.snapshot)
                     } else {
                         Color.clear
                     }

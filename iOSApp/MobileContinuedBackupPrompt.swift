@@ -34,13 +34,14 @@ struct MobileContinuedBackupPromptModifier: ViewModifier {
         let isSyncing: Bool
         let scenePhase: ScenePhase
         let isPresented: Bool
+        let appIsLocked: Bool
     }
 
     private var trigger: Trigger {
         Trigger(
             phase: controller?.status.phase, remaining: controller?.status.remainingCount ?? 0,
             owesWork: controller?.status.hasOutstandingWork ?? false, isSyncing: controller?.isSyncing ?? false,
-            scenePhase: scenePhase, isPresented: isPresented)
+            scenePhase: scenePhase, isPresented: isPresented, appIsLocked: probe.appIsLocked)
     }
 
     func body(content: Content) -> some View {
@@ -162,10 +163,14 @@ final class MobileContinuedBackupPromptProbe {
     }
 
     private weak var view: UIView?
+    private let gate: AccessGate
 
-    init() {
+    init(gate: AccessGate = MobileAppProtection.gate) {
+        self.gate = gate
         TextEditing.startObserving()
     }
+
+    var appIsLocked: Bool { !gate.admits(.app) }
 
     /// The view that marks the place in its view hierarchy.
     func anchorView() -> UIView {
@@ -178,6 +183,7 @@ final class MobileContinuedBackupPromptProbe {
     /// Something covers the place: more presentations than the own question, or text input in its window scene. A
     /// place whose view controller is not found counts as covered, so it never asks blind.
     func coversPlace(ownQuestionShows: Bool) -> Bool {
+        guard !appIsLocked else { return true }
         guard let presentations = presentationsOverPlace() else { return true }
         return presentations > (ownQuestionShows ? 1 : 0) || isEditingText
     }

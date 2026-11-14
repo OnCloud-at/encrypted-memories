@@ -41,7 +41,6 @@ public enum AppLockCopy {
         switch availability {
         case .available(.faceID): return "Face ID"
         case .available(.touchID): return "Touch ID"
-        // Unreachable on the shipped iOS and macOS targets; use the approved device credential label.
         case .available(.opticID): return L10n.string("settings.privacy_app_lock_passcode")
         case .available(.devicePasscode): return L10n.string("settings.privacy_app_lock_passcode")
         case .available(.accountPassword): return L10n.string("settings.privacy_app_lock_password")

@@ -18,7 +18,7 @@ final class MobileAppLockCenter: NSObject {
         weak var source: UIWindow?
         let scene: UIWindowScene
         let window: UIWindow
-        let presentation: MobileAppLockPresentation
+        let presentation: ProtectedScopePresentation
         var deactivating = false
         var background = false
         var hiddenAccessibility: [(UIWindow, Bool)] = []
@@ -26,7 +26,7 @@ final class MobileAppLockCenter: NSObject {
         init(source: UIWindow, scene: UIWindowScene, gate: AccessGate) {
             self.source = source
             self.scene = scene
-            presentation = MobileAppLockPresentation(gate: gate)
+            presentation = ProtectedScopePresentation(gate: gate)
             window = UIWindow(windowScene: scene)
             window.windowLevel = UIWindow.Level(rawValue: UIWindow.Level.alert.rawValue + 2)
             window.backgroundColor = .systemBackground
@@ -184,16 +184,8 @@ final class MobileAppLockCenter: NSObject {
     isolated deinit { invalidate() }
 }
 
-@MainActor @Observable
-final class MobileAppLockPresentation {
-    let gate: AccessGate
-    var phase: ScenePhase = .inactive
-    var snapshot = false
-    init(gate: AccessGate) { self.gate = gate }
-}
-
 private struct MobileAppLockWindowContent: View {
-    let presentation: MobileAppLockPresentation
+    let presentation: ProtectedScopePresentation
 
     var body: some View {
         GeometryReader { geometry in

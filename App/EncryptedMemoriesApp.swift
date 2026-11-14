@@ -7,6 +7,7 @@ import MetalRenderingCore
 import Observation
 import PhotoViewerFeature
 import PhotosCore
+import PrivacyFeature
 import SwiftUI
 import TimelineFeature
 
@@ -183,6 +184,9 @@ final class EncryptedMemoriesAppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private static func showLibraryWindow() {
+        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "library" }) {
+            MacAppProtection.shared.prepareToShow(window: window)
+        }
         NSApp.activate()
         if !LibraryWindowVisibilityController.shared.showLibrary() {
             NSApp.windows.first(where: { $0.identifier?.rawValue == "library" })?.makeKeyAndOrderFront(nil)
@@ -253,6 +257,7 @@ private final class LibraryWindowVisibilityController: NSObject {
     @discardableResult
     func showLibrary() -> Bool {
         guard let window = libraryWindow else { return false }
+        MacAppProtection.shared.prepareToShow(window: window)
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
@@ -272,6 +277,7 @@ private final class LibraryWindowDelegateProxy: NSObject, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        MacAppProtection.shared.prepareToHide(window: sender)
         sender.orderOut(nil)
         return false
     }
@@ -447,6 +453,7 @@ private extension View {
 }
 
 private struct LaunchVeilModifier: ViewModifier {
+    @Environment(\.protectedContentIsCovered) private var privacyCovered
     let purpose: LaunchVeilPurpose?
     let model: AppModel
 
@@ -465,7 +472,7 @@ private struct LaunchVeilModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .toolbarVisibility(visible ? .hidden : .automatic, for: .windowToolbar)
+            .toolbarVisibility(visible || privacyCovered ? .hidden : .automatic, for: .windowToolbar)
             .overlay {
                 ZStack {
                     LibraryLoadingCover(

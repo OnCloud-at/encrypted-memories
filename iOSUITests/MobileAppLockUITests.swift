@@ -22,7 +22,9 @@ final class MobileAppLockUITests: XCTestCase {
         XCTAssertTrue(app.switches["Blur App Preview"].waitForExistence(timeout: 5))
         let protection = app.switches["Require Face ID"]
         XCTAssertTrue(protection.waitForExistence(timeout: 5), "Privacy must offer the optional app lock")
-        protection.tap()
+        // The labeled AX row is not the native thumb; tap the thumb inside its measured row.
+        let thumb = protection.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5))
+        thumb.tap()
         XCTAssertEqual(protection.wait(until: "value == '1'", timeout: 5), .completed)
         let delay = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Lock After")).firstMatch
         XCTAssertTrue(delay.waitForExistence(timeout: 5))
@@ -33,7 +35,7 @@ final class MobileAppLockUITests: XCTestCase {
         let privacyBack = app.navigationBars.buttons["Privacy"]
         if privacyBack.exists { privacyBack.tap() }
         XCTAssertTrue(protection.waitForExistence(timeout: 5))
-        protection.tap()
+        thumb.tap()
         XCTAssertEqual(protection.wait(until: "value == '0'", timeout: 5), .completed)
         XCTAssertFalse(delay.exists)
         attachScreenshot("Privacy app lock")

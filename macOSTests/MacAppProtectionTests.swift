@@ -1,5 +1,6 @@
 import AppKit
 import PhotosCore
+import PrivacyFeature
 import SwiftUI
 import XCTest
 
@@ -16,12 +17,14 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertTrue(cover.worksWhenModal)
     }
 
-    func testSuccessfulAuthenticationRemovesTheChildCover() async throws {
+    func testSuccessfulAuthenticationRevealsOnlyAnActiveWindow() async throws {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let hidden = await fixture.waitForCover(visible: false)
-        XCTAssertTrue(hidden)
+        let expectedCover = !NSApp.isActive
+        let settled = await fixture.waitForCover(visible: expectedCover)
+        XCTAssertTrue(settled)
+        XCTAssertEqual(fixture.presentation.snapshot, expectedCover)
         XCTAssertTrue(fixture.gate.admits(.app))
     }
 
@@ -38,20 +41,82 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let hidden = await fixture.waitForCover(visible: false)
-        XCTAssertTrue(hidden)
+        let settled = await fixture.waitForCover(visible: !NSApp.isActive)
+        XCTAssertTrue(settled)
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidSleepNotification, object: nil)
         XCTAssertFalse(fixture.gate.admits(.app))
         XCTAssertNotNil(fixture.cover)
     }
 
-    func testClosingTheLastWindowStartsTheBackgroundGracePeriod() async throws {
+    func testOrderingOutTheLastWindowStartsTheBackgroundGracePeriod() async throws {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        fixture.window.close()
+        fixture.window.orderOut(nil)
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: fixture.window)
         fixture.gate.appWillEnterForeground(at: .now + .seconds(120))
         XCTAssertFalse(fixture.gate.admits(.app))
+    }
+    func testOrderingOutRetainsTheSnapshotCoverBeforeTheWindowReturns() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        _ = await fixture.waitForCover(visible: !NSApp.isActive)
+        fixture.window.orderOut(nil)
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: fixture.window)
+        XCTAssertTrue(fixture.window.childWindows?.contains { $0 is MacAppLockPanel } == true)
+        fixture.gate.appWillEnterForeground(at: .now + .seconds(120))
+        fixture.window.orderFront(nil)
+        XCTAssertNotNil(fixture.cover, "The returning window must already be covered in this turn")
+    }
+
+    func testTheCoverIsAttachedBeforeMiniaturizationBegins() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        _ = await fixture.waitForCover(visible: !NSApp.isActive)
+        NotificationCenter.default.post(name: NSWindow.willMiniaturizeNotification, object: fixture.window)
+        XCTAssertNotNil(fixture.cover, "The cover must precede the minimized Dock snapshot")
+        XCTAssertTrue(fixture.window.childWindows?.contains { $0 is MacAppLockPanel } == true)
+    }
+    func testPrepareToShowExpiresAdmissionBeforeOrderingTheWindowIn() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+        fixture.controller.prepareToHide(window: fixture.window)
+        fixture.window.orderOut(nil)
+        fixture.controller.prepareToShow(window: fixture.window)
+        XCTAssertFalse(fixture.gate.admits(.app), "Expiry must be applied while the source is still hidden")
+        fixture.window.orderFront(nil)
+        XCTAssertNotNil(fixture.cover, "The first returning frame must already have the cover attached")
+    }
+
+    func testRegisteringAnotherHiddenWindowPreservesTheBackgroundInterval() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        fixture.controller.prepareToHide(window: fixture.window)
+        fixture.window.orderOut(nil)
+        let other = NSWindow(
+            contentRect: .init(x: -10_000, y: -10_000, width: 100, height: 100),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        other.isReleasedWhenClosed = false
+        defer { other.close() }
+        fixture.controller.register(window: other)
+        fixture.gate.appWillEnterForeground(at: .now + .seconds(120))
+        XCTAssertFalse(fixture.gate.admits(.app), "Registering a hidden window is not a foreground entry")
+    }
+
+    func testSnapshotDrawsInsideTheSourceBeforeMiniaturization() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        fixture.presentation.snapshot = false
+        XCTAssertGreaterThan(try fixture.redSamples(), 0, "The uncovered source must provide a pixel positive control")
+        NotificationCenter.default.post(name: NSWindow.willMiniaturizeNotification, object: fixture.window)
+        XCTAssertTrue(fixture.presentation.snapshot)
+        XCTAssertEqual(try fixture.redSamples(), 0, "The source itself must conceal the photo before the Dock capture")
     }
 }
 
@@ -60,6 +125,7 @@ private final class Fixture {
     let window: NSWindow
     let gate: AccessGate
     let controller: MacAppProtection
+    let presentation: ProtectedScopePresentation
     private let defaults: UserDefaults
     private let suite = "MacAppProtectionTests.\(UUID().uuidString)"
 
@@ -71,13 +137,31 @@ private final class Fixture {
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
         gate = AccessGate(authenticator: Owner(), defaults: defaults)
         controller = MacAppProtection(gate: gate)
+        presentation = ProtectedScopePresentation(gate: gate)
         window = NSWindow(
             contentRect: CGRect(x: -10_000, y: -10_000, width: 320, height: 240),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: Color.red)
+        window.contentView = NSHostingView(rootView: SourceContent(presentation: presentation))
         window.orderFront(nil)
-        controller.register(window: window)
+        controller.register(window: window, presentation: presentation)
+    }
+
+    func redSamples() throws -> Int {
+        let view = try XCTUnwrap(window.contentView)
+        view.needsLayout = true
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        return stride(from: 0, to: bitmap.pixelsHigh, by: 8).reduce(0) { count, y in
+            count
+                + stride(from: 0, to: bitmap.pixelsWide, by: 8).filter { x in
+                    guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { return false }
+                    return color.redComponent > 0.5 && color.redComponent > color.greenComponent * 2
+                        && color.redComponent > color.blueComponent * 2
+                }.count
+        }
     }
 
     func waitForCover(visible: Bool) async -> Bool {
@@ -101,4 +185,15 @@ private final class Owner: DeviceOwnerAuthenticating {
     func availability() -> DeviceOwnerAuthAvailability { .available(.touchID) }
     func authenticate(reason: String) async -> DeviceOwnerAuthResult { .success }
     func cancel() {}
+}
+
+private struct SourceContent: View {
+    let presentation: ProtectedScopePresentation
+    var body: some View {
+        Color(red: 1, green: 0, blue: 0).protectedScope(
+            .app, gate: presentation.gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+            snapshot: presentation.snapshot
+        )
+        .environment(\.scenePhase, presentation.phase)
+    }
 }

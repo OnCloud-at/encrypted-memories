@@ -14,18 +14,24 @@ final class MacAppProtection: NSObject {
     private var wasForeground = false
     private var refreshing = false
     private var observing = true
+    private var hiding = false
+    private var suspending: Set<ObjectIdentifier> = []
 
     @MainActor private final class WeakWindow {
         weak var window: NSWindow?
-        init(_ window: NSWindow) { self.window = window }
+        var presentation: ProtectedScopePresentation
+        init(_ window: NSWindow, presentation: ProtectedScopePresentation) {
+            self.window = window
+            self.presentation = presentation
+        }
     }
 
     @MainActor private final class Cover {
         let window: MacAppLockPanel
-        let presentation: MacAppLockPresentation
+        let presentation: ProtectedScopePresentation
 
-        init(source: NSWindow, gate: AccessGate) {
-            presentation = MacAppLockPresentation(gate: gate)
+        init(source: NSWindow, presentation: ProtectedScopePresentation) {
+            self.presentation = presentation
             window = MacAppLockPanel(
                 contentRect: source.frame, styleMask: [.borderless], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
@@ -60,6 +66,9 @@ final class MacAppProtection: NSObject {
             center.addObserver(self, selector: #selector(windowChanged), name: name, object: nil)
         }
         center.addObserver(self, selector: #selector(windowClosing), name: NSWindow.willCloseNotification, object: nil)
+        center.addObserver(self, selector: #selector(willHide), name: NSApplication.willHideNotification, object: nil)
+        center.addObserver(
+            self, selector: #selector(willMiniaturize), name: NSWindow.willMiniaturizeNotification, object: nil)
         center.addObserver(
             self, selector: #selector(willUnhide), name: NSApplication.willUnhideNotification, object: nil)
         center.addObserver(
@@ -71,9 +80,32 @@ final class MacAppProtection: NSObject {
         observeGate()
     }
 
-    func register(window: NSWindow) {
-        if !roots.contains(where: { $0.window === window }) { roots.append(WeakWindow(window)) }
+    func register(window: NSWindow, presentation: ProtectedScopePresentation? = nil) {
+        if let root = roots.first(where: { $0.window === window }) {
+            if let presentation, root.presentation !== presentation {
+                covers.removeValue(forKey: ObjectIdentifier(window))?.hide()
+                root.presentation = presentation
+            }
+        } else {
+            roots.append(WeakWindow(window, presentation: presentation ?? ProtectedScopePresentation(gate: gate)))
+        }
         refresh()
+    }
+
+    /// Runs before a retained window orders in, so expired admission never reaches its first visible frame.
+    func prepareToShow(window: NSWindow) {
+        gate.appWillEnterForeground(at: .now)
+        suspending.remove(ObjectIdentifier(window))
+        register(window: window)
+    }
+
+    /// Draws the snapshot before AppKit orders out or captures a minimized window.
+    func prepareToHide(window: NSWindow) {
+        suspending.insert(ObjectIdentifier(window))
+        refresh()
+        window.contentView?.needsLayout = true
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
     }
 
     func invalidate() {
@@ -106,7 +138,11 @@ final class MacAppProtection: NSObject {
         defer { refreshing = false }
         roots.removeAll { $0.window == nil }
         let foreground =
-            !NSApp.isHidden && roots.contains { $0.window?.isVisible == true && $0.window?.isMiniaturized == false }
+            !hiding && !NSApp.isHidden
+            && roots.contains {
+                guard let window = $0.window else { return false }
+                return window.isVisible && !window.isMiniaturized && !suspending.contains(ObjectIdentifier(window))
+            }
         if foreground != wasForeground {
             wasForeground = foreground
             if foreground { gate.appWillEnterForeground(at: .now) } else { gate.appDidEnterBackground(at: .now) }
@@ -124,27 +160,46 @@ final class MacAppProtection: NSObject {
             covers.removeValue(forKey: key)?.hide()
         }
         for (key, source) in targets {
-            let show = !gate.admits(.app) && source.isVisible && !source.isMiniaturized && !NSApp.isHidden
-            guard show else {
+            let active =
+                NSApp.isActive && !hiding && !NSApp.isHidden && source.isVisible
+                && !source.isMiniaturized && !suspending.contains(key)
+            let snapshot = !active && gate.isEnabled(.app)
+            let root = roots.first { $0.window === source }
+            let presentation = root?.presentation ?? covers[key]?.presentation ?? ProtectedScopePresentation(gate: gate)
+            presentation.snapshot = snapshot
+            presentation.phase = active ? .active : .inactive
+            guard snapshot || !gate.admits(.app) else {
                 covers[key]?.hide()
                 continue
             }
-            let cover = covers[key] ?? Cover(source: source, gate: gate)
+            let cover = covers[key] ?? Cover(source: source, presentation: presentation)
             covers[key] = cover
-            cover.presentation.phase = NSApp.isActive ? .active : .inactive
             cover.window.appearance = source.appearance
             cover.window.level = source.level
             if cover.window.frame != source.frame { cover.window.setFrame(source.frame, display: true) }
             if cover.window.parent !== source { source.addChildWindow(cover.window, ordered: .above) }
-            if !cover.window.isVisible { cover.window.order(.above, relativeTo: source.windowNumber) }
-            if source.isKeyWindow && !gate.isAuthenticating { cover.window.makeKey() }
+            // Keep the relationship while hidden: AppKit carries the covered child through ordering and snapshots.
+            if source.isVisible && !source.isMiniaturized && !NSApp.isHidden && !cover.window.isVisible {
+                cover.window.order(.above, relativeTo: source.windowNumber)
+            }
+            if active && source.isKeyWindow && !gate.isAuthenticating { cover.window.makeKey() }
         }
     }
 
-    @objc private func windowChanged(_ note: Notification) { refresh() }
+    @objc private func windowChanged(_ note: Notification) {
+        if note.name == NSApplication.didUnhideNotification { hiding = false }
+        if note.name == NSWindow.didDeminiaturizeNotification || note.name == NSWindow.didBecomeKeyNotification,
+            let window = note.object as? NSWindow, roots.contains(where: { $0.window === window })
+        {
+            gate.appWillEnterForeground(at: .now)
+            suspending.remove(ObjectIdentifier(window))
+        }
+        refresh()
+    }
 
     @objc private func windowClosing(_ note: Notification) {
         guard let window = note.object as? NSWindow, !(window is MacAppLockPanel) else { return }
+        suspending.remove(ObjectIdentifier(window))
         roots.removeAll { $0.window === window }
         covers.removeValue(forKey: ObjectIdentifier(window))?.hide()
         refresh()
@@ -152,6 +207,24 @@ final class MacAppProtection: NSObject {
 
     @objc private func willUnhide(_ note: Notification) {
         gate.appWillEnterForeground(at: .now)
+        hiding = false
+        refresh()
+    }
+
+    @objc private func willHide(_ note: Notification) {
+        hiding = true
+        refresh()
+        for root in roots {
+            root.window?.contentView?.needsLayout = true
+            root.window?.contentView?.layoutSubtreeIfNeeded()
+            root.window?.displayIfNeeded()
+        }
+    }
+
+    @objc private func willMiniaturize(_ note: Notification) {
+        if let window = note.object as? NSWindow, roots.contains(where: { $0.window === window }) {
+            prepareToHide(window: window)
+        }
     }
 
     @objc private func sheetBeginning(_ note: Notification) {
@@ -166,20 +239,14 @@ final class MacAppProtection: NSObject {
     isolated deinit { invalidate() }
 }
 
-@MainActor @Observable
-final class MacAppLockPresentation {
-    let gate: AccessGate
-    var phase: ScenePhase = .inactive
-    init(gate: AccessGate) { self.gate = gate }
-}
-
 private struct MacAppLockWindowContent: View {
-    let presentation: MacAppLockPresentation
+    let presentation: ProtectedScopePresentation
     var body: some View {
         Color.clear.protectedScope(
             .app, gate: presentation.gate,
             unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
-            accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason
+            accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
+            snapshot: presentation.snapshot
         )
         .environment(\.scenePhase, presentation.phase)
     }
@@ -193,25 +260,40 @@ final class MacAppLockPanel: NSPanel {
 
 @MainActor
 extension View {
-    func macAppProtection() -> some View {
-        protectedScope(
-            .app, gate: MacAppProtection.shared.gate,
-            unlockTitle: AppLockCopy.unlockTitle(for: MacAppProtection.shared.gate.availability),
-            accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason
+    func macAppProtection() -> some View { modifier(MacAppProtectionModifier()) }
+}
+
+private struct MacAppProtectionModifier: ViewModifier {
+    @State private var presentation = ProtectedScopePresentation(gate: MacAppProtection.shared.gate)
+
+    func body(content: Content) -> some View {
+        content.protectedScope(
+            .app, gate: presentation.gate,
+            unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
+            accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
+            snapshot: presentation.snapshot
         )
-        .background(MacAppLockAttachment().frame(width: 0, height: 0))
+        .background(MacAppLockAttachment(presentation: presentation).frame(width: 0, height: 0))
     }
 }
 
 private struct MacAppLockAttachment: NSViewRepresentable {
-    func makeNSView(context: Context) -> Anchor { Anchor() }
+    let presentation: ProtectedScopePresentation
+    func makeNSView(context: Context) -> Anchor { Anchor(presentation: presentation) }
     func updateNSView(_ view: Anchor, context: Context) {
-        if let window = view.window { MacAppProtection.shared.register(window: window) }
+        if let window = view.window { MacAppProtection.shared.register(window: window, presentation: presentation) }
     }
     final class Anchor: NSView {
+        let presentation: ProtectedScopePresentation
+        init(presentation: ProtectedScopePresentation) {
+            self.presentation = presentation
+            super.init(frame: .zero)
+        }
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { nil }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            if let window { MacAppProtection.shared.register(window: window) }
+            if let window { MacAppProtection.shared.register(window: window, presentation: presentation) }
         }
     }
 }

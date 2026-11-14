@@ -50,10 +50,17 @@ final class MobileAppProtectionTests: XCTestCase {
         XCTAssertEqual(fixture.owner.calls, 1)
     }
 
-    func testTheDisabledSwitchNamesTheDevicePasscode() {
-        XCTAssertEqual(
-            AppLockCopy.switchTitle(for: .noDeviceLock),
-            AppLockCopy.switchTitle(for: .available(.devicePasscode)))
+    @MainActor func testAppLockCoversTheContinuedBackupQuestionAcrossWindows() async throws {
+        let fixture = try HostFixture(result: .cancelled)
+        defer { fixture.close() }
+        let probe = MobileContinuedBackupPromptProbe(gate: fixture.gate)
+        fixture.source.rootViewController?.view.addSubview(probe.anchorView())
+        XCTAssertEqual(probe.presentationsOverPlace(), 0)
+        XCTAssertTrue(probe.coversPlace(ownQuestionShows: false), "The separate lock window covers this place")
+        fixture.owner.result = .success
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        XCTAssertTrue(fixture.gate.admits(.app))
+        XCTAssertFalse(probe.coversPlace(ownQuestionShows: false), "An unlocked place may ask again")
     }
 
     func testAuthenticationFixtureRequiresTheOfflineAccountAndAKnownResult() {
@@ -108,7 +115,7 @@ private final class HostFixture {
 
 @MainActor
 private final class FixtureOwner: DeviceOwnerAuthenticating {
-    private let result: DeviceOwnerAuthResult
+    var result: DeviceOwnerAuthResult
     private(set) var calls = 0
     init(result: DeviceOwnerAuthResult) { self.result = result }
     func availability() -> DeviceOwnerAuthAvailability { .available(.faceID) }

@@ -14,13 +14,9 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
             .frame(width: 120, height: 240)
             .protectedScope(
                 .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")
-        let cover = ProtectedScopeCover(
-            unlockTitle: "Unlock", accessibilityLabel: "Locked", isAuthenticating: false
-        ) {}
-        .frame(width: 120, height: 240)
+        XCTAssertGreaterThan(redPixelCount(try pixels(Color.red)), 0, "The photo surface must be a positive control")
         XCTAssertEqual(
-            try pixels(protected.frame(width: 500, height: 240, alignment: .leading), width: 500),
-            try pixels(cover.frame(width: 500, height: 240, alignment: .leading), width: 500),
+            redPixelCount(try pixels(protected.frame(width: 500, height: 240, alignment: .leading), width: 500)), 0,
             "An offset photo must not remain visible beside the lock cover")
     }
 
@@ -31,6 +27,21 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
                 Color.red.protectedScope(
                     .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")),
             try pixels(Color.red))
+    }
+
+    func testASnapshotCoversAnUnlockedAreaWithoutChangingItsAdmission() throws {
+        let gate = AccessGate(authenticator: PendingDeviceOwner(), defaults: defaults)
+        XCTAssertTrue(gate.admits(.app))
+        XCTAssertEqual(
+            try pixels(
+                Color.red.protectedScope(
+                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+                    snapshot: true)),
+            try pixels(
+                ProtectedScopeCover(
+                    unlockTitle: "Unlock", accessibilityLabel: "Locked", isAuthenticating: true
+                ) {}))
+        XCTAssertTrue(gate.admits(.app))
     }
 
     func testALockedAreaCoversItsContent() throws {
@@ -75,6 +86,13 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
                 Color.red.protectedScope(
                     .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")),
             try coverPixels())
+    }
+
+    private func redPixelCount(_ pixels: Data) -> Int {
+        stride(from: 0, to: pixels.count, by: 4).filter { offset in
+            let red = Int(pixels[offset])
+            return red > 127 && red > Int(pixels[offset + 1]) * 2 && red > Int(pixels[offset + 2]) * 2
+        }.count
     }
 
     private func coverPixels() throws -> Data {
