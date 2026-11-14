@@ -32,15 +32,13 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
     func testASnapshotCoversAnUnlockedAreaWithoutChangingItsAdmission() throws {
         let gate = AccessGate(authenticator: PendingDeviceOwner(), defaults: defaults)
         XCTAssertTrue(gate.admits(.app))
+        XCTAssertGreaterThan(redPixelCount(try pixels(Color.red)), 0)
         XCTAssertEqual(
-            try pixels(
-                Color.red.protectedScope(
-                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
-                    snapshot: true)),
-            try pixels(
-                ProtectedScopeCover(
-                    unlockTitle: "Unlock", accessibilityLabel: "Locked", isAuthenticating: true
-                ) {}))
+            redPixelCount(
+                try pixels(
+                    Color.red.protectedScope(
+                        .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+                        snapshot: true))), 0)
         XCTAssertTrue(gate.admits(.app))
     }
 

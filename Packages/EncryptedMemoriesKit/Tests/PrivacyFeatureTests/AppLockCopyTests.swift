@@ -16,7 +16,7 @@ final class AppLockCopyTests: XCTestCase {
         #endif
     }
 
-    func testTheUnreachableOpticIDCaseUsesTheApprovedPasscodeLabel() {
+    func testTheOpticIDCaseUsesTheApprovedPasscodeLabel() {
         XCTAssertEqual(
             AppLockCopy.switchTitle(for: .available(.opticID)),
             AppLockCopy.switchTitle(for: .available(.devicePasscode)))

@@ -21,7 +21,7 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let expectedCover = !NSApp.isActive
+        let expectedCover = !fixture.activity.isActive
         let settled = await fixture.waitForCover(visible: expectedCover)
         XCTAssertTrue(settled)
         XCTAssertEqual(fixture.presentation.snapshot, expectedCover)
@@ -41,7 +41,7 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let settled = await fixture.waitForCover(visible: !NSApp.isActive)
+        let settled = await fixture.waitForCover(visible: !fixture.activity.isActive)
         XCTAssertTrue(settled)
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidSleepNotification, object: nil)
         XCTAssertFalse(fixture.gate.admits(.app))
@@ -61,7 +61,7 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        _ = await fixture.waitForCover(visible: !NSApp.isActive)
+        _ = await fixture.waitForCover(visible: !fixture.activity.isActive)
         fixture.window.orderOut(nil)
         NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: fixture.window)
         XCTAssertTrue(fixture.window.childWindows?.contains { $0 is MacAppLockPanel } == true)
@@ -74,7 +74,7 @@ final class MacAppProtectionTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        _ = await fixture.waitForCover(visible: !NSApp.isActive)
+        _ = await fixture.waitForCover(visible: !fixture.activity.isActive)
         NotificationCenter.default.post(name: NSWindow.willMiniaturizeNotification, object: fixture.window)
         XCTAssertNotNil(fixture.cover, "The cover must precede the minimized Dock snapshot")
         XCTAssertTrue(fixture.window.childWindows?.contains { $0 is MacAppLockPanel } == true)
@@ -108,6 +108,78 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertFalse(fixture.gate.admits(.app), "Registering a hidden window is not a foreground entry")
     }
 
+    func testClosingAndReopeningTheSameWindowRetainsProtectionWithoutReregistration() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        let revealed = await fixture.waitForCover(visible: false)
+        XCTAssertTrue(revealed)
+        XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+        fixture.window.close()
+        XCTAssertTrue(fixture.presentation.snapshot, "Closing a cached Settings window must retain coverage")
+        fixture.window.orderFront(nil)
+        XCTAssertEqual(try fixture.redSamples(), 0, "Reopening must not draw the stored settings before key handling")
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: fixture.window)
+        XCTAssertFalse(fixture.gate.admits(.app), "A reused window must still belong to the protection host")
+        XCTAssertNotNil(fixture.cover)
+    }
+
+    func testAnInactiveWindowKeepsItsSnapshotUntilItBecomesActive() async throws {
+        let fixture = try Fixture(active: false)
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        let covered = await fixture.waitForCover(visible: true)
+        XCTAssertTrue(covered)
+        XCTAssertTrue(fixture.presentation.snapshot)
+        fixture.activity.isActive = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
+        let revealed = await fixture.waitForCover(visible: false)
+        XCTAssertTrue(revealed)
+        XCTAssertFalse(fixture.presentation.snapshot)
+        XCTAssertTrue(fixture.gate.admits(.app))
+    }
+
+    func testNativeReturnNotificationsExpireAdmissionBeforeUncovering() async throws {
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didDeminiaturizeNotification] {
+            let fixture = try Fixture()
+            defer { fixture.close() }
+            _ = await fixture.gate.unlock(.app, reason: "Unlock")
+            XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+            fixture.gate.appDidEnterBackground(at: .now)
+            NotificationCenter.default.post(name: name, object: fixture.window)
+            XCTAssertFalse(fixture.gate.admits(.app), "The native return callback must apply expiry")
+            XCTAssertNotNil(fixture.cover)
+        }
+    }
+
+    func testNativeReturnNotificationsReleaseTheSuspendedSnapshotWithinGrace() async throws {
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didDeminiaturizeNotification] {
+            let fixture = try Fixture()
+            defer { fixture.close() }
+            _ = await fixture.gate.unlock(.app, reason: "Unlock")
+            fixture.controller.prepareToHide(window: fixture.window)
+            XCTAssertTrue(fixture.presentation.snapshot)
+            NotificationCenter.default.post(name: name, object: fixture.window)
+            XCTAssertFalse(fixture.presentation.snapshot, "A foreground return within grace must reveal the source")
+            XCTAssertNil(fixture.cover)
+        }
+    }
+
+    func testWillHideCoversTheStillVisibleSourceBeforeAppKitHidesIt() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        let revealed = await fixture.waitForCover(visible: false)
+        XCTAssertTrue(revealed)
+        XCTAssertGreaterThan(try fixture.redSamples(), 0)
+        NotificationCenter.default.post(name: NSApplication.willHideNotification, object: NSApp)
+        XCTAssertTrue(fixture.presentation.snapshot)
+        XCTAssertNotNil(fixture.cover)
+        XCTAssertEqual(try fixture.redSamples(), 0)
+        NotificationCenter.default.post(name: NSApplication.didUnhideNotification, object: NSApp)
+        XCTAssertFalse(fixture.presentation.snapshot)
+    }
+
     func testSnapshotDrawsInsideTheSourceBeforeMiniaturization() async throws {
         let fixture = try Fixture()
         defer { fixture.close() }
@@ -126,17 +198,20 @@ private final class Fixture {
     let gate: AccessGate
     let controller: MacAppProtection
     let presentation: ProtectedScopePresentation
+    let activity: Activity
     private let defaults: UserDefaults
     private let suite = "MacAppProtectionTests.\(UUID().uuidString)"
 
     var cover: NSPanel? { window.childWindows?.compactMap { $0 as? NSPanel }.first { $0.isVisible } }
 
-    init() throws {
+    init(active: Bool = true) throws {
         _ = NSApplication.shared
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
         gate = AccessGate(authenticator: Owner(), defaults: defaults)
-        controller = MacAppProtection(gate: gate)
+        activity = Activity(active: active)
+        let activity = activity
+        controller = MacAppProtection(gate: gate, applicationIsActive: { activity.isActive })
         presentation = ProtectedScopePresentation(gate: gate)
         window = NSWindow(
             contentRect: CGRect(x: -10_000, y: -10_000, width: 320, height: 240),
@@ -196,4 +271,10 @@ private struct SourceContent: View {
         )
         .environment(\.scenePhase, presentation.phase)
     }
+}
+
+@MainActor
+private final class Activity {
+    var isActive: Bool
+    init(active: Bool) { isActive = active }
 }

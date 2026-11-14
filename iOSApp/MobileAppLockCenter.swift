@@ -189,19 +189,11 @@ private struct MobileAppLockWindowContent: View {
 
     var body: some View {
         GeometryReader { geometry in
-            if presentation.snapshot {
-                ProtectedScopeCover(
-                    unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
-                    accessibilityLabel: AppLockCopy.lockedLabel, isAuthenticating: true,
-                    contentBounds: geometry.mobileCenteredContentBounds
-                ) {}
-            } else {
-                Color.clear.protectedScope(
-                    .app, gate: presentation.gate,
-                    unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
-                    accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
-                    contentBounds: geometry.mobileCenteredContentBounds)
-            }
+            Color.clear.protectedScope(
+                .app, gate: presentation.gate,
+                unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
+                accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
+                contentBounds: geometry.mobileCenteredContentBounds, snapshot: presentation.snapshot)
         }
         .ignoresSafeArea()
         .environment(\.scenePhase, presentation.phase)

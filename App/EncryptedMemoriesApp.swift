@@ -184,12 +184,12 @@ final class EncryptedMemoriesAppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private static func showLibraryWindow() {
-        if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "library" }) {
-            MacAppProtection.shared.prepareToShow(window: window)
-        }
         NSApp.activate()
-        if !LibraryWindowVisibilityController.shared.showLibrary() {
-            NSApp.windows.first(where: { $0.identifier?.rawValue == "library" })?.makeKeyAndOrderFront(nil)
+        if !LibraryWindowVisibilityController.shared.showLibrary(),
+            let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "library" })
+        {
+            MacAppProtection.shared.prepareToShow(window: window)
+            window.makeKeyAndOrderFront(nil)
         }
     }
 

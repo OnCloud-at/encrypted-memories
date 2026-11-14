@@ -9,6 +9,7 @@ import SwiftUI
 final class MacAppProtection: NSObject {
     static let shared = MacAppProtection(gate: AppProtection.gate)
     let gate: AccessGate
+    private let applicationIsActive: @MainActor () -> Bool
     private var roots: [WeakWindow] = []
     private var covers: [ObjectIdentifier: Cover] = [:]
     private var wasForeground = false
@@ -51,8 +52,9 @@ final class MacAppProtection: NSObject {
         }
     }
 
-    init(gate: AccessGate) {
+    init(gate: AccessGate, applicationIsActive: @escaping @MainActor () -> Bool = { NSApp.isActive }) {
         self.gate = gate
+        self.applicationIsActive = applicationIsActive
         super.init()
         let center = NotificationCenter.default
         for name in [
@@ -160,9 +162,10 @@ final class MacAppProtection: NSObject {
             covers.removeValue(forKey: key)?.hide()
         }
         for (key, source) in targets {
-            let active =
-                NSApp.isActive && !hiding && !NSApp.isHidden && source.isVisible
+            let foregroundWindow =
+                !hiding && !NSApp.isHidden && source.isVisible
                 && !source.isMiniaturized && !suspending.contains(key)
+            let active = applicationIsActive() && foregroundWindow
             let snapshot = !active && gate.isEnabled(.app)
             let root = roots.first { $0.window === source }
             let presentation = root?.presentation ?? covers[key]?.presentation ?? ProtectedScopePresentation(gate: gate)
@@ -199,10 +202,8 @@ final class MacAppProtection: NSObject {
 
     @objc private func windowClosing(_ note: Notification) {
         guard let window = note.object as? NSWindow, !(window is MacAppLockPanel) else { return }
-        suspending.remove(ObjectIdentifier(window))
-        roots.removeAll { $0.window === window }
-        covers.removeValue(forKey: ObjectIdentifier(window))?.hide()
-        refresh()
+        guard roots.contains(where: { $0.window === window }) else { return }
+        prepareToHide(window: window)
     }
 
     @objc private func willUnhide(_ note: Notification) {
