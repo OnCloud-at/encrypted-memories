@@ -110,23 +110,22 @@ final class MobileAppLockCenter: NSObject {
         }
     }
 
-    private func sceneChanged(_ scene: UIWindowScene, event: MobilePrivacyPreviewShieldCenter.SceneEvent) {
-        guard entries.contains(where: { $0.scene === scene }) else { return }
-        switch event {
-        case .willEnterForeground, .didActivate:
-            // Expire and reset the session before any active-phase automatic prompt can run.
+    private func sceneChanged(_ scene: UIWindowScene, event: Notification.Name) {
+        // Any app scene entering the foreground brings protected content back, also a new scene that has not
+        // registered its window yet. Expire and reset the session before an active-phase automatic prompt runs.
+        if event == UIScene.willEnterForegroundNotification || event == UIScene.didActivateNotification {
             gate.appWillEnterForeground(at: .now)
-        case .didDisconnect:
+        }
+        guard entries.contains(where: { $0.scene === scene }) else { return }
+        if event == UIScene.didDisconnectNotification {
             for entry in entries where entry.scene === scene {
                 entry.window.isHidden = true
                 entry.restoreAccessibility()
             }
             entries.removeAll { $0.scene === scene }
-        case .willDeactivate, .didEnterBackground:
-            break
         }
         entries.forEach(refresh)
-        if event == .didEnterBackground || event == .didDisconnect,
+        if event == UIScene.didEnterBackgroundNotification || event == UIScene.didDisconnectNotification,
             entries.allSatisfy({ lifecycle.phase(of: $0.scene) == .background })
         {
             gate.appDidEnterBackground(at: .now)

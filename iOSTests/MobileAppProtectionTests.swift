@@ -69,6 +69,42 @@ final class MobileAppProtectionTests: XCTestCase {
         XCTAssertNotNil(fixture.cover)
     }
 
+    @MainActor func testAForegroundSceneWithoutARegisteredWindowExpiresTheGracePeriod() async throws {
+        let fixture = try HostFixture(result: .success)
+        defer { fixture.close() }
+        let opened = await yieldUntil { fixture.gate.admits(.app) && fixture.cover == nil }
+        XCTAssertTrue(opened)
+        XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+        NotificationCenter.default.post(name: UIScene.willDeactivateNotification, object: fixture.scene)
+        NotificationCenter.default.post(name: UIScene.didEnterBackgroundNotification, object: fixture.scene)
+        // The disconnected scene's entry is gone; a new scene connects before its window registers.
+        fixture.center.invalidate()
+        let fresh = MobileAppLockCenter(gate: fixture.gate)
+        defer { fresh.invalidate() }
+        XCTAssertTrue(fixture.gate.admits(.app))
+        NotificationCenter.default.post(name: UIScene.willEnterForegroundNotification, object: fixture.scene)
+        XCTAssertFalse(fixture.gate.admits(.app), "A returning scene must expire the grace period before it renders")
+    }
+
+    @MainActor func testRegisteringAWindowInTheBackgroundKeepsTheBackgroundInterval() async throws {
+        let fixture = try HostFixture(result: .success)
+        defer { fixture.close() }
+        let opened = await yieldUntil { fixture.gate.admits(.app) && fixture.cover == nil }
+        XCTAssertTrue(opened)
+        XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+        NotificationCenter.default.post(name: UIScene.willDeactivateNotification, object: fixture.scene)
+        NotificationCenter.default.post(name: UIScene.didEnterBackgroundNotification, object: fixture.scene)
+        fixture.center.invalidate()
+        let fresh = MobileAppLockCenter(gate: fixture.gate)
+        defer { fresh.invalidate() }
+        let window = UIWindow(windowScene: fixture.scene)
+        defer { window.isHidden = true }
+        fresh.register(window: window)
+        XCTAssertTrue(fixture.gate.admits(.app), "Registering a window of a background scene is not a foreground entry")
+        NotificationCenter.default.post(name: UIScene.willEnterForegroundNotification, object: fixture.scene)
+        XCTAssertFalse(fixture.gate.admits(.app))
+    }
+
     @MainActor func testAppLockCoversTheContinuedBackupQuestionAcrossWindows() async throws {
         let fixture = try HostFixture(result: .cancelled)
         defer { fixture.close() }

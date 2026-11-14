@@ -1543,6 +1543,8 @@ struct MobileImagePage: View {
         .onChange(of: isCurrent) { _, current in
             if !current { cancelZoomDecode() }
         }
+        // The motion clip plays with sound through its own layer, outside the video surface hook.
+        .onProtectedCover { motion.stop() }
         .onDisappear {
             cancelZoomDecode()
             motion.teardown()
@@ -1688,7 +1690,7 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
-        ProtectedMediaPlayback.update(player, attached: controller.player, isCovered: isCovered) {
+        context.coordinator.playback.update(player, attached: controller.player, isCovered: isCovered) {
             controller.player = $0
         }
         controller.videoGravity = .resizeAspect
@@ -1735,13 +1737,14 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
         context.coordinator.parent = self
         context.coordinator.controller = controller
-        let changed = controller.player !== player
-        ProtectedMediaPlayback.update(player, attached: controller.player, isCovered: isCovered) {
+        // A surface that returns from the cover keeps its revealed poster state; only a new player gets a poster.
+        let wasShowing = controller.player === player
+        let changed = context.coordinator.playback.update(player, attached: controller.player, isCovered: isCovered) {
             controller.player = $0
         }
         if changed {
             context.coordinator.attachPoster(poster, to: controller)
-        } else {
+        } else if wasShowing {
             context.coordinator.updatePoster(poster, in: controller)
         }
     }
@@ -1759,6 +1762,7 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
         weak var dismissPan: UIPanGestureRecognizer?
         weak var dismissPinch: UIPinchGestureRecognizer?
         weak var singleTap: UITapGestureRecognizer?
+        let playback = ProtectedMediaPlayback()
         private weak var posterView: UIImageView?
         private var displayReadinessObservation: NSKeyValueObservation?
 

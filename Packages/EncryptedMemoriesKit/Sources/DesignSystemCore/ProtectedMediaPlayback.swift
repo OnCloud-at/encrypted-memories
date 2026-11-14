@@ -1,11 +1,59 @@
 import AVFoundation
+import SwiftUI
 
-/// Updates the native video surface without changing the viewer's player or seek position.
+/// Keeps one native video surface silent and empty while protected content is covered, without changing the
+/// viewer's player or seek position. Each surface owns one instance.
 @MainActor
-public enum ProtectedMediaPlayback {
-    public static func update(_ player: AVPlayer, attached: AVPlayer?, isCovered: Bool, attach: (AVPlayer?) -> Void) {
+public final class ProtectedMediaPlayback {
+    private weak var player: AVPlayer?
+    private var isCovered = false
+    private var rateObservation: NSKeyValueObservation?
+
+    public init() {}
+
+    /// Pauses and detaches the player while covered and attaches it again afterwards without resuming playback.
+    /// Playback that starts while covered pauses again. Returns whether the viewer supplied a different player,
+    /// so the host attaches its poster once per player and not on every return from the cover.
+    @discardableResult
+    public func update(_ player: AVPlayer, attached: AVPlayer?, isCovered: Bool, attach: (AVPlayer?) -> Void) -> Bool {
+        let changed = self.player !== player
+        if changed || self.isCovered != isCovered {
+            self.player = player
+            self.isCovered = isCovered
+            rateObservation = isCovered ? observeRate(of: player) : nil
+        }
         if isCovered { player.pause() }
         let visiblePlayer = isCovered ? nil : player
         if attached !== visiblePlayer { attach(visiblePlayer) }
+        return changed
+    }
+
+    private func observeRate(of player: AVPlayer) -> NSKeyValueObservation {
+        player.observe(\.rate, options: [.new]) { [weak self] _, change in
+            guard change.newValue != 0 else { return }
+            Task { @MainActor [weak self] in self?.pauseWhileCovered() }
+        }
+    }
+
+    private func pauseWhileCovered() {
+        if isCovered { player?.pause() }
+    }
+}
+
+extension View {
+    /// Runs `action` whenever protected content becomes covered, including content that appears covered.
+    public func onProtectedCover(_ action: @escaping () -> Void) -> some View {
+        modifier(ProtectedCoverAction(action: action))
+    }
+}
+
+private struct ProtectedCoverAction: ViewModifier {
+    @Environment(\.protectedContentIsCovered) private var isCovered
+    let action: () -> Void
+
+    func body(content: Content) -> some View {
+        content.onChange(of: isCovered, initial: true) { _, covered in
+            if covered { action() }
+        }
     }
 }

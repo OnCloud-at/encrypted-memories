@@ -1,6 +1,5 @@
 import PhotosCore
 import PrivacyFeature
-import SwiftUI
 import UIKit
 import os
 
@@ -117,31 +116,16 @@ final class MobilePrivacyPreviewShield {
 final class MobilePrivacyPreviewShieldCenter: NSObject {
     static let shared = MobilePrivacyPreviewShieldCenter()
 
-    enum SceneEvent {
-        case willEnterForeground, didActivate, willDeactivate, didEnterBackground, didDisconnect
-        var phase: ScenePhase? {
-            switch self {
-            case .willEnterForeground, .willDeactivate: .inactive
-            case .didActivate: .active
-            case .didEnterBackground: .background
-            case .didDisconnect: nil
-            }
-        }
+    /// The latest phase each scene reported through a lifecycle notification. A disconnect removes it.
+    private var scenePhases: [ObjectIdentifier: MobileScenePhase.Phase] = [:]
+    private var sceneObservers: [UUID: @MainActor (UIWindowScene, Notification.Name) -> Void] = [:]
+
+    func phase(of scene: UIWindowScene) -> MobileScenePhase.Phase {
+        scenePhases[ObjectIdentifier(scene)] ?? MobileScenePhase.phase(of: scene.activationState)
     }
 
-    private var sceneEvents: [ObjectIdentifier: SceneEvent] = [:]
-    private var sceneObservers: [UUID: @MainActor (UIWindowScene, SceneEvent) -> Void] = [:]
-
-    func phase(of scene: UIWindowScene) -> ScenePhase {
-        if let event = sceneEvents[ObjectIdentifier(scene)], let phase = event.phase { return phase }
-        switch scene.activationState {
-        case .foregroundActive: return .active
-        case .background, .unattached: return .background
-        default: return .inactive
-        }
-    }
-
-    func observeScenes(_ observer: @escaping @MainActor (UIWindowScene, SceneEvent) -> Void) -> UUID {
+    /// Reports each scene lifecycle notification after the scene's phase has changed.
+    func observeScenes(_ observer: @escaping @MainActor (UIWindowScene, Notification.Name) -> Void) -> UUID {
         let id = UUID()
         sceneObservers[id] = observer
         return id
@@ -149,13 +133,11 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
 
     func removeSceneObserver(_ id: UUID) { sceneObservers.removeValue(forKey: id) }
 
-    private func publish(_ event: SceneEvent, for scene: UIWindowScene) {
-        if event == .didDisconnect {
-            sceneEvents.removeValue(forKey: ObjectIdentifier(scene))
-        } else {
-            sceneEvents[ObjectIdentifier(scene)] = event
-        }
-        for observer in Array(sceneObservers.values) { observer(scene, event) }
+    private func publish(_ notification: Notification) -> UIWindowScene? {
+        guard let scene = notification.object as? UIWindowScene else { return nil }
+        scenePhases[ObjectIdentifier(scene)] = MobileScenePhase.phase(after: notification.name)
+        for observer in Array(sceneObservers.values) { observer(scene, notification.name) }
+        return scene
     }
 
     @MainActor private final class Entry {
@@ -223,13 +205,11 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     }
 
     @objc private func sceneWillEnterForeground(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        publish(.willEnterForeground, for: scene)
+        _ = publish(notification)
     }
 
     @objc private func sceneWillDeactivate(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        publish(.willDeactivate, for: scene)
+        guard let scene = publish(notification) else { return }
         for entry in entries where entry.window?.windowScene === scene {
             if let window = entry.window {
                 refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: false, animated: true)
@@ -238,8 +218,7 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     }
 
     @objc private func sceneDidEnterBackground(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        publish(.didEnterBackground, for: scene)
+        guard let scene = publish(notification) else { return }
         for entry in entries where entry.window?.windowScene === scene {
             if let window = entry.window {
                 refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: false)
@@ -249,8 +228,7 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     }
 
     @objc private func sceneDidActivate(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        publish(.didActivate, for: scene)
+        guard let scene = publish(notification) else { return }
         for entry in entries where entry.window?.windowScene === scene {
             if let window = entry.window {
                 refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: true, animated: true)
@@ -259,8 +237,7 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     }
 
     @objc private func sceneDidDisconnect(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
-        publish(.didDisconnect, for: scene)
+        guard let scene = publish(notification) else { return }
         entries.removeAll { entry in
             guard let window = entry.window else { return true }
             guard window.windowScene === scene else { return false }

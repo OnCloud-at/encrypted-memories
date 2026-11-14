@@ -1,5 +1,6 @@
 #if canImport(AppKit)
     import AppKit
+    import DesignSystemCore
     import Observation
     import PhotosCore
     import PrivacyFeature
@@ -27,6 +28,25 @@
             XCTAssertEqual(probe.isEnabled, true)
             XCTAssertEqual(probe.isCovered, false)
             XCTAssertTrue(host.hitReachesProtectedContent())
+        }
+
+        func testCoveringTheContentRunsItsCoverActionEachTime() async throws {
+            let owner = PendingDeviceOwner()
+            let gate = AccessGate(authenticator: owner, defaults: defaults)
+            let child = area("cover-action")
+            let state = HostState(gate: gate, scope: child)
+            let probe = Probe()
+            let host = makeHost(state: state, probe: probe)
+            defer { host.close() }
+            await fulfillment(of: [probe.appeared], timeout: 5)
+            XCTAssertEqual(probe.coverActions, 1, "Content that appears covered stops its playback")
+            await unlock(child, gate: gate, owner: owner)
+            host.layout()
+            XCTAssertEqual(probe.coverActions, 1, "Uncovering must not run the action")
+            state.snapshot = true
+            host.layout()
+            for _ in 0..<50 where probe.coverActions < 2 { await Task.yield() }
+            XCTAssertEqual(probe.coverActions, 2)
         }
 
         func testDetachingARetainedHierarchyReleasesItsPresence() async throws {
@@ -294,6 +314,7 @@
             let appeared = XCTestExpectation(description: "The content appears")
             let disappeared = XCTestExpectation(description: "The content disappears")
             var appearances = 0
+            var coverActions = 0
             var isEnabled: Bool?
             var isCovered: Bool?
             weak var button: NSButton?
@@ -346,6 +367,7 @@
                                 probe.appeared.fulfill()
                             }
                             .onDisappear { probe.disappeared.fulfill() }
+                            .onProtectedCover { probe.coverActions += 1 }
                             .protectedScope(
                                 state.scope, gate: state.gate, unlockTitle: "Unlock", accessibilityLabel: "Locked",
                                 reason: "Unlock", snapshot: state.snapshot)

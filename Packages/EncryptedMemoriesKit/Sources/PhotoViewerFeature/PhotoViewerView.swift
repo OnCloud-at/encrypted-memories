@@ -14,6 +14,7 @@ private final class DismissableAVPlayerView: AVPlayerView {
     var onPinchDismissEnded: (Bool) -> Void = { _ in }
     var onPageSwipe: (ViewerPageSwipeDirection) -> Void = { _ in }
 
+    let playback = ProtectedMediaPlayback()
     private var pinchDismiss = AppKitPinchDismissTracker()
     private var pageSwipeTracker = ViewerPageSwipeTracker()
     private weak var posterView: NSImageView?
@@ -109,7 +110,7 @@ private struct PlayerView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> DismissableAVPlayerView {
         let view = DismissableAVPlayerView()
-        ProtectedMediaPlayback.update(player, attached: view.player, isCovered: isCovered) { view.player = $0 }
+        view.playback.update(player, attached: view.player, isCovered: isCovered) { view.player = $0 }
         view.controlsStyle = .floating
         view.videoGravity = .resizeAspect
         view.allowsPictureInPicturePlayback = true
@@ -122,11 +123,11 @@ private struct PlayerView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: DismissableAVPlayerView, context: Context) {
-        let changed = view.player !== player
-        ProtectedMediaPlayback.update(player, attached: view.player, isCovered: isCovered) { view.player = $0 }
-        if changed {
+        // A surface that returns from the cover keeps its revealed poster state; only a new player gets a poster.
+        let wasShowing = view.player === player
+        if view.playback.update(player, attached: view.player, isCovered: isCovered, attach: { view.player = $0 }) {
             view.attachPoster(poster)
-        } else {
+        } else if wasShowing {
             view.updatePoster(poster)
         }
         view.onPinchDismissBegan = onPinchDismissBegan
@@ -602,6 +603,8 @@ private struct ViewerStillImage: View {
                 }
             }
         }
+        // The motion clip plays with sound through its own layer, outside the video surface hook.
+        .onProtectedCover { model.stopMotion() }
     }
 }
 
