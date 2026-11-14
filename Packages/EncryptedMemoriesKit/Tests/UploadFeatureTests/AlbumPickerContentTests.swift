@@ -56,9 +56,19 @@ import Testing
         }
     }
 
-    @Test func noAlbumOrNoMatchShowsTheEmptyState() {
-        #expect(Self.content(albums: []) == .empty)
-        #expect(Self.content(query: "zzz") == .empty)
+    @Test func noAlbumsShowsTheEmptyAlbumStateEvenWhenThereIsAQuery() {
+        for query in ["", "   ", "zzz"] {
+            #expect(Self.content(albums: [], query: query) == .noAlbums)
+        }
+    }
+
+    @Test func anUnmatchedQueryShowsTheSearchStateOnlyWhenAlbumsExist() {
+        #expect(Self.content(query: "zzz") == .noMatches)
+        #expect(Self.content(query: "zzz", isLoading: true, didLoad: true) == .noMatches)
         #expect(Self.content(query: "holi") == .list([Self.holidays]))
+    }
+
+    @Test func noAlbumsAndASearchWithoutMatchesNeedDifferentPresentations() {
+        #expect(Self.content(albums: []) != Self.content(query: "zzz"))
     }
 }

@@ -1,15 +1,17 @@
 import AlbumSyncCore
 import Foundation
 
-/// What the album picker shows. The Mac sheet and the iOS sheet decide it the same way and draw each case in
-/// their own native form.
+/// What the album picker shows. The Mac and iOS sheets decide it the same way and draw unavailable cases with
+/// the shared `AlbumPickerUnavailableView`. They draw the loading and list cases natively.
 public enum AlbumPickerContent: Equatable, Sendable {
     /// The first load of the albums is still running.
     case loading
     /// Photos access is denied or restricted, so no album can be listed.
     case accessDenied
-    /// No album exists, or none matches the search.
-    case empty
+    /// No local album exists, regardless of the search query.
+    case noAlbums
+    /// Local albums exist, but none matches the search.
+    case noMatches
     case list([LocalAlbumSummary])
 
     /// The albums whose title contains the query, ignoring case and the spaces around the query. A blank query keeps
@@ -20,15 +22,16 @@ public enum AlbumPickerContent: Equatable, Sendable {
         return albums.filter { $0.title.localizedCaseInsensitiveContains(query) }
     }
 
-    /// Loading wins until the sheet has loaded once, then denied or restricted access, then the empty state, and
-    /// otherwise the list of matching albums.
+    /// Loading wins until the sheet has loaded once, then denied or restricted access, then no albums, then no
+    /// search matches, and otherwise the list of matching albums.
     public static func resolve(
         albums: [LocalAlbumSummary], query: String, isLoading: Bool, didLoad: Bool, accessState: PhotoBackupAccessState
     ) -> AlbumPickerContent {
         if isLoading && !didLoad { return .loading }
         if accessState == .denied || accessState == .restricted { return .accessDenied }
+        guard !albums.isEmpty else { return .noAlbums }
         let matching = Self.albums(albums, matching: query)
-        return matching.isEmpty ? .empty : .list(matching)
+        return matching.isEmpty ? .noMatches : .list(matching)
     }
 }
 
