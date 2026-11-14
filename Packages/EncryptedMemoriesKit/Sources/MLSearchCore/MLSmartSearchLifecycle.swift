@@ -924,12 +924,10 @@ public actor MLSmartSearchLifecycle {
     // MARK: - Search
 
     /// Epoch-guarded semantic query against the active model. Results from a superseded model
-    /// generation are discarded, never returned. Suggestion discovery passes `.automatic` so it never
-    /// competes with a query the user is typing.
+    /// generation are discarded, never returned.
     public func search(
         _ text: String,
-        limit: Int = 50,
-        intent: LibraryWorkIntent = .interactive
+        limit: Int = 50
     ) async throws -> MLSearchResults {
         guard !isShutDown, persistent.isEnabled, let session, lastCoverage.indexed > 0 else {
             throw MLSmartSearchQueryError.unavailable
@@ -940,11 +938,11 @@ public actor MLSmartSearchLifecycle {
             throw MLSmartSearchQueryError.staleEpoch
         }
         let results = try await deps.resourceCoordinator.withHeavyPermit(
-            LibraryWorkRequest(workload: .mlInference, intent: intent, memoryClass: .small)
-        ) { lease in
+            LibraryWorkRequest(workload: .mlInference, intent: .interactive, memoryClass: .small)
+        ) { _ in
             try await session.search(
                 text, limit: limit,
-                shouldContinue: { intent >= .userInitiated || lease.shouldContinue() }
+                shouldContinue: { true }
             )
         }
         guard generation == sessionGeneration else {
