@@ -617,11 +617,18 @@ public enum UploadError: LocalizedError, Equatable {
         }
     }
 
-    /// Recreates native cancellation, including NSError boxes that bridge to CancellationError.
-    /// Rethrows other reported cancellations unchanged.
-    /// Otherwise checks task cancellation before the caller handles an ordinary failure.
-    package static func rethrowIfCancelled(_ error: any Error) throws {
-        if error is CancellationError { throw CancellationError() }
+    package enum NativeCancellationPolicy: Sendable {
+        case normalize
+        case preserveOriginal
+    }
+
+    /// Rethrows reported cancellation before checking task cancellation. The default recreates native
+    /// cancellation; `preserveOriginal` keeps the reported error, including an existing native NSError box.
+    /// Other reported cancellations keep their identity under both policies.
+    package static func rethrowIfCancelled(
+        _ error: any Error, nativeCancellation: NativeCancellationPolicy = .normalize
+    ) throws {
+        if case .normalize = nativeCancellation, error is CancellationError { throw CancellationError() }
         if isCancellation(error) { throw error }
         try Task.checkCancellation()
     }
