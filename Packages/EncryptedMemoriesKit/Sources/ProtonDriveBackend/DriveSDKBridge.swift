@@ -2915,6 +2915,7 @@ extension DriveSDKBridge: PhotoUploading {
             close: {
                 lineageStore?.close()
                 fingerprintCache?.close()
+                replacementJournal?.close()
                 store.close()
             }
         )
