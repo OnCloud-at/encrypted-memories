@@ -1,8 +1,8 @@
 import AlbumSyncCore
 import Foundation
 
-/// What the album picker shows. The Mac sheet and the iOS sheet decide it the same way and draw each case in
-/// their own native form.
+/// What the album picker shows. The Mac and iOS sheets decide it the same way and draw unavailable cases with
+/// the shared `AlbumPickerUnavailableView`. They draw the loading and list cases natively.
 public enum AlbumPickerContent: Equatable, Sendable {
     /// The first load of the albums is still running.
     case loading

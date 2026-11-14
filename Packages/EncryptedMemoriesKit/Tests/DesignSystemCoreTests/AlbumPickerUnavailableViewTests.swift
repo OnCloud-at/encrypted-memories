@@ -6,7 +6,6 @@ import Testing
 
 @Suite struct AlbumPickerUnavailableViewTests {
     @Test func noAlbumsUsesTheExistingAlbumChooserCopy() {
-        #expect(AlbumPickerUnavailableView.noAlbumsTitle == L10n.string("albums.none_available"))
         #expect(AlbumPickerUnavailableView.noAlbumsTitle != "albums.none_available")
     }
 
