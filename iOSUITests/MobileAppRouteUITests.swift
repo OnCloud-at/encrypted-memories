@@ -66,7 +66,8 @@ final class MobileAppRouteUITests: XCTestCase {
     }
 
     func testALinkWaitsWhileThePhotoViewerIsOpen() throws {
-        app.firstPhoto.tap()
+        // The first grid photo can sit under the bars of the iPhone Duo outer display; tap one that is visible.
+        try app.visiblePhoto(beside: app.verticalTabColumn()).tap()
         let close = app.buttons["Close"]
         XCTAssertTrue(close.waitForExistence(timeout: 10), "the viewer did not open")
 
