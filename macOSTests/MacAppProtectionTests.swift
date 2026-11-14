@@ -17,13 +17,14 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertTrue(cover.worksWhenModal)
     }
 
-    func testSuccessfulAuthenticationRevealsOnlyAnActiveWindow() async throws {
-        let fixture = try Fixture()
+    func testSuccessfulAuthenticationRevealsAnInactiveVisibleWindow() async throws {
+        let fixture = try Fixture(applicationIsActive: { false })
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
         let settled = await fixture.waitForCover(visible: false)
         XCTAssertTrue(settled)
         XCTAssertFalse(fixture.presentation.snapshot)
+        XCTAssertEqual(fixture.presentation.phase, .inactive)
         XCTAssertTrue(fixture.gate.admits(.app))
     }
 
@@ -131,14 +132,14 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertNotNil(fixture.cover)
     }
 
-    func testAnInactiveWindowKeepsItsSnapshotUntilItBecomesActive() async throws {
+    func testAnInactiveVisibleWindowStaysRevealedAfterAuthentication() async throws {
         let activity = Activity(active: false)
         let fixture = try Fixture(applicationIsActive: { activity.isActive })
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let covered = await fixture.waitForCover(visible: true)
+        let covered = await fixture.waitForCover(visible: false)
         XCTAssertTrue(covered)
-        XCTAssertTrue(fixture.presentation.snapshot)
+        XCTAssertFalse(fixture.presentation.snapshot)
         activity.isActive = true
         NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
         let revealed = await fixture.waitForCover(visible: false)
@@ -193,7 +194,8 @@ final class MacAppProtectionTests: XCTestCase {
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
         NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
-        XCTAssertEqual(fixture.presentation.snapshot, !NSApp.isActive)
+        XCTAssertEqual(fixture.presentation.phase, NSApp.isActive ? .active : .inactive)
+        XCTAssertFalse(fixture.presentation.snapshot)
     }
 
     func testClosingAChildKeepsItsSuspendedRootCovered() async throws {

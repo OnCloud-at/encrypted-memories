@@ -14,23 +14,25 @@ public final class ProtectedScopePresentation {
 
     /// Native hosts supply activity before exposing or snapshotting their windows.
     @discardableResult
-    public func update(isActive: Bool) -> Bool {
-        let coverage = ProtectedScopeCoverage(gate: gate, isActive: isActive)
+    public func update(isActive: Bool, foregroundVisible: Bool? = nil) -> Bool {
+        let coverage = ProtectedScopeCoverage(gate: gate, isActive: isActive, foregroundVisible: foregroundVisible)
         snapshot = coverage.snapshot
         phase = coverage.phase
         return coverage.isCovered
     }
 }
 
-/// The same coverage rule serves native window adapters and mounted SwiftUI roots.
+/// The same coverage rule serves native window adapters and mounted SwiftUI roots. An enabled lock snapshots
+/// content that is not visible in the foreground. Without `foregroundVisible`, an inactive scene counts as not
+/// visible, as in the iOS app switcher; a Mac window stays visible while another app is active.
 @MainActor
 public struct ProtectedScopeCoverage {
     public let snapshot: Bool
     public let phase: ScenePhase
     public let isCovered: Bool
 
-    public init(gate: AccessGate, isActive: Bool) {
-        snapshot = !isActive && gate.isEnabled(.app)
+    public init(gate: AccessGate, isActive: Bool, foregroundVisible: Bool? = nil) {
+        snapshot = !(foregroundVisible ?? isActive) && gate.isEnabled(.app)
         phase = isActive ? .active : .inactive
         isCovered = snapshot || !gate.admits(.app)
     }

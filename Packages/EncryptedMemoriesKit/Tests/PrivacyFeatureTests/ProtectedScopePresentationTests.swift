@@ -21,6 +21,17 @@ final class ProtectedScopePresentationTests: ProtectedScopeTestCase {
         XCTAssertTrue(presentation.gate.admits(.app))
     }
 
+    func testAVisibleInactiveWindowNeedsNoSnapshot() async {
+        let presentation = makePresentation(enabled: true)
+        XCTAssertTrue(presentation.update(isActive: false, foregroundVisible: true), "A locked window stays covered")
+        await unlock(presentation.gate)
+        XCTAssertFalse(presentation.update(isActive: false, foregroundVisible: true))
+        XCTAssertFalse(presentation.snapshot)
+        XCTAssertEqual(presentation.phase, .inactive)
+        XCTAssertTrue(presentation.update(isActive: false, foregroundVisible: false))
+        XCTAssertTrue(presentation.snapshot)
+    }
+
     func testActiveLockedAndUnlockedWindowsUseAdmission() async {
         let presentation = makePresentation(enabled: true)
         XCTAssertTrue(presentation.update(isActive: true))

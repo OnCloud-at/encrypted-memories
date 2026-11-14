@@ -157,7 +157,7 @@ final class MacAppProtection: NSObject {
             let foregroundWindow = !hiding && !NSApp.isHidden && Self.showsContent(source, root: root)
             let active = applicationIsActive() && foregroundWindow
             let presentation = root?.presentation ?? covers[key]?.presentation ?? ProtectedScopePresentation(gate: gate)
-            guard presentation.update(isActive: active) else {
+            guard presentation.update(isActive: active, foregroundVisible: foregroundWindow) else {
                 covers[key]?.hide()
                 continue
             }
