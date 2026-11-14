@@ -240,13 +240,15 @@ let package = Package(
                 "TimelineCore", "PhotosCore", "MediaFeedCore", "MediaLocationCore", "UploadCore", "GridCore",
             ],
             swiftSettings: disableDynamicActorIsolation),
+        .target(name: "TimelineAppleAdapter", swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "TimelineUIKitAdapter", dependencies: ["GridCore", "TimelineCore", "MetalRenderingCore"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "TimelineUIKitFeature",
             dependencies: [
-                "PhotosCore", "GridCore", "TimelineCore", "TimelineUIKitAdapter", "MetalRenderingCore",
+                "PhotosCore", "GridCore", "TimelineCore", "TimelineUIKitAdapter", "TimelineAppleAdapter",
+                "MetalRenderingCore",
                 "MetalGridTextureCore", "MetalGridTextureUIKitAdapter", "MetalGridComposeCore",
                 "MediaCacheUIKitAdapter", "MediaFeedCore",
             ], swiftSettings: disableDynamicActorIsolation),
