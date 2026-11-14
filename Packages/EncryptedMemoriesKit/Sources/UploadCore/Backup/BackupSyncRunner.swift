@@ -1501,52 +1501,34 @@ public actor BackupSyncRunner {
             requeueWithoutReceipt(entry, from: state)
             return
         }
-        if reconciliation.source == entry.source,
-            events?.recordHandoff(
-                source: entry.source,
-                revision: entry.revision,
-                remote: PhotoUID(
-                    volumeID: reconciliation.receipt.remoteVolumeID,
-                    nodeID: reconciliation.receipt.remoteLinkID
-                ),
-                kind: .uploaded
-            ) == .failed
-        {
-            // Keep the receipt: the handoff must be durable before the row can settle.
-            parkRemoteReconciliation(
-                entry,
-                reconciliation: reconciliation,
-                from: state,
-                message: "Pending handoff could not be persisted."
-            )
-            return
-        }
-        let descriptor: UploadResourceDescriptor?
-        if resolved.descriptor.source == reconciliation.source {
-            descriptor = resolved.descriptor
-        } else {
-            descriptor =
-                resolved.secondaries.first {
-                    $0.descriptor.source == reconciliation.source
-                }?.descriptor
-        }
-        guard let descriptor else {
-            parkRemoteReconciliation(
-                entry,
-                reconciliation: reconciliation,
-                from: state,
-                message: "Committed resource is not currently available for local reconciliation."
-            )
-            return
-        }
-
         do {
-            try await identityResolver.recordUploaded(
-                descriptor,
-                identity: reconciliation.identity,
-                remoteVolumeID: reconciliation.receipt.remoteVolumeID,
-                remoteLinkID: reconciliation.receipt.remoteLinkID
-            )
+            let recorded = try await UploadRemoteCommitRecording.record(
+                reconciliation, for: entry, events: events, identityResolver: identityResolver,
+                descriptorOrPark: {
+                    let descriptor: UploadResourceDescriptor?
+                    if resolved.descriptor.source == reconciliation.source {
+                        descriptor = resolved.descriptor
+                    } else {
+                        descriptor =
+                            resolved.secondaries.first {
+                                $0.descriptor.source == reconciliation.source
+                            }?.descriptor
+                    }
+                    guard let descriptor else {
+                        parkRemoteReconciliation(
+                            entry, reconciliation: reconciliation, from: state,
+                            message: "Committed resource is not currently available for local reconciliation.")
+                        return nil
+                    }
+                    return descriptor
+                },
+                onHandoffFailure: {
+                    // Keep the receipt: the handoff must be durable before the row can settle.
+                    parkRemoteReconciliation(
+                        entry, reconciliation: reconciliation, from: state,
+                        message: "Pending handoff could not be persisted.")
+                })
+            guard recorded else { return }
         } catch {
             _ = recordCancellation(error, for: entry)
             parkRemoteReconciliation(
