@@ -7,7 +7,7 @@
     import XCTest
 
     private enum SummaryCase: String, CaseIterable {
-        case batch, item, unreported, withheld, timeout, partial, manual, disk, skipped, late, disabled
+        case batch, item, unreported, withheld, timeout, partial, disk, skipped, late, disabled
 
         var errorText: String? {
             switch self {
@@ -17,7 +17,6 @@
             case .withheld: "thumbnail withheld"
             case .timeout: "thumbnail batch timed out"
             case .partial: "thumbnail refused"
-            case .manual: "thumbnail batch missing"
             case .disk: "thumbnail refused"
             case .skipped: "thumbnail batch missing"
             case .late: "thumbnail batch missing"
@@ -64,7 +63,7 @@
             cache.configure(accountUID: "summary", key: SymmetricKey(size: .bits256))
             let uids = (0..<4).map { PhotoUID(volumeID: "summary", nodeID: "\(name)-\($0)") }
             let body: any ThumbnailBatchLoader
-            var manualLoader: ControlledLateLoader?
+            var disabledLoader: ControlledLateLoader?
             var lateLoader: ControlledLateLoader?
             switch scenario {
             case .batch:
@@ -88,9 +87,9 @@
                     payloads: Dictionary(uniqueKeysWithValues: uids.map { ($0, png) }))
                 lateLoader = controlled
                 body = controlled
-            case .manual, .disabled:
+            case .disabled:
                 let controlled = ControlledLateLoader(payloads: [:])
-                manualLoader = controlled
+                disabledLoader = controlled
                 body = controlled
             case .partial:
                 let png = makePNGData(width: 8, height: 8)
@@ -111,15 +110,11 @@
                 try await ThumbnailFeedCoreTests.waitForCrawl(feed)
                 _ = await feed.replaceVisiblePriorityDemand(uids)
             }
-            if let manualLoader {
-                let started = await ThumbnailFeedCoreTests.waitForLeaseTest { await manualLoader.isWaiting() }
+            if let disabledLoader {
+                let started = await ThumbnailFeedCoreTests.waitForLeaseTest { await disabledLoader.isWaiting() }
                 XCTAssertTrue(started)
-                if scenario == .manual {
-                    await feed.pausePrefetch()
-                } else {
-                    await feed.setPrefetchEnabled(false)
-                }
-                await manualLoader.release()
+                await feed.setPrefetchEnabled(false)
+                await disabledLoader.release()
             }
             if let lateLoader {
                 let cancelled = await ThumbnailFeedCoreTests.waitForLeaseTest { await lateLoader.cancellations() == 1 }
@@ -247,16 +242,15 @@
                 XCTAssertEqual(
                     values["skippedUnfetchable"], scenario == .skipped ? "4" : "0",
                     "\(scenario.rawValue): skippedUnfetchable: \(summary)")
-                let reason = scenario == .manual ? "manual" : "none"
                 XCTAssertEqual(values["enabled"], "true", "\(scenario.rawValue): enabled: \(summary)")
-                XCTAssertEqual(values["pausedReason"], reason, "\(scenario.rawValue): pausedReason: \(summary)")
+                XCTAssertEqual(values["pausedReason"], "none", "\(scenario.rawValue): pausedReason: \(summary)")
                 let expectedCounts: [String: Int] = [
                     "failedTimeout": scenario == .timeout || scenario == .late ? 4 : 0,
                     "failedBatchError": scenario == .batch ? 4 : 0,
                     "failedItemError": scenario == .item || scenario == .skipped
                         ? 4
                         : scenario == .partial || scenario == .disk ? 2 : 0,
-                    "failedUnreported": scenario == .unreported || scenario == .manual ? 4 : 0,
+                    "failedUnreported": scenario == .unreported ? 4 : 0,
                     "failedWithheld": scenario == .withheld ? 4 : 0,
                 ]
                 for (field, count) in expectedCounts {

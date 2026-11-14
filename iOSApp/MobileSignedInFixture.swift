@@ -41,7 +41,8 @@ import os
 
         /// `includesVideo` adds one video as the newest item; the UI tests use it, the hosted tests count photos only.
         init(
-            runtime: MobileAccountRuntime = .shared, itemsPerSection: Int = 36, includesVideo: Bool = false
+            runtime: MobileAccountRuntime = .shared, itemsPerSection: Int = 36, includesVideo: Bool = false,
+            cacheRuntimeState: LibraryRuntimeState = .shared
         ) async throws {
             guard !BackupLocalDataPurge.isPurgePending() else { throw MobileFixtureError.pendingAccountPurge }
             self.runtime = runtime
@@ -89,7 +90,7 @@ import os
             thumbnails[Self.editedOriginalUID] = original.jpegData(compressionQuality: 0.8)
             self.sections = sections
             backend = MobileFixtureBackend(sections: sections, thumbnails: thumbnails)
-            cache = ThumbnailCache(rootDirectory: cacheDirectory)
+            cache = ThumbnailCache(rootDirectory: cacheDirectory, runtimeState: cacheRuntimeState)
             feed = UIKitThumbnailFeed(cache: cache, loader: backend)
             for (uid, data) in thumbnails {
                 await cache.store(data, for: uid)

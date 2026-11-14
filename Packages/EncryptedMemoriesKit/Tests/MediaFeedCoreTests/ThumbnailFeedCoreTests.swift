@@ -2485,9 +2485,10 @@ struct ThumbnailFeedCoreTests {
         coverage.release.signal()
         await bootstrap.value
         // Start a worker after the stale bootstrap returns; it must have no old crawl to run.
-        await feed.resumePrefetch()
+        let probe = Self.uid("bootstrap-probe")
+        await feed.requestPriority(probe)
         try await Self.waitForCrawl(feed)
-        #expect(await loader.requestCount() == 0)
+        #expect(await loader.requestOrder() == [probe])
     }
 
     @Test func diskOnlyBytesWarmIntoDecodedRamWithoutNetwork() async throws {
@@ -3202,12 +3203,12 @@ struct ThumbnailFeedCoreTests {
     @Test(arguments: [true, false])
     func visibleNetworkDemandBeforeAuthorizationRecoversAndDecodesArrival(includedInLibrary: Bool) async throws {
         let uid = Self.uid("visible-network-before-scope")
-        let cache = Self.cache("visible-network-before-scope")
+        let runtimeState = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .suspended))
+        let cache = Self.cache("visible-network-before-scope", runtimeState: runtimeState)
         let loader = RecordingLoader(payloads: [uid: Self.pngData(width: 8, height: 8)])
         let feed = ThumbnailFeedCore(cache: cache, loader: loader, configuration: Self.configuration())
-        // Pause only speculative crawling. Disabling prefetch also fences network disk probes, so it
+        // A suspended runtime holds speculative crawling. Disabling prefetch also fences network disk probes, so it
         // cannot exercise the supported visible-network path.
-        await feed.pausePrefetch()
         let graph = LibrarySourceGraph()
         let change = Self.visibleScope(in: graph, uids: [uid], includedInLibrary: includedInLibrary)
         #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
@@ -4639,8 +4640,10 @@ struct ThumbnailFeedCoreTests {
             let uid = Self.uid(name)
             let runtime = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .foregroundActive))
             let cache = Self.cache(name, runtimeState: runtime)
+            // The wake probe is withheld once as well; it must not hold the crawl again.
+            let probing = FlagBox()
             let loader = WithheldOnceLoader(payload: Self.pngData(width: 8, height: 8)) {
-                runtime.update { $0.executionOpportunity = .suspended }
+                if !probing.isSet { runtime.update { $0.executionOpportunity = .suspended } }
             }
             let feed = ThumbnailFeedCore(
                 cache: cache, loader: loader,
@@ -4654,8 +4657,12 @@ struct ThumbnailFeedCoreTests {
 
             if disable { await feed.setPrefetchEnabled(false) }
             runtime.update { $0.executionOpportunity = .foregroundActive }
-            if disable { await feed.setPrefetchEnabled(true) }
-            await feed.resumePrefetch()
+            if disable {
+                await feed.setPrefetchEnabled(true)
+                // Start a worker without a restart: a restart would clear the withheld retries itself.
+                probing.set()
+                await feed.requestPriority(Self.uid("withheld-probe"))
+            }
             if disable {
                 try await Self.waitForCrawl(feed)
                 #expect(await loader.requests(for: uid) == 1, "disabling clears the pending retry")

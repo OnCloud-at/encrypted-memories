@@ -1,9 +1,6 @@
 import CoreGraphics
-import CryptoKit
 import Foundation
-import MediaByteCache
 import MediaCache
-import MediaFeedCore
 import PhotosCore
 import Testing
 
@@ -152,29 +149,6 @@ struct AppInfrastructureTests {
         #expect(order.max() == .idleLibraryCrawl)
     }
 
-    @Test func manualPauseHoldsCrawlUntilResumed() async throws {
-        let namespace = "tests-pause-\(UUID().uuidString)"
-        let root = timelineFeatureTestCacheRoot("pause")
-        let loader = StubThumbnailLoader()
-        let cache = ThumbnailCache(namespace: namespace, rootDirectory: root)
-        cache.configure(accountUID: "fixture", key: SymmetricKey(size: .bits256))
-        let feed = ThumbnailFeed(
-            cache: cache,
-            loader: loader,
-            concurrency: 1, batch: 1)
-        await feed.pausePrefetch()
-        await feed.startPrefetch([PhotoUID(volumeID: "v", nodeID: "a")])
-        try await Task.sleep(for: .milliseconds(200))
-        #expect(await loader.requestCount == 0)
-        await feed.resumePrefetch()
-        for _ in 0..<600 where await loader.requestCount == 0 {
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        #expect(await loader.requestCount == 1)
-        await feed.setPrefetchEnabled(false)
-        await feed.stopPrefetch()
-    }
-
     //
     // The timeline query-plan guard lives with `TimelineMetadataStore` in PhotosCoreTests.
     // It checks the store schema and load statement directly.
@@ -242,14 +216,4 @@ struct AppInfrastructureTests {
             #expect(stats.gpuMs == 0)
         }
     #endif
-}
-
-private actor StubThumbnailLoader: ThumbnailBatchLoader {
-    private(set) var requestCount = 0
-    func loadThumbnails(
-        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult {
-        requestCount += uids.count
-        return .delivered
-    }
 }

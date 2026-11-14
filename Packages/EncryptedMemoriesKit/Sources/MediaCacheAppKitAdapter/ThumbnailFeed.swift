@@ -205,14 +205,6 @@ public actor ThumbnailFeed {
         await core.setPrefetchEnabled(enabled)
     }
 
-    public func pausePrefetch() async {
-        await core.pausePrefetch()
-    }
-
-    public func resumePrefetch() async {
-        await core.resumePrefetch()
-    }
-
     public nonisolated func setUserInteractionActive(_ active: Bool, owner: ThumbnailInteractionOwner) {
         core.setUserInteractionActive(active, owner: owner)
     }

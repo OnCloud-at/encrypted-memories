@@ -79,7 +79,6 @@ struct ThumbnailCrawlYieldTests {
 
         // Demand goes quiet after advancing past the 0.25 s window, so the crawl resumes.
         clock.advance(1.0)
-        await feed.resumePrefetch()
         try await Self.waitUntil {
             let o = await loader.fetchOrder()
             return seq.allSatisfy { o.contains($0) }
@@ -105,7 +104,6 @@ struct ThumbnailCrawlYieldTests {
 
         // Demand goes quiet (past the 0.25 s window) to the crawl resumes and drains the sequential set.
         clock.advance(1.0)
-        await feed.resumePrefetch()
         try await Self.waitUntil {
             let o = await loader.fetchOrder()
             return seq.allSatisfy { o.contains($0) }
