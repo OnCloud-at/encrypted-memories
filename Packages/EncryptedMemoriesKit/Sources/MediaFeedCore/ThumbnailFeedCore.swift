@@ -389,7 +389,6 @@ public actor ThumbnailFeedCore {
     private var batchesInFlight: [UUID: Set<PhotoUID>] = [:]
     private var lastErrors: [String] = []
     private var prefetchEnabled = true
-    private var prefetchPaused = false
     /// Wakes the crawl once nothing holds it: storage is below the critical level and the app is no longer
     /// suspended (foreground, or a background window).
     private var crawlWakeTask: Task<Void, Never>?
@@ -442,8 +441,8 @@ public actor ThumbnailFeedCore {
     private var prefetchFailedItemError = 0
     private var prefetchFailedUnreported = 0
     private var prefetchFailedWithheld = 0
-    /// Photos withheld after an authorization change, which the crawl requests again behind its own gates (pause,
-    /// backoff, visible demand, storage pressure), and how often each was requeued in this crawl. The bound keeps
+    /// Photos withheld after an authorization change, which the crawl requests again behind its own gates (backoff,
+    /// visible demand, storage pressure), and how often each was requeued in this crawl. The bound keeps
     /// churn from looping forever.
     private var withheldRetry: [PhotoUID] = []
     private var withheldRequeues: [PhotoUID: Int] = [:]
@@ -1992,15 +1991,6 @@ public actor ThumbnailFeedCore {
         if !enabled { stopPrefetch() }
     }
 
-    public func pausePrefetch() {
-        prefetchPaused = true
-    }
-
-    public func resumePrefetch() {
-        prefetchPaused = false
-        startWorkers()
-    }
-
     /// One platform grid host reports only its own gesture state. Several windows can drive the same shared
     /// feed at once; the feed stays interacting while any owner is active, and a host that stops, switches
     /// feeds, or goes away removes only its own contribution.
@@ -2601,7 +2591,7 @@ public actor ThumbnailFeedCore {
         let now = clock()
         let backingOff = crawlBackoffUntil.map { now < $0 } ?? false
         // A nearly full device or a background window holds the crawl; visible photos still load.
-        guard crawlAllowed, !prefetchPaused, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff,
+        guard crawlAllowed, prefetchEnabled, !recentVisibleDemand(now: now), !backingOff,
             !crawlIsHeld()
         else {
             let batch = await finishDiskProbeBatch(
@@ -3489,8 +3479,6 @@ public actor ThumbnailFeedCore {
             let pausedReason: String
             if !prefetchEnabled {
                 pausedReason = "disabled"
-            } else if prefetchPaused {
-                pausedReason = "manual"
             } else {
                 pausedReason = "none"
             }

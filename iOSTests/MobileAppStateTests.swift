@@ -950,12 +950,12 @@ private func waitUntil(
     }
 
     @Test func directAccountSwitchClosesThePreviousAccountFirst() async throws {
-        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        let runtimeState = LibraryRuntimeState(initial: LibraryRuntimeSnapshot(executionOpportunity: .suspended))
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1, cacheRuntimeState: runtimeState)
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         fixture.install(into: model)
         let feed = fixture.feed
-        await feed.pausePrefetch()
         await feed.startPrefetch(fixture.items.map(\.uid))
         #expect(await feed.hasPendingThumbnailWork())
 
