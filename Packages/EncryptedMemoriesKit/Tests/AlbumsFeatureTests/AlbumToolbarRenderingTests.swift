@@ -31,34 +31,25 @@
             for appearance in [NSAppearance.Name.aqua, .darkAqua] {
                 sheet.appearance = NSAppearance(named: appearance)
                 try await Task.sleep(for: .milliseconds(300))
-                view.layoutSubtreeIfNeeded()
-                let bitmap = try XCTUnwrap(
-                    view.bitmapImageRepForCachingDisplay(in: view.bounds), "Album Mac: bitmapRep unavailable")
-                view.cacheDisplay(in: view.bounds, to: bitmap)
-                let request = VNRecognizeTextRequest()
-                request.recognitionLevel = .accurate
-                request.recognitionLanguages = ["de-DE", "en-US"]
+                let bitmap = try snapshot(of: view)
                 let image = try XCTUnwrap(bitmap.cgImage, "Album Mac: bitmap cgImage unavailable")
+                let observations: [VNRecognizedTextObservation]
                 do {
-                    try VNImageRequestHandler(cgImage: image).perform([request])
+                    observations = try recognizedText(in: image)
                 } catch {
                     XCTFail("Album Mac: Vision.perform failed: \(error)")
                     throw error
                 }
-                let visibleText = request.results?.compactMap { $0.topCandidates(1).first?.string } ?? []
+                let visibleText = observations.compactMap { $0.topCandidates(1).first?.string }
                 print("[Album Mac] visible text=\(visibleText)")
                 XCTAssertTrue(visibleText.contains(L10n.string("action.cancel")))
                 XCTAssertTrue(visibleText.contains(L10n.string("albums.create_action")))
-                let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                let data = try pngData(from: bitmap)
                 let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.png")
                 attachment.name = "Album sheet \(appearance.rawValue)"
                 attachment.lifetime = .keepAlways
                 add(attachment)
-                if let directory = ProcessInfo.processInfo.environment["ALBUM_TOOLBAR_SCREENSHOT_DIR"] {
-                    let url = URL(fileURLWithPath: directory, isDirectory: true)
-                    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-                    try data.write(to: url.appendingPathComponent("album-\(appearance.rawValue).png"))
-                }
+                try saveScreenshotIfRequested(bitmap, named: "album-\(appearance.rawValue).png")
             }
         }
 
@@ -79,27 +70,16 @@
             defer { window.orderOut(nil) }
             try await Task.sleep(for: .milliseconds(500))
             let view = try XCTUnwrap(window.contentView)
-            view.layoutSubtreeIfNeeded()
-            let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-            view.cacheDisplay(in: view.bounds, to: bitmap)
+            let bitmap = try snapshot(of: view)
             let image = try XCTUnwrap(bitmap.cgImage)
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.recognitionLanguages = ["de-DE", "en-US"]
-            try VNImageRequestHandler(cgImage: image).perform([request])
+            let observations = try recognizedText(in: image)
             let emptyText = try XCTUnwrap(
-                request.results?.first { $0.topCandidates(1).first?.string == title },
+                observations.first { $0.topCandidates(1).first?.string == title },
                 "The real destination picker must draw its existing empty text")
             let textWidth = emptyText.boundingBox.width * view.bounds.width
             let referenceWidth = reference.fittingSize.width
             XCTAssertGreaterThan(referenceWidth, 100, "The reference must measure the actual text")
-            print("[Album empty row] textWidth=\(textWidth), referenceWidth=\(referenceWidth)")
-            if let directory = ProcessInfo.processInfo.environment["ALBUM_TOOLBAR_SCREENSHOT_DIR"] {
-                let url = URL(fileURLWithPath: directory, isDirectory: true)
-                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-                let data = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-                try data.write(to: url.appendingPathComponent("album-empty-row.png"))
-            }
+            try saveScreenshotIfRequested(bitmap, named: "album-empty-row.png")
             // OCR excludes the glyph bearings; allow that small difference from the native text's width.
             XCTAssertGreaterThan(textWidth, referenceWidth * 0.9)
         }
@@ -113,16 +93,41 @@
                     .background(.white))
             renderer.scale = 2
             guard let image = renderer.cgImage else { throw XCTSkip("Vision OCR unavailable on this runner") }
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.recognitionLanguages = ["de-DE", "en-US"]
+            let text: String
             do {
-                try VNImageRequestHandler(cgImage: image).perform([request])
+                text = try recognizedText(in: image).compactMap { $0.topCandidates(1).first?.string }
+                    .joined(separator: " ")
             } catch {
                 throw XCTSkip("Vision OCR unavailable on this runner")
             }
-            let text = request.results?.compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ") ?? ""
             guard !text.isEmpty else { throw XCTSkip("Vision OCR unavailable on this runner") }
+        }
+
+        @MainActor private func snapshot(of view: NSView) throws -> NSBitmapImageRep {
+            view.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(
+                view.bitmapImageRepForCachingDisplay(in: view.bounds), "Album Mac: bitmapRep unavailable")
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            return bitmap
+        }
+
+        @MainActor private func recognizedText(in image: CGImage) throws -> [VNRecognizedTextObservation] {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["de-DE", "en-US"]
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            return request.results ?? []
+        }
+
+        @MainActor private func pngData(from bitmap: NSBitmapImageRep) throws -> Data {
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        }
+
+        @MainActor private func saveScreenshotIfRequested(_ bitmap: NSBitmapImageRep, named name: String) throws {
+            guard let directory = ProcessInfo.processInfo.environment["ALBUM_TOOLBAR_SCREENSHOT_DIR"] else { return }
+            let url = URL(fileURLWithPath: directory, isDirectory: true)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try pngData(from: bitmap).write(to: url.appendingPathComponent(name))
         }
     }
 #endif
