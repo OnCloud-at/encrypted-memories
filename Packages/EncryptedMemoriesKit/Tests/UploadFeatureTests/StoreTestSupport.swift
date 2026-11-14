@@ -170,32 +170,40 @@ func withSQLiteAuthorization(
     in store: Any, authorizing: @escaping (Int32, String?, String?) -> Int32,
     _ body: () throws -> Void
 ) throws {
-    let authorization = try SQLiteAuthorization(in: store, authorizing: authorizing)
-    defer { authorization.remove() }
+    let connection = try storeConnection(store)
+    let authorization = connection.withLock {
+        SQLiteAuthorization(onLockedConnection: connection, authorizing: authorizing)
+    }
+    defer {
+        connection.withLock { SQLiteAuthorization.remove(authorization, fromLockedConnection: connection) }
+    }
     try body()
 }
 
-private final class SQLiteAuthorization {
-    private let connection: SQLiteStoreConnection
+/// Owns the callback storage for one installed authorizer. Retain it until removal finishes.
+/// Install and remove only while holding the connection lock, so a fixture can change its other callbacks atomically.
+/// The caller must remove the authorizer before releasing this object or closing the store.
+final class SQLiteAuthorization {
     private let authorizing: (Int32, String?, String?) -> Int32
 
-    init(in store: Any, authorizing: @escaping (Int32, String?, String?) -> Int32) throws {
-        connection = try storeConnection(store)
+    init(
+        onLockedConnection connection: SQLiteStoreConnection, authorizing: @escaping (Int32, String?, String?) -> Int32
+    ) {
         self.authorizing = authorizing
-        connection.withLock {
-            XCTAssertEqual(
-                sqlite3_set_authorizer(
-                    connection.database,
-                    { context, action, table, column, _, _ in
-                        guard let context else { return SQLITE_DENY }
-                        let authorization = Unmanaged<SQLiteAuthorization>.fromOpaque(context).takeUnretainedValue()
-                        return authorization.authorizing(
-                            action, table.map { String(cString: $0) }, column.map { String(cString: $0) })
-                    }, Unmanaged.passUnretained(self).toOpaque()), SQLITE_OK)
-        }
+        XCTAssertEqual(
+            sqlite3_set_authorizer(
+                connection.database,
+                { context, action, table, column, _, _ in
+                    guard let context else { return SQLITE_DENY }
+                    let authorization = Unmanaged<SQLiteAuthorization>.fromOpaque(context).takeUnretainedValue()
+                    return authorization.authorizing(
+                        action, table.map { String(cString: $0) }, column.map { String(cString: $0) })
+                }, Unmanaged.passUnretained(self).toOpaque()), SQLITE_OK)
     }
 
-    func remove() {
-        connection.withLock { XCTAssertEqual(sqlite3_set_authorizer(connection.database, nil, nil), SQLITE_OK) }
+    static func remove(_ authorization: SQLiteAuthorization?, fromLockedConnection connection: SQLiteStoreConnection) {
+        withExtendedLifetime(authorization) {
+            XCTAssertEqual(sqlite3_set_authorizer(connection.database, nil, nil), SQLITE_OK)
+        }
     }
 }

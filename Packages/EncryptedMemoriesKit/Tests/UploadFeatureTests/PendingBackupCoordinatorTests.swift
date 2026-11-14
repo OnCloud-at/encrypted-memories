@@ -4834,7 +4834,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
 
         func install(on store: PendingBackupManifestStore) throws {
-            let connection = try Self.connection(of: store)
+            let connection = try storeConnection(store)
             connection.withLock {
                 _ = sqlite3_trace_v2(
                     connection.database, UInt32(SQLITE_TRACE_STMT),
@@ -4865,7 +4865,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
 
         func remove(from store: PendingBackupManifestStore) {
-            guard let connection = try? Self.connection(of: store) else { return }
+            guard let connection = try? storeConnection(store) else { return }
             connection.withLock { _ = sqlite3_trace_v2(connection.database, 0, nil, nil) }
         }
 
@@ -4874,18 +4874,13 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         func recover() {
             lock.withLock { limit = 0 }
         }
-
-        static func connection(of store: PendingBackupManifestStore) throws -> SQLiteStoreConnection {
-            try XCTUnwrap(
-                Mirror(reflecting: store).children.first(where: { $0.label == "connection" })?.value
-                    as? SQLiteStoreConnection)
-        }
     }
 
     /// Fails the selected SQL operation, once or until removal. Transient recovery tests use SQLITE_INTERRUPT;
     /// the default SQLITE_AUTH is a lasting failure and never claims that removing the fault recovers the connection.
     private final class SourceListFailure: @unchecked Sendable {
         private let lock = NSLock()
+        private var authorization: SQLiteAuthorization?
         private var done = false
         private let table: String
         private let untilRemoved: Bool
@@ -4907,7 +4902,7 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         }
 
         func install(on store: PendingBackupManifestStore) throws {
-            let connection = try KeyedReadFailure.connection(of: store)
+            let connection = try storeConnection(store)
             connection.withLock {
                 if transient {
                     sqlite3_progress_handler(
@@ -4923,36 +4918,34 @@ final class PendingBackupCoordinatorTests: XCTestCase {
                             }
                         }, Unmanaged.passUnretained(self).toOpaque())
                 }
-                _ = sqlite3_set_authorizer(
-                    connection.database,
-                    { context, action, table, column, _, _ in
-                        guard let context, let table else { return SQLITE_OK }
-                        let failure = Unmanaged<SourceListFailure>.fromOpaque(context).takeUnretainedValue()
-                        guard action == failure.action, String(cString: table) == failure.table,
-                            failure.column == nil || column.map({ String(cString: $0) }) == failure.column
-                        else { return SQLITE_OK }
-                        return failure.lock.withLock {
-                            guard !failure.done || failure.untilRemoved else { return SQLITE_OK }
-                            if failure.transient {
-                                failure.interruptNextOperation = true
-                                return SQLITE_OK
-                            }
-                            failure.done = true
-                            return SQLITE_DENY
+                authorization = SQLiteAuthorization(onLockedConnection: connection) {
+                    [unowned self] action, table, column in
+                    guard action == self.action, table == self.table,
+                        self.column == nil || column == self.column
+                    else { return SQLITE_OK }
+                    return self.lock.withLock {
+                        guard !self.done || self.untilRemoved else { return SQLITE_OK }
+                        if self.transient {
+                            self.interruptNextOperation = true
+                            return SQLITE_OK
                         }
-                    }, Unmanaged.passUnretained(self).toOpaque())
+                        self.done = true
+                        return SQLITE_DENY
+                    }
+                }
             }
         }
 
         func remove(from store: PendingBackupManifestStore) {
-            guard let connection = try? KeyedReadFailure.connection(of: store) else { return }
+            guard let connection = try? storeConnection(store) else { return }
             connection.withLock {
-                _ = sqlite3_set_authorizer(connection.database, nil, nil)
+                SQLiteAuthorization.remove(authorization, fromLockedConnection: connection)
                 if transient {
                     sqlite3_progress_handler(connection.database, 0, nil, nil)
                     XCTAssertTrue(
                         connection.failuresAreTransient, "the recovery fixture must not inject lasting errors")
                 }
+                authorization = nil
             }
         }
     }
