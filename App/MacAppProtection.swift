@@ -121,6 +121,11 @@ final class MacAppProtection: NSObject {
         roots = []
     }
 
+    /// A window shows protected content when it is on screen, not minimized and not prepared to leave.
+    private static func showsContent(_ window: NSWindow, root: WeakWindow?) -> Bool {
+        window.isVisible && !window.isMiniaturized && !(root?.suspended ?? false)
+    }
+
     private func refresh() {
         guard !refreshing, observing else { return }
         refreshing = true
@@ -130,10 +135,7 @@ final class MacAppProtection: NSObject {
         }
         roots = liveRoots.map(\.root)
         let foreground =
-            !hiding && !NSApp.isHidden
-            && liveRoots.contains {
-                $0.window.isVisible && !$0.window.isMiniaturized && !$0.root.suspended
-            }
+            !hiding && !NSApp.isHidden && liveRoots.contains { Self.showsContent($0.window, root: $0.root) }
         if foreground != wasForeground {
             wasForeground = foreground
             if foreground { gate.appWillEnterForeground(at: .now) } else { gate.appDidEnterBackground(at: .now) }
@@ -152,9 +154,7 @@ final class MacAppProtection: NSObject {
         }
         for (key, source) in targets {
             let root = liveRoots.first { $0.window === source }?.root
-            let foregroundWindow =
-                !hiding && !NSApp.isHidden && source.isVisible
-                && !source.isMiniaturized && !(root?.suspended ?? false)
+            let foregroundWindow = !hiding && !NSApp.isHidden && Self.showsContent(source, root: root)
             let active = applicationIsActive() && foregroundWindow
             let presentation = root?.presentation ?? covers[key]?.presentation ?? ProtectedScopePresentation(gate: gate)
             guard presentation.update(isActive: active) else {
@@ -193,10 +193,7 @@ final class MacAppProtection: NSObject {
     }
 
     @objc private func willUnhide(_ note: Notification) {
-        let returning = roots.contains { root in
-            guard let window = root.window else { return false }
-            return window.isVisible && !window.isMiniaturized && !root.suspended
-        }
+        let returning = roots.contains { root in root.window.map { Self.showsContent($0, root: root) } ?? false }
         gate.appWillEnterForeground(at: .now, hasForegroundContent: returning)
         hiding = false
         refresh()

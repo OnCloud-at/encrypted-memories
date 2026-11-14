@@ -46,12 +46,9 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
         let gate = AccessGate(authenticator: PendingDeviceOwner(), defaults: defaults)
         XCTAssertEqual(gate.state(of: .app), .locked)
-        XCTAssertEqual(
-            try pixels(
-                Color.red.protectedScope(
-                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")),
-            try coverPixels(),
-            "The protected-area modifier must replace the visible photo surface with the shared opaque cover")
+        try assertShowsTheCover(
+            Color.red.protectedScope(
+                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock"))
     }
 
     func testSuccessfulAuthenticationRevealsTheMountedContent() async throws {
@@ -79,11 +76,22 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
         owner.answer(.cancelled)
         let result = await authentication.value
         XCTAssertEqual(result, .locked)
-        XCTAssertEqual(
-            try pixels(
-                Color.red.protectedScope(
-                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")),
-            try coverPixels())
+        try assertShowsTheCover(
+            Color.red.protectedScope(
+                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock"))
+    }
+
+    /// The glass button may round one channel level between renders; content showing through differs far more.
+    private func assertShowsTheCover(
+        _ view: some View, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let rendered = try pixels(view)
+        let cover = try coverPixels()
+        XCTAssertEqual(rendered.count, cover.count, file: file, line: line)
+        XCTAssertEqual(redPixelCount(rendered), 0, "No photo pixel may show through the cover", file: file, line: line)
+        let largest = zip(rendered, cover).map { abs(Int($0) - Int($1)) }.max() ?? .max
+        XCTAssertLessThanOrEqual(
+            largest, 1, "The protected area must show the shared opaque cover", file: file, line: line)
     }
 
     private func redPixelCount(_ pixels: Data) -> Int {
