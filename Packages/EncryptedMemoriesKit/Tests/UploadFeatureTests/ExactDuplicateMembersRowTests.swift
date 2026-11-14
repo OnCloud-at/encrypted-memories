@@ -52,14 +52,10 @@
             for (name, row, moves) in [("fitting", fittingRow, false), ("wide", wideRow, true)] {
                 let before = row.contentView.bounds.origin.x
                 // A trackpad gesture to the left: continuous events with a began, changed, and ended phase.
-                for phase: NSEvent.Phase in [.began, .changed, .changed, .changed, .changed, .ended] {
-                    let event = try XCTUnwrap(
-                        CGEvent(
-                            scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0,
-                            wheel2: phase == .ended ? 0 : -60, wheel3: 0))
-                    event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-                    event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue))
-                    row.scrollWheel(with: try XCTUnwrap(NSEvent(cgEvent: event)))
+                for phase in ExactDuplicateScrollTestSupport.phases {
+                    row.scrollWheel(
+                        with: try ExactDuplicateScrollTestSupport.event(
+                            deltaX: phase == .ended ? 0 : -60, deltaY: 0, phase: phase))
                     try await Task.sleep(for: .milliseconds(30))
                 }
                 if moves {
@@ -71,17 +67,29 @@
 
             // A vertical gesture over the row that fits scrolls the list, not the row.
             let listBefore = list.contentView.bounds.origin.y
-            for phase: NSEvent.Phase in [.began, .changed, .changed, .changed, .changed, .ended] {
-                let event = try XCTUnwrap(
-                    CGEvent(
-                        scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
-                        wheel1: phase == .ended ? 0 : -40, wheel2: 0, wheel3: 0))
-                event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
-                event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase.rawValue))
-                fittingRow.scrollWheel(with: try XCTUnwrap(NSEvent(cgEvent: event)))
+            for phase in ExactDuplicateScrollTestSupport.phases {
+                fittingRow.scrollWheel(
+                    with: try ExactDuplicateScrollTestSupport.event(
+                        deltaX: 0, deltaY: phase == .ended ? 0 : -40, phase: phase))
                 try await Task.sleep(for: .milliseconds(30))
             }
             XCTAssertGreaterThan(list.contentView.bounds.origin.y, listBefore, "the list scrolls")
+        }
+
+        func testScrollGesturePhasesRoundTripToAppKit() throws {
+            let expected: [NSEvent.Phase] = [.began, .changed, .changed, .changed, .changed, .ended]
+            for horizontal in [true, false] {
+                let events = try ExactDuplicateScrollTestSupport.phases.map { phase in
+                    let delta: Int32 = phase == .ended ? 0 : -40
+                    return try ExactDuplicateScrollTestSupport.event(
+                        deltaX: horizontal ? delta : 0, deltaY: horizontal ? 0 : delta, phase: phase)
+                }
+                XCTAssertEqual(events.map(\.phase), expected)
+                XCTAssertTrue(events.allSatisfy(\.hasPreciseScrollingDeltas))
+                let deltas: [CGFloat] = expected.map { $0 == .ended ? 0 : -40 }
+                XCTAssertEqual(events.map(\.scrollingDeltaX), horizontal ? deltas : deltas.map { _ in 0 })
+                XCTAssertEqual(events.map(\.scrollingDeltaY), horizontal ? deltas.map { _ in 0 } : deltas)
+            }
         }
 
         /// The Duplicates screen with real thumbnail tiles in a window as wide as a Mac screen.
