@@ -370,12 +370,11 @@
                             .onProtectedCover { probe.coverActions += 1 }
                             .protectedScope(
                                 state.scope, gate: state.gate, unlockTitle: "Unlock", accessibilityLabel: "Locked",
-                                reason: "Unlock", snapshot: state.snapshot)
+                                reason: "Unlock", snapshot: state.snapshot, scenePhase: state.phase)
                     } else {
                         Color.clear
                     }
                 }
-                .environment(\.scenePhase, state.phase)
             }
         }
     }

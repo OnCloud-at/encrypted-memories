@@ -13,7 +13,8 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
             .offset(x: 240)
             .frame(width: 120, height: 240)
             .protectedScope(
-                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")
+                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+                scenePhase: .inactive)
         XCTAssertGreaterThan(redPixelCount(try pixels(Color.red)), 0, "The photo surface must be a positive control")
         XCTAssertEqual(
             redPixelCount(try pixels(protected.frame(width: 500, height: 240, alignment: .leading), width: 500)), 0,
@@ -25,7 +26,8 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
         XCTAssertEqual(
             try pixels(
                 Color.red.protectedScope(
-                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")),
+                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+                    scenePhase: .inactive)),
             try pixels(Color.red))
     }
 
@@ -38,7 +40,7 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
                 try pixels(
                     Color.red.protectedScope(
                         .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
-                        snapshot: true))), 0)
+                        snapshot: true, scenePhase: .inactive))), 0)
         XCTAssertTrue(gate.admits(.app))
     }
 
@@ -48,7 +50,8 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
         XCTAssertEqual(gate.state(of: .app), .locked)
         try assertShowsTheCover(
             Color.red.protectedScope(
-                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock"))
+                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+                scenePhase: .inactive))
     }
 
     func testSuccessfulAuthenticationRevealsTheMountedContent() async throws {
@@ -63,7 +66,8 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
         XCTAssertEqual(
             try pixels(
                 Color.red.protectedScope(
-                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock")),
+                    .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+                    scenePhase: .inactive)),
             try pixels(Color.red))
     }
 
@@ -78,7 +82,8 @@ final class ProtectedScopeModifierTests: ProtectedScopeTestCase {
         XCTAssertEqual(result, .locked)
         try assertShowsTheCover(
             Color.red.protectedScope(
-                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock"))
+                .app, gate: gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
+                scenePhase: .inactive))
     }
 
     /// The glass button may round one channel level between renders; content showing through differs far more.

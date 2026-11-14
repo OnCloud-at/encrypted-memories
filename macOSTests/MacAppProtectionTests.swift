@@ -36,8 +36,7 @@ final class MacAppProtectionTests: XCTestCase {
     }
 
     func testALockedWindowOfAnInactiveAppDoesNotPromptAutomatically() async throws {
-        // SwiftUI may report the window's scene as active although another app is active; the host phase wins.
-        let fixture = try Fixture(applicationIsActive: { false }, swiftUIPhase: .active)
+        let fixture = try Fixture(applicationIsActive: { false })
         defer { fixture.close() }
         XCTAssertNotNil(fixture.cover)
         for _ in 0..<200 { await Task.yield() }
@@ -306,7 +305,7 @@ private final class Fixture {
 
     var cover: NSPanel? { window.childWindows?.compactMap { $0 as? NSPanel }.first { $0.isVisible } }
 
-    init(applicationIsActive: (@MainActor () -> Bool)? = { true }, swiftUIPhase: ScenePhase? = nil) throws {
+    init(applicationIsActive: (@MainActor () -> Bool)? = { true }) throws {
         _ = NSApplication.shared
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
@@ -318,8 +317,7 @@ private final class Fixture {
         }
         presentation = ProtectedScopePresentation(gate: gate)
         window = makeWindow(size: .init(width: 320, height: 240), styleMask: [.titled, .closable])
-        window.contentView = NSHostingView(
-            rootView: SourceContent(presentation: presentation, swiftUIPhase: swiftUIPhase))
+        window.contentView = NSHostingView(rootView: SourceContent(presentation: presentation))
         window.orderFront(nil)
         controller.register(window: window, presentation: presentation)
     }
@@ -370,12 +368,9 @@ private final class Owner: DeviceOwnerAuthenticating {
 
 private struct SourceContent: View {
     let presentation: ProtectedScopePresentation
-    let swiftUIPhase: ScenePhase?
-    @Environment(\.scenePhase) private var environmentPhase
     var body: some View {
         // The production root modifier, which passes the host's window phase to the automatic prompt.
         Color(red: 1, green: 0, blue: 0).appProtection(presentation)
-            .environment(\.scenePhase, swiftUIPhase ?? environmentPhase)
     }
 }
 

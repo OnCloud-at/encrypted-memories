@@ -4,17 +4,17 @@ import SwiftUI
 
 @MainActor
 extension View {
-    /// Keeps the content mounted while the shared gate covers it. The caller supplies the area-specific copy.
-    /// A native host passes `scenePhase` when it knows the window's activity better than SwiftUI's scene phase;
-    /// the automatic prompt waits for an active phase.
+    /// Keeps the content mounted while the shared gate covers it. The caller supplies the area-specific copy and the
+    /// host's own phase of the window; the automatic prompt waits for an active phase. SwiftUI's scene phase is not
+    /// used, because it does not reliably report an inactive app on macOS.
     public func protectedScope(
         _ scope: ProtectedScope, gate: AccessGate, unlockTitle: String, accessibilityLabel: String,
-        reason: String, contentBounds: CGRect? = nil, snapshot: Bool = false, scenePhase: ScenePhase? = nil
+        reason: String, contentBounds: CGRect? = nil, snapshot: Bool = false, scenePhase: ScenePhase
     ) -> some View {
         modifier(
             ProtectedScopeModifier(
                 scope: scope, gate: gate, unlockTitle: unlockTitle, accessibilityLabel: accessibilityLabel,
-                reason: reason, contentBounds: contentBounds, snapshot: snapshot, hostPhase: scenePhase))
+                reason: reason, contentBounds: contentBounds, snapshot: snapshot, scenePhase: scenePhase))
     }
 }
 
@@ -27,9 +27,7 @@ private struct ProtectedScopeModifier: ViewModifier {
     let reason: String
     let contentBounds: CGRect?
     let snapshot: Bool
-    let hostPhase: ScenePhase?
-    @Environment(\.scenePhase) private var environmentPhase
-    private var scenePhase: ScenePhase { hostPhase ?? environmentPhase }
+    let scenePhase: ScenePhase
     @State private var presence: ProtectedScopePresence?
 
     private var identity: Identity { Identity(scope: scope, gate: ObjectIdentifier(gate)) }

@@ -17,7 +17,8 @@ public final class ProtectedMediaPlayback {
         case attach
         /// The same player stayed on screen: refresh a poster that is still waiting for the first frame.
         case refresh
-        /// The surface was covered or returned from the cover: keep the poster state as it is.
+        /// Keep the poster state as it is: the surface is covered, returns from the cover, or gets the same player
+        /// back after the host cleared or replaced its attachment outside this hook.
         case keep
     }
 
