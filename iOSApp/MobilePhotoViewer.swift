@@ -355,6 +355,7 @@ struct MobilePhotoViewer: View {
             visibleThumbnail?.end()
             editedOriginalLookup.cancel()
             // The viewer closed: a revert that ends later must not close or dismiss anything.
+            // A failure goes to the host.
             revert.detach()
         }
         .animation(

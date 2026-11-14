@@ -377,7 +377,8 @@ public final class PhotoViewerModel {
         albumMembershipTask?.cancel()
         placeTask?.cancel()
         editedOriginalLookup.cancel()
-        // The viewer closed: a revert that ends later closes nothing. The host work of the revert still runs.
+        // The viewer closed: a revert that ends later closes nothing. A failure goes to the host.
+        // The host work of the revert still runs.
         revert.detach()
         titleMetadataCoordinator.cancelAll()
         isLoadingOriginal = false

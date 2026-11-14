@@ -190,6 +190,37 @@ final class MobileRevertToOriginalUITests: XCTestCase {
         try assertTheFailureShowsInTheLibraryAfterTheViewerClosed(.german)
     }
 
+    func testAFailureWaitsUntilTheNextViewerCloses() throws {
+        let copy = Copy.english
+        let gate = FileManager.default.temporaryDirectory.appendingPathComponent("revert-gate-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: gate) }
+        launch(copy, gateFile: gate)
+        let (more, _) = try presentConfirmation(copy)
+        try app.tapDialogButton(copy.confirm)
+        let close = app.buttons[copy.close].firstMatch
+        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        close.tap()
+        XCTAssertTrue(isGone(more), "the first viewer closed")
+
+        let column = try app.verticalTabColumn()
+        let photo = try app.visiblePhoto(beside: column)
+        photo.tap()
+        XCTAssertTrue(more.waitForExistence(timeout: 30), "the second viewer opened")
+        XCTAssertTrue(FileManager.default.createFile(atPath: gate.path, contents: Data()))
+        let failure = app.alerts[copy.failure]
+        XCTAssertFalse(failure.waitForExistence(timeout: 5), "the failure must not cover the second viewer")
+        XCTAssertTrue(more.exists, "the second viewer stays open")
+        let secondClose = app.buttons[copy.close].firstMatch
+        XCTAssertTrue(secondClose.waitForExistence(timeout: 10))
+        secondClose.tap()
+        XCTAssertTrue(isGone(more), "the second viewer closed")
+        XCTAssertTrue(failure.waitForExistence(timeout: 30), "the failure appears after the second viewer closes")
+        XCTAssertEqual(distinctButtons(of: failure), [copy.ok])
+        try app.tapDialogButton(copy.ok)
+        XCTAssertTrue(isGone(failure, timeout: 10))
+        XCTAssertFalse(failure.waitForExistence(timeout: 3), "the failure came back")
+    }
+
     /// The fixture holds the revert until the test creates the gate file, so the viewer is closed before the failure
     /// arrives. The library then shows the same alert once, with OK only.
     private func assertTheFailureShowsInTheLibraryAfterTheViewerClosed(_ copy: Copy) throws {
