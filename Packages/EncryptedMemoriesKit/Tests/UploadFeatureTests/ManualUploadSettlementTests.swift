@@ -686,6 +686,72 @@ final class ManualUploadSettlementTests: XCTestCase {
         XCTAssertFalse(durableStore.isOperational())
     }
 
+    func testManualVersionMarkersKeepTheirReadRulesAndRefuseUnknownVersions() async throws {
+        let id = try await seedCompletedRow()
+        let source = try store()
+        let saved = try XCTUnwrap(source.record(for: id))
+        source.close()
+        let sourceURL = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
+        XCTAssertEqual(
+            try firstText("SELECT value FROM manual_upload_settlement_info WHERE key='schema';", inStoreAt: sourceURL),
+            "1", "A new settlement store writes the existing version marker")
+        let schemaSQL = try XCTUnwrap(
+            try firstText(
+                "SELECT group_concat(sql, ';') FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%';",
+                inStoreAt: sourceURL))
+        let version = SQLiteInfoTableVersion(
+            table: "manual_upload_settlement_info", version: 1, stampReplacesExistingRow: true)
+
+        let cases: [(String, String?, Bool)] = [
+            ("current", "1", true),
+            ("real", "1.75", true),
+            ("text", "'1tail'", true),
+            ("wide", "4294967297", true),
+            ("older", "0", false),
+            ("newer", "2", false),
+            ("missing", nil, false),
+        ]
+        for (name, value, readable) in cases {
+            let url = tempDir.appendingPathComponent("marker-\(name).sqlite")
+            let seeded = try XCTUnwrap(UploadManualSettlementStore(url: url), name)
+            XCTAssertTrue(seeded.upsert(saved), name)
+            seeded.close()
+            if let value {
+                try runSQL(
+                    "UPDATE manual_upload_settlement_info SET value=\(value) WHERE key='schema';", inStoreAt: url)
+            } else {
+                try runSQL("DELETE FROM manual_upload_settlement_info WHERE key='schema';", inStoreAt: url)
+            }
+            try runSQL("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;", inStoreAt: url)
+            let files = ["", "-wal", "-shm"].map { URL(fileURLWithPath: url.path + $0) }
+            let before: [Data?] = try files.map { file in
+                FileManager.default.fileExists(atPath: file.path) ? try Data(contentsOf: file) : nil
+            }
+            XCTAssertEqual(
+                SQLiteStoreSchemaGate.compatibility(at: url, schemaSQL: schemaSQL, versionIsCurrent: version.verify),
+                readable ? .current : .incompatible, name)
+            let reopened = UploadManualSettlementStore(url: url)
+            if readable {
+                let reopened = try XCTUnwrap(reopened, name)
+                XCTAssertEqual(reopened.record(for: id), saved, name)
+                reopened.close()
+            } else {
+                XCTAssertNil(reopened, name)
+                reopened?.close()
+                for (file, bytes) in zip(files, before) {
+                    if let bytes {
+                        XCTAssertEqual(
+                            try Data(contentsOf: file), bytes, "\(name): refusal must keep \(file.lastPathComponent)")
+                    } else {
+                        XCTAssertFalse(
+                            FileManager.default.fileExists(atPath: file.path),
+                            "\(name): refusal must not create \(file.lastPathComponent)")
+                    }
+                }
+            }
+        }
+    }
+
     func testMarkerlessSettlementShapeFailsClosedWithoutRepairingIt() throws {
         let url = tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName)
         var handle: OpaquePointer?
