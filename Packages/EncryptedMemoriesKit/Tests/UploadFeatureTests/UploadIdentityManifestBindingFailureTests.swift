@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import SQLite3
+import SQLiteTestSupport
 import UploadTestSupport
 import XCTest
 

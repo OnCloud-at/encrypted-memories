@@ -26,7 +26,6 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
     private let lock = NSLock()
     private var db: OpaquePointer?
     private let key: SymmetricKey
-    private let transient = SQLiteStoreSchemaGate.transientDestructor
     private var cachedIndex: PhotoNameIndex?
     private var cachesIndex = true
     private var revision: UInt64 = 0
@@ -95,7 +94,8 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
             guard sqlite3_prepare_v2(db, "SELECT node FROM photo_name WHERE vol=?1;", -1, &stmt, nil) == SQLITE_OK
             else { return nil }
             defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_text(stmt, 1, volumeID, -1, transient)
+            // A volume that does not bind is no proof that it has no names (#1194).
+            guard SQLiteBinding.text(stmt, 1, volumeID) == SQLITE_OK else { return nil }
             var nodes = Set<String>()
             while true {
                 switch sqlite3_step(stmt) {
@@ -142,12 +142,12 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
                 defer { sqlite3_finalize(stmt) }
                 for (uid, blob) in sealed {
                     sqlite3_reset(stmt)
-                    sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
-                    sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
-                    let bound = blob.withUnsafeBytes {
-                        sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32($0.count), transient)
-                    }
-                    guard bound == SQLITE_OK, sqlite3_step(stmt) == SQLITE_DONE else { return false }
+                    // A failed bind leaves its parameter NULL; the write must not run (#1194).
+                    guard SQLiteBinding.text(stmt, 1, uid.volumeID) == SQLITE_OK,
+                        SQLiteBinding.text(stmt, 2, uid.nodeID) == SQLITE_OK,
+                        SQLiteBinding.blob(stmt, 3, blob) == SQLITE_OK,
+                        sqlite3_step(stmt) == SQLITE_DONE
+                    else { return false }
                 }
                 return true
             }
@@ -240,9 +240,11 @@ public final class PhotoNameStore: MemoryPressureResponder, @unchecked Sendable 
         defer { sqlite3_finalize(stmt) }
         for uid in uids {
             sqlite3_reset(stmt)
-            sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
-            sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
-            guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+            // A key that does not bind removes nothing; that is no successful removal (#1194).
+            guard SQLiteBinding.text(stmt, 1, uid.volumeID) == SQLITE_OK,
+                SQLiteBinding.text(stmt, 2, uid.nodeID) == SQLITE_OK,
+                sqlite3_step(stmt) == SQLITE_DONE
+            else { return false }
         }
         return true
     }

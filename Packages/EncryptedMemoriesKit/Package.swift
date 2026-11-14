@@ -85,7 +85,13 @@ let package = Package(
         ),
         // PhotosCore owns the package-wide localization catalog.
         .target(name: "PhotosCore", resources: [.process("Resources")], swiftSettings: disableDynamicActorIsolation),
-        .testTarget(name: "PhotosCoreTests", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
+        .testTarget(
+            name: "PhotosCoreTests", dependencies: ["PhotosCore", "SQLiteTestSupport"],
+            swiftSettings: disableDynamicActorIsolation),
+        // Test-only SQLite fault helpers that more than one test target uses. No product and no app depends on it.
+        .target(
+            name: "SQLiteTestSupport", dependencies: ["PhotosCore"], path: "Tests/SQLiteTestSupport",
+            swiftSettings: disableDynamicActorIsolation),
         // App Intents for Shortcuts and Siri. They only hand a route to the app; navigation stays in the apps.
         .target(name: "AppRouteIntents", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .testTarget(
@@ -322,7 +328,7 @@ let package = Package(
             name: "UploadFeatureTests",
             dependencies: [
                 "UploadCore", "UploadFeature", "PhotosCore", "PhotoLibraryBackupAdapter", "AlbumSyncCore",
-                "UploadTestSupport",
+                "UploadTestSupport", "SQLiteTestSupport",
                 // The Duplicates screenshots render the shared viewer with its merge tools.
                 "PhotoViewerFeature", "MediaCache", "MediaByteCache", "ProtonDriveBackend",
                 .product(name: "ProtonCoreCryptoPatchedGoImplementation", package: "protoncore_ios"),

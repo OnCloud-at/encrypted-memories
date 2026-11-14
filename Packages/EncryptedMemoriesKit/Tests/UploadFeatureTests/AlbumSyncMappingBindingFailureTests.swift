@@ -2,6 +2,7 @@ import AlbumSyncCore
 import Foundation
 import PhotosCore
 import SQLite3
+import SQLiteTestSupport
 import XCTest
 
 /// Every text bind of the album sync mapping store checks its result (#1194). A failed bind leaves its parameter NULL:
