@@ -138,7 +138,7 @@ import Testing
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = UnpairedStartupRepository()
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let model = TimelineViewModel(repository: repository, feed: feed)
         await model.load()
         #expect(model.initialLibraryChangeToken == "", "A probe before the load cannot certify its unpaired rows")
@@ -154,7 +154,7 @@ import Testing
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: directory) }
             let repository = HeldWarmStartRepository(correction: correction)
-            let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+            let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
             let model = TimelineViewModel(repository: repository, feed: feed)
             let loading = Task { await model.load() }
             #expect(await repository.waitUntilSeedProbeIsHeld())
@@ -190,11 +190,11 @@ import Testing
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: directory) }
             let repository = HeldWarmStartRepository(correction: .mediaType)
-            let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+            let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
             let model = TimelineViewModel(repository: repository, feed: feed)
             let loading = Task { await model.load() }
             #expect(await repository.waitUntilSeedProbeIsHeld())
-            model.cancelInitialLoadForTesting()
+            model.cancelLoadAndCrawlStart()
             await repository.completeCorrectionAndReleaseProbe()
             await loading.value
             #expect(model.allItems == repository.originalItems)
@@ -209,7 +209,7 @@ import Testing
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = HeldWarmStartRepository(correction: .mediaType)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let model = TimelineViewModel(repository: repository, feed: feed)
         let loading = Task { await model.load() }
         #expect(await repository.waitUntilSeedProbeIsHeld())
@@ -227,7 +227,7 @@ import Testing
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = HeldWarmStartRepository(correction: .mediaType)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let model = TimelineViewModel(repository: repository, feed: feed)
         let loading = Task { await model.load() }
         #expect(await repository.waitUntilSeedProbeIsHeld())
@@ -255,7 +255,7 @@ import Testing
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = RouteSwitchStartupRepository(hold: hold)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let model = TimelineViewModel(repository: repository, feed: feed)
         let loading = Task { await model.load() }
         #expect(await repository.waitUntilHeld(), "The first load must reach the held \(hold) step")
@@ -274,7 +274,7 @@ import Testing
     func aScopeLossInTheFirstLoadLeavesARetrySeed() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let model = TimelineViewModel(repository: RouteSwitchStartupRepository(hold: .terminalValidation), feed: feed)
 
         await model.load()
@@ -289,7 +289,7 @@ import Testing
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = RouteSwitchStartupRepository(hold: .firstServerFetchOnly)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let model = TimelineViewModel(repository: repository, feed: feed)
         let loading = Task { await model.load() }
         #expect(await repository.waitUntilHeld())
@@ -310,7 +310,7 @@ import Testing
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = RouteSwitchStartupRepository(hold: nil)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let photo = PhotoItem(
             uid: .init(volumeID: "fixture", nodeID: "favorite"), captureTime: Date(timeIntervalSince1970: 1_000),
             mediaType: "image/jpeg")
@@ -337,7 +337,7 @@ import Testing
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let repository = RouteSwitchStartupRepository(hold: nil)
-        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoCatchUpThumbnails())
+        let feed = ThumbnailFeedCore(cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
         let model = TimelineViewModel(repository: repository, feed: feed)
         await model.select(route)
 
@@ -551,14 +551,6 @@ private func tokensPublishedByAMonitor(seededBy seed: String?) async -> (probed:
     let probed = await waitUntil { await provider.probeCount >= 3 }
     await monitor.stop()
     return (probed, await provider.publishedTokens)
-}
-
-private struct NoCatchUpThumbnails: ThumbnailBatchLoader {
-    func loadThumbnails(
-        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult {
-        ThumbnailBatchLoadResult()
-    }
 }
 
 enum WarmStartCorrection: Sendable {
