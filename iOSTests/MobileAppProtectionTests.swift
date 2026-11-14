@@ -105,6 +105,52 @@ final class MobileAppProtectionTests: XCTestCase {
         XCTAssertFalse(fixture.gate.admits(.app))
     }
 
+    @MainActor func testAnUnregisteredSceneThatLeavesAgainRestartsTheBackgroundInterval() async throws {
+        let fixture = try HostFixture(result: .success)
+        defer { fixture.close() }
+        let opened = await yieldUntil { fixture.gate.admits(.app) && fixture.cover == nil }
+        XCTAssertTrue(opened)
+        NotificationCenter.default.post(name: UIScene.willDeactivateNotification, object: fixture.scene)
+        NotificationCenter.default.post(name: UIScene.didEnterBackgroundNotification, object: fixture.scene)
+        fixture.center.invalidate()
+        let fresh = MobileAppLockCenter(gate: fixture.gate)
+        defer { fresh.invalidate() }
+        // An unregistered scene returns within the grace period and leaves before its window registers.
+        NotificationCenter.default.post(name: UIScene.willEnterForegroundNotification, object: fixture.scene)
+        XCTAssertTrue(fixture.gate.admits(.app), "A return within the grace period keeps the area open")
+        NotificationCenter.default.post(name: UIScene.didEnterBackgroundNotification, object: fixture.scene)
+        fixture.gate.appWillEnterForeground(at: .now + .seconds(120))
+        XCTAssertFalse(fixture.gate.admits(.app), "Leaving again must start a new background interval")
+    }
+
+    @MainActor func testActivationAloneExpiresTheGracePeriod() async throws {
+        let fixture = try HostFixture(result: .success)
+        defer { fixture.close() }
+        let opened = await yieldUntil { fixture.gate.admits(.app) && fixture.cover == nil }
+        XCTAssertTrue(opened)
+        XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+        fixture.owner.result = .cancelled
+        NotificationCenter.default.post(name: UIScene.willDeactivateNotification, object: fixture.scene)
+        NotificationCenter.default.post(name: UIScene.didEnterBackgroundNotification, object: fixture.scene)
+        NotificationCenter.default.post(name: UIScene.didActivateNotification, object: fixture.scene)
+        XCTAssertFalse(fixture.gate.admits(.app), "A scene that activates without entering the foreground first locks")
+    }
+
+    @MainActor func testASceneWithoutLifecycleEventsUsesItsActivationState() throws {
+        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
+        let lifecycle = MobilePrivacyPreviewShieldCenter()
+        XCTAssertEqual(lifecycle.phase(of: scene), MobileScenePhase.phase(of: scene.activationState))
+        XCTAssertEqual(lifecycle.phase(of: scene), .active)
+    }
+
+    func testActivationStatesMapToPhases() {
+        XCTAssertEqual(MobileScenePhase.phase(of: .foregroundActive), .active)
+        XCTAssertEqual(MobileScenePhase.phase(of: .foregroundInactive), .inactive)
+        XCTAssertEqual(MobileScenePhase.phase(of: .background), .background, "A scene connecting in the background")
+        XCTAssertEqual(MobileScenePhase.phase(of: .unattached), .background)
+        XCTAssertEqual(MobileScenePhase.phase(after: UIScene.didDisconnectNotification), nil)
+    }
+
     @MainActor func testAppLockCoversTheContinuedBackupQuestionAcrossWindows() async throws {
         let fixture = try HostFixture(result: .cancelled)
         defer { fixture.close() }

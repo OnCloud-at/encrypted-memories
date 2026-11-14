@@ -17,15 +17,33 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertTrue(cover.worksWhenModal)
     }
 
-    func testSuccessfulAuthenticationRevealsAnInactiveVisibleWindow() async throws {
-        let fixture = try Fixture(applicationIsActive: { false })
+    func testSuccessfulAuthenticationRevealsAVisibleWindowOfAnInactiveApp() async throws {
+        let activity = Activity(active: false)
+        let fixture = try Fixture(applicationIsActive: { activity.isActive })
         defer { fixture.close() }
         _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let settled = await fixture.waitForCover(visible: false)
-        XCTAssertTrue(settled)
+        let revealed = await fixture.waitForCover(visible: false)
+        XCTAssertTrue(revealed)
         XCTAssertFalse(fixture.presentation.snapshot)
         XCTAssertEqual(fixture.presentation.phase, .inactive)
         XCTAssertTrue(fixture.gate.admits(.app))
+        activity.isActive = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
+        let stillRevealed = await fixture.waitForCover(visible: false)
+        XCTAssertTrue(stillRevealed)
+        XCTAssertEqual(fixture.presentation.phase, .active)
+        XCTAssertTrue(fixture.gate.admits(.app))
+    }
+
+    func testALockedWindowOfAnInactiveAppDoesNotPromptAutomatically() async throws {
+        // SwiftUI may report the window's scene as active although another app is active; the host phase wins.
+        let fixture = try Fixture(applicationIsActive: { false }, swiftUIPhase: .active)
+        defer { fixture.close() }
+        XCTAssertNotNil(fixture.cover)
+        for _ in 0..<200 { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(fixture.owner.calls, 0, "The system dialog must not appear over another app")
+        XCTAssertFalse(fixture.gate.admits(.app))
     }
 
     func testApplicationDeactivationDoesNotStartTheBackgroundGracePeriod() async throws {
@@ -130,22 +148,6 @@ final class MacAppProtectionTests: XCTestCase {
         NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: fixture.window)
         XCTAssertFalse(fixture.gate.admits(.app), "A reused window must still belong to the protection host")
         XCTAssertNotNil(fixture.cover)
-    }
-
-    func testAnInactiveVisibleWindowStaysRevealedAfterAuthentication() async throws {
-        let activity = Activity(active: false)
-        let fixture = try Fixture(applicationIsActive: { activity.isActive })
-        defer { fixture.close() }
-        _ = await fixture.gate.unlock(.app, reason: "Unlock")
-        let covered = await fixture.waitForCover(visible: false)
-        XCTAssertTrue(covered)
-        XCTAssertFalse(fixture.presentation.snapshot)
-        activity.isActive = true
-        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: NSApp)
-        let revealed = await fixture.waitForCover(visible: false)
-        XCTAssertTrue(revealed)
-        XCTAssertFalse(fixture.presentation.snapshot)
-        XCTAssertTrue(fixture.gate.admits(.app))
     }
 
     func testNativeReturnNotificationsExpireAdmissionBeforeUncovering() async throws {
@@ -298,16 +300,17 @@ private final class Fixture {
     let gate: AccessGate
     let controller: MacAppProtection
     let presentation: ProtectedScopePresentation
+    let owner = Owner()
     private let defaults: UserDefaults
     private let suite = "MacAppProtectionTests.\(UUID().uuidString)"
 
     var cover: NSPanel? { window.childWindows?.compactMap { $0 as? NSPanel }.first { $0.isVisible } }
 
-    init(applicationIsActive: (@MainActor () -> Bool)? = { true }) throws {
+    init(applicationIsActive: (@MainActor () -> Bool)? = { true }, swiftUIPhase: ScenePhase? = nil) throws {
         _ = NSApplication.shared
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
-        gate = AccessGate(authenticator: Owner(), defaults: defaults)
+        gate = AccessGate(authenticator: owner, defaults: defaults)
         if let applicationIsActive {
             controller = MacAppProtection(gate: gate, applicationIsActive: applicationIsActive)
         } else {
@@ -315,7 +318,8 @@ private final class Fixture {
         }
         presentation = ProtectedScopePresentation(gate: gate)
         window = makeWindow(size: .init(width: 320, height: 240), styleMask: [.titled, .closable])
-        window.contentView = NSHostingView(rootView: SourceContent(presentation: presentation))
+        window.contentView = NSHostingView(
+            rootView: SourceContent(presentation: presentation, swiftUIPhase: swiftUIPhase))
         window.orderFront(nil)
         controller.register(window: window, presentation: presentation)
     }
@@ -355,19 +359,23 @@ private final class Fixture {
 
 @MainActor
 private final class Owner: DeviceOwnerAuthenticating {
+    private(set) var calls = 0
     func availability() -> DeviceOwnerAuthAvailability { .available(.touchID) }
-    func authenticate(reason: String) async -> DeviceOwnerAuthResult { .success }
+    func authenticate(reason: String) async -> DeviceOwnerAuthResult {
+        calls += 1
+        return .success
+    }
     func cancel() {}
 }
 
 private struct SourceContent: View {
     let presentation: ProtectedScopePresentation
+    let swiftUIPhase: ScenePhase?
+    @Environment(\.scenePhase) private var environmentPhase
     var body: some View {
-        Color(red: 1, green: 0, blue: 0).protectedScope(
-            .app, gate: presentation.gate, unlockTitle: "Unlock", accessibilityLabel: "Locked", reason: "Unlock",
-            snapshot: presentation.snapshot
-        )
-        .environment(\.scenePhase, presentation.phase)
+        // The production root modifier, which passes the host's window phase to the automatic prompt.
+        Color(red: 1, green: 0, blue: 0).appProtection(presentation)
+            .environment(\.scenePhase, swiftUIPhase ?? environmentPhase)
     }
 }
 

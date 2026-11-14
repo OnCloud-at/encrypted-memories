@@ -78,7 +78,7 @@ extension View {
             .app, gate: presentation.gate,
             unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
             accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
-            contentBounds: contentBounds, snapshot: presentation.snapshot)
+            contentBounds: contentBounds, snapshot: presentation.snapshot, scenePhase: presentation.phase)
     }
 
     /// Conceals mounted content while preserving its tasks and state.

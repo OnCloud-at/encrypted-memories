@@ -116,17 +116,22 @@ final class MobileAppLockCenter: NSObject {
         if event == UIScene.willEnterForegroundNotification || event == UIScene.didActivateNotification {
             gate.appWillEnterForeground(at: .now)
         }
-        guard entries.contains(where: { $0.scene === scene }) else { return }
-        if event == UIScene.didDisconnectNotification {
-            for entry in entries where entry.scene === scene {
-                entry.window.isHidden = true
-                entry.restoreAccessibility()
+        if entries.contains(where: { $0.scene === scene }) {
+            if event == UIScene.didDisconnectNotification {
+                for entry in entries where entry.scene === scene {
+                    entry.window.isHidden = true
+                    entry.restoreAccessibility()
+                }
+                entries.removeAll { $0.scene === scene }
             }
-            entries.removeAll { $0.scene === scene }
+            entries.forEach(refresh)
         }
-        entries.forEach(refresh)
-        if event == UIScene.didEnterBackgroundNotification || event == UIScene.didDisconnectNotification,
-            entries.allSatisfy({ lifecycle.phase(of: $0.scene) == .background })
+        // The app is in the background when the registered scenes and this event's scene, registered or not, all
+        // are. A disconnecting scene no longer counts.
+        let disconnecting = event == UIScene.didDisconnectNotification
+        let scenes = entries.map(\.scene) + (disconnecting ? [] : [scene])
+        if event == UIScene.didEnterBackgroundNotification || disconnecting,
+            scenes.allSatisfy({ lifecycle.phase(of: $0) == .background })
         {
             gate.appDidEnterBackground(at: .now)
         }
@@ -143,7 +148,6 @@ private struct MobileAppLockWindowContent: View {
             Color.clear.appProtection(presentation, contentBounds: geometry.mobileCenteredContentBounds)
         }
         .ignoresSafeArea()
-        .environment(\.scenePhase, presentation.phase)
         .animation(nil, value: presentation.snapshot)
     }
 }

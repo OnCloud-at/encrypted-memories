@@ -123,12 +123,10 @@ private struct PlayerView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: DismissableAVPlayerView, context: Context) {
-        // A surface that returns from the cover keeps its revealed poster state; only a new player gets a poster.
-        let wasShowing = view.player === player
-        if view.playback.update(player, attached: view.player, isCovered: isCovered, attach: { view.player = $0 }) {
-            view.attachPoster(poster)
-        } else if wasShowing {
-            view.updatePoster(poster)
+        switch view.playback.update(player, attached: view.player, isCovered: isCovered, attach: { view.player = $0 }) {
+        case .attach: view.attachPoster(poster)
+        case .refresh: view.updatePoster(poster)
+        case .keep: break
         }
         view.onPinchDismissBegan = onPinchDismissBegan
         view.onPinchDismissChanged = onPinchDismissChanged

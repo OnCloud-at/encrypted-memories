@@ -11,12 +11,24 @@ public final class ProtectedMediaPlayback {
 
     public init() {}
 
+    /// What the host does with its poster after an update.
+    public enum PosterAction: Equatable {
+        /// A different player arrived: show its poster until its first frame is ready.
+        case attach
+        /// The same player stayed on screen: refresh a poster that is still waiting for the first frame.
+        case refresh
+        /// The surface was covered or returned from the cover: keep the poster state as it is.
+        case keep
+    }
+
     /// Pauses and detaches the player while covered and attaches it again afterwards without resuming playback.
-    /// Playback that starts while covered pauses again. Returns whether the viewer supplied a different player,
-    /// so the host attaches its poster once per player and not on every return from the cover.
+    /// Playback that starts while covered pauses again.
     @discardableResult
-    public func update(_ player: AVPlayer, attached: AVPlayer?, isCovered: Bool, attach: (AVPlayer?) -> Void) -> Bool {
+    public func update(
+        _ player: AVPlayer, attached: AVPlayer?, isCovered: Bool, attach: (AVPlayer?) -> Void
+    ) -> PosterAction {
         let changed = self.player !== player
+        let stayedOnScreen = !changed && !isCovered && attached === player
         if changed || self.isCovered != isCovered {
             self.player = player
             self.isCovered = isCovered
@@ -25,7 +37,8 @@ public final class ProtectedMediaPlayback {
         if isCovered { player.pause() }
         let visiblePlayer = isCovered ? nil : player
         if attached !== visiblePlayer { attach(visiblePlayer) }
-        return changed
+        if changed { return .attach }
+        return stayedOnScreen ? .refresh : .keep
     }
 
     private func observeRate(of player: AVPlayer) -> NSKeyValueObservation {

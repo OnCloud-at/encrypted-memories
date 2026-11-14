@@ -231,7 +231,6 @@ private struct MacAppLockWindowContent: View {
     let presentation: ProtectedScopePresentation
     var body: some View {
         Color.clear.appProtection(presentation)
-            .environment(\.scenePhase, presentation.phase)
     }
 }
 

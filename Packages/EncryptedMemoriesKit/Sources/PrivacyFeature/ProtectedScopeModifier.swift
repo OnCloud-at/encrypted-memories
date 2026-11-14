@@ -5,14 +5,16 @@ import SwiftUI
 @MainActor
 extension View {
     /// Keeps the content mounted while the shared gate covers it. The caller supplies the area-specific copy.
+    /// A native host passes `scenePhase` when it knows the window's activity better than SwiftUI's scene phase;
+    /// the automatic prompt waits for an active phase.
     public func protectedScope(
         _ scope: ProtectedScope, gate: AccessGate, unlockTitle: String, accessibilityLabel: String,
-        reason: String, contentBounds: CGRect? = nil, snapshot: Bool = false
+        reason: String, contentBounds: CGRect? = nil, snapshot: Bool = false, scenePhase: ScenePhase? = nil
     ) -> some View {
         modifier(
             ProtectedScopeModifier(
                 scope: scope, gate: gate, unlockTitle: unlockTitle, accessibilityLabel: accessibilityLabel,
-                reason: reason, contentBounds: contentBounds, snapshot: snapshot))
+                reason: reason, contentBounds: contentBounds, snapshot: snapshot, hostPhase: scenePhase))
     }
 }
 
@@ -25,7 +27,9 @@ private struct ProtectedScopeModifier: ViewModifier {
     let reason: String
     let contentBounds: CGRect?
     let snapshot: Bool
-    @Environment(\.scenePhase) private var scenePhase
+    let hostPhase: ScenePhase?
+    @Environment(\.scenePhase) private var environmentPhase
+    private var scenePhase: ScenePhase { hostPhase ?? environmentPhase }
     @State private var presence: ProtectedScopePresence?
 
     private var identity: Identity { Identity(scope: scope, gate: ObjectIdentifier(gate)) }

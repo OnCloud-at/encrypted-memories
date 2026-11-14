@@ -35,14 +35,21 @@ import Testing
         #expect(player.rate == 1, "Uncovered playback must stay untouched")
     }
 
-    @Test func onlyADifferentPlayerCountsAsAChange() {
+    @Test func thePosterIsAttachedOncePerPlayerAndKeptThroughTheCover() {
         let playback = ProtectedMediaPlayback()
         let first = AVPlayer()
         var attached: AVPlayer?
-        #expect(playback.update(first, attached: attached, isCovered: false) { attached = $0 })
-        #expect(!playback.update(first, attached: attached, isCovered: true) { attached = $0 })
-        let returned = playback.update(first, attached: attached, isCovered: false) { attached = $0 }
-        #expect(!returned, "Returning from the cover keeps the poster state of the same player")
-        #expect(playback.update(AVPlayer(), attached: attached, isCovered: false) { attached = $0 })
+        func update(_ player: AVPlayer, covered: Bool) -> ProtectedMediaPlayback.PosterAction {
+            playback.update(player, attached: attached, isCovered: covered) { attached = $0 }
+        }
+        #expect(update(first, covered: false) == .attach)
+        #expect(update(first, covered: false) == .refresh, "A poster still waiting for the first frame refreshes")
+        #expect(update(first, covered: true) == .keep, "The covering update must not show the poster again")
+        #expect(update(first, covered: true) == .keep)
+        #expect(update(first, covered: false) == .keep, "Returning from the cover keeps the revealed poster state")
+        #expect(update(first, covered: false) == .refresh)
+        let second = AVPlayer()
+        #expect(update(second, covered: true) == .attach, "A new player gets its poster once, also while covered")
+        #expect(update(second, covered: false) == .keep)
     }
 }

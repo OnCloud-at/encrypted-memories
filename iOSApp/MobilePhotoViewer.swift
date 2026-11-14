@@ -1737,15 +1737,13 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
         context.coordinator.parent = self
         context.coordinator.controller = controller
-        // A surface that returns from the cover keeps its revealed poster state; only a new player gets a poster.
-        let wasShowing = controller.player === player
-        let changed = context.coordinator.playback.update(player, attached: controller.player, isCovered: isCovered) {
+        let action = context.coordinator.playback.update(player, attached: controller.player, isCovered: isCovered) {
             controller.player = $0
         }
-        if changed {
-            context.coordinator.attachPoster(poster, to: controller)
-        } else if wasShowing {
-            context.coordinator.updatePoster(poster, in: controller)
+        switch action {
+        case .attach: context.coordinator.attachPoster(poster, to: controller)
+        case .refresh: context.coordinator.updatePoster(poster, in: controller)
+        case .keep: break
         }
     }
 
