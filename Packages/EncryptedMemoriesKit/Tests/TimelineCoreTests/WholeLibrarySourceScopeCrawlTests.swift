@@ -95,7 +95,7 @@ import Testing
         }
 
         @Test(.timeLimit(.minutes(1)))
-        func aPhotoBackFromRecentlyDeletedCountsAsALibraryPhotoAgain() async throws {
+        func aPhotoBackFromRecentlyDeletedInTheSourceScopeIsNotLoadedAgain() async throws {
             let fixture = try await CrawlFixture.loaded(photoCount: 12, withSources: true)
             let sources = try #require(fixture.sources)
             let trashed = crawlItem("scope-trashed")
@@ -107,13 +107,16 @@ import Testing
             try await fixture.waitUntilIdle(expecting: fixture.expectedOnDisk + [trashed.uid])
 
             // The photo is restored: the library lists it again, and the crawl already holds it.
+            let requests = await fixture.loader.requests(for: trashed.uid)
             await fixture.library.add(trashed)
             await fixture.refresh()
+            try await fixture.waitUntilIdle(expecting: [trashed.uid])
 
-            let status = await fixture.feed.prefetchStatus()
+            let library = fixture.timeline.wholeLibraryUIDs
+            #expect(library.contains(trashed.uid), "The library lists it again")
             #expect(
-                status.diskThumbnailTotal == fixture.timeline.wholeLibraryUIDs.count, "The library count includes it")
-            #expect(status.diskFileCount == status.diskThumbnailTotal, "No thumbnail of the library is missing")
+                library.allSatisfy { fixture.cache.hasUsableDiskData($0) }, "No thumbnail of the library is missing")
+            #expect(await fixture.loader.requests(for: trashed.uid) == requests, "Its thumbnail is not loaded again")
             await fixture.close()
         }
 
@@ -219,14 +222,10 @@ import Testing
                 #expect(gate.result == .reconciled(removedEntries: 0))
 
                 // The cache has committed A+B. Decode B so resident pruning and the authorization fence are visible.
-                let png = try #require(
-                    Data(
-                        base64Encoded:
-                            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aE3sAAAAASUVORK5CYII="
-                    ))
+                let png = try onePixelPNG()
                 await cache.store(png, for: joined.uid)
                 _ = try #require(await feed.cachedDecoded(for: joined.uid))
-                #expect(await feed.prefetchStatus().ramDecodedCount == 1)
+                #expect(feed.memoryDecoded(for: joined.uid) != nil)
                 let generation = cache.captureWriterGeneration()
                 shrinkTask = Task {
                     await feed.reconcile(
@@ -234,9 +233,10 @@ import Testing
                         retention: shrink.thumbnailRetentionScope)
                 }
                 // Admission applies authorization before queueing, without another suspension in between.
+                // From here on the revoked authorization hides B, so this test cannot see when the decoded copy goes.
+                // The cache-return and generation checks below prove only that the cache shrink waits for the join.
                 try #require(await waitUntil { feed.memoryDecoded(for: joined.uid) == nil })
                 #expect(!(await feed.requestPriority(joined.uid)))
-                #expect(await feed.prefetchStatus().ramDecodedCount == 1)
                 gate.release()
                 try #require(
                     await waitUntil {
@@ -251,16 +251,51 @@ import Testing
                 _ = await shrinkTask?.value
                 #expect(stoppedWorkers.value > 0)
                 #expect(cacheReturnsBeforeJoin.value == 0, "The cache shrink returns only after the worker joins")
-                #expect(await feed.prefetchStatus().ramDecodedCount == 0, "The removed decoded photo is pruned")
                 #expect(feed.memoryDecoded(for: joined.uid) == nil)
                 #expect(!(await feed.requestPriority(joined.uid)))
                 #expect(!cache.hasUsableDiskData(joined.uid))
                 #expect(!gate.timedOut)
+
+                // Authorize B again without loading it. Its thumbnail left the disk and the crawl is off, so only a
+                // decoded copy that survived the shrink can show; a grown scope keeps decoded photos (see
+                // aGrowingSourceScopeKeepsADecodedPhoto).
+                await feed.setPrefetchEnabled(false)
+                let regrowth = try commit(original + [joined])
+                _ = await feed.reconcile(
+                    selected: regrowth.selectedScope, analysis: regrowth.analysisScope,
+                    retention: regrowth.thumbnailRetentionScope)
+                #expect(feed.memoryDecoded(for: joined.uid) == nil, "The shrink pruned the decoded photo")
+                #expect(await feed.requestPriority(joined.uid), "B is authorized again")
                 await close()
             } catch {
                 await close()
                 throw error
             }
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aGrowingSourceScopeKeepsADecodedPhoto() async throws {
+            let fixture = try await CrawlFixture.loaded(photoCount: 12, withSources: true)
+            let sources = try #require(fixture.sources)
+            let original = fixture.timeline.wholeLibraryItemsForViewer
+            let kept = try #require(original.first?.uid)
+            let png = try onePixelPNG()
+            await fixture.cache.store(png, for: kept)
+            _ = try #require(await fixture.feed.cachedDecoded(for: kept))
+            // The crawl is off, as in the shrink test, so nothing can decode the photo again.
+            await fixture.feed.setPrefetchEnabled(false)
+
+            let lease = try #require(sources.graph.beginRefresh(sources.source.id))
+            let growth = try #require(
+                sources.graph.commit(
+                    (original + [crawlItem("scope-kept-growth")]).map(LibrarySourceItem.complete), validationToken: nil,
+                    using: lease))
+            _ = await fixture.feed.reconcile(
+                selected: growth.selectedScope, analysis: growth.analysisScope,
+                retention: growth.thumbnailRetentionScope)
+
+            #expect(fixture.feed.memoryDecoded(for: kept) != nil, "A grown scope keeps the decoded photo")
+            await fixture.close()
         }
 
         @Test(.timeLimit(.minutes(1)))
@@ -465,6 +500,14 @@ import Testing
             }
             if shouldSignal { semaphore.signal() }
         }
+    }
+
+    /// A 1x1 PNG, so the feed can decode a stored thumbnail.
+    private func onePixelPNG() throws -> Data {
+        try #require(
+            Data(
+                base64Encoded:
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aE3sAAAAASUVORK5CYII="))
     }
 
     /// The folders below `root`, and `root` itself, with their current permissions, so a test can make the encrypted

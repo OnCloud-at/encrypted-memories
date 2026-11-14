@@ -286,6 +286,7 @@ import Testing
                 last = now
                 try await Task.sleep(for: .milliseconds(50))
             }
+            try #require(quietChecks >= 5, "The crawl did not settle within 20 seconds")
             try await feed.waitForPrefetchToFinish()
         }
 

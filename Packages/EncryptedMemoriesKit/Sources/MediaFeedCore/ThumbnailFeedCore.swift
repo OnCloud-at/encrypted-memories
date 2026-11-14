@@ -2006,8 +2006,8 @@ public actor ThumbnailFeedCore {
         // A stop outside reconciliation empties the crawl list but leaves its position; a new list starts at its head.
         if sequential.isEmpty { sequentialIndex = 0 }
         sequential.append(contentsOf: added)
-        // The library count follows the selected scope also when no photo is new, as when a photo returns from
-        // Recently Deleted that the crawl already holds.
+        // The coverage tracking follows the selected scope also when no photo is new, as when a photo returns from
+        // Recently Deleted that the crawl already holds. Only a crawl that has not settled checks its coverage again.
         prefetchReportingUIDs = request.selectedScope.uids
         diskPresence.beginTracking(sequential, reporting: request.selectedScope.uids, knownPresent: [])
         guard !added.isEmpty else { return }
