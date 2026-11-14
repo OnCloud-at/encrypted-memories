@@ -4861,6 +4861,166 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         return predicate()
     }
 
+    // MARK: Photos that Proton refused until the backup stopped
+
+    private func seedRefusal(
+        _ queue: UploadBackupSyncQueueManifestStore, _ id: String,
+        state: UploadBackupSyncQueueState = .failedPermanent, rounds: Int? = 4, kind: BackupIssueKind = .remoteService
+    ) throws -> UploadBackupSyncQueueEntry {
+        let start = Date(timeIntervalSince1970: 1_720_000_000)
+        let entry = UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: id), revision: .init(rawValue: 1),
+            originalFilename: "\(id).heic", state: state, attempts: 8,
+            lastError: BackupIssueRecord(
+                kind: kind, detail: "stored",
+                serviceRejection: rounds.map {
+                    .init(rounds: $0, firstRoundAt: start, lastRoundAt: start.addingTimeInterval(72 * 3600))
+                }
+            ).persistedValue,
+            updatedAt: start)
+        XCTAssertTrue(queue.upsert(entry))
+        return entry
+    }
+
+    private func reopenFixture(
+        prefix: String, build: String?
+    ) throws -> (ControllerFixture, UploadBackupSyncQueueManifestStore) {
+        let fixture = try makeControllerFixture(
+            prefix: prefix, identityResolver: FakeIdentityResolver(), runtimeSignals: .wiFiWithMobileDataOff,
+            appBuild: build)
+        return (fixture, try photoBackupQueueStore(fixture.controller))
+    }
+
+    func testAnAppUpdateReopensEachStoppedRefusalOnce() throws {
+        let (fixture, queue) = try reopenFixture(prefix: "refusal-reopen", build: "200")
+        defer { fixture.cleanup() }
+        let stopped = try seedRefusal(queue, "stopped")
+        let stillRetrying = try seedRefusal(queue, "still-retrying", state: .failed, rounds: 2)
+        let notStopped = try seedRefusal(queue, "two-rounds", rounds: 2)
+        let draft = try seedRefusal(queue, "draft", rounds: nil, kind: .remoteDraftStale)
+        let dismissed = try seedRefusal(queue, "dismissed", state: .dismissedFailure)
+
+        fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+
+        let reopened = try XCTUnwrap(queue.entry(for: stopped.source, revision: stopped.revision))
+        XCTAssertEqual(reopened.state, .discovered)
+        XCTAssertEqual(reopened.attempts, 0)
+        XCTAssertEqual(reopened.lastError, stopped.lastError, "the rounds stay, so the next refusal stops it again")
+        for unchanged in [stillRetrying, notStopped, draft, dismissed] {
+            XCTAssertEqual(
+                try queue.entry(for: unchanged.source, revision: unchanged.revision)?.state, unchanged.state,
+                unchanged.originalFilename)
+        }
+        XCTAssertEqual(
+            fixture.defaults.string(forKey: PhotoLibraryBackupController.refusalReopenBuildDefaultsKey), "200")
+
+        let stoppedAgain = try seedRefusal(queue, "stopped-again")
+        fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+        XCTAssertEqual(
+            try queue.entry(for: stoppedAgain.source, revision: stoppedAgain.revision)?.state, .failedPermanent,
+            "the same build never reopens a photo twice")
+    }
+
+    func testAFailedReopenWriteKeepsTheUpdateRetry() throws {
+        for failedWrite in [1, 2] {
+            let (fixture, queue) = try reopenFixture(prefix: "refusal-reopen-write", build: "200")
+            defer { fixture.cleanup() }
+            let entries = try [seedRefusal(queue, "first"), seedRefusal(queue, "second")]
+            var writes = 0
+            let fault = try SQLiteStatementFaults(in: queue, failures: 1) { sql in
+                guard sql.contains("UPDATE backup_sync_queue SET state = 'discovered', attempts = ") else {
+                    return false
+                }
+                writes += 1
+                return writes == failedWrite
+            }
+            defer { fault.stop() }
+
+            fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+
+            XCTAssertEqual(fault.firedCount, 1, "The reopen write really failed")
+            fault.stop()
+            XCTAssertNil(fixture.defaults.string(forKey: PhotoLibraryBackupController.refusalReopenBuildDefaultsKey))
+            let afterFailure = try entries.map { entry in
+                try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+            }
+            XCTAssertEqual(afterFailure.filter { $0.state == .discovered }.count, failedWrite - 1)
+            XCTAssertEqual(afterFailure.filter { $0.state == .failedPermanent }.count, 3 - failedWrite)
+            for (entry, stored) in zip(entries, afterFailure) {
+                XCTAssertEqual(stored.lastError, entry.lastError)
+                XCTAssertEqual(stored.attempts, stored.state == .discovered ? 0 : entry.attempts)
+            }
+
+            fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+
+            XCTAssertEqual(
+                fixture.defaults.string(forKey: PhotoLibraryBackupController.refusalReopenBuildDefaultsKey), "200")
+            for entry in entries {
+                let stored = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
+                XCTAssertEqual(stored.state, .discovered)
+                XCTAssertEqual(stored.attempts, 0)
+                XCTAssertEqual(stored.lastError, entry.lastError)
+            }
+        }
+    }
+
+    func testAFailedReadKeepsTheReopenForTheNextLaunch() throws {
+        let (fixture, queue) = try reopenFixture(prefix: "refusal-reopen-failed", build: "200")
+        defer { fixture.cleanup() }
+        _ = try seedRefusal(queue, "stopped")
+        try storeConnection(queue).markFailed()
+
+        fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+
+        XCTAssertNil(fixture.defaults.string(forKey: PhotoLibraryBackupController.refusalReopenBuildDefaultsKey))
+    }
+
+    #if DEBUG
+        func testTheFirstPassOfALaunchReopensStoppedRefusals() async throws {
+            let (fixture, queue) = try reopenFixture(prefix: "refusal-reopen-launch", build: "200")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            _ = try seedRefusal(queue, "stopped")
+            controller.setEnabledForTesting()
+            controller.setAccessStateForTesting(.full)
+            controller.replaceScanForTesting {}
+
+            controller.syncNow()
+
+            let recorded = await waitUntil(timeout: .seconds(10)) {
+                fixture.defaults.string(forKey: PhotoLibraryBackupController.refusalReopenBuildDefaultsKey) == "200"
+            }
+            XCTAssertTrue(recorded, "the launch pass reopens the stopped photo and records the build")
+            _ = await waitUntil(timeout: .seconds(10)) { !controller.isSyncing }
+            await controller.shutdown()
+        }
+    #endif
+
+    func testTryAgainLeavesAStoppedRefusalAlone() async throws {
+        let (fixture, queue) = try reopenFixture(prefix: "refusal-try-again", build: nil)
+        defer { fixture.cleanup() }
+        let stopped = try seedRefusal(queue, "stopped")
+        let parked = try seedRefusal(queue, "parked", state: .failed, rounds: 2)
+
+        await fixture.controller.retryUserResolvableWork()
+
+        XCTAssertEqual(try queue.entry(for: stopped.source, revision: stopped.revision)?.state, .failedPermanent)
+        XCTAssertNotEqual(
+            try queue.entry(for: parked.source, revision: parked.revision)?.state, .failed,
+            "Try again reopens a parked refusal that has not stopped yet")
+        await fixture.controller.shutdown()
+    }
+
+    func testAnUnknownBuildReopensNothing() throws {
+        let (fixture, queue) = try reopenFixture(prefix: "refusal-reopen-unknown", build: nil)
+        defer { fixture.cleanup() }
+        let stopped = try seedRefusal(queue, "stopped")
+
+        fixture.controller.reopenStoppedRefusals(in: queue, at: Date())
+
+        XCTAssertEqual(try queue.entry(for: stopped.source, revision: stopped.revision)?.state, .failedPermanent)
+    }
+
     private struct ControllerFixture {
         let controller: PhotoLibraryBackupController
         let defaults: UserDefaults
@@ -4954,7 +5114,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
     private func makeControllerFixture(
         prefix: String, enabled: Bool = false, identityResolver: (any UploadIdentityResolving)? = nil,
         runtimeSignals: BackupRuntimeSignalSource = .apple, firstNetworkPathWait: Duration = .seconds(10),
-        backgroundLog: BackgroundWorkLog = BackgroundWorkLog { _, _ in }
+        backgroundLog: BackgroundWorkLog = BackgroundWorkLog { _, _ in }, appBuild: String? = nil
     ) throws -> ControllerFixture {
         let suite = "\(prefix)-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -4969,6 +5129,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             firstNetworkPathWait: firstNetworkPathWait
         )
         configuration.backgroundLog = backgroundLog
+        configuration.appBuild = appBuild
         let controller = PhotoLibraryBackupController(
             configuration: configuration,
             identityResolver: identityResolver,

@@ -586,6 +586,9 @@ public enum UploadError: LocalizedError, Equatable {
     /// rejection, this must not consume an item's finite retry budget and strand valid media.
     case retryableBackend(code: Int?, message: String)
     case backend(String)
+    /// Proton refused the request itself (an API answer with a 4xx status that a repeat cannot change). It carries
+    /// only the status: the server's own text is logged where the failure happens and never reaches a person.
+    case serviceRejected(code: Int)
     case albumStep(String)
     case cancelled
     /// The platform still prepares the source (the camera still processes a new photo). The runner makes the
@@ -641,6 +644,7 @@ public enum UploadError: LocalizedError, Equatable {
         case .transport(_, let message): message
         case .retryableBackend(_, let message): message
         case .backend(let message): message
+        case .serviceRejected: L10n.string("backup.fail_reason_generic")
         case .albumStep(let message): L10n.string("error.upload_album_step \(message)")
         case .cancelled: L10n.string("error.upload_cancelled")
         case .sourceNotReady(let name, _): L10n.string("error.upload_source_not_ready \(name)")

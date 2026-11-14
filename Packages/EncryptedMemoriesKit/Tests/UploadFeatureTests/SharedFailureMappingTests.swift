@@ -136,6 +136,7 @@ final class SharedFailureMappingTests: XCTestCase {
         XCTAssertEqual(UploadError.permissionDenied("x").failureCause, .permission)
         XCTAssertEqual(UploadError.retryableBackend(code: 503, message: "").failureCause, .serviceTemporary)
         XCTAssertEqual(UploadError.retryableBackend(code: 429, message: "").failureCause, .rateLimited)
+        XCTAssertEqual(UploadError.serviceRejected(code: 422).failureCause, .protonRestriction)
         XCTAssertEqual(UploadError.fileMissing("x").failureCause, .unknown)
         XCTAssertEqual(UploadError.sourceReportedMissing("x").failureCause, .unknown)
         XCTAssertEqual(UploadError.albumStep("x").failureCause, .unknown)

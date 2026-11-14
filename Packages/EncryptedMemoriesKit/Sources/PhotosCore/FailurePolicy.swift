@@ -16,7 +16,7 @@ public enum FailureCause: Sendable, Equatable, CaseIterable {
     case sourceGone
     /// The service limited the request rate.
     case rateLimited
-    /// A fixed Proton rule rejects the operation; #1152 supplies this cause.
+    /// A fixed Proton rule rejects the operation.
     case protonRestriction
     /// The operation was cancelled; a cancelled write may still have committed.
     case cancelled
@@ -90,7 +90,7 @@ public enum FailureCancellation {
 }
 
 /// Album page reads in DriveSession use this policy for one retry. Other retry and presentation paths do not use it yet.
-/// The model supersedes VideoPlaybackError, BackupIssueKind and MLRuntimeFailure `isRetryable`, AlbumWriteCause
+/// The model supersedes VideoPlaybackError and MLRuntimeFailure `isRetryable`, AlbumWriteCause
 /// `isTransient`, MLRuntimeFailure `isPermanent`, `offersUserRetry`, `canRetry`, and the follow-up replacement of
 /// `canRetryMerge` in ExactDuplicatesModel.
 /// `retriesExhausted` prevents automatic retries. Manual retry can remain for network and other transient reads,
