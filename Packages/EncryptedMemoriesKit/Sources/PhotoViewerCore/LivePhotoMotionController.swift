@@ -42,6 +42,8 @@ public final class LivePhotoMotionController {
     private var asset: StreamingVideoAsset?
     private var prepareTask: Task<Void, Never>?
     private var preparingMotionUID: PhotoUID?
+    private var isLooping = false
+    private var looper: AVPlayerLooper?
     private var endObserver: NSObjectProtocol?
     private var preparationGeneration: UInt = 0
     /// Retains a press that began while the encrypted clip was still being prepared. Without this intent,
@@ -65,9 +67,13 @@ public final class LivePhotoMotionController {
             teardown()
             return
         }
-        guard preparingMotionUID != motionUID || (loadState != .loading && loadState != .ready) else { return }
+        let loops = item.isLoopingLivePhoto
+        guard preparingMotionUID != motionUID || isLooping != loops || (loadState != .loading && loadState != .ready)
+        else { return }
         teardown()
         preparingMotionUID = motionUID
+        isLooping = loops
+        isPlayRequested = loops
         loadState = .loading
         let generation = preparationGeneration
         prepareTask = Task { [weak self] in
@@ -80,28 +86,41 @@ public final class LivePhotoMotionController {
                 var adopted = false
                 defer { if !adopted { stream.close() } }
                 guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else { return }
-                let player = AVPlayer(playerItem: AVPlayerItem(asset: stream.asset))
-                player.actionAtItemEnd = .pause
-                player.automaticallyWaitsToMinimizeStalling = false
-                // Wait until ready, then preroll - the clip is local + encrypted-cached, so this is fast.
-                if let item = player.currentItem {
-                    var tries = 0
-                    while item.status == .unknown, !Task.isCancelled,
-                        tries < LivePhotoMotionPolicy.prerollMaxTries
-                    {
-                        try await Task.sleep(
-                            for: .milliseconds(LivePhotoMotionPolicy.prerollPollMilliseconds)
-                        )
-                        tries += 1
-                    }
-                    guard item.status == .readyToPlay,
+                let template = AVPlayerItem(asset: stream.asset)
+                let player: AVPlayer
+                let looper: AVPlayerLooper?
+                if loops {
+                    let duration = CMTimeGetSeconds(try await stream.asset.load(.duration))
+                    guard duration.isFinite, duration > 0,
                         self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true
                     else {
                         self?.markPreparationFailed(generation, isStillCurrent: isStillCurrent)
                         return
                     }
-                    player.preroll(atRate: 1) { _ in }
+                    let queue = AVQueuePlayer()
+                    looper = AVPlayerLooper(player: queue, templateItem: template)
+                    player = queue
+                } else {
+                    looper = nil
+                    player = AVPlayer(playerItem: template)
                 }
+                player.actionAtItemEnd = loops ? .advance : .pause
+                player.automaticallyWaitsToMinimizeStalling = false
+                // Wait until ready, then preroll - the clip is local + encrypted-cached, so this is fast.
+                var tries = 0
+                while player.currentItem?.status != .readyToPlay, !Task.isCancelled,
+                    player.currentItem?.status != .failed, tries < LivePhotoMotionPolicy.prerollMaxTries
+                {
+                    try await Task.sleep(for: .milliseconds(LivePhotoMotionPolicy.prerollPollMilliseconds))
+                    tries += 1
+                }
+                guard player.currentItem?.status == .readyToPlay,
+                    self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true
+                else {
+                    self?.markPreparationFailed(generation, isStillCurrent: isStillCurrent)
+                    return
+                }
+                player.preroll(atRate: 1) { _ in }
                 // Expose the player only after preparation. An active press starts playback as soon as it is ready.
                 guard let self,
                     self.isCurrentPreparation(generation, isStillCurrent: isStillCurrent)
@@ -109,6 +128,7 @@ public final class LivePhotoMotionController {
                 self.asset = stream
                 adopted = true
                 self.player = player
+                self.looper = looper
                 self.loadState = .ready
                 self.startPlaybackIfRequested()
             } catch is CancellationError {
@@ -122,6 +142,7 @@ public final class LivePhotoMotionController {
     /// Plays the motion clip once from the start, with sound. Idempotent while already playing. `isMuted`/`volume`
     /// are reset every call (they persist on the `AVPlayer`), so a prior `stop()` can never leave the next play muted.
     public func play() {
+        guard !isLooping else { return }
         isPlayRequested = true
         startPlaybackIfRequested()
     }
@@ -136,6 +157,7 @@ public final class LivePhotoMotionController {
             let streamer, isStillCurrent()
         else { return }
         prepare(for: item, streamer: streamer, isStillCurrent: isStillCurrent)
+        guard !isLooping else { return }
         isPlayRequested = true
         startPlaybackIfRequested()
     }
@@ -143,17 +165,20 @@ public final class LivePhotoMotionController {
     private func startPlaybackIfRequested() {
         guard isPlayRequested, let player, !isPlaying else { return }
         isPlaying = true
-        player.isMuted = false
+        player.isMuted = isLooping
         player.volume = 1
         player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
         player.play()
-        endObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem, queue: .main
-        ) { [weak self] _ in Task { @MainActor in self?.stop() } }
+        if !isLooping {
+            endObserver = NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem, queue: .main
+            ) { [weak self] _ in Task { @MainActor in self?.stop() } }
+        }
     }
 
     /// Stops the motion clip and lets the viewer crossfade back to the still (release, or auto at end-of-clip).
     public func stop() {
+        guard !isLooping else { return }
         isPlayRequested = false
         guard isPlaying else { return }
         isPlaying = false
@@ -170,12 +195,16 @@ public final class LivePhotoMotionController {
         preparingMotionUID = nil
         removeEndObserver()
         player?.pause()
+        looper?.disableLooping()
+        looper = nil
+        (player as? AVQueuePlayer)?.removeAllItems()
         isPlayRequested = false
         isPlaying = false
         player?.replaceCurrentItem(with: nil)
         player = nil
         asset?.close()
         asset = nil
+        isLooping = false
         loadState = .idle
     }
 
@@ -191,6 +220,7 @@ public final class LivePhotoMotionController {
         isStillCurrent: @MainActor () -> Bool
     ) {
         guard isCurrentPreparation(generation, isStillCurrent: isStillCurrent) else { return }
+        PhotoDiagnostics.shared.increment("viewer.liveMotion.prepareFailure")
         loadState = .failed
     }
 

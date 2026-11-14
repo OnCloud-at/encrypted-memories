@@ -4,6 +4,11 @@ import PhotosCore
 /// prepare motion and how long to wait for their (local, encrypted-cached) player to become ready.
 /// Shared by the macOS and iOS viewers so the rule can never drift between platforms.
 public enum LivePhotoMotionPolicy {
+    /// Only ordinary Live Photos show a Live control and accept a press. Loops start without one.
+    public static func acceptsPress(item: PhotoItem) -> Bool {
+        item.isLivePhoto && !item.isLoopingLivePhoto
+    }
+
     /// Poll interval (ms) while waiting for the preloaded clip's player item to reach `.readyToPlay`.
     public static let prerollPollMilliseconds = 20
 

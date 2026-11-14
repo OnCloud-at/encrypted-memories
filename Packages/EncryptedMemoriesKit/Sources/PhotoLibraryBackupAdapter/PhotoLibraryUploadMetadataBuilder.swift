@@ -21,18 +21,25 @@ enum PhotoLibraryUploadMetadataBuilder {
             height: asset.pixelHeight > 0 ? asset.pixelHeight : nil,
             duration: asset.mediaType == .video ? asset.duration : nil
         )
-        let iOSPhotos = (cachedCloudIdentifier ?? resolveCloudIdentifier(for: asset)).map {
-            PhotoUploadMetadataEncoder.IOSPhotos(
-                iCloudID: $0,
-                modificationTime: modificationDate.map(format)
-            )
-        }
+        let iOSPhotos = photosSource(
+            cloudIdentifier: cachedCloudIdentifier ?? resolveCloudIdentifier(for: asset),
+            modificationDate: modificationDate, playbackStyle: asset.playbackStyle)
         return try PhotoUploadMetadataEncoder.metadata(
             location: location,
             camera: camera,
             media: media,
             iOSPhotos: iOSPhotos
         )
+    }
+
+    static func photosSource(
+        cloudIdentifier: String?, modificationDate: Date?, playbackStyle: PHAsset.PlaybackStyle
+    ) -> PhotoUploadMetadataEncoder.IOSPhotos? {
+        let loops = playbackStyle == .videoLooping
+        guard cloudIdentifier != nil || loops else { return nil }
+        return PhotoUploadMetadataEncoder.IOSPhotos(
+            iCloudID: cloudIdentifier, modificationTime: modificationDate.map(format),
+            playbackStyle: loops ? PhotoUploadMetadataEncoder.IOSPhotos.loopingPlaybackStyle : nil)
     }
 
     static func location(from location: CLLocation?) -> PhotoUploadMetadataEncoder.Location? {

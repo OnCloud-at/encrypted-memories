@@ -83,6 +83,19 @@ struct TimelineLocalRebuildTests {
             })
     }
 
+    @Test func aMimeRefinementPreservesLoopingMotion() throws {
+        let loop = PhotoItem(
+            uid: PhotoUID(volumeID: "vol", nodeID: "loop"), captureTime: Date(timeIntervalSince1970: 100),
+            mediaType: "image/jpeg", isLivePhoto: true, isLoopingLivePhoto: true,
+            relatedVideoID: "motion", tags: [.livePhotos])
+        let sections = try #require(Self.plan(Self.conditions(), stored: [loop], evidence: ["loop": "image/heic"]))
+        let rebuilt = try #require(sections.first?.items.first)
+        #expect(rebuilt.isLoopingLivePhoto)
+        #expect(rebuilt.isLivePhoto)
+        #expect(rebuilt.relatedVideoID == "motion")
+        #expect(rebuilt.tags.contains(.livePhotos))
+    }
+
     @Test func aRevisionOnlyChangeForTheSameCursorRebuildsFromTheStore() {
         let sections = Self.plan(Self.conditions(), stored: [Self.item("a"), Self.item("b", at: 200)])
         #expect(sections?.first?.items.map(\.uid.nodeID) == ["a", "b"])

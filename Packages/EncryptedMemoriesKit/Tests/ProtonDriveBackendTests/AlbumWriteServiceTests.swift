@@ -175,6 +175,34 @@ private actor AlbumWriteCancellationGate {
 extension DriveSessionStubSuite {
     /// Serialized with every other stub-based suite (process-global URLProtocol route table).
     @Suite struct AlbumWriteServiceTests {
+        @Test func livePlaybackReadsThePrimaryEncryptedSourceWithTheRealKeyChain() async throws {
+            let fixture = try AlbumCryptoFixture()
+            let node = UnlockableKey(armored: fixture.photoKeyArmored, passphrase: fixture.photoPassphraseClear)
+            let payloads = [
+                (#"{"Camera":{"CaptureTime":123},"iOS.photos":{"ICloudID":4,"PlaybackStyle":"videoLooping"}}"#, true),
+                (#"{"iOS.photos":{"ICloudID":"legacy"}}"#, false),
+                (#"{"iOS.photos":{"PlaybackStyle":"futureStyle"}}"#, false),
+            ]
+            for (payload, expected) in payloads {
+                let encrypted = try fixture.crypto.encrypt(text: payload, to: node)
+                let link = try JSONDecoder().decode(
+                    AlbumPhotoLinkBody.self,
+                    from: JSONSerialization.data(withJSONObject: [
+                        "LinkID": "main", "State": 1, "NodeKey": fixture.photoKeyArmored,
+                        "NodePassphrase": fixture.photoPassphraseMessage,
+                        "FileProperties": ["ActiveRevision": ["XAttr": encrypted]],
+                    ]))
+                let result = try await LivePhotoMotionLinks.answer(
+                    links: [link], nameLinkIDs: [], rootKey: { fixture.rootKey },
+                    decrypt: { try fixture.crypto.decryptName($0, parent: $1) }, playbackPhotoIDs: ["main"],
+                    decryptPlayback: { link, parent in
+                        try LivePhotoMotionLinks.isLoopingPlayback(of: link, parent: parent, crypto: fixture.crypto)
+                    })
+                #expect(result.playback == ["main": expected])
+                #expect(result.unreadPlayback.isEmpty)
+            }
+        }
+
         @Test func createAlbumSendsProtonCompatibleCryptoMaterial() async throws {
             StubURLProtocol.reset()
             let fixture = try AlbumCryptoFixture()
