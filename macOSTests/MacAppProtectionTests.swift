@@ -213,13 +213,18 @@ final class MacAppProtectionTests: XCTestCase {
             window.close()
         }
         XCTAssertNil(released, "The old root must deallocate before a new root registers")
+        XCTAssertTrue(
+            try windowRoots(in: fixture.controller).contains { root in
+                guard let field = Mirror(reflecting: root).children.first(where: { $0.label == "window" }) else {
+                    return false
+                }
+                return (field.value as? NSWindow) == nil
+            },
+            "The dead root must still be registered before replacement registration")
         let replacement = makeWindow()
         defer { replacement.close() }
         fixture.controller.register(window: replacement)
         XCTAssertEqual(try suspension(of: replacement, in: fixture.controller), false)
-        XCTAssertNil(
-            Mirror(reflecting: fixture.controller).children.first { $0.label == "suspending" },
-            "A parallel identity set can transfer a stale suspension to a reused address")
     }
 
     func testExplicitShowClearsSuspensionWithinGrace() async throws {
@@ -257,9 +262,13 @@ private func makeWindow(
 }
 
 @MainActor
+private func windowRoots(in controller: MacAppProtection) throws -> [AnyObject] {
+    try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == "roots" }?.value as? [AnyObject])
+}
+
+@MainActor
 private func suspension(of window: NSWindow, in controller: MacAppProtection) throws -> Bool? {
-    let roots = try XCTUnwrap(
-        Mirror(reflecting: controller).children.first { $0.label == "roots" }?.value as? [AnyObject])
+    let roots = try windowRoots(in: controller)
     let root = try XCTUnwrap(
         roots.first { candidate in
             (Mirror(reflecting: candidate).children.first { $0.label == "window" }?.value as? NSWindow) === window
