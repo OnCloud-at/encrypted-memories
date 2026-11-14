@@ -49,7 +49,8 @@ final class CancellationReadFault: @unchecked Sendable {
     }
 
     func assertCaught(
-        _ caught: any Error, context: String, file: StaticString = #filePath, line: UInt = #line
+        _ caught: any Error, context: String, preservesNativeBox: Bool = false,
+        file: StaticString = #filePath, line: UInt = #line
     ) {
         switch scenario {
         case .taskDuringReadFailure:
@@ -66,9 +67,15 @@ final class CancellationReadFault: @unchecked Sendable {
                 line: line)
             XCTAssertTrue(
                 caught is CancellationError, "\(context): native cancellation stays native", file: file, line: line)
-            XCTAssertFalse(
-                (caught as NSError) === (error as NSError), "\(context): native cancellation gets a fresh box",
-                file: file, line: line)
+            if preservesNativeBox {
+                XCTAssertTrue(
+                    (caught as NSError) === (error as NSError), "\(context): native cancellation keeps its box",
+                    file: file, line: line)
+            } else {
+                XCTAssertFalse(
+                    (caught as NSError) === (error as NSError), "\(context): native cancellation gets a fresh box",
+                    file: file, line: line)
+            }
         }
     }
 }

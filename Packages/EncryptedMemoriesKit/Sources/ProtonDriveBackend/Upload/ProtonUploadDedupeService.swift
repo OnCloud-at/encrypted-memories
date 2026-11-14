@@ -944,8 +944,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 generation: eventID, measurement: measurement
             )
         } catch {
-            if UploadError.isCancellation(error) { throw error }
-            try Task.checkCancellation()
+            try UploadError.rethrowIfCancelled(error, nativeCancellation: .preserveOriginal)
             measurement?.finish(.partial)
             return
         }
@@ -997,8 +996,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 try Task.checkCancellation()
                 return links
             } catch {
-                if UploadError.isCancellation(error) { throw error }
-                try Task.checkCancellation()
+                try UploadError.rethrowIfCancelled(error, nativeCancellation: .preserveOriginal)
                 return nil
             }
         }
@@ -1026,8 +1024,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 retry = try await session.fetchPhotoLinksMetadata(shareID: shareID, linkIDs: batch)
                 try Task.checkCancellation()
             } catch {
-                if UploadError.isCancellation(error) { throw error }
-                try Task.checkCancellation()
+                try UploadError.rethrowIfCancelled(error, nativeCancellation: .preserveOriginal)
                 endpointFailureIDs.formUnion(batch)
                 continue
             }
@@ -1221,8 +1218,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     )
                 }
             } catch {
-                if UploadError.isCancellation(error) { throw error }
-                try Task.checkCancellation()
+                try UploadError.rethrowIfCancelled(error, nativeCancellation: .preserveOriginal)
                 let failedHashes = Set(batch)
                 for index in rows.unresolvedIssues.indices {
                     let linkID = rows.unresolvedIssues[index].remoteLinkID
