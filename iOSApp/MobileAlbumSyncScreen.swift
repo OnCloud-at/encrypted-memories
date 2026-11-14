@@ -227,8 +227,7 @@ private struct MobileAlbumPickerSheet: View {
             Group {
                 switch controller.pickerContent(matching: searchText, didLoad: didLoad) {
                 case .loading:
-                    ProgressView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    ProtonLoadingView()
                 case .accessDenied:
                     ContentUnavailableView(
                         String(localized: "settings.photos_backup_denied_ios"),
