@@ -168,7 +168,7 @@ import Testing
         }
     }
 
-    private func crawlItem(_ id: String) -> PhotoItem {
+    func crawlItem(_ id: String) -> PhotoItem {
         PhotoItem(
             uid: PhotoUID(volumeID: "crawl", nodeID: id), captureTime: Date(timeIntervalSince1970: 1_700_000_000),
             mediaType: "image/jpeg")
@@ -194,8 +194,9 @@ import Testing
     }
 
     /// One shared timeline model with a real feed and an encrypted cache. `refresh()` does what the Mac host does
-    /// after a refresh: it hands the added photos to the incremental update coordinator.
-    @MainActor private struct CrawlFixture {
+    /// after a refresh: it hands the added photos to the incremental update coordinator. With sources, every changed
+    /// whole library also reaches the feed as a source scope, as the source analysis runtime of the app delivers it.
+    @MainActor struct CrawlFixture {
         let directory: URL
         let library: CrawlLibrary
         let loader: CountingThumbnails
@@ -205,11 +206,12 @@ import Testing
         let diagnostics: PhotoDiagnostics
         let probes: ProbeCounter
         let refused: Set<PhotoUID>
+        let sources: CrawlSources?
         let updates = LibraryThumbnailUpdateCoordinator(policy: .init(pollInterval: .milliseconds(10)))
 
         static func loaded(
             photoCount: Int, extra: [PhotoItem] = [], trash: [PhotoItem] = [], refusing: Set<PhotoUID> = [],
-            holding: PhotoUID? = nil
+            holding: PhotoUID? = nil, withSources: Bool = false
         ) async throws -> CrawlFixture {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
                 "whole-library-crawl-" + UUID().uuidString)
@@ -224,10 +226,16 @@ import Testing
             let probes = ProbeCounter()
             feed.setDiskProbeHookForTesting { probes.increment() }
             let timeline = TimelineViewModel(repository: library, feed: feed, library: library)
+            let sources = withSources ? CrawlSources() : nil
+            if let sources {
+                let bound = await feed.bindDerivedDataEpoch(sources.graph.runtimeEpoch)
+                #expect(bound)
+            }
             let fixture = CrawlFixture(
                 directory: directory, library: library, loader: loader, cache: cache, feed: feed,
-                timeline: timeline, diagnostics: diagnostics, probes: probes, refused: refusing)
+                timeline: timeline, diagnostics: diagnostics, probes: probes, refused: refusing, sources: sources)
             await timeline.load()
+            await fixture.publishSources()
             // A held photo blocks its crawl batch, so that test goes on while the first crawl still runs.
             if holding == nil {
                 try await fixture.waitUntilIdle(expecting: items.map(\.uid).filter { !refusing.contains($0) })
@@ -237,12 +245,28 @@ import Testing
 
         func refresh() async {
             let result = await timeline.refreshLibrary()
+            await publishSources()
             updates.reconcile(
                 currentUIDs: timeline.wholeLibraryUIDs, addedUIDs: result.addedUIDs,
                 resolver: { [feed] uids, enqueueMissing in
                     await feed.libraryUpdateResolution(for: uids, enqueueMissing: enqueueMissing)
                 })
             try? await waitUntilIdle(expecting: expectedOnDisk)
+        }
+
+        /// Commits a changed whole library as the authoritative inventory of the one source and hands the scope change
+        /// to the feed. An unchanged library commits nothing, as the source coordinator of the app does.
+        func publishSources() async {
+            guard let sources else { return }
+            let items = timeline.wholeLibraryItemsForViewer
+            guard items != sources.published, let lease = sources.graph.beginRefresh(sources.source.id),
+                let change = sources.graph.commit(
+                    items.map(LibrarySourceItem.complete), validationToken: nil, using: lease)
+            else { return }
+            sources.published = items
+            _ = await feed.reconcile(
+                selected: change.selectedScope, analysis: change.analysisScope,
+                retention: change.thumbnailRetentionScope)
         }
 
         /// Every photo of the whole library whose thumbnail Proton does not refuse.
@@ -262,6 +286,7 @@ import Testing
                 last = now
                 try await Task.sleep(for: .milliseconds(50))
             }
+            try #require(quietChecks >= 5, "The crawl did not settle within 20 seconds")
             try await feed.waitForPrefetchToFinish()
         }
 
@@ -279,7 +304,18 @@ import Testing
         }
     }
 
-    private final class ProbeCounter: @unchecked Sendable {
+    /// The one library source of the fixture and the inventory it last committed.
+    @MainActor final class CrawlSources {
+        let graph = LibrarySourceGraph()
+        let source = LibrarySource(id: SourceID("crawl-library"), capabilities: .readThumbnail)
+        var published: [PhotoItem]?
+
+        init() {
+            _ = graph.commitSourceSet([source], using: graph.beginSourceSetRefresh())
+        }
+    }
+
+    final class ProbeCounter: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
         var value: Int { lock.withLock { count } }
@@ -287,7 +323,7 @@ import Testing
     }
 
     /// The whole library and Recently Deleted of one account, with no saved timeline.
-    private actor CrawlLibrary: PhotosRepository, PhotoLibraryProvider {
+    actor CrawlLibrary: PhotosRepository, PhotoLibraryProvider {
         private var items: [PhotoItem]
         private var trash: [PhotoItem]
 
@@ -297,6 +333,8 @@ import Testing
         }
 
         func add(_ item: PhotoItem) { items.append(item) }
+
+        func remove(_ uid: PhotoUID) { items.removeAll { $0.uid == uid } }
 
         func restore(_ item: PhotoItem) {
             trash.removeAll { $0.uid == item.uid }
@@ -318,8 +356,9 @@ import Testing
         }
     }
 
-    /// Counts every thumbnail request per photo. Refused photos get an item error; a held photo waits for release.
-    private actor CountingThumbnails: ThumbnailBatchLoader {
+    /// Counts every thumbnail request per photo when it arrives. Refused photos get an item error; a held photo waits
+    /// for release.
+    actor CountingThumbnails: ThumbnailBatchLoader {
         private let refusing: Set<PhotoUID>
         private var holding: PhotoUID?
         private var held: [CheckedContinuation<Void, Never>] = []
@@ -333,6 +372,8 @@ import Testing
 
         func requests(for uid: PhotoUID) -> Int { perPhoto[uid, default: 0] }
 
+        func hold(_ uid: PhotoUID) { holding = uid }
+
         func releaseHeld() {
             holding = nil
             held.forEach { $0.resume() }
@@ -344,9 +385,9 @@ import Testing
         ) async -> ThumbnailBatchLoadResult {
             var errors: [PhotoUID: String] = [:]
             for uid in uids {
-                if uid == holding { await withCheckedContinuation { held.append($0) } }
                 perPhoto[uid, default: 0] += 1
                 totalRequests += 1
+                if uid == holding { await withCheckedContinuation { held.append($0) } }
                 if refusing.contains(uid) {
                     errors[uid] = "no thumbnail"
                 } else {
