@@ -216,7 +216,6 @@ public final class LivePhotoMotionController {
         isStillCurrent: @MainActor () -> Bool
     ) {
         guard isCurrentPreparation(generation, isStillCurrent: isStillCurrent) else { return }
-        PhotoDiagnostics.shared.increment("viewer.liveMotion.prepareFailure")
         loadState = .failed
     }
 

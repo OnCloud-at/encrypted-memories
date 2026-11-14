@@ -89,9 +89,8 @@ struct LivePhotoMotionLinks: Sendable {
                     (link.linkID.map(nameLinkIDs.contains) ?? false) && isVideo(link.mimeType ?? "")
                 }, rootKey: sharedRootKey, decrypt: decrypt)
             answer = Answer(files: files)
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
+            if FailureCancellation.isCancellation(error) { throw error }
             DebugLog.log("timeline: Live Photo video names unread, root key unavailable - \(error)")
             let files = try await RelatedFileRead.files(
                 in: links, decryptingNamesWhere: { _ in false }, rootKey: rootKey, decrypt: decrypt)
@@ -116,9 +115,8 @@ struct LivePhotoMotionLinks: Sendable {
             }
             do {
                 answer.playback[id] = try decryptPlayback(link, try await sharedRootKey())
-            } catch is CancellationError {
-                throw CancellationError()
             } catch {
+                if FailureCancellation.isCancellation(error) { throw error }
                 answer.unreadPlayback.insert(id)
                 PhotoDiagnostics.shared.increment("timeline.liveMotion.playbackUnread")
             }
@@ -255,9 +253,8 @@ struct LivePhotoMotionLinks: Sendable {
                 for linkID in playbackPhotoIDs where !answer.unreadPlayback.contains(linkID) {
                     read.playback[linkID] = answer.playback[linkID] ?? false
                 }
-            } catch is CancellationError {
-                throw CancellationError()
             } catch {
+                if FailureCancellation.isCancellation(error) { throw error }
                 DebugLog.log("timeline: type or name of \(unread.count) Live Photo related files unread - \(error)")
             }
         }

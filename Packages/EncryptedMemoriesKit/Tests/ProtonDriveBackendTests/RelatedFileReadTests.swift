@@ -139,6 +139,35 @@ struct RelatedFileReadTests {
         }
     }
 
+    @Test(arguments: ["video-name-key", "playback-key", "playback-decrypt", "metadata-fetch"])
+    func nativeCancellationPreservesTheOriginalError(path: String) async throws {
+        let cancellation = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        do {
+            if path == "metadata-fetch" {
+                _ = try await LivePhotoMotionLinks().motions(
+                    of: ["main": ["video"]], stored: [:], evidence: [:]
+                ) { _, _, _ in throw cancellation }
+            } else {
+                let readsName = path == "video-name-key"
+                _ = try await LivePhotoMotionLinks.answer(
+                    links: try links(
+                        [("main", "image/heic", nil), ("video", "video/quicktime", "sealed:FullSizeRender.mov")],
+                        xattrs: ["main": "sealed-xattr"]),
+                    nameLinkIDs: readsName ? ["video"] : [],
+                    rootKey: { () async throws -> String in
+                        if path != "playback-decrypt" { throw cancellation }
+                        return "root"
+                    },
+                    decrypt: { name, _ in name },
+                    playbackPhotoIDs: readsName ? [] : ["main"],
+                    decryptPlayback: { _, _ in throw cancellation })
+            }
+            Issue.record("native cancellation must end \(path)")
+        } catch {
+            #expect(error as NSError === cancellation, "preserve the original cancellation from \(path)")
+        }
+    }
+
     @Test func anInactiveMainNeverSuppliesPlaybackEvidence() async throws {
         let crypto = Crypto()
         let inactive = try JSONDecoder().decode(
