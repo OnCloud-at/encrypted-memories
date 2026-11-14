@@ -28,7 +28,7 @@ import XCTest
                 let main = try await fixture.backUp()
                 try fixture.exclude(main)
                 try await fixture.startSession(main)
-                await assertEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
+                await assertRestoreEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
                 let uploads = fixture.server.uploadRequestCount
                 let reads = fixture.resolver.readCount
 
@@ -50,7 +50,7 @@ import XCTest
                 let admitted = try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision))
                 XCTAssertFalse(admitted.state.isTerminalSuccess, "The old completed queue row must reopen")
                 XCTAssertTrue(try XCTUnwrap(fixture.pending.sourceState(for: fixture.key)).needsQueueSync)
-                await assertEventually { fixture.session.excludedTiles.isEmpty }
+                await assertRestoreEventually { fixture.session.excludedTiles.isEmpty }
 
                 // The recheck timer must stay parked while the queue drains. A released timer runs its
                 // reconcile on fake time at once, so its restore recheck can re-admit the queue row
@@ -64,7 +64,7 @@ import XCTest
                 // The recheck ran and the queue is idle before the resolver reads are counted: the parked
                 // timer resumes with the drain finished, so its reconcile sees the completed row and can
                 // neither re-admit it nor start a second queue pass.
-                await assertEventually { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
+                await assertRestoreEventually { fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil) }
                 XCTAssertEqual(fixture.resolver.readCount, reads + 1, "One restored revision needs one queue drain")
                 XCTAssertEqual(
                     fixture.server.uploadRequestCount, uploads, "The real duplicate check must reuse Proton data")
@@ -93,7 +93,7 @@ import XCTest
                 let main = try await fixture.backUp()
                 try fixture.exclude(main)
                 try await fixture.startSession(main)
-                await assertEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
+                await assertRestoreEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
                 try fixture.execute("UPDATE source_state SET desired='future-state';")
                 XCTAssertEqual(fixture.pending.sourceStateRead(for: fixture.key), .unreadable)
                 let saved = try fixture.rawSourceRow()
@@ -122,7 +122,7 @@ import XCTest
                 try fixture.exclude(main, trashInFlight: true)
                 await fixture.remote.trashGate.hold()
                 try await fixture.startSession(main, waitForExcluded: false)
-                await assertEventually { fixture.remote.trashEntered }
+                await assertRestoreEventually { fixture.remote.trashEntered }
                 let uploads = fixture.server.uploadRequestCount
                 let reads = fixture.resolver.readCount
 
@@ -133,12 +133,12 @@ import XCTest
                 XCTAssertTrue(restored.needsQueueSync, "The held trash cannot count as a completed Restore")
                 await fixture.remote.trashGate.release()
 
-                await assertEventually { fixture.remote.trashes == 1 && fixture.remote.compensations == 1 }
+                await assertRestoreEventually { fixture.remote.trashes == 1 && fixture.remote.compensations == 1 }
                 XCTAssertEqual(fixture.server.links.first { $0.uid == main }?.state, .active)
                 XCTAssertTrue(try XCTUnwrap(fixture.pending.sourceState(for: fixture.key)).needsQueueSync)
                 XCTAssertEqual(fixture.server.uploadRequestCount, uploads)
                 // Reconcile can admit the real queue after compensation. Wait for that admission before draining it.
-                await assertEventually {
+                await assertRestoreEventually {
                     queueEntryForTesting(in: fixture.queue, source: fixture.source, revision: fixture.revision)?.state
                         .isTerminalSuccess == false
                 }
@@ -162,7 +162,7 @@ import XCTest
                 // 61 s clears the compound's own real-time 30-second admission floor, so the registered date
                 // is exactly the configured delay; 61, not the production 60, proves the seam is live.
                 try await fixture.startSession(main, restoreRecheckDelays: [61, 62, 63])
-                await assertEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
+                await assertRestoreEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
 
                 fixture.clockGate.hold()
                 let result = try await fixture.restore(main)
@@ -183,7 +183,7 @@ import XCTest
                 }
                 defer { fixture.session.onPendingChange = nil }
                 // Keep the recheck parked while the queue drains; releasing fake time can run the whole ladder.
-                await assertEventually { fixture.session.excludedTiles.isEmpty }
+                await assertRestoreEventually { fixture.session.excludedTiles.isEmpty }
                 await fixture.drain()
                 XCTAssertTrue(
                     try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision)).state
@@ -204,7 +204,7 @@ import XCTest
                 let main = try await fixture.backUp()
                 try fixture.exclude(main)
                 try await fixture.startSession(main, productionTimers: true)
-                await assertEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
+                await assertRestoreEventually { fixture.session.excludedTiles.map(\.key) == [fixture.key] }
                 let uploads = fixture.server.uploadRequestCount
 
                 let restoreStarted = Date()
@@ -214,12 +214,12 @@ import XCTest
                 guard case .waiting? = result.outcomes[fixture.key] else {
                     return XCTFail("The production effects must enqueue a real compound recheck")
                 }
-                await assertEventually { fixture.session.excludedTiles.isEmpty }
+                await assertRestoreEventually { fixture.session.excludedTiles.isEmpty }
                 await fixture.drain()
                 XCTAssertTrue(
                     try XCTUnwrap(fixture.queue.entry(for: fixture.source, revision: fixture.revision)).state
                         .isTerminalSuccess)
-                await assertEventually(seconds: 400) {
+                await assertRestoreEventually(seconds: 400) {
                     fixture.pending.sourceStateRead(for: fixture.key) == .readable(nil)
                 }
                 XCTAssertGreaterThanOrEqual(
@@ -240,7 +240,7 @@ import XCTest
             await fixture.close()
         }
 
-        private func assertEventually(
+        private func assertRestoreEventually(
             seconds: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line, _ predicate: () -> Bool
         ) async {
             let deadline = Date().addingTimeInterval(seconds)
