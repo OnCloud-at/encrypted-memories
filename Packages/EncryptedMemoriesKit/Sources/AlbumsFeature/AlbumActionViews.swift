@@ -203,16 +203,9 @@ public struct AlbumDestinationPicker: View {
                 }
             }
         } else if coordinator.albums.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "rectangle.stack")
-                    .font(.title2)
-                    .foregroundStyle(.secondary)
-                Text(L10n.string("albums.none_available"))
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 18)
+            Text(L10n.string("albums.none_available"))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             ForEach(coordinator.albums) { album in
                 let membershipState = coordinator.membershipState(for: album.id)
