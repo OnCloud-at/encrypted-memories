@@ -1174,19 +1174,12 @@ private struct AlbumPickerSheet: View {
                 ProgressView()
                 Spacer()
             case .accessDenied:
-                Spacer()
-                Text("settings.photos_backup_denied_macos")
-                    .font(.footnote)
-                    .foregroundStyle(.orange)
-                    .padding()
-                Spacer()
-            case .empty:
-                Spacer()
-                Text(L10n.string("settings.albumsync_picker_empty"))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .padding()
-                Spacer()
+                AlbumPickerUnavailableView(
+                    accessDeniedMessage: String(localized: "settings.photos_backup_denied_macos"))
+            case .noAlbums:
+                AlbumPickerUnavailableView()
+            case .noMatches:
+                AlbumPickerUnavailableView(searchText: searchText)
             case .list(let albums):
                 List(albums) { album in
                     Toggle(isOn: draftBinding(album.id)) {
