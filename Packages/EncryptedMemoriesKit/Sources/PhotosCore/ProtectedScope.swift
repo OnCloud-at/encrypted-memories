@@ -276,8 +276,9 @@ public final class AccessGate {
         endAuthentication()
     }
 
-    /// A window returns. Areas lock when the app stayed in the background for their grace period.
-    public func appWillEnterForeground(at instant: ContinuousClock.Instant) {
+    /// Only returning protected content ends the background interval; activation alone need not show a window.
+    public func appWillEnterForeground(at instant: ContinuousClock.Instant, hasForegroundContent: Bool = true) {
+        guard hasForegroundContent else { return }
         refreshAvailability()
         guard let since = backgroundSince else { return }
         automaticPromptTaken = []

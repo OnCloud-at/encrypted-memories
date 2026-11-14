@@ -98,6 +98,7 @@ private final class DismissableAVPlayerView: AVPlayerView {
 /// generic-metadata fatalError), and `AVPlayerView` is the better macOS surface anyway - native
 /// floating controls, scrubbing, Picture-in-Picture.
 private struct PlayerView: NSViewRepresentable {
+    @Environment(\.protectedContentIsCovered) private var isCovered
     let player: AVPlayer
     let poster: NSImage?
     var isDismissing: Bool = false
@@ -108,7 +109,7 @@ private struct PlayerView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> DismissableAVPlayerView {
         let view = DismissableAVPlayerView()
-        view.player = player
+        ProtectedMediaPlayback.update(player, attached: view.player, isCovered: isCovered) { view.player = $0 }
         view.controlsStyle = .floating
         view.videoGravity = .resizeAspect
         view.allowsPictureInPicturePlayback = true
@@ -121,8 +122,9 @@ private struct PlayerView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: DismissableAVPlayerView, context: Context) {
-        if view.player !== player {
-            view.player = player
+        let changed = view.player !== player
+        ProtectedMediaPlayback.update(player, attached: view.player, isCovered: isCovered) { view.player = $0 }
+        if changed {
             view.attachPoster(poster)
         } else {
             view.updatePoster(poster)

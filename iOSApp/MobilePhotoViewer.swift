@@ -1676,6 +1676,7 @@ struct MobileImagePage: View {
 /// AVKit chrome is intentionally disabled because iOS exposes it only as one all-or-nothing surface; the app
 /// owns the visible play and seek controls while AVKit retains playback, poster, and Picture in Picture behavior.
 private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
+    @Environment(\.protectedContentIsCovered) private var isCovered
     let player: AVPlayer
     let poster: UIImage?
     let reduceMotion: Bool
@@ -1687,7 +1688,9 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
-        controller.player = player
+        ProtectedMediaPlayback.update(player, attached: controller.player, isCovered: isCovered) {
+            controller.player = $0
+        }
         controller.videoGravity = .resizeAspect
         controller.showsPlaybackControls = false
         controller.allowsPictureInPicturePlayback = true
@@ -1732,8 +1735,11 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
         context.coordinator.parent = self
         context.coordinator.controller = controller
-        if controller.player !== player {
-            controller.player = player
+        let changed = controller.player !== player
+        ProtectedMediaPlayback.update(player, attached: controller.player, isCovered: isCovered) {
+            controller.player = $0
+        }
+        if changed {
             context.coordinator.attachPoster(poster, to: controller)
         } else {
             context.coordinator.updatePoster(poster, in: controller)

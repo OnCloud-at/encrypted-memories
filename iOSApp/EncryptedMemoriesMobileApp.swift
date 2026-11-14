@@ -91,7 +91,11 @@ private struct MobileSupportedAppRoot: View {
             .environmentObject(runtime.sessionModel)
             .environment(runtime.libraryModel)
             .environment(sceneContext)
-            .protectedContent(isCovered: !MobileAppProtection.gate.admits(.app))
+            .protectedContent(
+                isCovered: ProtectedScopeCoverage(
+                    gate: MobileAppProtection.gate, isActive: scenePhase == .active
+                ).isCovered
+            )
             .mobileSceneWindowAnchor(sceneContext)
             .onAppear {
                 sceneContext.onWindowChange = { window in

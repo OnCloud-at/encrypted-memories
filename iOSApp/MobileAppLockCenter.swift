@@ -1,5 +1,4 @@
 import DesignSystemCore
-import Observation
 import PhotosCore
 import PrivacyFeature
 import SwiftUI
@@ -12,15 +11,15 @@ final class MobileAppLockCenter: NSObject {
 
     private let gate: AccessGate
     private var entries: [Entry] = []
-    private var observing = true
+    private let lifecycle: MobilePrivacyPreviewShieldCenter
+    private var sceneObservation: UUID?
+    private var gateObservation: ProtectedScopeObservation?
 
     @MainActor private final class Entry {
         weak var source: UIWindow?
         let scene: UIWindowScene
         let window: UIWindow
         let presentation: ProtectedScopePresentation
-        var deactivating = false
-        var background = false
         var hiddenAccessibility: [(UIWindow, Bool)] = []
 
         init(source: UIWindow, scene: UIWindowScene, gate: AccessGate) {
@@ -42,20 +41,17 @@ final class MobileAppLockCenter: NSObject {
         }
     }
 
-    init(gate: AccessGate) {
+    init(gate: AccessGate, lifecycle: MobilePrivacyPreviewShieldCenter = .shared) {
         self.gate = gate
+        self.lifecycle = lifecycle
         super.init()
-        let center = NotificationCenter.default
-        center.addObserver(
-            self, selector: #selector(willEnterForeground), name: UIScene.willEnterForegroundNotification, object: nil)
-        center.addObserver(self, selector: #selector(didActivate), name: UIScene.didActivateNotification, object: nil)
-        center.addObserver(
-            self, selector: #selector(willDeactivate), name: UIScene.willDeactivateNotification, object: nil)
-        center.addObserver(
-            self, selector: #selector(didEnterBackground), name: UIScene.didEnterBackgroundNotification, object: nil)
-        center.addObserver(
-            self, selector: #selector(didDisconnect), name: UIScene.didDisconnectNotification, object: nil)
-        observeGate()
+        sceneObservation = lifecycle.observeScenes { [weak self] scene, event in
+            self?.sceneChanged(scene, event: event)
+        }
+        gateObservation = ProtectedScopeObservation(gate: gate) { [weak self] in
+            guard let self else { return }
+            self.entries.forEach(self.refresh)
+        }
     }
 
     func register(window: UIWindow) {
@@ -66,15 +62,16 @@ final class MobileAppLockCenter: NSObject {
             return
         }
         let entry = Entry(source: window, scene: scene, gate: gate)
-        entry.background = scene.activationState == .background
         entries.append(entry)
-        if !entry.background { gate.appWillEnterForeground(at: .now) }
+        gate.appWillEnterForeground(at: .now, hasForegroundContent: lifecycle.phase(of: scene) != .background)
         refresh(entry)
     }
 
     func invalidate() {
-        observing = false
-        NotificationCenter.default.removeObserver(self)
+        gateObservation?.invalidate()
+        gateObservation = nil
+        if let sceneObservation { lifecycle.removeSceneObserver(sceneObservation) }
+        sceneObservation = nil
         for entry in entries {
             entry.window.isHidden = true
             entry.restoreAccessibility()
@@ -82,28 +79,9 @@ final class MobileAppLockCenter: NSObject {
         entries = []
     }
 
-    private func observeGate() {
-        guard observing else { return }
-        withObservationTracking {
-            _ = gate.state(of: .app)
-            _ = gate.isEnabled(.app)
-            _ = gate.availability
-            _ = gate.isAuthenticating
-        } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.observing else { return }
-                self.entries.forEach(self.refresh)
-                self.observeGate()
-            }
-        }
-    }
-
     private func refresh(_ entry: Entry) {
-        let active = !entry.deactivating && entry.scene.activationState == .foregroundActive
-        let snapshot = !active && gate.isEnabled(.app)
-        let show = snapshot || !gate.admits(.app)
-        entry.presentation.snapshot = snapshot
-        entry.presentation.phase = active ? .active : .inactive
+        let active = lifecycle.phase(of: entry.scene) == .active
+        let show = entry.presentation.update(isActive: active)
         entry.window.frame = entry.scene.coordinateSpace.bounds
         if let source = entry.source {
             entry.window.overrideUserInterfaceStyle = source.traitCollection.userInterfaceStyle
@@ -132,53 +110,27 @@ final class MobileAppLockCenter: NSObject {
         }
     }
 
-    @objc private func willEnterForeground(_ note: Notification) {
-        guard let scene = note.object as? UIWindowScene else { return }
-        // Reset the session before any hosting view can run its active-phase automatic task.
-        gate.appWillEnterForeground(at: .now)
-        for entry in entries where entry.scene === scene {
-            entry.background = false
-            entry.deactivating = true
-            refresh(entry)
+    private func sceneChanged(_ scene: UIWindowScene, event: MobilePrivacyPreviewShieldCenter.SceneEvent) {
+        guard entries.contains(where: { $0.scene === scene }) else { return }
+        switch event {
+        case .willEnterForeground, .didActivate:
+            // Expire and reset the session before any active-phase automatic prompt can run.
+            gate.appWillEnterForeground(at: .now)
+        case .didDisconnect:
+            for entry in entries where entry.scene === scene {
+                entry.window.isHidden = true
+                entry.restoreAccessibility()
+            }
+            entries.removeAll { $0.scene === scene }
+        case .willDeactivate, .didEnterBackground:
+            break
         }
-    }
-
-    @objc private func didActivate(_ note: Notification) {
-        guard let scene = note.object as? UIWindowScene else { return }
-        gate.appWillEnterForeground(at: .now)
-        for entry in entries where entry.scene === scene {
-            entry.background = false
-            entry.deactivating = false
-            refresh(entry)
+        entries.forEach(refresh)
+        if event == .didEnterBackground || event == .didDisconnect,
+            entries.allSatisfy({ lifecycle.phase(of: $0.scene) == .background })
+        {
+            gate.appDidEnterBackground(at: .now)
         }
-    }
-
-    @objc private func willDeactivate(_ note: Notification) {
-        guard let scene = note.object as? UIWindowScene else { return }
-        for entry in entries where entry.scene === scene {
-            entry.deactivating = true
-            refresh(entry)
-        }
-    }
-
-    @objc private func didEnterBackground(_ note: Notification) {
-        guard let scene = note.object as? UIWindowScene else { return }
-        for entry in entries where entry.scene === scene {
-            entry.background = true
-            entry.deactivating = true
-            refresh(entry)
-        }
-        if !entries.isEmpty && entries.allSatisfy(\.background) { gate.appDidEnterBackground(at: .now) }
-    }
-
-    @objc private func didDisconnect(_ note: Notification) {
-        guard let scene = note.object as? UIWindowScene else { return }
-        for entry in entries where entry.scene === scene {
-            entry.window.isHidden = true
-            entry.restoreAccessibility()
-        }
-        entries.removeAll { $0.scene === scene }
-        if entries.allSatisfy(\.background) { gate.appDidEnterBackground(at: .now) }
     }
 
     isolated deinit { invalidate() }
@@ -189,11 +141,7 @@ private struct MobileAppLockWindowContent: View {
 
     var body: some View {
         GeometryReader { geometry in
-            Color.clear.protectedScope(
-                .app, gate: presentation.gate,
-                unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
-                accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
-                contentBounds: geometry.mobileCenteredContentBounds, snapshot: presentation.snapshot)
+            Color.clear.appProtection(presentation, contentBounds: geometry.mobileCenteredContentBounds)
         }
         .ignoresSafeArea()
         .environment(\.scenePhase, presentation.phase)

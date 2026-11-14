@@ -104,6 +104,17 @@ final class MacAppProtectionTests: XCTestCase {
         XCTAssertFalse(fixture.gate.admits(.app), "Registering a hidden window is not a foreground entry")
     }
 
+    func testUnhidingWithoutAReturningWindowPreservesTheBackgroundInterval() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        _ = await fixture.gate.unlock(.app, reason: "Unlock")
+        fixture.controller.prepareToHide(window: fixture.window)
+        fixture.window.orderOut(nil)
+        NotificationCenter.default.post(name: NSApplication.willUnhideNotification, object: NSApp)
+        fixture.gate.appWillEnterForeground(at: .now + .seconds(120))
+        XCTAssertFalse(fixture.gate.admits(.app), "Unhide without a protected window must preserve expiry")
+    }
+
     func testClosingAndReopeningTheSameWindowRetainsProtectionWithoutReregistration() async throws {
         let fixture = try Fixture()
         defer { fixture.close() }
@@ -217,10 +228,7 @@ final class MacAppProtectionTests: XCTestCase {
         defer { replacement.close() }
         XCTAssertTrue(
             try windowRoots(in: fixture.controller).contains { root in
-                guard let field = Mirror(reflecting: root).children.first(where: { $0.label == "window" }) else {
-                    return false
-                }
-                return (field.value as? NSWindow) == nil
+                try rootWindow(root) == nil
             },
             "The dead root must still be registered before replacement registration")
         fixture.controller.register(window: replacement)
@@ -267,11 +275,17 @@ private func windowRoots(in controller: MacAppProtection) throws -> [AnyObject] 
 }
 
 @MainActor
+private func rootWindow(_ root: AnyObject) throws -> NSWindow? {
+    let field = try XCTUnwrap(Mirror(reflecting: root).children.first { $0.label == "window" })
+    return field.value as? NSWindow
+}
+
+@MainActor
 private func suspension(of window: NSWindow, in controller: MacAppProtection) throws -> Bool? {
     let roots = try windowRoots(in: controller)
     let root = try XCTUnwrap(
-        roots.first { candidate in
-            (Mirror(reflecting: candidate).children.first { $0.label == "window" }?.value as? NSWindow) === window
+        try roots.first { candidate in
+            try rootWindow(candidate) === window
         })
     return Mirror(reflecting: root).children.first { $0.label == "suspended" }?.value as? Bool
 }

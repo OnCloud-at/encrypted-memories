@@ -1,5 +1,4 @@
 import AppKit
-import Observation
 import PhotosCore
 import PrivacyFeature
 import SwiftUI
@@ -15,6 +14,7 @@ final class MacAppProtection: NSObject {
     private var wasForeground = false
     private var refreshing = false
     private var observing = true
+    private var gateObservation: ProtectedScopeObservation?
     private var hiding = false
 
     @MainActor private final class WeakWindow {
@@ -79,7 +79,7 @@ final class MacAppProtection: NSObject {
             NSWorkspace.shared.notificationCenter.addObserver(
                 self, selector: #selector(systemLocked), name: name, object: nil)
         }
-        observeGate()
+        gateObservation = ProtectedScopeObservation(gate: gate) { [weak self] in self?.refresh() }
     }
 
     func register(window: NSWindow, presentation: ProtectedScopePresentation? = nil) {
@@ -112,26 +112,13 @@ final class MacAppProtection: NSObject {
 
     func invalidate() {
         observing = false
+        gateObservation?.invalidate()
+        gateObservation = nil
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         covers.values.forEach { $0.hide() }
         covers = [:]
         roots = []
-    }
-
-    private func observeGate() {
-        guard observing else { return }
-        withObservationTracking {
-            _ = gate.state(of: .app)
-            _ = gate.isAuthenticating
-            _ = gate.availability
-        } onChange: { [weak self] in
-            Task { @MainActor in
-                guard let self, self.observing else { return }
-                self.refresh()
-                self.observeGate()
-            }
-        }
     }
 
     private func refresh() {
@@ -169,11 +156,8 @@ final class MacAppProtection: NSObject {
                 !hiding && !NSApp.isHidden && source.isVisible
                 && !source.isMiniaturized && !(root?.suspended ?? false)
             let active = applicationIsActive() && foregroundWindow
-            let snapshot = !active && gate.isEnabled(.app)
             let presentation = root?.presentation ?? covers[key]?.presentation ?? ProtectedScopePresentation(gate: gate)
-            presentation.snapshot = snapshot
-            presentation.phase = active ? .active : .inactive
-            guard snapshot || !gate.admits(.app) else {
+            guard presentation.update(isActive: active) else {
                 covers[key]?.hide()
                 continue
             }
@@ -209,7 +193,11 @@ final class MacAppProtection: NSObject {
     }
 
     @objc private func willUnhide(_ note: Notification) {
-        gate.appWillEnterForeground(at: .now)
+        let returning = roots.contains { root in
+            guard let window = root.window else { return false }
+            return window.isVisible && !window.isMiniaturized && !root.suspended
+        }
+        gate.appWillEnterForeground(at: .now, hasForegroundContent: returning)
         hiding = false
         refresh()
     }
@@ -245,13 +233,8 @@ final class MacAppProtection: NSObject {
 private struct MacAppLockWindowContent: View {
     let presentation: ProtectedScopePresentation
     var body: some View {
-        Color.clear.protectedScope(
-            .app, gate: presentation.gate,
-            unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
-            accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
-            snapshot: presentation.snapshot
-        )
-        .environment(\.scenePhase, presentation.phase)
+        Color.clear.appProtection(presentation)
+            .environment(\.scenePhase, presentation.phase)
     }
 }
 
@@ -270,13 +253,8 @@ private struct MacAppProtectionModifier: ViewModifier {
     @State private var presentation = ProtectedScopePresentation(gate: MacAppProtection.shared.gate)
 
     func body(content: Content) -> some View {
-        content.protectedScope(
-            .app, gate: presentation.gate,
-            unlockTitle: AppLockCopy.unlockTitle(for: presentation.gate.availability),
-            accessibilityLabel: AppLockCopy.lockedLabel, reason: AppLockCopy.unlockReason,
-            snapshot: presentation.snapshot
-        )
-        .background(MacAppLockAttachment(presentation: presentation).frame(width: 0, height: 0))
+        content.appProtection(presentation)
+            .background(MacAppLockAttachment(presentation: presentation).frame(width: 0, height: 0))
     }
 }
 

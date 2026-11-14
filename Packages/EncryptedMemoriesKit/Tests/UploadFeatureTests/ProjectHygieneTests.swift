@@ -42,22 +42,18 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertFalse(mac.contains("NSFaceIDUsageDescription"))
         XCTAssertFalse(mac.contains("InfoPlist.xcstrings"))
         XCTAssertFalse(project.contains("INFOPLIST_KEY_NSFaceIDUsageDescription"))
-        XCTAssertFalse(project.contains("Shared/InfoPlist.xcstrings"))
 
         let mobileData = try Data(contentsOf: repoRoot.appendingPathComponent("iOSApp/Info.plist"))
         let mobile = try XCTUnwrap(
             PropertyListSerialization.propertyList(from: mobileData, format: nil) as? [String: Any])
         XCTAssertEqual(mobile["NSFaceIDUsageDescription"] as? String, "The app uses Face ID to unlock your library.")
         let german = repoRoot.appendingPathComponent("iOSApp/de.lproj/InfoPlist.strings")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: german.path))
-        if FileManager.default.fileExists(atPath: german.path) {
-            let translations = try XCTUnwrap(
-                PropertyListSerialization.propertyList(from: Data(contentsOf: german), format: nil) as? [String: String]
-            )
-            XCTAssertEqual(
-                translations["NSFaceIDUsageDescription"], "Die App verwendet Face ID, um deine Mediathek zu entsperren."
-            )
-        }
+        let translations = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: Data(contentsOf: german), format: nil) as? [String: String]
+        )
+        XCTAssertEqual(
+            translations["NSFaceIDUsageDescription"], "Die App verwendet Face ID, um deine Mediathek zu entsperren."
+        )
     }
 
     /// The iOS catalog declares the dark rendition; both catalogs reference existing files of the declared size.

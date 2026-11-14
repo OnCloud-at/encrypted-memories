@@ -50,6 +50,25 @@ final class MobileAppProtectionTests: XCTestCase {
         XCTAssertEqual(fixture.owner.calls, 1)
     }
 
+    @MainActor func testBackgroundAndReturnRelockBeforeTheActivePrompt() async throws {
+        let fixture = try HostFixture(result: .success)
+        defer { fixture.close() }
+        let opened = await yieldUntil { fixture.gate.admits(.app) && fixture.cover == nil }
+        XCTAssertTrue(opened)
+        XCTAssertTrue(fixture.gate.setGracePeriod(.zero, for: .app))
+        fixture.owner.result = .cancelled
+        NotificationCenter.default.post(name: UIScene.willDeactivateNotification, object: fixture.scene)
+        NotificationCenter.default.post(name: UIScene.didEnterBackgroundNotification, object: fixture.scene)
+        NotificationCenter.default.post(name: UIScene.willEnterForegroundNotification, object: fixture.scene)
+        XCTAssertFalse(fixture.gate.admits(.app), "Background expiry must precede the active-phase automatic prompt")
+        XCTAssertNotNil(fixture.cover)
+        NotificationCenter.default.post(name: UIScene.didActivateNotification, object: fixture.scene)
+        let asked = await yieldUntil { fixture.owner.calls == 2 && !fixture.gate.isAuthenticating }
+        XCTAssertTrue(asked, "A new foreground session must ask once")
+        XCTAssertFalse(fixture.gate.admits(.app))
+        XCTAssertNotNil(fixture.cover)
+    }
+
     @MainActor func testAppLockCoversTheContinuedBackupQuestionAcrossWindows() async throws {
         let fixture = try HostFixture(result: .cancelled)
         defer { fixture.close() }
