@@ -322,12 +322,7 @@ struct MobilePhotoViewer: View {
         } message: {
             Text(L10n.string("viewer.revert_original_message"))
         }
-        .alert(
-            L10n.string("viewer.revert_original_failed"),
-            isPresented: Binding(get: { revert.showsFailure }, set: { _ in })
-        ) {
-            Button(L10n.string("action.ok"), role: .cancel) { revert.dismissFailure() }
-        }
+        .revertToOriginalFailedAlert(isPresented: revert.showsFailure) { revert.dismissFailure() }
         .alert(
             saveToLibraryMessage ?? "",
             isPresented: Binding(
@@ -360,6 +355,7 @@ struct MobilePhotoViewer: View {
             visibleThumbnail?.end()
             editedOriginalLookup.cancel()
             // The viewer closed: a revert that ends later must not close or dismiss anything.
+            // A failure goes to the host.
             revert.detach()
         }
         .animation(
@@ -949,7 +945,8 @@ struct MobilePhotoViewer: View {
                 // this belongs here and not in `onSuccess`, which only closes the viewer.
                 viewerRouter.noteCompletedMutation(uid: base.uid)
             },
-            onSuccess: { dismiss() })
+            onSuccess: { dismiss() },
+            onFailureAfterClose: { [viewerRouter] in viewerRouter.noteRevertFailedAfterViewerClosed() })
     }
 
     private func confirmMoveToTrash() {

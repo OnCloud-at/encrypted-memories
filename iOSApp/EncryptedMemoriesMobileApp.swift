@@ -478,6 +478,11 @@ private struct MobileMainTabView: View {
                     duplicateGroup: presentation.duplicateGroup
                 )
             }
+            // A revert that failed after its viewer closed. The alert waits until no viewer is up, because an alert
+            // under a presented cover cannot show.
+            .revertToOriginalFailedAlert(
+                isPresented: viewerRouter.revertFailedAfterViewerClosed && viewerRouter.presentation == nil
+            ) { viewerRouter.clearRevertFailure() }
             .onChange(of: networkMonitor.didRecentlyRestoreConnection) { _, restored in
                 guard restored else { return }
                 libraryModel.refreshLibrarySources()

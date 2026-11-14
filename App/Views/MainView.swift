@@ -38,6 +38,8 @@ struct MainView: View {
     @State private var timelineModel: TimelineViewModel
     @State private var mapClusterModel: TimelineViewModel
     @State private var viewerModel: PhotoViewerModel?
+    /// A revert to original failed after the viewer closed. This window shows the failure once.
+    @State private var revertFailedAfterViewerClosed = false
     /// Set when the viewer opens: only a viewer of the whole library without search or filter follows replacements.
     @State private var viewerFollowsReplacements = false
     @State private var level: Int = 3  // 0 is largest; 5 is the densest overview.
@@ -660,6 +662,9 @@ struct MainView: View {
         } message: {
             Text(exportFailureMessage ?? "")
         }
+        .revertToOriginalFailedAlert(isPresented: revertFailedAfterViewerClosed) {
+            revertFailedAfterViewerClosed = false
+        }
     }
 
     private func handleDisappear() {
@@ -1143,7 +1148,8 @@ struct MainView: View {
                 if mapClusterPresentation != nil { await mapClusterModel.commitTrash([main]) }
                 duplicates?.didTrashElsewhere([main.uid])
                 refreshLibraryManually()
-            })
+            },
+            onRevertFailedAfterClose: { revertFailedAfterViewerClosed = true })
     }
 
     /// Shows local photos on their way to Proton in the whole-library grid.
