@@ -50,7 +50,7 @@ enum ProtonFailureClassifier {
         } ?? false
     }
 
-    /// Every 4xx except 408 and 429 is final for batch writes and pending remote effects.
+    /// Every 4xx answer that is not temporary (408, 423, 425, 429) is final for batch writes and pending remote effects.
     static func isFinal(_ error: any Error) -> Bool {
         guard case .apiError(let code, _)? = error as? ProtonAuthError else { return false }
         return (400...499).contains(code) && httpStatus(code) != .temporary

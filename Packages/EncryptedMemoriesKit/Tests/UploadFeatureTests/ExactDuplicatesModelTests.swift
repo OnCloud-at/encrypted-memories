@@ -2364,6 +2364,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
             URLError(.networkConnectionLost),
             UploadError.transport(code: URLError.timedOut.rawValue, message: "fixture"),
             UploadError.retryableBackend(code: 503, message: "fixture"),
+            UploadError.retryableBackend(code: 423, message: "fixture"),
+            UploadError.retryableBackend(code: 425, message: "fixture"),
         ]
         for error in errors {
             let (model, finder, _) = await loadedModel(groups: 2)

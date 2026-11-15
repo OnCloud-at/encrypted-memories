@@ -130,12 +130,16 @@ struct ProtonFailureCharacterizationTests {
         #expect(!ProtonFailureClassifier.isSDKCancellation(CancellationError()))
     }
 
-    @Test func batchFinalityKeepsItsExistingHTTPBoundaries() {
-        for code in [399, 400, 401, 403, 408, 409, 429, 499, 500] {
+    /// A 4xx answer is final unless it is temporary (408, 423, 425, 429); no other status is final.
+    private static let finalityByStatus: [(code: Int, final: Bool)] = [
+        (399, false), (400, true), (401, true), (403, true), (408, false), (409, true), (422, true), (423, false),
+        (425, false), (429, false), (499, true), (500, false),
+    ]
+
+    @Test func batchFinalityIsEveryFourHundredAnswerThatIsNotTemporary() {
+        for (code, final) in Self.finalityByStatus {
             let error = ProtonAuthError.apiError(code: code, message: "fixture")
-            #expect(
-                ProtonFailureClassifier.isFinal(error)
-                    == ((400...499).contains(code) && code != 408 && code != 429))
+            #expect(ProtonFailureClassifier.isFinal(error) == final, "HTTP \(code)")
         }
         #expect(!ProtonFailureClassifier.isFinal(URLError(.timedOut)))
     }
@@ -149,13 +153,12 @@ struct ProtonFailureCharacterizationTests {
         #expect(!ProtonFailureClassifier.isUnauthorized(URLError(.userAuthenticationRequired)))
     }
 
-    @Test func pendingEffectKeepsFinalAndRetryableHTTPOutcomes() async {
-        for code in [400, 401, 403, 408, 409, 429, 499, 500] {
+    @Test func pendingEffectFollowsTheFinalityOfEachStatus() async {
+        for (code, final) in Self.finalityByStatus where code >= 400 {
             let result = await ProtonPendingRemoteEffects.run {
                 throw ProtonAuthError.apiError(code: code, message: "fixture")
             }
-            let final = (400...499).contains(code) && code != 408 && code != 429
-            #expect(result == (final ? .permanentFailure : .retry))
+            #expect(result == (final ? .permanentFailure : .retry), "HTTP \(code)")
         }
     }
 

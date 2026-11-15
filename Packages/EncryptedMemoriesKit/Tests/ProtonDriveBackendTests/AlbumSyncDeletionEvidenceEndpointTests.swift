@@ -65,7 +65,7 @@ extension DriveSessionStubSuite {
         }
 
         /// A busy service waits like every other request; it must not use up the retry budget of the photo.
-        @Test(arguments: [408, 429, 500, 503])
+        @Test(arguments: [408, 423, 425, 429, 500, 503])
         func duplicateLookupTurnsABusyServiceIntoARetryableWait(status: Int) async throws {
             let failure = try await duplicateLookupFailure(status: status)
             guard case .retryableBackend(let code, _)? = failure as? UploadCore.UploadError else {
@@ -85,7 +85,7 @@ extension DriveSessionStubSuite {
             #expect(code == status)
         }
 
-        @Test(arguments: [408, 429, 500, 503])
+        @Test(arguments: [408, 423, 425, 429, 500, 503])
         func visibilityLookupTurnsABusyServiceIntoARetryableWait(status: Int) async throws {
             let failure = try await duplicateLookupFailure(status: status, visibility: true)
             guard case .retryableBackend(let code, _)? = failure as? UploadCore.UploadError else {
