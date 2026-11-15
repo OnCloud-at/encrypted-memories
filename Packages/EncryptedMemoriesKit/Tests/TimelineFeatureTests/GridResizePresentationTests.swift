@@ -65,9 +65,6 @@ import TimelineCore
         #expect(abs(narrowed.width - expected.width) < 0.001)
         #expect(abs(narrowed.width - narrowed.height) < 0.001)
 
-        #expect(
-            !coordinator.beginResizeSettle(targetScrollY: coordinator.centerAnchoredScroll()),
-            "fixed-column resize should not arm a release reflow morph")
         coordinator.endPresentationResize()
         #expect(!coordinator.presentationResizeActive)
     }
@@ -182,9 +179,7 @@ import TimelineCore
             MetalGridCoordinator.maxIndexedRectDelta(source: endSlots, target: target) < 0.001,
             "the final presentation frame must exactly match the canonical settled layout")
 
-        let result = coordinator.endSidebarResize()
-        #expect(result.scroll >= 0)
-        #expect(!result.animating, "fixed-column sidebar width changes must not arm a release morph")
+        #expect(coordinator.endSidebarResize() >= 0)
         #expect(!coordinator.isSidebarResizing)
         #expect(coordinator.sidebarObstructionInset == 280)
     }
@@ -208,8 +203,7 @@ import TimelineCore
             MetalGridCoordinator.maxIndexedRectDelta(source: finalPresented, target: target) < 0.001,
             "closing the sidebar at startup/newest must end on the settled target without a second set")
 
-        let result = coordinator.endSidebarResize()
-        #expect(!result.animating)
+        _ = coordinator.endSidebarResize()
         #expect(coordinator.sidebarObstructionInset == 0)
     }
 
@@ -288,27 +282,19 @@ import TimelineCore
         #expect(MetalGridCoordinator.resizeIsBottomPinned(scrollY: 0, contentHeight: 400, viewportHeight: 900))
     }
 
-    // maxIndexedRectDelta is zero for identical layouts and large when the same indexed items move. Fixed-column
-    // resize normally never arms this path; it remains useful for any future responsive policy that changes columns.
+    // maxIndexedRectDelta is zero for identical layouts and large when the same indexed items move.
     @Test func indexedRectDeltaDetectsReflow() {
         let a = [
             GridRenderSlot(index: 0, column: 0, row: 0, rect: CGRect(x: 0, y: 0, width: 100, height: 100)),
             GridRenderSlot(index: 1, column: 1, row: 0, rect: CGRect(x: 100, y: 0, width: 100, height: 100)),
         ]
-        #expect(MetalGridCoordinator.maxIndexedRectDelta(source: a, target: a) == 0, "identical layouts ⇒ no settle")
+        #expect(MetalGridCoordinator.maxIndexedRectDelta(source: a, target: a) == 0, "identical layouts ⇒ zero delta")
         let b = [
             GridRenderSlot(index: 0, column: 0, row: 0, rect: CGRect(x: 0, y: 0, width: 80, height: 80)),
             GridRenderSlot(index: 1, column: 0, row: 1, rect: CGRect(x: 0, y: 80, width: 80, height: 80)),
         ]
         #expect(
             MetalGridCoordinator.maxIndexedRectDelta(source: a, target: b) > 20, "a column reflow ⇒ a measurable delta")
-    }
-
-    // easeOutCubic is a clamped 0 to 1 fast-start, gentle-landing curve.
-    @Test func easeOutCubicShape() {
-        #expect(
-            abs(MetalGridCoordinator.easeOutCubic(0) - 0) < eps && abs(MetalGridCoordinator.easeOutCubic(1) - 1) < eps)
-        #expect(MetalGridCoordinator.easeOutCubic(0.5) > 0.5, "easeOut leads linear at the midpoint")
     }
 
     // The vertical counter-scroll shares the height loss: the dragging edge clips most of it, while the opposite
