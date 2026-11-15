@@ -5,7 +5,7 @@ import Testing
 
 @Suite struct TimelineCacheValidationPolicyTests {
     @Test func matchingStableTokenValidatesCachedInventory() async {
-        let repository = CacheValidationRepository(cachedToken: "event-4", currentToken: "event-4")
+        let repository = CacheValidationRepository(currentToken: "event-4")
 
         #expect(
             await TimelineCacheValidationPolicy.validate(
@@ -15,7 +15,7 @@ import Testing
     }
 
     @Test func changedTokenRequiresRefreshAndPreservesOldBaseline() async {
-        let repository = CacheValidationRepository(cachedToken: "event-4", currentToken: "event-5")
+        let repository = CacheValidationRepository(currentToken: "event-5")
 
         #expect(
             await TimelineCacheValidationPolicy.validate(
@@ -24,7 +24,7 @@ import Testing
     }
 
     @Test func missingPersistedTokenFailsClosedButStillCapturesMonitorBaseline() async {
-        let repository = CacheValidationRepository(cachedToken: nil, currentToken: "event-5")
+        let repository = CacheValidationRepository(currentToken: "event-5")
 
         #expect(
             await TimelineCacheValidationPolicy.validate(
@@ -34,7 +34,7 @@ import Testing
     }
 
     @Test func failedProbeFailsClosed() async {
-        let repository = CacheValidationRepository(cachedToken: "event-4", currentToken: nil)
+        let repository = CacheValidationRepository(currentToken: nil)
 
         #expect(
             await TimelineCacheValidationPolicy.validate(
@@ -91,12 +91,10 @@ import Testing
 }
 
 private actor CacheValidationRepository: PhotosRepository, LibraryChangeTokenProvider {
-    let cachedToken: String?
     let currentToken: String?
     private(set) var probeCount = 0
 
-    init(cachedToken: String?, currentToken: String?) {
-        self.cachedToken = cachedToken
+    init(currentToken: String?) {
         self.currentToken = currentToken
     }
 
