@@ -978,7 +978,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
     func beginPresentationResize() {
         guard !presentationResizeActive, let clip = clipView, let view = metalView else { return }
         if presentationSidebarActive { cancelSidebarResize() }  // a window resize supersedes a sidebar scale
-        if resizeSettleActive { endResizeSettle() }  // a fresh drag during a settle supersedes it
         guard canPresentResize else { return }
         let viewportSize = view.bounds.size
         guard viewportSize.width > 1, viewportSize.height > 1 else { return }
@@ -1131,7 +1130,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         }
         let viewportSize = view.bounds.size
         guard viewportSize.width > 1, viewportSize.height > 1 else { return false }
-        if resizeSettleActive { endResizeSettle() }
         presentationSidebarBottomPinned = Self.resizeIsBottomPinned(
             scrollY: clip.bounds.origin.y,
             contentHeight: contentSize().height,
@@ -1229,32 +1227,16 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         return arrived
     }
 
-    /// Commit the sidebar transition at `toInset`. The last presented frame already equals the settled target; the
-    /// defensive resize-settle path remains only for a future profile that changes column count.
-    func endSidebarResize() -> (scroll: CGFloat, animating: Bool) {
-        let startLayoutW = max(1, presentationSidebarViewportWidth - presentationSidebarFromInset)
-        // Source is exactly the last frame the user saw. It has already reached the pre-resolved canonical target,
-        // so committing the inset below cannot cause a second resize/vertical settle.
-        let source = sidebarPresentationSlots(viewportSize: metalView?.bounds.size ?? .zero, progress: 1)
+    /// Commit the sidebar transition at `toInset` and return the bottom-anchored scroll. The last presented frame
+    /// already equals the settled target, so committing the inset cannot cause a second resize or vertical settle.
+    func endSidebarResize() -> CGFloat {
         presentationSidebarActive = false
         sidebarObstructionInset = presentationSidebarToEventInset  // commit the WIDTH (engine re-adds the gap)
         let scroll = presentationSidebarTargetScroll
-        let target = presentationSidebarTargetSlots
         presentationSnapshotSlots = []
         presentationSidebarTargetSlots = []
         presentationSidebarSlotPairs = []
-        let startCols = engine.resolvedMetrics(level: level, width: startLayoutW).columns
-        let delta = Self.maxIndexedRectDelta(source: source, target: target)
-        let targetCols = engine.resolvedMetrics(level: level, width: layoutWidth).columns
-        guard targetCols != startCols, delta > 1.5 else {
-            resizeSettleActive = false
-            return (scroll, false)
-        }
-        resizeSettleSource = source
-        resizeSettleTarget = target
-        resizeSettleProgress = 0
-        resizeSettleActive = true
-        return (scroll, true)
+        return scroll
     }
 
     /// Finalize an in-flight sidebar scale immediately - commit its target inset (engine re-adds the gap), drop the
@@ -1451,123 +1433,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         return scrollY >= maxScroll - 2
     }
 
-    // MARK: - Resize settle (reserved for release-time column-count changes)
-    //
-    // A live resize scales the snapshot at the gesture-start column count. With fixed columns, release normally
-    // resolves to the same column count and this morph is not armed. The path is retained defensively for any future
-    // responsive policy that changes columns at release: every visible item's viewport rect eases from the last
-    // scaled position to the settled position instead of snapping.
-    private(set) var resizeSettleActive = false
-    var isResizeSettling: Bool { resizeSettleActive }
-    private var resizeSettleSource: [GridRenderSlot] = []
-    private var resizeSettleTarget: [GridRenderSlot] = []
-    /// Normalized resize-settle progress advanced by the display link.
-    var resizeSettleProgress: CGFloat = 0
-
-    /// Arms a release settle from the last scaled presentation frame to the settled layout. Returns false unless
-    /// the release layout changed its column count.
-    @discardableResult
-    func beginResizeSettle(targetScrollY: CGFloat) -> Bool {
-        guard presentationResizeActive, let view = metalView else {
-            resizeSettleActive = false
-            return false
-        }
-        let viewportSize = view.bounds.size
-        let viewportHeight = viewportSize.height
-        let inset = presentationStartInset
-        let curLayoutW = max(1, viewportSize.width - inset - gridHorizontalMargin(forLevel: level))  // right gutter too
-        // Start from the scaled and vertically shifted snapshot shown in the last live frame.
-        let source = resizePresentationSlots(viewportSize: viewportSize)
-        // The target uses the release width and the scroll the host will apply.
-        let phase = currentPhase()
-        let overscan = max(budget.overscanFraction, 1.5) * viewportHeight
-        let lvp = CGSize(width: curLayoutW, height: viewportHeight)
-        let plan = engine.framePlan(
-            level: level, viewportSize: lvp, scrollOffset: CGPoint(x: 0, y: targetScrollY), overscan: overscan,
-            columnPhase: phase)
-        let target = renderTranslate(
-            plan.visibleSlots.map {
-                GridRenderSlot(index: $0.index, column: $0.column, row: $0.row, rect: $0.viewportRect)
-            })
-        // Fixed-column resizes normally need no morph. Arm only when a future policy produces a genuine reflow.
-        let startCols = engine.resolvedMetrics(level: level, width: presentationStartLayoutWidth).columns
-        let delta = Self.maxIndexedRectDelta(source: source, target: target)
-        guard plan.columns != startCols, delta > 1.5 else {
-            resizeSettleActive = false
-            return false
-        }
-        resizeSettleSource = source
-        resizeSettleTarget = target
-        resizeSettleProgress = 0
-        resizeSettleActive = true
-        return true
-    }
-
-    func endResizeSettle() {
-        resizeSettleActive = false
-        resizeSettleSource = []
-        resizeSettleTarget = []
-    }
-
-    /// Render the settle: each settled (target) slot eased from its scaled (source) position by `easeOut(progress)`.
-    /// A target item with no source match (newly revealed at an edge) appears at its settled rect. Textures stream
-    /// + decorations draw via the canonical real-slot path.
-    private func drawResizeSettle(to target: MetalGridDrawableTarget, viewportSize: CGSize, now: CFTimeInterval) {
-        let q = Self.easeOutCubic(min(1, max(0, resizeSettleProgress)))
-        var srcByIndex: [Int: CGRect] = [:]
-        srcByIndex.reserveCapacity(resizeSettleSource.count)
-        for s in resizeSettleSource { srcByIndex[s.index] = s.rect }
-        let slots: [GridRenderSlot] = resizeSettleTarget.map { t in
-            guard let s = srcByIndex[t.index] else { return t }
-            let r = CGRect(
-                x: s.minX + (t.rect.minX - s.minX) * q,
-                y: s.minY + (t.rect.minY - s.minY) * q,
-                width: s.width + (t.rect.width - s.width) * q,
-                height: s.height + (t.rect.height - s.height) * q)
-            return GridRenderSlot(index: t.index, column: t.column, row: t.row, rect: r)
-        }
-        let pureViewport = CGRect(origin: .zero, size: viewportSize)
-        let flatUIDs = dataSource.flatUIDs
-        var visibleUIDs: [PhotoUID] = []
-        var overscanUIDs: [PhotoUID] = []
-        for s in slots where s.index < flatUIDs.count {
-            if s.rect.intersects(pureViewport) {
-                visibleUIDs.append(flatUIDs[s.index])
-            } else {
-                overscanUIDs.append(flatUIDs[s.index])
-            }
-        }
-        streamTextures(visibleUIDs: visibleUIDs, overscanUIDs: overscanUIDs, now: now)
-        updatePlaceholderPulse(visibleUIDs: visibleUIDs, now: now)
-        _ = renderRealSlots(
-            to: target, slots: slots, visibleUIDs: visibleUIDs, flatUIDs: flatUIDs, viewportSize: viewportSize)
-        let activeReveal = hasActiveAnimation(in: visibleUIDs, now: now)
-        hasPendingVisibleThumbnails = activeReveal
-    }
-
-    /// Max per-item rect delta (L1 of origin + size) between two index-keyed slot sets - 0 when every shared item
-    /// sits in the same place, large when a future responsive policy reflows the same indexed items.
-    nonisolated static func maxIndexedRectDelta(source: [GridRenderSlot], target: [GridRenderSlot]) -> CGFloat {
-        var src: [Int: CGRect] = [:]
-        src.reserveCapacity(source.count)
-        for s in source { src[s.index] = s.rect }
-        var maxD: CGFloat = 0
-        for t in target {
-            guard let r = src[t.index] else { continue }
-            let d =
-                abs(r.minX - t.rect.minX) + abs(r.minY - t.rect.minY) + abs(r.width - t.rect.width)
-                + abs(r.height - t.rect.height)
-            if d > maxD { maxD = d }
-        }
-        return maxD
-    }
-
-    /// easeOutCubic - fast start, gentle landing: the "fly into place" the resize settle wants.
-    nonisolated static func easeOutCubic(_ q: CGFloat) -> CGFloat {
-        let p = 1 - q
-        return 1 - p * p * p
-    }
-
     /// easeInOutCubic - slow ends, fast middle: matches a sidebar slide's acceleration.
     nonisolated static func easeInOutCubic(_ q: CGFloat) -> CGFloat {
         if q < 0.5 { return 4 * q * q * q }
@@ -1611,11 +1476,6 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
         // Metal surface behind the glass. Separate from live window resize; driven by the host's timed tick.
         if presentationSidebarActive {
             drawSidebarResize(to: target, viewportSize: viewportSize, now: now)
-            return
-        }
-        // A release settle is used only when the release layout changed its column count.
-        if resizeSettleActive {
-            drawResizeSettle(to: target, viewportSize: viewportSize, now: now)
             return
         }
         // Overview boundaries use an offscreen two-layer dissolve.

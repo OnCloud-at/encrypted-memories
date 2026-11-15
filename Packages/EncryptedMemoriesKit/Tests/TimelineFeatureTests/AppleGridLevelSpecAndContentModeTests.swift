@@ -34,25 +34,33 @@ import TimelineCore
     // count is constant (held at nominalColumns) and the tile scales with width (resize = scale, never reflow).
     // At the calibration width it reproduces nominalColumns.
     @Test func levelSpecsFillWidthFixedColumns() {
-        let e = engine()
-        for level in 0..<e.levelCount {
-            let nominal = e.metrics(level: level).nominalColumns
-            var sides: [CGFloat] = []
-            for w in [CGFloat(700), 1000, 1440, 2560, 3840] {
-                let m = e.resolvedMetrics(level: level, width: w)
-                sides.append(m.slotSide)
-                #expect(abs((CGFloat(m.columns) * m.pitch - m.gap) - w) < 2.0, "level \(level) must fill width \(w)")
-                #expect(m.columns == nominal, "level \(level) fixed-columns: count holds at \(nominal)")
+        for profile in [GridLevelProfile.testRegularTimeline, GridLevelProfile.testCompactTimeline] {
+            let e = SquareTileGridEngine(sectionCounts: [4000], profile: profile)
+            for level in 0..<e.levelCount {
+                let nominal = e.metrics(level: level).nominalColumns
+                var sides: [CGFloat] = []
+                for w: CGFloat in [120, 400, 700, 1000, 1080, 1440, 1600, 2560, 3840] {
+                    let m = e.resolvedMetrics(level: level, width: w)
+                    if w >= 700 {
+                        sides.append(m.slotSide)
+                        #expect(
+                            abs((CGFloat(m.columns) * m.pitch - m.gap) - w) < 2.0,
+                            "level \(level) must fill width \(w)")
+                    }
+                    #expect(m.columns == nominal, "level \(level) fixed-columns: count holds at \(nominal)")
+                    let plan = e.framePlan(
+                        level: level, viewportSize: CGSize(width: w, height: 800), scrollOffset: .zero, overscan: 0)
+                    #expect(plan.columns == nominal)
+                }
+                #expect(
+                    sides.first! < sides.last!, "level \(level) tile must SCALE with width (fixed-columns, no reflow)")
+                for i in 1..<sides.count {
+                    #expect(sides[i] >= sides[i - 1] - 0.001, "level \(level) tile monotone non-decreasing in width")
+                }
+                #expect(
+                    e.resolvedMetrics(level: level, width: GridSizePolicy.referenceWidth).columns == nominal,
+                    "level \(level) must reproduce nominalColumns at the reference width")
             }
-            #expect(sides.first! < sides.last!, "level \(level) tile must SCALE with width (fixed-columns, no reflow)")
-            for i in 1..<sides.count {
-                #expect(sides[i] >= sides[i - 1] - 0.001, "level \(level) tile monotone non-decreasing in width")
-            }
-            // At any width the level holds its nominalColumns (fixed-columns; equal at the reference width too).
-            #expect(
-                e.resolvedMetrics(level: level, width: GridSizePolicy.referenceWidth).columns
-                    == e.metrics(level: level).nominalColumns,
-                "level \(level) must reproduce nominalColumns at the reference width")
         }
     }
 

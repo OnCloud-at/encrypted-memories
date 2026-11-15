@@ -75,7 +75,7 @@ final class MetalGridScrollHost: NSView {
             guard abs(topBarInset - oldValue) > 0.5 else { return }
             coordinator.topBarInset = topBarInset
             guard !coordinator.presentationResizeActive, !coordinator.isSidebarResizing,
-                !coordinator.isZoomingLive, !coordinator.isCommitBridging, !coordinator.isResizeSettling
+                !coordinator.isZoomingLive, !coordinator.isCommitBridging
             else { return }
             applyContentSize(coordinator.contentSize())
         }
@@ -105,9 +105,6 @@ final class MetalGridScrollHost: NSView {
     /// The viewport screen frame captured at the start of the current live window resize. Used for the single
     /// settle rebase on `didEndLiveResize`. `.zero` outside a live resize.
     private var liveResizeStartFrame: NSRect = .zero
-    /// Release-settle (detent-crossing reflow) clock: the tiles fly from the scaled frame to the settled layout.
-    private var resizeSettleStart: CFTimeInterval = 0
-    private let resizeSettleDuration: CFTimeInterval = 0.22
     /// Sidebar open/close clock: the full Metal surface interpolates to the canonical obstructed layout.
     private var sidebarResizeStart: CFTimeInterval = 0
     /// Clock of the sidebar transition. Tests replace it to step a transition without waiting.
@@ -297,7 +294,7 @@ final class MetalGridScrollHost: NSView {
         let block: (NSEvent) -> Bool = { [weak self] event in
             guard let self else { return false }
             if pinchActive || pinchSettling || coordinator.isZoomingLive || coordinator.isCommitBridging
-                || coordinator.isResizeSettling || coordinator.isSidebarResizing
+                || coordinator.isSidebarResizing
             {
                 return true
             }
@@ -374,7 +371,7 @@ final class MetalGridScrollHost: NSView {
             applyResolvedGridProfileAfterLiveResizeFallback()
             return
         }
-        // Width and corner changes scale the fixed-column grid and animate to the resize anchor. A pure vertical
+        // Width and corner changes scale the fixed-column grid and settle at the resize anchor. A pure vertical
         // change keeps the live counter-scrolled position and settles without animation.
         let widthChanged = abs(viewportScreenFrame().width - liveResizeStartFrame.width) > 0.5
         let finalScrollY =
@@ -384,11 +381,8 @@ final class MetalGridScrollHost: NSView {
         stickToBottom = false
         applyContentSize(coordinator.contentSize())
         let settledY = clampedScrollY(finalScrollY)
-        // The detent fly-into-place only applies to a width reflow; a pure vertical resize settles instantly.
-        let animating = widthChanged && coordinator.beginResizeSettle(targetScrollY: settledY)
         coordinator.endPresentationResize()
         if abs(settledY - scrollView.contentView.bounds.origin.y) > 0.5 { scrollClip(toY: settledY) }
-        if animating { resizeSettleStart = CACurrentMediaTime() }
         let finalFrame = viewportScreenFrame()
         let profileOldFrame = liveResizeStartFrame == .zero ? lastViewportScreenFrame : liveResizeStartFrame
         lastViewportScreenFrame = finalFrame
@@ -631,12 +625,8 @@ final class MetalGridScrollHost: NSView {
     private func finishInFlightGridPresentationForGestureStart() {
         var didFinishPresentation = false
         if coordinator.isSidebarResizing {
-            let (settleScroll, _) = coordinator.endSidebarResize()
+            let settleScroll = coordinator.endSidebarResize()
             applySidebarSettleScroll(settleScroll)
-            didFinishPresentation = true
-        }
-        if coordinator.isResizeSettling {
-            coordinator.endResizeSettle()
             didFinishPresentation = true
         }
         if coordinator.isCommitBridging {
@@ -868,7 +858,7 @@ final class MetalGridScrollHost: NSView {
     /// grace after the magnify.
     private func isScrollBlocking() -> Bool {
         pinchActive || pinchSettling || coordinator.isZoomingLive || coordinator.isCommitBridging
-            || coordinator.isScrollRebasing || coordinator.isResizeSettling || coordinator.isSidebarResizing
+            || coordinator.isScrollRebasing || coordinator.isSidebarResizing
             || CACurrentMediaTime() - lastMagnifyEventTime < 0.6
     }
 
@@ -929,7 +919,6 @@ final class MetalGridScrollHost: NSView {
         framePump.shouldTick
             || coordinator.isCommitBridging
             || coordinator.isSidebarResizing
-            || coordinator.isResizeSettling
             || coordinator.isScrollRebasing
             || coordinator.gridTransition.activeKind == .click
             || coordinator.isOverviewClickDissolving
@@ -965,7 +954,6 @@ final class MetalGridScrollHost: NSView {
             && !pinchSettling
             && !coordinator.presentationResizeActive
             && !coordinator.isSidebarResizing
-            && !coordinator.isResizeSettling
             && !coordinator.isZoomingLive
             && !coordinator.isCommitBridging
             && !coordinator.isScrollRebasing
@@ -1088,7 +1076,6 @@ final class MetalGridScrollHost: NSView {
         } else {
             sidebarEdgeSource = nil  // a superseded or finished transition leaves no edge source behind
         }
-        if coordinator.isResizeSettling { advanceResizeSettle() }
         if coordinator.gridTransition.activeKind == .click { requestFrame() }
         if coordinator.isOverviewClickDissolving { requestFrame() }
         // Live-pinch post-release settle. Gated on lattice mode so the driver never drives the reflow fallback;
@@ -1118,35 +1105,21 @@ final class MetalGridScrollHost: NSView {
     }
 
     /// Advance the sidebar open/close transition. Its last frame is the canonical target geometry, so committing
-    /// the engine inset cannot produce a second resize; a release morph remains only for future column reflows.
+    /// the engine inset cannot produce a second resize.
     private func advanceSidebarResize() {
         let arrived = coordinator.advanceSidebarResize(
             elapsed: sidebarClock() - sidebarResizeStart, measuredEdge: sidebarEdgeSource?.edge())
         requestFrame()
         guard arrived else { return }
         sidebarEdgeSource = nil
-        let (settleScroll, animating) = coordinator.endSidebarResize()  // commits the inset + bottom-anchored scroll
+        let settleScroll = coordinator.endSidebarResize()  // commits the inset + bottom-anchored scroll
         coordinator.liveResizeChanged?(false)
         applySidebarSettleScroll(settleScroll)
-        if animating { resizeSettleStart = CACurrentMediaTime() }
         let oldFrame = lastViewportScreenFrame
         let newFrame = viewportScreenFrame()
         lastViewportScreenFrame = newFrame
         _ = applyResolvedGridProfileIfNeeded(oldFrame: oldFrame, newFrame: newFrame)
         requestFrame()
-    }
-
-    /// Advance the release-time resize settle: morph the scaled frame into the settled layout. The scroll is
-    /// already at its settled value, so when this completes the canonical render matches exactly (no jump).
-    private func advanceResizeSettle() {
-        let t = resizeSettleDuration > 0 ? min(1, (CACurrentMediaTime() - resizeSettleStart) / resizeSettleDuration) : 1
-        coordinator.resizeSettleProgress = CGFloat(t)
-        requestFrame()
-        if t >= 1 {
-            coordinator.endResizeSettle()
-            _ = applyResolvedGridProfileIfNeeded(oldFrame: lastViewportScreenFrame, newFrame: viewportScreenFrame())
-            requestFrame()
-        }
     }
 
     override func layout() {
