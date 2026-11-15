@@ -42,7 +42,12 @@ struct MobilePhotoViewer: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var index: Int
-    @State private var chromeVisible = true
+    /// The chrome state a tap chooses.
+    @State private var chromeChosen = true
+    /// Video pages that showed a playback failure and have no player yet. Such a page has no tap to bring the chrome
+    /// back, and a card that scrolls leaves every pan to its scrolling, so the chrome stays visible there: Close is the
+    /// way out.
+    @State private var failedVideoUIDs: Set<PhotoUID> = []
     /// Whether the system put the media and the lower part side by side: the folded layout of a partly open device.
     @State private var arrangementSideBySide = false
     @State private var videoTransport: ViewerVideoTransport
@@ -200,7 +205,14 @@ struct MobilePhotoViewer: View {
                                     .easeInOut(duration: 0.2), reduceMotion: reduceMotion
                                 )
                             ) {
-                                chromeVisible.toggle()
+                                chromeChosen.toggle()
+                            }
+                        },
+                        onPlaybackFailureShown: { uid, shown in
+                            if shown {
+                                failedVideoUIDs.insert(uid)
+                            } else {
+                                failedVideoUIDs.remove(uid)
                             }
                         },
                         onCloseRequested: { dismiss() }
@@ -1056,6 +1068,13 @@ struct MobilePhotoViewer: View {
         items.indices.contains(index) ? items[index] : nil
     }
 
+    /// The chosen chrome, shown in any case from a playback failure of the current page until that page leaves or a
+    /// player mounts on it; then the chosen state returns.
+    private var chromeVisible: Bool {
+        guard let currentBaseItem else { return chromeChosen }
+        return chromeChosen || failedVideoUIDs.contains(editedOriginal.displayed(currentBaseItem).uid)
+    }
+
     @MainActor
     private func selectPage(_ uid: PhotoUID) {
         guard let selected = pageIndex.index(of: uid) else { return }
@@ -1330,6 +1349,7 @@ private struct MobileViewerPage: View {
     let liveTextHighlighted: Bool
     let onLiveTextAvailable: (PhotoUID, Bool) -> Void
     let onToggleChrome: () -> Void
+    let onPlaybackFailureShown: (PhotoUID, Bool) -> Void
     let onCloseRequested: () -> Void
 
     var body: some View {
@@ -1341,6 +1361,7 @@ private struct MobileViewerPage: View {
                 transportPlacement: transportPlacement,
                 libraryModel: libraryModel,
                 onToggleChrome: onToggleChrome,
+                onPlaybackFailureShown: onPlaybackFailureShown,
                 onCloseRequested: onCloseRequested
             )
         } else {
@@ -1984,6 +2005,9 @@ private struct MobileVideoPage: View {
     let transportPlacement: ViewerArrangement.VideoTransportPlacement
     let libraryModel: MobileLibraryModel
     let onToggleChrome: () -> Void
+    /// Reports whether this page needs Close visible: from its failure until the page leaves or a player mounts, so
+    /// also while Try again prepares the video once more.
+    let onPlaybackFailureShown: (PhotoUID, Bool) -> Void
     let onCloseRequested: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1995,9 +2019,16 @@ private struct MobileVideoPage: View {
     @State private var failure: VideoPlaybackError?
     /// Changes when the person taps Try again, so the preparation task starts again.
     @State private var retryCount = 0
+    /// True while the failure card is taller than the page and scrolls.
+    @State private var failureCardScrolls = false
+    /// True from a failure until a player mounts; see `onPlaybackFailureShown`.
+    @State private var needsClose = false
     @State private var poster: UIImage?
     @State private var pinch = ViewerPinchState()
     @State private var drag = ViewerDragState()
+    /// True while the page's own drag runs. The system resets it also when it cancels the drag without an end, such as
+    /// on rotation or when the player mounts, so the page then returns to rest.
+    @GestureState private var isPlaceholderDragging = false
     @State private var viewportHeight: CGFloat = 0
     @State private var playbackTime: Double = 0
     @State private var playbackDuration: Double = 0
@@ -2071,16 +2102,31 @@ private struct MobileVideoPage: View {
         }
         .scaleEffect(pinch.displayScale * drag.scale, anchor: drag.isActive ? .center : pinch.anchor)
         .offset(drag.offset)
+        .onPreferenceChange(PlaybackFailedView.ScrollsKey.self) { failureCardScrolls = $0 }
         // AVKit's surface carries the dismiss pan once the player is mounted. Before that, and when the video
-        // cannot play, the same swipe down closes the viewer from anywhere on the page.
+        // cannot play, the same swipe down on the page closes the viewer. A failure card that scrolls keeps every pan
+        // for its scrolling; the Close button still closes the viewer.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
-        .simultaneousGesture(placeholderDismissDrag, including: player == nil ? .all : .subviews)
+        .simultaneousGesture(placeholderDismissDrag, including: player == nil && !failureCardScrolls ? .all : .subviews)
         .onGeometryChange(for: CGFloat.self) {
             $0.size.height
         } action: {
             viewportHeight = $0
         }
+        // A drag that ended normally is already done; a cancelled one springs back.
+        .onChange(of: isPlaceholderDragging) { _, isDragging in
+            if !isDragging { handleDragEnded(.zero, velocityY: 0, completed: false) }
+        }
+        .onChange(of: failure != nil) { _, failed in
+            if failed { needsClose = true }
+        }
+        .onChange(of: player != nil) { _, mounted in
+            if mounted { needsClose = false }
+        }
+        .onChange(of: needsClose) { _, needed in onPlaybackFailureShown(item.uid, needed) }
+        .onAppear { onPlaybackFailureShown(item.uid, needsClose) }
+        .onDisappear { onPlaybackFailureShown(item.uid, false) }
         .task(
             id: LoadToken(
                 uid: item.uid,
@@ -2224,6 +2270,7 @@ private struct MobileVideoPage: View {
 
     private var placeholderDismissDrag: some Gesture {
         DragGesture(minimumDistance: 10)
+            .updating($isPlaceholderDragging) { _, isDragging, _ in isDragging = true }
             .onChanged { handleDragChanged($0.translation) }
             .onEnded { handleDragEnded($0.translation, velocityY: $0.velocity.height, completed: true) }
     }
