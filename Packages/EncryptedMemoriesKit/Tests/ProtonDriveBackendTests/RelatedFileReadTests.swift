@@ -30,15 +30,209 @@ struct RelatedFileReadTests {
     }
 
     /// Metadata links as the server answers them: link ID, type and armored name, each optional.
-    private func links(_ rows: [(id: String, mime: String?, name: String?)]) throws -> [AlbumPhotoLinkBody] {
+    private func links(
+        _ rows: [(id: String, mime: String?, name: String?)], xattrs: [String: String] = [:]
+    ) throws -> [AlbumPhotoLinkBody] {
         let body = rows.map { row -> [String: Any] in
             var link: [String: Any] = ["LinkID": row.id, "State": 1]
             if let mime = row.mime { link["MIMEType"] = mime }
             if let name = row.name { link["Name"] = name }
+            if let xattr = xattrs[row.id] {
+                link["FileProperties"] = ["ActiveRevision": ["XAttr": xattr]]
+                link["NodeKey"] = "sealed-key"
+                link["NodePassphrase"] = "sealed-passphrase"
+            }
             return link
         }
         return try JSONDecoder().decode(
             [AlbumPhotoLinkBody].self, from: JSONSerialization.data(withJSONObject: body))
+    }
+
+    private func decodedPlayback(of link: AlbumPhotoLinkBody) -> Bool {
+        LivePhotoMotionLinks.isLoopingPlayback(
+            in: Data((LivePhotoMotionLinks.playbackXAttr(of: link) ?? "").utf8))
+    }
+
+    @Test func playbackIgnoresUnrelatedIdentityAndDateFields() {
+        let data = Data(
+            #"{"Camera":{"CaptureTime":123},"iOS.photos":{"ICloudID":4,"ModificationTime":[],"PlaybackStyle":"videoLooping"}}"#
+                .utf8)
+        #expect(LivePhotoMotionLinks.isLoopingPlayback(in: data))
+        #expect(
+            !LivePhotoMotionLinks.isLoopingPlayback(
+                in: Data(#"{"iOS.photos":{"PlaybackStyle":"futureStyle"}}"#.utf8)))
+        #expect(!LivePhotoMotionLinks.isLoopingPlayback(in: Data("{}".utf8)))
+    }
+
+    @Test(arguments: [
+        #"{"iOS.photos":{"PlaybackStyle":true}}"#, #"{"iOS.photos":[]}"#, "not JSON",
+    ])
+    func aDecryptedMalformedMarkerKeepsOrdinaryEditedMotion(payload: String) async throws {
+        let crypto = Crypto()
+        let metadata = try links(
+            [
+                ("main", "image/heic", nil), ("paired", "video/quicktime", "sealed:IMG.MOV"),
+                ("edited", "video/quicktime", "sealed:FullSizeRender.mov"),
+            ], xattrs: ["main": payload])
+        var requests = 0
+        let fetch: ([String], Set<String>, Set<String>) async throws -> LivePhotoMotionLinks.Answer = {
+            _, nameIDs, mainIDs in
+            requests += 1
+            return try await LivePhotoMotionLinks.answer(
+                links: metadata, nameLinkIDs: nameIDs, rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+                playbackPhotoIDs: mainIDs,
+                decryptPlayback: { link, _ in
+                    decodedPlayback(of: link)
+                })
+        }
+        var reader = LivePhotoMotionLinks()
+        let photos = ["main": ["paired", "edited"]]
+        let first = try await reader.motions(of: photos, stored: [:], evidence: [:], fetch: fetch)
+        #expect(first.motions["main"] == .video("edited"), "malformed metadata keeps press-to-play")
+        #expect(first.read.playback == ["main": false])
+        reader.record(first.read)
+        let second = try await reader.motions(of: photos, stored: [:], evidence: [:], fetch: fetch)
+        #expect(second.motions["main"] == .video("edited"))
+        #expect(requests == 1, "successful decrypt with malformed metadata is known non-looping playback")
+    }
+
+    @Test func mainPlaybackAndVideoNamesShareOneKeyRead() async throws {
+        let crypto = Crypto()
+        let payload = #"{"iOS.photos":{"PlaybackStyle":"videoLooping"}}"#
+        var decrypted: [String] = []
+        let result = try await LivePhotoMotionLinks.answer(
+            links: try links(
+                [
+                    ("main", "image/heic", "sealed:IMG.HEIC"),
+                    ("video", "video/quicktime", "sealed:FullSizeRender.mov"),
+                    ("other", "image/heic", "sealed:Other.HEIC"),
+                ], xattrs: ["main": payload, "other": payload]),
+            nameLinkIDs: ["video"], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+            playbackPhotoIDs: ["main"],
+            decryptPlayback: { link, key in
+                #expect(key == "root")
+                decrypted.append(link.linkID ?? "")
+                return decodedPlayback(of: link)
+            })
+        #expect(result.playback == ["main": true])
+        #expect(crypto.keyReads == 1)
+        #expect(crypto.decrypted == ["FullSizeRender.mov"])
+        #expect(decrypted == ["main"])
+    }
+
+    @Test func aMainWithoutXattrIsKnownAbsenceWithoutReadingAKey() async throws {
+        let crypto = Crypto()
+        let result = try await LivePhotoMotionLinks.answer(
+            links: try links([("main", "image/heic", nil)]), nameLinkIDs: [],
+            rootKey: crypto.rootKey, decrypt: crypto.decrypt, playbackPhotoIDs: ["main"],
+            decryptPlayback: { _, _ in
+                Issue.record("no encrypted metadata to decrypt")
+                return true
+            })
+        #expect(result.playback == ["main": false])
+        #expect(crypto.keyReads == 0)
+    }
+
+    @Test func aMissingMainStaysUnread() async throws {
+        let crypto = Crypto()
+        let result = try await LivePhotoMotionLinks.answer(
+            links: [], nameLinkIDs: [], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+            playbackPhotoIDs: ["main"], decryptPlayback: { _, _ in true })
+        #expect(result.playback.isEmpty)
+        #expect(crypto.keyReads == 0)
+    }
+
+    @Test func aFailedPlaybackKeyOrDecryptionStaysUnread() async throws {
+        for keyFails in [true, false] {
+            let crypto = Crypto()
+            crypto.keyFails = keyFails
+            let result = try await LivePhotoMotionLinks.answer(
+                links: try links([("main", "image/heic", nil)], xattrs: ["main": "sealed-xattr"]),
+                nameLinkIDs: [], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+                playbackPhotoIDs: ["main"], decryptPlayback: { _, _ in throw KeyUnavailable() })
+            #expect(result.playback.isEmpty)
+            #expect(crypto.keyReads == 1)
+        }
+    }
+
+    @Test func playbackCancellationEndsTheRead() async throws {
+        let crypto = Crypto()
+        await #expect(throws: CancellationError.self) {
+            _ = try await LivePhotoMotionLinks.answer(
+                links: try links([("main", "image/heic", nil)], xattrs: ["main": "sealed-xattr"]),
+                nameLinkIDs: [], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+                playbackPhotoIDs: ["main"], decryptPlayback: { _, _ in throw CancellationError() })
+        }
+    }
+
+    @Test func aCancelledTaskCannotPublishAnAbsentMarker() async throws {
+        let metadata = try links([("main", "image/heic", nil)])
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await LivePhotoMotionLinks.answer(
+                links: metadata, nameLinkIDs: [], rootKey: { "root" }, decrypt: { name, _ in name },
+                playbackPhotoIDs: ["main"], decryptPlayback: { _, _ in false })
+        }
+        await #expect(throws: CancellationError.self) { _ = try await task.value }
+    }
+
+    @Test(arguments: ["video-name-key", "playback-key", "playback-decrypt", "metadata-fetch"])
+    func nativeCancellationPreservesTheOriginalError(path: String) async throws {
+        let cancellation = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+        do {
+            if path == "metadata-fetch" {
+                _ = try await LivePhotoMotionLinks().motions(
+                    of: ["main": ["video"]], stored: [:], evidence: [:]
+                ) { _, _, _ in throw cancellation }
+            } else {
+                let readsName = path == "video-name-key"
+                _ = try await LivePhotoMotionLinks.answer(
+                    links: try links(
+                        [("main", "image/heic", nil), ("video", "video/quicktime", "sealed:FullSizeRender.mov")],
+                        xattrs: ["main": "sealed-xattr"]),
+                    nameLinkIDs: readsName ? ["video"] : [],
+                    rootKey: { () async throws -> String in
+                        if path != "playback-decrypt" { throw cancellation }
+                        return "root"
+                    },
+                    decrypt: { name, _ in name },
+                    playbackPhotoIDs: readsName ? [] : ["main"],
+                    decryptPlayback: { _, _ in throw cancellation })
+            }
+            Issue.record("native cancellation must end \(path)")
+        } catch {
+            #expect(error as NSError === cancellation, "preserve the original cancellation from \(path)")
+        }
+    }
+
+    @Test func anInactiveMainNeverSuppliesPlaybackEvidence() async throws {
+        let crypto = Crypto()
+        let inactive = try JSONDecoder().decode(
+            AlbumPhotoLinkBody.self,
+            from: Data(
+                #"{"LinkID":"main","State":0,"XAttr":"sealed-xattr"}"#.utf8))
+        let result = try await LivePhotoMotionLinks.answer(
+            links: [inactive], nameLinkIDs: [], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+            playbackPhotoIDs: ["main"],
+            decryptPlayback: { _, _ in
+                Issue.record("inactive main")
+                return true
+            })
+        #expect(result.playback.isEmpty)
+        #expect(crypto.keyReads == 0)
+    }
+
+    @Test func theActiveRevisionPrecedesAStaleTopLevelXattr() throws {
+        let link = try JSONDecoder().decode(
+            AlbumPhotoLinkBody.self,
+            from: Data(
+                #"{"LinkID":"main","XAttr":"stale","FileProperties":{"ActiveRevision":{"XAttr":"active"}}}"#.utf8))
+        #expect(LivePhotoMotionLinks.playbackXAttr(of: link) == "active")
+        let absent = try JSONDecoder().decode(
+            AlbumPhotoLinkBody.self,
+            from: Data(
+                #"{"LinkID":"main","XAttr":"stale","FileProperties":{"ActiveRevision":{}}}"#.utf8))
+        #expect(LivePhotoMotionLinks.playbackXAttr(of: absent) == nil)
     }
 
     @Test
@@ -94,7 +288,8 @@ struct RelatedFileReadTests {
                 ("original", "image/heic", "sealed:IMG_1.HEIC"),
                 ("other-photo", "video/quicktime", "sealed:IMG_2.MOV"),
             ]),
-            nameLinkIDs: ["paired", "edited", "plist", "original"], rootKey: crypto.rootKey, decrypt: crypto.decrypt)
+            nameLinkIDs: ["paired", "edited", "plist", "original"], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+            playbackPhotoIDs: [], decryptPlayback: { _, _ in false })
 
         #expect(answer.namesRead)
         #expect(
@@ -109,7 +304,8 @@ struct RelatedFileReadTests {
         let crypto = Crypto()
         let answer = try await LivePhotoMotionLinks.answer(
             links: try links([("plist", "application/xml", "sealed:Adjustments.plist"), ("motion", "video/mp4", nil)]),
-            nameLinkIDs: ["plist", "motion"], rootKey: crypto.rootKey, decrypt: crypto.decrypt)
+            nameLinkIDs: ["plist", "motion"], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+            playbackPhotoIDs: [], decryptPlayback: { _, _ in false })
 
         #expect(answer.namesRead)
         #expect(crypto.keyReads == 0)
@@ -125,7 +321,8 @@ struct RelatedFileReadTests {
                 ("edited", "video/quicktime", "sealed:FullSizeRender.mov"),
                 ("single", "video/quicktime", "sealed:IMG_2.MOV"),
             ]),
-            nameLinkIDs: ["paired", "edited"], rootKey: crypto.rootKey, decrypt: crypto.decrypt)
+            nameLinkIDs: ["paired", "edited"], rootKey: crypto.rootKey, decrypt: crypto.decrypt,
+            playbackPhotoIDs: [], decryptPlayback: { _, _ in false })
 
         #expect(!answer.namesRead)
         #expect(
@@ -141,7 +338,7 @@ struct RelatedFileReadTests {
             _ = try await LivePhotoMotionLinks.answer(
                 links: try links([("paired", "video/quicktime", "sealed:IMG_1.MOV")]), nameLinkIDs: ["paired"],
                 rootKey: { () async throws -> String in throw CancellationError() },
-                decrypt: { name, _ in name })
+                decrypt: { name, _ in name }, playbackPhotoIDs: [], decryptPlayback: { _, _ in false })
         }
     }
 }

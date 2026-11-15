@@ -205,7 +205,7 @@ struct MobilePhotoViewer: View {
             }
             // The Live Photo status sits on the media inside the safe area, below the navigation bar.
             .overlay(alignment: .topLeading) {
-                if currentBaseItem?.isLivePhoto == true {
+                if let item = currentBaseItem, LivePhotoMotionPolicy.acceptsPress(item: item) {
                     viewerBadge(.live)
                 }
             }
@@ -1375,11 +1375,11 @@ struct MobileImagePage: View {
                     reduceMotion: reduceMotion,
                     onSingleTap: onToggleChrome,
                     onCloseRequested: onCloseRequested,
-                    onMotionStart: item.isLivePhoto
+                    onMotionStart: LivePhotoMotionPolicy.acceptsPress(item: item)
                         ? {
                             motion.play(for: item, streamer: streamer) { isCurrent }
                         } : nil,
-                    onMotionStop: item.isLivePhoto ? { motion.stop() } : nil,
+                    onMotionStop: LivePhotoMotionPolicy.acceptsPress(item: item) ? { motion.stop() } : nil,
                     onPhotoFrameChanged: { photoFrame = $0 },
                     onZoomSettled: { loadZoomedDecodeIfNeeded(zoom: $0) },
                     liveTextAnalysis: isCurrent ? liveTextAnalysis : nil,
@@ -1510,7 +1510,7 @@ struct MobileImagePage: View {
             isFullResolutionStillReady: isFullResolutionStillReady,
             didFullResolutionStillFail: didFullResolutionStillFail,
             motionState: motion.loadState,
-            isMotionRequested: motion.isPlayRequested
+            isMotionRequested: motion.isPlayRequested && LivePhotoMotionPolicy.acceptsPress(item: item)
         )
     }
 

@@ -28,6 +28,8 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
     public var timelineOrder: TimelineOrderMetadata?
     public let mediaType: String  // e.g. "image/jpeg", "video/quicktime"
     public let isLivePhoto: Bool
+    /// New uploads can identify a rendered Loop or Bounce clip. Older Live Photos keep press-to-play.
+    public let isLoopingLivePhoto: Bool
     /// For a Live Photo, the node ID (same volume) of the paired video file.
     public let relatedVideoID: String?
     public let durationSeconds: Double?  // for videos
@@ -59,6 +61,7 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         captureTime: Date,
         mediaType: String,
         isLivePhoto: Bool = false,
+        isLoopingLivePhoto: Bool = false,
         relatedVideoID: String? = nil,
         durationSeconds: Double? = nil,
         tags: Set<PhotoTag> = [],
@@ -70,6 +73,7 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         self.timelineOrder = timelineOrder
         self.mediaType = mediaType
         self.isLivePhoto = isLivePhoto
+        self.isLoopingLivePhoto = isLivePhoto && isLoopingLivePhoto
         self.relatedVideoID = relatedVideoID
         self.durationSeconds = durationSeconds
         self.tags = tags
@@ -77,7 +81,8 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case uid, captureTime, mediaType, isLivePhoto, relatedVideoID, durationSeconds, tags, burstMemberIDs,
+        case uid, captureTime, mediaType, isLivePhoto, isLoopingLivePhoto, relatedVideoID, durationSeconds, tags,
+            burstMemberIDs,
             timelineOrder
     }
 
@@ -88,6 +93,8 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         timelineOrder = try container.decodeIfPresent(TimelineOrderMetadata.self, forKey: .timelineOrder)
         mediaType = try container.decode(String.self, forKey: .mediaType)
         isLivePhoto = try container.decodeIfPresent(Bool.self, forKey: .isLivePhoto) ?? false
+        isLoopingLivePhoto =
+            (try container.decodeIfPresent(Bool.self, forKey: .isLoopingLivePhoto) ?? false) && isLivePhoto
         relatedVideoID = try container.decodeIfPresent(String.self, forKey: .relatedVideoID)
         durationSeconds = try container.decodeIfPresent(Double.self, forKey: .durationSeconds)
         tags = try container.decodeIfPresent(Set<PhotoTag>.self, forKey: .tags) ?? []
@@ -101,6 +108,7 @@ public struct PhotoItem: Identifiable, Hashable, Sendable, Codable {
         try container.encodeIfPresent(timelineOrder, forKey: .timelineOrder)
         try container.encode(mediaType, forKey: .mediaType)
         try container.encode(isLivePhoto, forKey: .isLivePhoto)
+        if isLoopingLivePhoto { try container.encode(true, forKey: .isLoopingLivePhoto) }
         try container.encodeIfPresent(relatedVideoID, forKey: .relatedVideoID)
         try container.encodeIfPresent(durationSeconds, forKey: .durationSeconds)
         try container.encode(tags.sorted { $0.rawValue < $1.rawValue }, forKey: .tags)

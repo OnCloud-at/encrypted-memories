@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import ProtonAuth
 import ProtonDriveSDK
 import SQLite3
 import Testing
@@ -24,6 +25,29 @@ struct LivePhotoMotionLinksTests {
         "original": "IMG_2000.HEIC", "render": "FullSizeRender.heic",
     ]
 
+    private struct TimelineFixture {
+        let directory: URL
+        let url: URL
+        let store: TimelineMetadataStore
+
+        init() throws {
+            directory = FileManager.default.temporaryDirectory.appendingPathComponent("live-motion-\(UUID())")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            url = directory.appendingPathComponent("library.sqlite")
+            do {
+                store = try #require(TimelineMetadataStore(url: url))
+            } catch {
+                try? FileManager.default.removeItem(at: directory)
+                throw error
+            }
+        }
+
+        func close() {
+            store.close()
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
     /// An answer of the metadata read: each requested file with its type, and its name when it was asked for.
     private func answer(
         _ linkIDs: [String], _ nameLinkIDs: Set<String>, types: [String: String], names: [String: String]
@@ -36,13 +60,219 @@ struct LivePhotoMotionLinksTests {
     }
 
     @Test
+    func aMarkedRenderReadsItsMainInTheSameBatchAndKeepsTheAnswerForTheSession() async throws {
+        var links = LivePhotoMotionLinks()
+        let photos = ["loop": ["paired", "edited"], "single": ["motion"], "adjusted": ["plist"], "empty": []]
+        var requests = 0
+        let first = try await links.motions(of: photos, stored: [:], evidence: types) { ids, nameIDs, mainIDs in
+            requests += 1
+            #expect(Set(ids) == ["paired", "edited", "loop"])
+            #expect(nameIDs == ["paired", "edited"])
+            #expect(mainIDs == ["loop"], "no ordinary, empty or single-video primary")
+            var result = answer(ids, nameIDs, types: types, names: names)
+            result.playback = ["loop": true]
+            return result
+        }
+        #expect(first.motions["loop"] == .loopingVideo("edited"))
+        #expect(first.motions["single"] == .video("motion"))
+        #expect(first.read.playback == ["loop": true])
+        #expect(first.read.types.isEmpty, "a name read cannot replace already-known MIME types")
+        links.record(first.read)
+        let second = try await links.motions(of: photos, stored: [:], evidence: types) { _, _, _ in
+            requests += 1
+            throw URLError(.notConnectedToInternet)
+        }
+        #expect(requests == 1)
+        #expect(second.motions["loop"] == .loopingVideo("edited"))
+    }
+
+    @Test
+    func anUnreadMainMarkerRetriesWithoutReadingVideoNamesAgain() async throws {
+        var links = LivePhotoMotionLinks()
+        let photos = ["live": ["paired", "edited"]]
+        let first = try await links.motions(of: photos, stored: [:], evidence: types) { ids, nameIDs, _ in
+            return answer(ids, nameIDs, types: types, names: names)
+        }
+        #expect(first.motions["live"] == .unknown, "an unread marker is not known ordinary playback")
+        #expect(first.read.playback.isEmpty)
+        links.record(first.read)
+        let second = try await links.motions(of: photos, stored: [:], evidence: types) { ids, nameIDs, mainIDs in
+            #expect(ids == ["live"])
+            #expect(nameIDs.isEmpty)
+            #expect(mainIDs == ["live"])
+            return .init(files: [:], playback: ["live": true])
+        }
+        #expect(second.motions["live"] == .loopingVideo("edited"))
+    }
+
+    @Test
+    func aMarkerNeverLoopsAnOrdinaryMotionOrOneOfItsSecondaryFiles() async throws {
+        let photos = ["ordinary": ["paired", "motion"], "unmarked": ["paired", "edited"]]
+        let selectedNames = names.merging(["motion": "Other.mov"]) { first, _ in first }
+        let result = try await LivePhotoMotionLinks().motions(of: photos, stored: [:], evidence: types) {
+            ids, nameIDs, _ in
+            var result = answer(ids, nameIDs, types: types, names: selectedNames)
+            result.playback = ["ordinary": true, "unmarked": false, "edited": true]
+            return result
+        }
+        #expect(result.motions["ordinary"] == .video("paired"))
+        #expect(result.motions["unmarked"] == .video("edited"), "a secondary marker never classifies its parent")
+    }
+
+    @Test
+    func bothListingPathsPreserveLoopsAndTheLivePhotosTag() throws {
+        let entries = [
+            PhotosListEntry(linkID: "loop", captureTime: 1, tags: [3], relatedPhotos: [.init(linkID: "edited")])
+        ]
+        let motions: [String: LivePhotoMotion] = ["loop": .loopingVideo("edited")]
+        let direct = DriveSDKBridge.group(entries, volumeID: "v", motions: motions).flatMap(\.items)
+        let sdk = DriveSDKBridge.group(
+            [PhotoTimelineItem(nodeUid: SDKNodeUid(volumeID: "v", nodeID: "loop"), captureTime: 1)],
+            livePhotoMotions: motions
+        ).flatMap(\.items)
+        for items in [direct, sdk] {
+            let item = try #require(items.first)
+            #expect(item.isLoopingLivePhoto)
+            #expect(item.isLivePhoto)
+            #expect(item.relatedVideoID == "edited")
+        }
+        #expect(direct.first?.tags.contains(.livePhotos) == true)
+        #expect(sdk.first?.tags.contains(.motionPhotos) == true)
+    }
+
+    @Test
+    func anAOnlyStoredMotionRereadsOnceUnderTheLoopingRule() async throws {
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let store = fixture.store
+        let uid = PhotoUID(volumeID: "v", nodeID: "loop")
+        #expect(
+            store.save([
+                PhotoItem(
+                    uid: uid, captureTime: .distantPast, mediaType: "image/heic",
+                    isLivePhoto: true, relatedVideoID: "edited")
+            ]).succeeded)
+        #expect(store.markRelatedVideosChosen(by: "liveMotion.editedOrFirstVideo.3"))
+        let photos = ["loop": ["paired", "edited"]]
+        var requests = 0
+        let first = try await LivePhotoMotionLinks().motions(
+            of: photos, stored: LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store),
+            evidence: types
+        ) { ids, nameIDs, mainIDs in
+            requests += 1
+            #expect(mainIDs == ["loop"])
+            var result = answer(ids, nameIDs, types: types, names: names)
+            result.playback = ["loop": true]
+            return result
+        }
+        #expect(first.motions["loop"] == .loopingVideo("edited"))
+        #expect(requests == 1)
+        let motion = try #require(first.motions["loop"])
+        #expect(
+            store.save([
+                PhotoItem(
+                    uid: uid, captureTime: .distantPast, mediaType: "image/heic", isLivePhoto: motion.isLivePhoto,
+                    isLoopingLivePhoto: motion.isLooping, relatedVideoID: motion.linkID)
+            ]).succeeded)
+        #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        let again = try await LivePhotoMotionLinks().motions(
+            of: photos, stored: LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store), evidence: [:]
+        ) { _, _, _ in
+            requests += 1
+            return .init(files: [:])
+        }
+        #expect(again.motions["loop"] == .loopingVideo("edited"))
+        #expect(requests == 1, "the rule upgrade does not repeat the metadata read")
+    }
+
+    @Test
+    func aStoredLoopSurvivesReopenWithoutAnotherMetadataRequest() async throws {
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let url = fixture.url
+        let store = fixture.store
+        let loop = PhotoItem(
+            uid: PhotoUID(volumeID: "v", nodeID: "loop"), captureTime: .distantPast, mediaType: "image/heic",
+            isLivePhoto: true, isLoopingLivePhoto: true, relatedVideoID: "edited")
+        #expect(store.save([loop]).succeeded)
+        #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
+        store.close()
+        let reopened = try #require(TimelineMetadataStore(url: url))
+        defer { reopened.close() }
+        let photos = ["loop": ["paired", "edited"]]
+        let stored = LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: reopened)
+        let result = try await LivePhotoMotionLinks().motions(of: photos, stored: stored, evidence: [:]) { _, _, _ in
+            Issue.record("a current stored loop needs no metadata")
+            throw URLError(.notConnectedToInternet)
+        }
+        #expect(result.motions["loop"] == .loopingVideo("edited"))
+    }
+
+    @Test
+    func nativeHTTPRequestsKeepTheBatchBoundaryAndDoNotRepeatCachedReads() async throws {
+        let server = try MotionMetadataServer()
+        defer { server.close() }
+        let cache = FileManager.default.temporaryDirectory.appendingPathComponent("motion-http-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: cache) }
+        let session = DriveSession(
+            session: ProtonSession(uid: "fixture", accessToken: "at", refreshToken: "rt", keyPassword: "kp"),
+            store: SessionKeychainStore(service: "tests.motion-metadata.never-used"),
+            config: ProtonAPIConfig(baseURL: server.url), accountCacheDirectory: cache)
+        let fetch: ([String], Set<String>, Set<String>) async throws -> LivePhotoMotionLinks.Answer = {
+            ids, nameIDs, mainIDs in
+            let batches = try await DriveSDKBridge.concurrentMetadataBatches(ids) {
+                try await session.fetchPhotoLinksMetadata(shareID: "fixture", linkIDs: $0)
+            }
+            return try await LivePhotoMotionLinks.answer(
+                links: batches.flatMap { $0 }, nameLinkIDs: nameIDs, rootKey: { 0 }, decrypt: { name, _ in name },
+                playbackPhotoIDs: mainIDs,
+                decryptPlayback: { link, _ in
+                    let xattr = try #require(LivePhotoMotionLinks.playbackXAttr(of: link))
+                    return LivePhotoMotionLinks.isLoopingPlayback(in: Data(xattr.utf8))
+                })
+        }
+        for (count, looping) in [
+            (0, true), (49, true), (50, true), (51, true), (100, true), (150, false), (151, false),
+        ] {
+            var links = LivePhotoMotionLinks()
+            let photos = Dictionary(
+                uniqueKeysWithValues: (0..<count).map { index in
+                    let prefix = "\(index)"
+                    return (
+                        prefix + "-main", looping ? [prefix + "-original", prefix + "-render"] : [prefix + "-original"]
+                    )
+                })
+            let evidence =
+                looping
+                ? Dictionary(uniqueKeysWithValues: photos.values.flatMap { $0 }.map { ($0, "video/quicktime") }) : [:]
+            let before = try await server.requests().count
+            let result = try await links.motions(of: photos, stored: [:], evidence: evidence, fetch: fetch)
+            let requests = Array(try await server.requests().dropFirst(before))
+            let expectedIDs = count * (looping ? 3 : 1)
+            #expect(requests.count == (expectedIDs + 149) / 150)
+            #expect(requests.allSatisfy { $0.count <= 150 })
+            #expect(requests.flatMap { $0 }.count == expectedIDs)
+            #expect(Set(requests.flatMap { $0 }).count == expectedIDs, "each link is sent once")
+            #expect(result.motions.count == count)
+            #expect(result.motions.values.filter(\.isLooping).count == (looping ? count : 0))
+            links.record(result.read)
+            let again = try await links.motions(of: photos, stored: [:], evidence: evidence, fetch: fetch)
+            #expect(again.motions == result.motions)
+            #expect(try await server.requests().count == before + requests.count)
+            print(
+                "[LiveMotionHTTP] photos=\(count) looping=\(looping) ids=\(expectedIDs) requests=\(requests.count) repeat=0"
+            )
+        }
+    }
+
+    @Test
     func aLivePhotoWithOneRelatedFileTakesItAsMotionOnlyWhenItIsAVideo() async throws {
         #expect(LivePhotoMotionLinks.motion(among: [], mimeTypes: [:], names: [:]) == .unknown)
         var reads: [[String]] = []
         var nameReads: [Set<String>] = []
         let answer = try await LivePhotoMotionLinks().motions(
             of: ["video": ["motion"], "edited": ["plist"], "none": []], stored: [:], evidence: [:]
-        ) { linkIDs, nameLinkIDs in
+        ) { linkIDs, nameLinkIDs, _ in
             reads.append(linkIDs)
             nameReads.append(nameLinkIDs)
             return self.answer(linkIDs, nameLinkIDs, types: types, names: names)
@@ -50,8 +280,8 @@ struct LivePhotoMotionLinksTests {
         #expect(reads == [["plist", "motion"]], "one read, also for a single related file")
         #expect(nameReads == [[]], "a photo with one related file reads no name")
         #expect(answer.motions == ["video": .video("motion"), "edited": .noVideo, "none": .unknown])
-        #expect(!LivePhotoMotion.noVideo.showsLiveControl, "only adjustment data: no Live control")
-        #expect(LivePhotoMotion.video("motion").showsLiveControl)
+        #expect(!LivePhotoMotion.noVideo.isLivePhoto, "only adjustment data: no Live control")
+        #expect(LivePhotoMotion.video("motion").isLivePhoto)
     }
 
     @Test
@@ -123,7 +353,7 @@ struct LivePhotoMotionLinksTests {
     func aReadWithoutNamesKeepsItsTypesAndLeavesOnlyThePhotosThatNeedANameUndecided() async throws {
         var links = LivePhotoMotionLinks()
         let photos = ["edited": ["paired", "plist", "edited"], "single": ["motion"]]
-        let first = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs in
+        let first = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs, _ in
             var answer = self.answer(linkIDs, [], types: types, names: names)
             answer.namesRead = false
             return answer
@@ -138,9 +368,11 @@ struct LivePhotoMotionLinksTests {
         #expect(first.motions == ["edited": .unknown, "single": .video("motion")])
 
         var reads: [[String]] = []
-        let second = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs in
+        let second = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs, mainIDs in
             reads.append(linkIDs)
-            return self.answer(linkIDs, nameLinkIDs, types: types, names: names)
+            var result = self.answer(linkIDs, nameLinkIDs, types: types, names: names)
+            result.playback = Dictionary(uniqueKeysWithValues: mainIDs.map { ($0, false) })
+            return result
         }
         #expect(reads == [["paired", "edited"]], "only the names; the types stay read for the session")
         #expect(second.motions == ["edited": .video("edited"), "single": .video("motion")])
@@ -182,14 +414,19 @@ struct LivePhotoMotionLinksTests {
             "unread": ["x", "y"],
         ]
         let allTypes = types.merging(["x": "video/quicktime", "y": "image/heic"]) { first, _ in first }
-        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, nameLinkIDs in
+        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) {
+            linkIDs, nameLinkIDs, mainIDs in
             reads.append(linkIDs)
             nameReads.append(nameLinkIDs)
             let allNames = names.merging(["x": "x.mov"]) { name, _ in name }
-            return self.answer(linkIDs, nameLinkIDs, types: allTypes, names: allNames)
+            var result = self.answer(linkIDs, nameLinkIDs, types: allTypes, names: allNames)
+            result.playback = Dictionary(uniqueKeysWithValues: mainIDs.map { ($0, false) })
+            return result
         }
         links.record(first.read)
-        #expect(reads == [["paired", "edited", "motion", "x", "y"]], "one read; known types of videos join it")
+        #expect(
+            reads == [["paired", "edited", "motion", "x", "y", "unread"]],
+            "one read includes candidate primaries and known video types")
         #expect(
             nameReads == [["paired", "edited", "x", "y"]],
             "names only of the files that are or can be videos, in photos with two or more of them")
@@ -200,7 +437,7 @@ struct LivePhotoMotionLinksTests {
                 "unread": .video("x"),
             ])
 
-        let second = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, nameLinkIDs in
+        let second = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, nameLinkIDs, _ in
             reads.append(linkIDs)
             return .init(files: [:])
         }
@@ -210,12 +447,9 @@ struct LivePhotoMotionLinksTests {
 
     @Test
     func aMotionThatTheEarlierRuleStoredIsNotTrustedAndOneMarkedSaveTrustsTheNewRule() throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("live-motion-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
-        defer { store.close() }
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let store = fixture.store
         let photos = ["live": ["paired", "plist", "edited"]]
 
         // The earlier rule played the first video, the original motion of an edited Live Photo.
@@ -229,28 +463,28 @@ struct LivePhotoMotionLinksTests {
         #expect(store.save(items(["live": "edited"])).succeeded)
         #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
         #expect(store.relatedVideosChosen(by: LivePhotoMotionLinks.rule))
-        #expect(LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store) == ["live": "edited"])
+        #expect(LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store) == ["live": .video("edited")])
     }
 
     @Test
-    func readsOnlyTheUnknownRelatedFilesOfLivePhotosOnce() async throws {
+    func readsUnknownRelatedFilesAndCandidatePrimariesOnce() async throws {
         var links = LivePhotoMotionLinks()
         let photos = ["a": ["motion"], "b": ["plist", "paired"], "c": ["paired", "edited", "plist"]]
         let evidence = ["plist": "application/xml"]
         var reads: [[String]] = []
 
-        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, _ in
+        let first = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, _, _ in
             reads.append(linkIDs)
             return self.answer(
                 linkIDs, [], types: ["motion": "video/quicktime", "paired": "video/quicktime", "plist": "text/plain"],
                 names: [:])
         }
         links.record(first.read)
-        #expect(reads == [["motion", "paired", "edited"]])
+        #expect(reads == [["motion", "paired", "edited", "c"]])
         #expect(first.read.types == ["motion": "video/quicktime", "paired": "video/quicktime", "edited": ""])
         #expect(first.motions == ["a": .video("motion"), "b": .video("paired"), "c": .video("paired")])
 
-        let second = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, _ in
+        let second = try await links.motions(of: photos, stored: [:], evidence: evidence) { linkIDs, _, _ in
             reads.append(linkIDs)
             return .init(files: [:])
         }
@@ -264,13 +498,13 @@ struct LivePhotoMotionLinksTests {
         var links = LivePhotoMotionLinks()
         let photos = ["live": ["plist", "paired"]]
 
-        let failed = try await links.motions(of: photos, stored: [:], evidence: [:]) { _, _ in throw Offline() }
+        let failed = try await links.motions(of: photos, stored: [:], evidence: [:]) { _, _, _ in throw Offline() }
         links.record(failed.read)
         #expect(failed.read == .init())
         #expect(failed.motions == ["live": .unknown])
 
         var reads = 0
-        let retried = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs in
+        let retried = try await links.motions(of: photos, stored: [:], evidence: [:]) { linkIDs, nameLinkIDs, _ in
             reads += 1
             return self.answer(linkIDs, nameLinkIDs, types: types, names: names)
         }
@@ -278,7 +512,7 @@ struct LivePhotoMotionLinksTests {
         #expect(retried.motions == ["live": .video("paired")])
 
         await #expect(throws: CancellationError.self) {
-            _ = try await LivePhotoMotionLinks().motions(of: photos, stored: [:], evidence: [:]) { _, _ in
+            _ = try await LivePhotoMotionLinks().motions(of: photos, stored: [:], evidence: [:]) { _, _, _ in
                 throw CancellationError()
             }
         }
@@ -286,21 +520,19 @@ struct LivePhotoMotionLinksTests {
 
     @Test
     func aLaterLaunchReadsNothingForUnchangedLivePhotosAndReadsAChangedOneAgain() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("live-motion-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let url = directory.appendingPathComponent("library.sqlite")
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let url = fixture.url
         var photos = [
             "one": ["plist-1", "paired-1", "original-1"], "three": ["paired-3"], "two": ["other-2", "paired-2"],
         ]
 
         // An earlier build stored the first related file as the motion and never marked its rule.
-        var store = try #require(TimelineMetadataStore(url: url))
+        var store = fixture.store
         #expect(store.save(items(photos.mapValues { $0[0] })).succeeded)
         let first = try await launch(photos, store: store)
         #expect(
-            first.reads == ["plist-1", "paired-1", "original-1", "paired-3", "other-2", "paired-2"],
+            first.reads == ["plist-1", "paired-1", "original-1", "paired-3", "other-2", "paired-2", "one", "two"],
             "rows before the mark, also of a Live Photo with one related file")
         #expect(first.motions == ["one": .video("paired-1"), "three": .video("paired-3"), "two": .video("paired-2")])
         #expect(store.save(items(first.motions.compactMapValues(\.linkID))).succeeded)
@@ -315,52 +547,47 @@ struct LivePhotoMotionLinksTests {
         // A changed related list without the stored video reads again, for that photo only.
         photos["two"] = ["other-2", "edited-2"]
         let third = try await launch(photos, store: store)
-        #expect(third.reads == ["other-2", "edited-2"])
+        #expect(third.reads == ["other-2", "edited-2", "two"])
         #expect(third.motions == ["one": .video("paired-1"), "three": .video("paired-3"), "two": .video("edited-2")])
 
         // A later save that does not mark the rule, for example by an earlier build, voids the mark.
         #expect(store.save(items(["one": "plist-1", "three": "paired-3", "two": "other-2"])).succeeded)
-        #expect(try await launch(photos, store: store).reads.count == 6)
+        #expect(try await launch(photos, store: store).reads.count == 8)
         store.close()
     }
 
     @Test
     func aFailedReadStillCommitsTheTimelineAndTheNextRefreshReadsOnlyThosePhotos() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("live-motion-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let store = try #require(TimelineMetadataStore(url: directory.appendingPathComponent("library.sqlite")))
-        defer { store.close() }
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let store = fixture.store
         let photos = ["known": ["paired-1"], "failed": ["plist-2", "paired-2"]]
 
         // The read of "failed" fails: its motion stays unknown, and the timeline and its token are still saved.
         let motions = try await LivePhotoMotionLinks().motions(
-            of: photos, stored: ["known": "paired-1"], evidence: [:]
-        ) { _, _ in throw URLError(.timedOut) }
+            of: photos, stored: ["known": .video("paired-1")], evidence: [:]
+        ) { _, _, _ in throw URLError(.timedOut) }
         #expect(motions.motions == ["known": .video("paired-1"), "failed": .unknown])
         let saved = photos.keys.sorted().enumerated().map { index, linkID in
             PhotoItem(
                 uid: PhotoUID(volumeID: "v", nodeID: linkID), captureTime: Date(timeIntervalSince1970: Double(index)),
-                mediaType: "image/heic", isLivePhoto: motions.motions[linkID]!.showsLiveControl,
+                mediaType: "image/heic", isLivePhoto: motions.motions[linkID]!.isLivePhoto,
                 relatedVideoID: motions.motions[linkID]?.linkID)
         }
         #expect(store.save(saved, validationToken: "token").succeeded)
         #expect(store.markRelatedVideosChosen(by: LivePhotoMotionLinks.rule))
         #expect(store.validationToken() == "token")
 
-        #expect(try await launch(photos, store: store).reads == ["plist-2", "paired-2"])
+        #expect(try await launch(photos, store: store).reads == ["plist-2", "paired-2", "failed"])
     }
 
     @Test(arguments: [false, true])
     @MainActor
     func failedEvidenceRefreshKeepsPhotosUsableWithoutExtraMIMERequests(partial: Bool) async throws {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let url = directory.appendingPathComponent("library.sqlite")
-        let store = try #require(TimelineMetadataStore(url: url))
-        defer { store.close() }
+        let fixture = try TimelineFixture()
+        defer { fixture.close() }
+        let url = fixture.url
+        let store = fixture.store
         let saved = [
             PhotoItem(
                 uid: .init(volumeID: "v", nodeID: "known"), captureTime: .distantPast,
@@ -397,7 +624,7 @@ struct LivePhotoMotionLinksTests {
         var requests = 0
         let answer = try await LivePhotoMotionLinks().motions(
             of: photos, stored: stored, evidence: evidence.types, allowFetch: evidence.canRefine
-        ) { _, _ in
+        ) { _, _, _ in
             requests += 1
             throw URLError(.timedOut)
         }
@@ -441,7 +668,7 @@ struct LivePhotoMotionLinksTests {
         var reads: [String] = []
         let stored = LivePhotoMotionLinks.storedMotions(of: photos, volumeID: "v", in: store)
         let answer = try await LivePhotoMotionLinks().motions(of: photos, stored: stored, evidence: [:]) {
-            linkIDs, nameLinkIDs in
+            linkIDs, nameLinkIDs, _ in
             reads += linkIDs
             let videos = linkIDs.filter { $0.hasPrefix("paired") || $0.hasPrefix("edited") }
             return self.answer(
@@ -501,7 +728,7 @@ struct LivePhotoMotionLinksTests {
                 "unread": ["x", "y"], "adjusted": ["plist"],
             ],
             stored: [:], evidence: types
-        ) { _, _ in throw URLError(.notConnectedToInternet) }
+        ) { _, _, _ in throw URLError(.notConnectedToInternet) }
         let items = DriveSDKBridge.group(entries, volumeID: "v", motions: motions.motions).flatMap(\.items)
         let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.uid.nodeID, $0) })
 
@@ -538,4 +765,101 @@ private actor InFlightGauge {
     }
 
     func leave() { current -= 1 }
+}
+
+/// Runs only this test's loopback fixture. Reuses the maintained server's backlog and bind policy.
+private final class MotionMetadataServer {
+    let url: URL
+    private let process: Process
+    private let input: Pipe
+    private let errors: Pipe
+    private var closed = false
+
+    init() throws {
+        let process = Process()
+        let input = Pipe()
+        let errors = Pipe()
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            "python3", "-u", "-c", Self.script, root.appendingPathComponent("scripts/upgrade-test").path,
+        ]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        let line = String(decoding: output.fileHandleForReading.availableData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = URL(string: line), parsed.host == "127.0.0.1", parsed.port != nil else {
+            try? input.fileHandleForWriting.close()
+            process.waitUntilExit()
+            let detail = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            throw FixtureFailure.start(detail)
+        }
+        self.process = process
+        self.input = input
+        self.errors = errors
+        url = parsed
+    }
+
+    func requests() async throws -> [[String]] {
+        let (data, response) = try await URLSession.shared.data(from: url.appendingPathComponent("requests"))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw FixtureFailure.response }
+        return try JSONDecoder().decode([[String]].self, from: data)
+    }
+
+    func close() {
+        guard !closed else { return }
+        closed = true
+        try? input.fileHandleForWriting.close()
+        process.waitUntilExit()
+    }
+
+    deinit { close() }
+    private enum FixtureFailure: Error {
+        case start(String)
+        case response
+    }
+
+    private static let script = #"""
+        import sys, json, threading
+        from http.server import BaseHTTPRequestHandler
+        sys.path.insert(0, sys.argv[1])
+        from server import BurstHTTPServer
+        rows, lock = [], threading.Lock()
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def log_message(self, *_): pass
+            def send(self, value):
+                data = json.dumps(value).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def do_POST(self):
+                if self.path != '/drive/shares/fixture/links/fetch_metadata':
+                    self.send_error(404); return
+                ids = json.loads(self.rfile.read(int(self.headers['Content-Length'])))['LinkIDs']
+                with lock: rows.append(ids)
+                links = []
+                for value in ids:
+                    main = value.endswith('-main')
+                    name = 'IMG.HEIC' if main else ('FullSizeRender.mov' if value.endswith('-render') else 'IMG.MOV')
+                    link = {'LinkID': value, 'State': 1, 'MIMEType': 'image/heic' if main else 'video/quicktime', 'Name': name}
+                    if main: link['XAttr'] = json.dumps({'iOS.photos': {'PlaybackStyle': 'videoLooping'}})
+                    links.append(link)
+                self.send({'Code': 1000, 'Links': links})
+            def do_GET(self):
+                if self.path != '/requests': self.send_error(404); return
+                with lock: self.send(rows)
+        server = BurstHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print('http://127.0.0.1:' + str(server.server_port), flush=True)
+        sys.stdin.buffer.read()
+        server.shutdown()
+        server.server_close()
+        """#
 }

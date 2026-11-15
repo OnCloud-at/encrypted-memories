@@ -391,7 +391,7 @@ public struct PhotoViewerView: View {
 
     @ViewBuilder private var mediaBadges: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if model.current.isLivePhoto {
+            if LivePhotoMotionPolicy.acceptsPress(item: model.current) {
                 livePhotoBadge
             }
             if model.isShowingOriginal {
@@ -585,10 +585,12 @@ private struct ViewerStillImage: View {
                 onPinchDismissBegan: onPinchDismissBegan,
                 onPinchDismissChanged: onPinchDismissChanged,
                 onPinchDismissEnded: onPinchDismissEnded,
-                onForceClick: { model.playMotion() },  // Press starts motion playback.
-                onForceClickEnded: { model.stopMotion() },  // Release stops motion and fades to still.
-                onMotionStart: model.current.isLivePhoto ? { model.playMotion() } : nil,
-                onMotionStop: model.current.isLivePhoto ? { model.stopMotion() } : nil,
+                onForceClick: {
+                    if LivePhotoMotionPolicy.acceptsPress(item: model.current) { model.playMotion() }
+                },
+                onForceClickEnded: { model.stopMotion() },  // An ordinary release stops motion and fades to still.
+                onMotionStart: LivePhotoMotionPolicy.acceptsPress(item: model.current) ? { model.playMotion() } : nil,
+                onMotionStop: LivePhotoMotionPolicy.acceptsPress(item: model.current) ? { model.stopMotion() } : nil,
                 onPageSwipe: onPageSwipe,
                 onPhotoFrameChanged: { livePhotoFrame = $0 },
                 onZoomChanged: { zoom in

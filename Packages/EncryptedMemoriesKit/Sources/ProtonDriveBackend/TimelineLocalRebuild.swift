@@ -114,6 +114,7 @@ enum TimelineLocalRebuild {
                     captureTime: item.captureTime,
                     mediaType: mediaType,
                     isLivePhoto: item.isLivePhoto,
+                    isLoopingLivePhoto: item.isLoopingLivePhoto,
                     relatedVideoID: item.relatedVideoID,
                     tags: tags,
                     burstMemberIDs: item.burstMemberIDs)

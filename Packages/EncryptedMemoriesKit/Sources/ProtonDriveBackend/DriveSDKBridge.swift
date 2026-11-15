@@ -2385,7 +2385,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         let answer = try await livePhotoMotionLinks.motions(
             of: livePhotos, stored: stored, evidence: evidence, allowFetch: allowMetadataRequests
         ) {
-            [driveSession, photosShareID, crypto] linkIDs, nameLinkIDs in
+            [driveSession, photosShareID, crypto] linkIDs, nameLinkIDs, playbackPhotoIDs in
             guard let shareID = photosShareID else { throw DriveBridgeError.noPhotosShare }
             let start = Date()
             let batches = try await Self.concurrentMetadataBatches(linkIDs) { batch in
@@ -2395,7 +2395,11 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             let answer = try await LivePhotoMotionLinks.answer(
                 links: batches.flatMap { $0 }, nameLinkIDs: nameLinkIDs,
                 rootKey: { try await self.fileSource().nodeKey(ofLinkID: try await self.resolvePhotosRoot().nodeID) },
-                decrypt: { try crypto.decryptName($0, parent: $1) })
+                decrypt: { try crypto.decryptName($0, parent: $1) },
+                playbackPhotoIDs: playbackPhotoIDs,
+                decryptPlayback: { link, parent in
+                    try LivePhotoMotionLinks.isLoopingPlayback(of: link, parent: parent, crypto: crypto)
+                })
             DebugLog.log(
                 "timeline: read the type of \(linkIDs.count) Live Photo related files in \(batches.count) requests, "
                     + "\(Int(Date().timeIntervalSince(start) * 1000)) ms, names read \(answer.namesRead); "
@@ -2663,7 +2667,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     uid: PhotoUID(volumeID: item.nodeUid.volumeID, nodeID: nodeID),
                     captureTime: Date(timeIntervalSince1970: item.captureTime),
                     mediaType: mediaType,
-                    isLivePhoto: motion.showsLiveControl,
+                    isLivePhoto: motion.isLivePhoto,
+                    isLoopingLivePhoto: motion.isLooping,
                     relatedVideoID: relatedVideo,
                     tags: tags,
                     burstMemberIDs: burstMembers)
@@ -2706,7 +2711,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             uid: PhotoUID(volumeID: volumeID, nodeID: entry.linkID),
             captureTime: Date(timeIntervalSince1970: entry.captureTime),
             mediaType: mediaType,
-            isLivePhoto: motion.showsLiveControl,
+            isLivePhoto: motion.isLivePhoto,
+            isLoopingLivePhoto: motion.isLooping,
             relatedVideoID: motion.linkID,
             tags: tags,
             burstMemberIDs: burstMemberIDs

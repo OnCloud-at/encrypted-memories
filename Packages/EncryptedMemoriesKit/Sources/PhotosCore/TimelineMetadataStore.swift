@@ -414,6 +414,7 @@ public final class TimelineMetadataStore {
                     captureTime: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
                     mediaType: mime,
                     isLivePhoto: sqlite3_column_int(stmt, 4) != 0,
+                    isLoopingLivePhoto: sqlite3_column_int(stmt, 4) == 2,
                     relatedVideoID: relvid,
                     durationSeconds: dur,
                     tags: tags[uid] ?? [],
@@ -703,7 +704,7 @@ public final class TimelineMetadataStore {
             sqlite3_bind_text(stmt, 2, item.uid.nodeID, -1, transient)
             sqlite3_bind_double(stmt, 3, item.captureTime.timeIntervalSince1970)
             sqlite3_bind_text(stmt, 4, item.mediaType, -1, transient)
-            sqlite3_bind_int(stmt, 5, item.isLivePhoto ? 1 : 0)
+            sqlite3_bind_int(stmt, 5, item.isLoopingLivePhoto ? 2 : (item.isLivePhoto ? 1 : 0))
             if let rel = item.relatedVideoID {
                 sqlite3_bind_text(stmt, 6, rel, -1, transient)
             } else {
@@ -1084,21 +1085,23 @@ public final class TimelineMetadataStore {
         return TimelineDurationUpdateResult(updatedRows: updated, succeeded: true)
     }
 
-    /// The stored `relvid` of the given photos, by node ID, when `rule` chose the related videos of the stored timeline
+    /// The stored motion and playback of the given photos, by node ID, when `rule` chose the stored timeline's motions
     /// (`markRelatedVideosChosen(by:)`). Empty otherwise: an earlier build, or a save after the mark, chose them.
-    public func relatedVideoIDs(for uids: [PhotoUID], chosenBy rule: String) -> [String: String] {
+    public func relatedVideos(for uids: [PhotoUID], chosenBy rule: String) -> [String: (id: String, loops: Bool)] {
         guard !uids.isEmpty, readMeta(Self.metaRelatedVideoRuleKey) == relatedVideoRuleMark(rule) else { return [:] }
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT relvid FROM photos WHERE vol=? AND node=?;", -1, &stmt, nil) == SQLITE_OK
+        guard
+            sqlite3_prepare_v2(db, "SELECT relvid, live FROM photos WHERE vol=? AND node=?;", -1, &stmt, nil)
+                == SQLITE_OK
         else { return [:] }
         defer { sqlite3_finalize(stmt) }
-        var result: [String: String] = [:]
+        var result: [String: (id: String, loops: Bool)] = [:]
         for uid in uids {
             sqlite3_reset(stmt)
             sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
             sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
             guard sqlite3_step(stmt) == SQLITE_ROW, let relvid = sqlite3_column_text(stmt, 0) else { continue }
-            result[uid.nodeID] = String(cString: relvid)
+            result[uid.nodeID] = (id: String(cString: relvid), loops: sqlite3_column_int(stmt, 1) == 2)
         }
         return result
     }
@@ -1207,7 +1210,7 @@ public final class TimelineMetadataStore {
             feed(item.uid.nodeID)
             feed(item.captureTime.timeIntervalSince1970)
             feed(item.mediaType)
-            feed(item.isLivePhoto ? "1" : "0")
+            feed(item.isLoopingLivePhoto ? "2" : (item.isLivePhoto ? "1" : "0"))
             feed(item.relatedVideoID ?? "")
             if let dur = item.durationSeconds { feed(dur) } else { feed("") }
             // Tags as ascending raw values and burst members in order, each joined by a comma.

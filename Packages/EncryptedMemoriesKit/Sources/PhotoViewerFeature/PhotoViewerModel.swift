@@ -58,7 +58,7 @@ public final class PhotoViewerModel {
             isFullResolutionStillReady: isSharp,
             didFullResolutionStillFail: originalLoadFailed,
             motionState: motion.loadState,
-            isMotionRequested: motion.isPlayRequested
+            isMotionRequested: motion.isPlayRequested && LivePhotoMotionPolicy.acceptsPress(item: current)
         )
     }
 

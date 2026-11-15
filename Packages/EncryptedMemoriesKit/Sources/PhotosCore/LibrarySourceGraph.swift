@@ -150,6 +150,7 @@ public struct LibrarySourceItem: Hashable, Sendable, Codable {
             captureTime: item.captureTime,
             mediaType: item.mediaType,
             isLivePhoto: knownFields.contains(.livePhotoRelationship) ? item.isLivePhoto : false,
+            isLoopingLivePhoto: knownFields.contains(.livePhotoRelationship) ? item.isLoopingLivePhoto : false,
             relatedVideoID: knownFields.contains(.livePhotoRelationship) ? item.relatedVideoID : nil,
             durationSeconds: knownFields.contains(.duration) ? item.durationSeconds : nil,
             tags: knownFields.contains(.tags) ? item.tags : [],
@@ -1500,6 +1501,8 @@ public final class LibrarySourceGraph {
                     ? preferredItem.mediaType : fallbackItem.mediaType,
                 isLivePhoto: preferred.knownFields.contains(.livePhotoRelationship)
                     ? preferredItem.isLivePhoto : fallbackItem.isLivePhoto,
+                isLoopingLivePhoto: preferred.knownFields.contains(.livePhotoRelationship)
+                    ? preferredItem.isLoopingLivePhoto : fallbackItem.isLoopingLivePhoto,
                 relatedVideoID: preferred.knownFields.contains(.livePhotoRelationship)
                     ? preferredItem.relatedVideoID : fallbackItem.relatedVideoID,
                 durationSeconds: preferred.knownFields.contains(.duration)

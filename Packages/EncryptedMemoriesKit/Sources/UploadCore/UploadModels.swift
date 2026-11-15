@@ -429,17 +429,31 @@ public enum PhotoUploadMetadataEncoder {
     }
 
     public struct IOSPhotos: Codable, Sendable, Equatable {
+        package static let loopingPlaybackStyle = "videoLooping"
+
+        /// Reads playback independently of optional identity and date fields in the encrypted source section.
+        package static func readPlaybackStyle(from decoder: any Decoder) throws -> String? {
+            let root = try decoder.container(keyedBy: SourceKey.self)
+            guard root.contains(.photos), try !root.decodeNil(forKey: .photos) else { return nil }
+            let photos = try root.nestedContainer(keyedBy: CodingKeys.self, forKey: .photos)
+            return try photos.decodeIfPresent(String.self, forKey: .playbackStyle)
+        }
+
+        private enum SourceKey: String, CodingKey { case photos = "iOS.photos" }
         public let iCloudID: String?
         public let modificationTime: String?
+        public let playbackStyle: String?
 
         enum CodingKeys: String, CodingKey {
             case iCloudID = "ICloudID"
             case modificationTime = "ModificationTime"
+            case playbackStyle = "PlaybackStyle"
         }
 
-        public init(iCloudID: String?, modificationTime: String?) {
+        public init(iCloudID: String?, modificationTime: String?, playbackStyle: String? = nil) {
             self.iCloudID = iCloudID
             self.modificationTime = modificationTime
+            self.playbackStyle = playbackStyle
         }
     }
 
