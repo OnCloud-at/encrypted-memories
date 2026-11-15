@@ -11,8 +11,15 @@ final class MobileSettingsFooterUITests: XCTestCase {
         let settings = app.buttons["Proton Account and Settings"]
         XCTAssertTrue(settings.waitForExistence(timeout: 60))
         settings.tap()
-        let versions = app.links.matching(NSPredicate(format: "label BEGINSWITH 'Version '"))
-        let commits = app.links.matching(NSPredicate(format: "label MATCHES '[0-9a-f]{7}'"))
+        // The footer's links report the link role on iOS 27 and the button role on iOS 26.5.
+        func footerLinks(_ label: String) -> XCUIElementQuery {
+            app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "(elementType == %d OR elementType == %d) AND \(label)",
+                    XCUIElement.ElementType.link.rawValue, XCUIElement.ElementType.button.rawValue))
+        }
+        let versions = footerLinks("label BEGINSWITH 'Version '")
+        let commits = footerLinks("label MATCHES '[0-9a-f]{7}'")
         let version = versions.firstMatch
         let commit = commits.firstMatch
         let attribution = app.staticTexts["Made with ❤️ in Austria 🇦🇹"]
