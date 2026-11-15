@@ -107,6 +107,58 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         XCTAssertEqual(sqlite3_column_int(statement, 0), 2)
     }
 
+    // MARK: user_version markers
+
+    func testUserVersionVerificationDistinguishesZeroFromPrepareAndStepFailures() throws {
+        let directory = try scratchDirectory()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.appendingPathComponent("marker.sqlite").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertTrue(SQLiteUserVersion(version: 0).verify(db))
+        XCTAssertEqual(sqlite3_exec(db, "PRAGMA user_version=1;", nil, nil, nil), SQLITE_OK)
+        XCTAssertTrue(SQLiteUserVersion(version: 1).verify(db))
+        XCTAssertFalse(SQLiteUserVersion(version: 0).verify(db))
+        denyPragmas(on: db)
+        XCTAssertFalse(SQLiteUserVersion(version: 0).verify(db), "a failed prepare is no zero marker")
+        XCTAssertFalse(SQLiteUserVersion(version: 1).verify(db))
+        sqlite3_set_authorizer(db, nil, nil)
+        XCTAssertTrue(SQLiteUserVersion(version: 1).verify(db))
+
+        // A file that is no database prepares the marker read, and its step fails.
+        let damaged = directory.appendingPathComponent("damaged.sqlite")
+        try Data(repeating: 0x41, count: 4_096).write(to: damaged)
+        var other: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(damaged.path, &other), SQLITE_OK)
+        defer { sqlite3_close(other) }
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(other, "PRAGMA user_version;", -1, &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_NOTADB)
+        sqlite3_finalize(statement)
+        XCTAssertFalse(SQLiteUserVersion(version: 0).verify(other), "a failed step is no zero marker")
+    }
+
+    func testUserVersionStampReportsFailureAndKeepsThePreviousMarker() throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_open(try scratchDirectory().appendingPathComponent("marker.sqlite").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let current = SQLiteUserVersion(version: 1)
+        let next = SQLiteUserVersion(version: 2)
+        XCTAssertTrue(current.stamp(db))
+        denyPragmas(on: db)
+        XCTAssertFalse(next.stamp(db))
+        sqlite3_set_authorizer(db, nil, nil)
+        XCTAssertTrue(current.verify(db))
+        XCTAssertTrue(next.stamp(db))
+        XCTAssertTrue(next.verify(db))
+        XCTAssertFalse(current.verify(db))
+    }
+
+    /// Makes every pragma fail at its prepare with a real SQLite error (`SQLITE_AUTH`).
+    private func denyPragmas(on db: OpaquePointer?) {
+        sqlite3_set_authorizer(db, { _, action, _, _, _, _ in action == SQLITE_PRAGMA ? SQLITE_DENY : SQLITE_OK }, nil)
+    }
+
     // MARK: Files that cannot be checked now
 
     private let markerSchema = "CREATE TABLE marker (version INTEGER NOT NULL);"

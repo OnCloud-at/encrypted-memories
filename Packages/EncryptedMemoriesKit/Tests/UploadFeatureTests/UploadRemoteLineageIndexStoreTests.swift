@@ -276,6 +276,21 @@ final class UploadRemoteLineageIndexStoreTests: XCTestCase {
         XCTAssertEqual(resumed.health(hashKeyEpoch: "epoch", contentCheckpoint: checkpoint("two")), .incomplete)
     }
 
+    func testAnotherUserVersionRebuildsTheIndex() throws {
+        let store = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        XCTAssertTrue(replace(store, links: [identity("main")]))
+        let connection = try storeConnection(store)
+        connection.withLock {
+            XCTAssertEqual(sqlite3_exec(connection.database, "PRAGMA user_version=99;", nil, nil, nil), SQLITE_OK)
+        }
+        store.close()
+
+        let reopened = try XCTUnwrap(UploadRemoteLineageIndexStore(url: url))
+        defer { reopened.close() }
+        XCTAssertEqual(reopened.activeMainLinkIDs(forExternalIdentifier: "cloud", hashKeyEpoch: "epoch"), [])
+        XCTAssertFalse(reopened.hasCheckpoint(hashKeyEpoch: "epoch", eventID: "one"))
+    }
+
     func testAnotherSchemaIsRebuilt() throws {
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)

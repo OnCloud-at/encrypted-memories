@@ -183,6 +183,27 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
         }
     }
 
+    /// The current schema with another marker is rebuilt, so its rows are never read as current.
+    func testAnotherUserVersionRebuildsTheCache() throws {
+        for marker in [0, 99] {
+            let url = try directory().appendingPathComponent("order.sqlite")
+            let items = [photo("a"), photo("b")]
+            let store = try XCTUnwrap(TimelineOrderMetadataStore(url: url))
+            XCTAssertTrue(store.synchronize(items, classifiedUIDs: Set(items.map(\.uid))))
+            store.close()
+            XCTAssertEqual(rowCount(at: url), 2)
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+            XCTAssertEqual(sqlite3_exec(db, "PRAGMA user_version=\(marker);", nil, nil, nil), SQLITE_OK)
+            sqlite3_close(db)
+
+            let reopened = try XCTUnwrap(TimelineOrderMetadataStore(url: url))
+            XCTAssertEqual(try reopened.nextPage().count, 0, "marker \(marker)")
+            reopened.close()
+            XCTAssertEqual(rowCount(at: url), 0, "marker \(marker)")
+        }
+    }
+
     // MARK: - Issue 447: a cache that another connection holds is kept
 
     private func filledCache(at url: URL, policy: LibraryDatabasePolicy) throws {

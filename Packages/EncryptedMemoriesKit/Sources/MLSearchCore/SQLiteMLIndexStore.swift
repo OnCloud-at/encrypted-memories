@@ -14,7 +14,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     public static let databaseFileName = "ml-search-index-v1.sqlite"
 
     // Derived state never migrates. Version 5 forces one clean rebuild for the source-aware inventory cut.
-    private static let schemaVersion: Int32 = 5
+    private static let userVersion = SQLiteUserVersion(version: 5)
     private static let membershipChunkSize = 200
     /// The one precision this build writes and reads. Rows with any other precision are
     /// invisible (skipped by the epoch-read predicate), never misinterpreted.
@@ -615,21 +615,9 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
             at: url,
             schemaSQL: schema,
             policy: policy,
-            verifyVersion: verifyVersion,
-            stampVersion: stampVersion
+            verifyVersion: userVersion.verify,
+            stampVersion: userVersion.stamp
         )
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK else { return false }
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
-        return sqlite3_column_int(stmt, 0) == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
     }
 
     // MARK: - Helpers (lock held)

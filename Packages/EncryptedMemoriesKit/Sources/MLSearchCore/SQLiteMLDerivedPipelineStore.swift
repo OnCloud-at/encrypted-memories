@@ -11,7 +11,7 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     public static let databaseFileName = "ml-derived-index-v1.sqlite"
 
     // Derived state never migrates. Version 7 adds account-keyed bounded work selection.
-    private static let schemaVersion: Int32 = 7
+    private static let userVersion = SQLiteUserVersion(version: 7)
     private static let pending = Int32(0)
     private static let completed = Int32(1)
     private static let skipped = Int32(2)
@@ -1008,8 +1008,8 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 schemaSQL: schema,
                 policy: policy,
                 enforceForeignKeys: true,
-                verifyVersion: verifyVersion,
-                stampVersion: stampVersion
+                verifyVersion: userVersion.verify,
+                stampVersion: userVersion.stamp
             )
         else { return nil }
         // A previous process may have exited with a large committed WAL. This is the one canonical
@@ -1022,18 +1022,6 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
             nil
         )
         return handle
-    }
-
-    private static func verifyVersion(_ handle: OpaquePointer?) -> Bool {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK else { return false }
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
-        return sqlite3_column_int(stmt, 0) == schemaVersion
-    }
-
-    private static func stampVersion(_ handle: OpaquePointer?) -> Bool {
-        sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK
     }
 
     private func artifactIDsLocked(

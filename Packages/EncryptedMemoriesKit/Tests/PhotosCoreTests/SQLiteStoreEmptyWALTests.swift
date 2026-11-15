@@ -6,6 +6,7 @@ import XCTest
 
 final class SQLiteStoreEmptyWALTests: XCTestCase {
     private let schema = "CREATE TABLE marker(value INTEGER NOT NULL);"
+    private let version = SQLiteUserVersion(version: 1)
 
     func testEmptyWALHeaderOpensAndReopensThroughBothStorePolicies() throws {
         for rebuildable in [false, true] {
@@ -14,10 +15,10 @@ final class SQLiteStoreEmptyWALTests: XCTestCase {
             let url = try interruptedWAL(in: root)
             XCTAssertEqual(readOnlySchemaResult(at: url), SQLITE_CANTOPEN)
             XCTAssertEqual(
-                SQLiteStoreSchemaGate.compatibility(at: url, schemaSQL: schema, versionIsCurrent: verifyVersion),
+                SQLiteStoreSchemaGate.compatibility(at: url, schemaSQL: schema, versionIsCurrent: version.verify),
                 .empty)
             let first = try XCTUnwrap(open(at: url, rebuildable: rebuildable))
-            XCTAssertTrue(verifyVersion(first))
+            XCTAssertTrue(version.verify(first))
             XCTAssertEqual(sqlite3_exec(first, "INSERT INTO marker VALUES(42);", nil, nil, nil), SQLITE_OK)
             sqlite3_close(first)
             let reopened = try XCTUnwrap(open(at: url, rebuildable: rebuildable))
@@ -40,10 +41,10 @@ final class SQLiteStoreEmptyWALTests: XCTestCase {
         XCTAssertEqual(readOnlySchemaResult(at: url), SQLITE_READONLY)
         let before = try files(at: url)
         XCTAssertEqual(
-            SQLiteStoreSchemaGate.compatibility(at: url, schemaSQL: schema, versionIsCurrent: verifyVersion), .empty)
+            SQLiteStoreSchemaGate.compatibility(at: url, schemaSQL: schema, versionIsCurrent: version.verify), .empty)
         XCTAssertEqual(try files(at: url), before, "inspection must recover only its temporary copy")
         let handle = try XCTUnwrap(open(at: url))
-        XCTAssertTrue(verifyVersion(handle))
+        XCTAssertTrue(version.verify(handle))
         sqlite3_close(handle)
     }
 
@@ -142,7 +143,7 @@ final class SQLiteStoreEmptyWALTests: XCTestCase {
     private func assertUnavailableAndUnchanged(at url: URL) throws {
         let before = try files(at: url)
         XCTAssertEqual(
-            SQLiteStoreSchemaGate.compatibility(at: url, schemaSQL: schema, versionIsCurrent: verifyVersion),
+            SQLiteStoreSchemaGate.compatibility(at: url, schemaSQL: schema, versionIsCurrent: version.verify),
             .unavailable)
         for rebuildable in [false, true] {
             let handle = open(at: url, rebuildable: rebuildable)
@@ -156,20 +157,11 @@ final class SQLiteStoreEmptyWALTests: XCTestCase {
         if rebuildable {
             return SQLiteStoreSchemaGate.openRebuildableStore(
                 at: url, schemaSQL: schema, policy: .conservative,
-                verifyVersion: verifyVersion,
-                stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK })
+                verifyVersion: version.verify, stampVersion: version.stamp)
         }
         return SQLiteStoreSchemaGate.openCurrentStore(
             at: url, schemaSQL: schema, policy: .conservative,
-            verifyVersion: verifyVersion,
-            stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK })
-    }
-
-    private func verifyVersion(_ db: OpaquePointer?) -> Bool {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &statement, nil) == SQLITE_OK else { return false }
-        defer { sqlite3_finalize(statement) }
-        return sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1
+            verifyVersion: version.verify, stampVersion: version.stamp)
     }
 
     private func temporaryDirectory() throws -> URL {

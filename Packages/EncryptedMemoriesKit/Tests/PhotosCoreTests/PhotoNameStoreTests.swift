@@ -67,6 +67,21 @@ import Testing
         #expect(other.recordedNodeIDs(volumeID: "vol") == [])
     }
 
+    /// The current schema with another marker is rebuilt, so its rows are never read as current.
+    @Test(arguments: [0, 99]) func anotherUserVersionRebuildsTheNames(marker: Int) throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try #require(makeStore(directory))
+        #expect(store.record([first: "IMG_1.JPG"]) == .written)
+        store.close()
+        try execute(directory, "PRAGMA user_version=\(marker);")
+
+        let reopened = try #require(makeStore(directory))
+        defer { reopened.close() }
+        #expect(reopened.index().isEmpty)
+        #expect(reopened.recordedNodeIDs(volumeID: "vol") == [])
+    }
+
     @Test func forgetRemovesTheNameFromFileAndIndex() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

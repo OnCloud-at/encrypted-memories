@@ -2,6 +2,25 @@ import Foundation
 import OSLog
 import SQLite3
 
+/// A schema version kept in the `user_version` pragma. Stores use the same marker for verification and stamping.
+public struct SQLiteUserVersion: Sendable {
+    private let version: Int32
+
+    public init(version: Int32) {
+        self.version = version
+    }
+
+    /// A failed prepare or step does not verify the marker, including a marker of zero.
+    public func verify(_ db: OpaquePointer?) -> Bool {
+        SQLiteStoreSchemaGate.userVersion(of: db) == version
+    }
+
+    /// Writes the marker and reports whether SQLite accepted it.
+    public func stamp(_ db: OpaquePointer?) -> Bool {
+        sqlite3_exec(db, "PRAGMA user_version=\(version);", nil, nil, nil) == SQLITE_OK
+    }
+}
+
 /// The schema version of a store that keeps it in the `schema` row of an info table. `verify` and `stamp` are the
 /// version checks that `SQLiteStoreSchemaGate.openCurrentStore` takes.
 public struct SQLiteInfoTableVersion: Sendable {
@@ -520,7 +539,7 @@ public enum SQLiteStoreSchemaGate {
         return objects.isEmpty ? .empty : .populated
     }
 
-    private static func userVersion(of db: OpaquePointer?) -> Int32? {
+    fileprivate static func userVersion(of db: OpaquePointer?) -> Int32? {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &statement, nil) == SQLITE_OK else {
             return nil

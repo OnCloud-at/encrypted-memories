@@ -37,18 +37,11 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
             CREATE TABLE fingerprint_context(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
             CREATE TABLE fingerprint(link_id TEXT PRIMARY KEY, payload BLOB NOT NULL);
             """
+        let version = SQLiteUserVersion(version: 1)
         guard
             let db = SQLiteStoreSchemaGate.openRebuildableStore(
                 at: url.standardized, schemaSQL: schema, policy: policy,
-                verifyVersion: { db in
-                    var statement: OpaquePointer?
-                    guard sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &statement, nil) == SQLITE_OK else {
-                        return false
-                    }
-                    defer { sqlite3_finalize(statement) }
-                    return sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1
-                },
-                stampVersion: { sqlite3_exec($0, "PRAGMA user_version=1;", nil, nil, nil) == SQLITE_OK }
+                verifyVersion: version.verify, stampVersion: version.stamp
             )
         else { return nil }
         connection = SQLiteStoreConnection(database: db, optimizesOnClose: false)

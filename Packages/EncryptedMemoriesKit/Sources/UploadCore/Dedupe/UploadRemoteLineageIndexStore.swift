@@ -109,18 +109,11 @@ public final class UploadRemoteLineageIndexStore: @unchecked Sendable {
               cursor INTEGER NOT NULL
             );
             """
+        let version = SQLiteUserVersion(version: 2)
         guard
             let handle = SQLiteStoreSchemaGate.openRebuildableStore(
                 at: url, schemaSQL: schema, policy: policy,
-                verifyVersion: { handle in
-                    var statement: OpaquePointer?
-                    guard sqlite3_prepare_v2(handle, "PRAGMA user_version;", -1, &statement, nil) == SQLITE_OK else {
-                        return false
-                    }
-                    defer { sqlite3_finalize(statement) }
-                    return sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 2
-                },
-                stampVersion: { sqlite3_exec($0, "PRAGMA user_version=2;", nil, nil, nil) == SQLITE_OK }
+                verifyVersion: version.verify, stampVersion: version.stamp
             )
         else { return nil }
         connection = SQLiteStoreConnection(database: handle, optimizesOnClose: false)
