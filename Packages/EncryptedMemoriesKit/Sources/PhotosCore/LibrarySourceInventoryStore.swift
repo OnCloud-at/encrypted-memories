@@ -33,7 +33,7 @@ public struct LibrarySourceInventorySaveResult: Sendable, Equatable {
 /// digest probes and writes only changed rows; an anti-join removes vanished rows without replacing
 /// the full database.
 public final class LibrarySourceInventoryStore: @unchecked Sendable {
-    private enum OpenResult {
+    enum OpenResult {
         case opened
         case incompatible
         case failed
@@ -656,26 +656,8 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
             guard Self.userVersion(handle) == 0,
                 SQLiteStoreSchemaGate.state(of: handle) == .empty
             else { return close(.incompatible) }
-            guard
-                SQLiteStoreSchemaGate.initializeCurrentSchema(
-                    handle,
-                    schemaSQL: Self.persistentSchema,
-                    stamp: {
-                        sqlite3_exec(
-                            handle,
-                            "PRAGMA user_version=\(Self.schemaVersion);",
-                            nil,
-                            nil,
-                            nil
-                        ) == SQLITE_OK
-                    }
-                )
-            else {
-                let code = sqlite3_errcode(handle)
-                return close(
-                    code == SQLITE_OK || Self.isConfirmedCorruption(code) ? .incompatible : .failed
-                )
-            }
+            let created = Self.createSchema(on: handle)
+            guard created == .opened else { return close(created) }
         }
 
         SQLiteStoreSchemaGate.configureConnection(handle, policy: policy)
@@ -692,6 +674,28 @@ public final class LibrarySourceInventoryStore: @unchecked Sendable {
         }
         db = handle
         return .opened
+    }
+
+    /// Creates the schema in an empty database and tells the caller what a failure means for the file.
+    static func createSchema(on handle: OpaquePointer) -> OpenResult {
+        var failedStep = SQLITE_OK
+        guard
+            SQLiteStoreSchemaGate.initializeCurrentSchema(
+                handle,
+                schemaSQL: persistentSchema,
+                failure: { failedStep = $0 },
+                stamp: { sqlite3_exec(handle, "PRAGMA user_version=\(schemaVersion);", nil, nil, nil) == SQLITE_OK }
+            )
+        else { return schemaCreationFailure(failedStep: failedStep, afterRollback: sqlite3_errcode(handle)) }
+        return .opened
+    }
+
+    /// A failure asks for a rebuild only when neither error code contradicts it: no error, or confirmed corruption,
+    /// at the failed step and again after the rollback. Every other pair keeps the file. A successful rollback resets
+    /// the error code to OK, so the code of the failed step is read before it.
+    static func schemaCreationFailure(failedStep: Int32, afterRollback: Int32) -> OpenResult {
+        func provesUnusable(_ code: Int32) -> Bool { code == SQLITE_OK || isConfirmedCorruption(code) }
+        return provesUnusable(failedStep) && provesUnusable(afterRollback) ? .incompatible : .failed
     }
 
     private static let persistentSchema = """
