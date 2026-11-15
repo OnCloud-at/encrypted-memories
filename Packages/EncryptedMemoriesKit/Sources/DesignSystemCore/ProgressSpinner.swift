@@ -2,7 +2,7 @@ import PhotosCore
 import SwiftUI
 
 /// The one native spinner of macOS, iOS and iPadOS, in the primary color. `.small` is the inline spinner for rows,
-/// sections, toolbar buttons and the activity banner; `.large` is for a window or a sheet that waits as a whole.
+/// sections, toolbar buttons, the activity banner and sheet loading; `.large` is for larger waiting surfaces.
 /// VoiceOver reads "Loading" unless the caller names what loads. Spinners over photos and full-screen loading use the
 /// loading marks instead.
 public struct ProgressSpinner: View {

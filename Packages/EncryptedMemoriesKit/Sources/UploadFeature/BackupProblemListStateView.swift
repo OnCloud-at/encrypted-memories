@@ -19,8 +19,7 @@ public struct BackupProblemListStateView: View {
     @ViewBuilder public var body: some View {
         switch presentation {
         case .loading:
-            ProgressView(Self.loadingTitle)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ProtonLoadingView()
                 .accessibilityIdentifier(Self.loadingIdentifier)
         case .unavailable:
             ContentUnavailableView {
@@ -38,7 +37,6 @@ public struct BackupProblemListStateView: View {
         }
     }
 
-    nonisolated static var loadingTitle: String { L10n.string("loading.content") }
     nonisolated static var unavailableTitle: String { L10n.string("backup.failed_sheet_unavailable") }
     nonisolated static var emptyTitle: String { L10n.string("backup.failed_sheet_empty") }
     nonisolated static let unavailableSystemImage = "exclamationmark.triangle"

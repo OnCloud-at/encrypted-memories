@@ -6,7 +6,6 @@ import Testing
 
 @Suite struct BackupProblemListStateViewTests {
     @Test func theStatesUseTheirCopySymbolsAndIdentifiers() {
-        #expect(BackupProblemListStateView.loadingTitle == L10n.string("loading.content"))
         #expect(BackupProblemListStateView.unavailableTitle == L10n.string("backup.failed_sheet_unavailable"))
         #expect(BackupProblemListStateView.emptyTitle == L10n.string("backup.failed_sheet_empty"))
         #expect(BackupProblemListStateView.unavailableSystemImage == "exclamationmark.triangle")
@@ -38,5 +37,20 @@ import Testing
 
     @MainActor @Test func theListStateDrawsNothingBecauseTheHostShowsTheList() throws {
         #expect(try RenderedInk.pixels(BackupProblemListStateView(.list, retry: {})) == 0)
+    }
+
+    @MainActor @Test func loadingDoesNotSupplyAVisibleCaption() throws {
+        let loading = BackupProblemListStateView(.loading, retry: {})
+            .progressViewStyle(CaptionOnlyProgressStyle())
+        #expect(try RenderedInk.pixels(loading) == 0)
+    }
+}
+
+/// Draw only the supplied label, so native spinner rendering cannot affect the caption check.
+private struct CaptionOnlyProgressStyle: ProgressViewStyle {
+    @ViewBuilder func makeBody(configuration: Configuration) -> some View {
+        if let label = configuration.label {
+            label
+        }
     }
 }

@@ -1170,9 +1170,7 @@ private struct AlbumPickerSheet: View {
 
             switch controller.pickerContent(matching: searchText, didLoad: didLoad) {
             case .loading:
-                Spacer()
-                ProgressView()
-                Spacer()
+                ProtonLoadingView()
             case .accessDenied:
                 AlbumPickerUnavailableView(
                     accessDeniedMessage: String(localized: "settings.photos_backup_denied_macos"))
