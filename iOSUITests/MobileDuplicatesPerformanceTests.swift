@@ -17,10 +17,7 @@ final class MobileDuplicatesPerformanceTests: XCTestCase {
         let collections = app.buttons["Collections"].firstMatch
         XCTAssertTrue(collections.waitForExistence(timeout: 60))
         collections.tap()
-        let entry = app.buttons["duplicates.entry"]
-        for _ in 0..<4 where !entry.waitForExistence(timeout: 3) { app.swipeUp() }
-        XCTAssertTrue(entry.waitForExistence(timeout: 10))
-        entry.tap()
+        app.openCollectionsRow(app.buttons["duplicates.entry"])
         let first = app.descendants(matching: .any).matching(identifier: "duplicates.group.0").firstMatch
         XCTAssertTrue(first.waitForExistence(timeout: 30), "the groups show")
 

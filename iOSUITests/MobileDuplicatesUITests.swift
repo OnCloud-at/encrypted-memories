@@ -34,10 +34,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         (collectionsButton.exists ? collectionsButton : collectionsCell).tap()
 
         // The list creates rows lazily; Utilities follows the Library rows below the fold on a phone.
-        let entry = app.buttons["duplicates.entry"]
-        for _ in 0..<4 where !entry.waitForExistence(timeout: 3) { app.swipeUp() }
-        XCTAssertTrue(entry.waitForExistence(timeout: 10))
-        entry.tap()
+        app.openCollectionsRow(app.buttons["duplicates.entry"])
     }
 
     private func group(_ index: Int) -> XCUIElement {
@@ -117,7 +114,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesReloadFailure"])
         XCTAssertTrue(group(1).waitForExistence(timeout: 10))
-        app.buttons["duplicates.merge.0"].tap()
+        app.tapOnScreen(app.buttons["duplicates.merge.0"])
         let retry = app.buttons["Try again"].firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["The duplicates could not be loaded."].waitForExistence(timeout: 10))
@@ -125,7 +122,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         waitUntil(app.buttons["duplicates.mergeAll"], "isEnabled == false", "Merge All stays off")
         keepScreenshot("duplicates-ios-reload-failed")
 
-        retry.tap()
+        app.tapOnScreen(retry)
         XCTAssertTrue(group(1).waitForExistence(timeout: 10), "Retry restores the checked list")
         waitUntil(app.buttons["duplicates.mergeAll"], "isEnabled == true", "Retry turns Merge All on again")
         XCTAssertFalse(retry.exists)
@@ -212,7 +209,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         openDuplicates()
         let merge = app.buttons["duplicates.merge.0"]
         XCTAssertTrue(merge.waitForExistence(timeout: 5))
-        merge.tap()
+        app.tapOnScreen(merge)
 
         waitUntilGone(group(1), "the merged group leaves the list")
         XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the other group stays")
@@ -398,7 +395,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Merging Duplicates"].waitForExistence(timeout: 30), "the progress row shows")
         let stop = app.buttons["duplicates.stopMerge"]
         XCTAssertTrue(stop.waitForExistence(timeout: 5))
-        stop.tap()
+        app.tapOnScreen(stop)
 
         let notice = app.staticTexts
             .matching(
@@ -429,7 +426,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertEqual(row.label, "Same Photo, Different Details · 1")
         keepScreenshot("duplicates-ios-differing-row")
 
-        row.tap()
+        app.tapOnScreen(row)
 
         let message = app.staticTexts["duplicates.differing.message"]
         XCTAssertTrue(message.waitForExistence(timeout: 10))
@@ -466,7 +463,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             extra: ["-EncryptedMemoriesDuplicatesDifferingDetails", "-EncryptedMemoriesDuplicatesRescanDropsGroup"])
         let row = app.buttons["duplicates.differing"]
         XCTAssertTrue(row.waitForExistence(timeout: 10))
-        row.tap()
+        app.tapOnScreen(row)
         let message = app.staticTexts["duplicates.differing.message"]
         XCTAssertTrue(message.waitForExistence(timeout: 10))
 
@@ -476,7 +473,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         let entry = app.buttons["duplicates.entry"]
         XCTAssertTrue(entry.waitForExistence(timeout: 10), "Collections shows again")
         XCTAssertFalse(message.exists)
-        entry.tap()
+        app.openCollectionsRow(entry)
         XCTAssertTrue(group(0).waitForExistence(timeout: 10))
         XCTAssertFalse(message.exists, "the next visit starts on the duplicates")
         // The next visit loads again; this fixture's second scan leaves out the differing copies.
@@ -504,7 +501,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(0).waitForExistence(timeout: 10))
         let row = app.buttons["duplicates.differing"]
         XCTAssertTrue(row.waitForExistence(timeout: 10))
-        row.tap()
+        app.tapOnScreen(row)
         let message = app.staticTexts["duplicates.differing.message"]
         XCTAssertTrue(message.waitForExistence(timeout: 10))
 
