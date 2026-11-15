@@ -138,16 +138,8 @@ enum TrashedRelatedPhotos {
 
     private struct CheckedTrashPage: Decodable {
         let code: Int
-        let trash: [Group]
+        let trash: [VolumeTrashGroup]
         let complete: Bool
-        struct Group: Decodable {
-            let shareID: String
-            let linkIDs: [String]
-            enum CodingKeys: String, CodingKey {
-                case shareID = "ShareID"
-                case linkIDs = "LinkIDs"
-            }
-        }
         enum CodingKeys: String, CodingKey {
             case code = "Code"
             case trash = "Trash"
@@ -155,7 +147,7 @@ enum TrashedRelatedPhotos {
         init(from decoder: any Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             code = try values.decode(Int.self, forKey: .code)
-            trash = try values.decode([Group].self, forKey: .trash)
+            trash = try values.decode([VolumeTrashGroup].self, forKey: .trash)
             let fields = try decoder.container(keyedBy: Field.self)
             complete = fields.allKeys.allSatisfy { ["Code", "Trash"].contains($0.stringValue) }
         }

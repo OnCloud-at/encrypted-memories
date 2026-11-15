@@ -877,3 +877,45 @@ extension DriveSessionStubSuite {
         }
     }
 }
+
+extension DriveSessionStubSuite {
+    @Suite struct TrashGroupDecodeTests {
+        @Test(arguments: [false, true])
+        func eachTrashReadResolvesTheGroup(checked: Bool) async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.route(
+                "GET /drive/volumes/vol1/trash",
+                json: #"{"Code":1000,"Trash":[{"ShareID":"share1","LinkIDs":["photo1"],"ParentIDs":["root"]}]}"#)
+            StubURLProtocol.route(
+                "POST /drive/shares/share1/links/fetch_metadata",
+                json:
+                    #"{"Code":1000,"Links":[{"LinkID":"photo1","Type":2,"State":2,"Trashed":1000,"FileProperties":{"ActiveRevision":{"Photo":{}}}}]}"#
+            )
+
+            let session = makeSession()
+            let links: [TrashLink]
+            if checked {
+                links = try await TrashedRelatedPhotos.checkedTrash(
+                    session: session, volumeID: "vol1", retryOnRateLimit: false)
+            } else {
+                links = try await session.listTrash(volumeID: "vol1")
+            }
+            #expect(links.map(\.linkID) == ["photo1"])
+            #expect(StubURLProtocol.requests().filter { $0.method == "POST" }.count == 1)
+        }
+
+        @Test(arguments: [#"{"ShareID":"share1"}"#, #"{"LinkIDs":["photo1"]}"#])
+        func bothTrashReadsRejectGroupsMissingRequiredFields(group: String) async {
+            StubURLProtocol.reset()
+            StubURLProtocol.route("GET /drive/volumes/vol1/trash", json: #"{"Code":1000,"Trash":[\#(group)]}"#)
+            let session = makeSession()
+            await #expect(throws: DecodingError.self) {
+                try await session.listTrash(volumeID: "vol1")
+            }
+            await #expect(throws: DecodingError.self) {
+                try await TrashedRelatedPhotos.checkedTrash(session: session, volumeID: "vol1", retryOnRateLimit: false)
+            }
+            #expect(StubURLProtocol.requests().allSatisfy { $0.method == "GET" })
+        }
+    }
+}
