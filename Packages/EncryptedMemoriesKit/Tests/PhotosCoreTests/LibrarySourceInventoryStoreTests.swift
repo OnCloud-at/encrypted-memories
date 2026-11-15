@@ -262,6 +262,62 @@ final class LibrarySourceInventoryStoreTests: XCTestCase {
         XCTAssertEqual(String(cString: sqlite3_column_text(statement, 0)), "kept")
     }
 
+    private func emptyDatabase(_ directory: URL) throws -> OpaquePointer {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_open(directory.appendingPathComponent("schema.sqlite").path, &db), SQLITE_OK)
+        return try XCTUnwrap(db)
+    }
+
+    func testAnEnvironmentalFailureWhileCreatingTheSchemaIsNotAnIncompatibleFile() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let db = try emptyDatabase(directory)
+        defer { sqlite3_close(db) }
+        // The authorizer fails the first CREATE after BEGIN IMMEDIATE. The denial leaves the transaction open; the
+        // gate's ROLLBACK ends it, and that successful rollback resets the error code of the connection to OK.
+        sqlite3_set_authorizer(
+            db, { _, action, _, _, _, _ in action == SQLITE_CREATE_TABLE ? SQLITE_DENY : SQLITE_OK }, nil)
+
+        XCTAssertEqual(LibrarySourceInventoryStore.createSchema(on: db), .failed)
+        XCTAssertEqual(sqlite3_errcode(db), SQLITE_OK, "the rollback hides the cause, so the caller cannot read it")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("schema.sqlite").path))
+    }
+
+    func testOnlyCodesThatProveAnUnusableFileAskForARebuild() {
+        let unusable = [SQLITE_OK, SQLITE_CORRUPT, SQLITE_NOTADB]
+        let environmental = [SQLITE_FULL, SQLITE_IOERR, SQLITE_NOMEM, SQLITE_AUTH, SQLITE_BUSY, SQLITE_CANTOPEN]
+        for step in unusable + environmental {
+            for rollback in unusable + environmental {
+                let expected: LibrarySourceInventoryStore.OpenResult =
+                    unusable.contains(step) && unusable.contains(rollback) ? .incompatible : .failed
+                XCTAssertEqual(
+                    LibrarySourceInventoryStore.schemaCreationFailure(failedStep: step, afterRollback: rollback),
+                    expected, "step \(step), after rollback \(rollback)")
+            }
+        }
+    }
+
+    func testASchemaThatIsNotEmptyAsksForARebuild() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let db = try emptyDatabase(directory)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE legacy(value TEXT);", nil, nil, nil), SQLITE_OK)
+
+        XCTAssertEqual(LibrarySourceInventoryStore.createSchema(on: db), .incompatible)
+    }
+
+    func testAnEmptyDatabaseGetsTheSchema() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let db = try emptyDatabase(directory)
+        defer { sqlite3_close(db) }
+
+        XCTAssertEqual(LibrarySourceInventoryStore.createSchema(on: db), .opened)
+    }
+
     func testInvalidInventoryCannotReplaceExistingDocument() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

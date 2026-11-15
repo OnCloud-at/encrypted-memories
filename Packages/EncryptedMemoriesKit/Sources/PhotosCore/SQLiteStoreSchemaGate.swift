@@ -556,15 +556,21 @@ public enum SQLiteStoreSchemaGate {
     }
 
     /// Creates and stamps a new schema as one transaction. The caller must first prove that `db` is empty.
+    /// A successful rollback resets the error code of the connection, so `failure` receives the code of the failed
+    /// step before the rollback runs.
     public static func initializeCurrentSchema(
         _ db: OpaquePointer?,
         schemaSQL: String,
         strictEmptySchema: Bool = false,
+        failure: (Int32) -> Void = { _ in },
         stamp: () -> Bool
     ) -> Bool {
         guard state(of: db, strictEmptySchema: strictEmptySchema) == .empty,
             sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
-        else { return false }
+        else {
+            failure(sqlite3_errcode(db))
+            return false
+        }
 
         var committed = false
         defer {
@@ -574,7 +580,10 @@ public enum SQLiteStoreSchemaGate {
             stamp(),
             matchesCurrentSchema(db, schemaSQL: schemaSQL),
             sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
-        else { return false }
+        else {
+            failure(sqlite3_errcode(db))
+            return false
+        }
         committed = true
         return true
     }
