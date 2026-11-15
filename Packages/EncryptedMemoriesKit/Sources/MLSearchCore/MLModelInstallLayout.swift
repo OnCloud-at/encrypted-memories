@@ -37,11 +37,6 @@ public struct MLModelInstallLayout: Sendable, Equatable {
         rootDirectory.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName)
     }
 
-    /// SQLite sidecar files that must be part of any purge inventory.
-    public var indexDatabaseFileURLs: [URL] {
-        ["", "-wal", "-shm"].map { URL(fileURLWithPath: indexDatabaseURL.path + $0) }
-    }
-
     public func modelDirectory(for id: MLModelID) -> URL {
         modelsDirectory.appendingPathComponent(safePathComponent(id.rawValue), isDirectory: true)
     }
