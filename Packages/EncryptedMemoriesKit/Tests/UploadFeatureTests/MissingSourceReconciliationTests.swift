@@ -881,6 +881,62 @@ final class MissingSourceReconciliationTests: XCTestCase {
             try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision)?.state, .completed)
     }
 
+    /// A recheck that the permission defers after its claim keeps its own wait: the row returns with a later
+    /// check date, not as ordinary work that the next claim can take at once.
+    func testDismissedSourceRecheckThatThePermissionDefersWaitsUntilItsNextCheckDate() async throws {
+        let offered = try candidate("permission-defers-with-date")
+        let clock = BackupTestClock()
+        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: "acknowledged missing"))
+        try await engine(clock: clock).enqueueChangedMissingSources([offered])
+        let network = BackupNetworkBox(.unconstrained)
+        let queue = try XCTUnwrap(self.queue)
+        queue.setChangeObserver { _ in
+            if queueEntryForTesting(in: queue, source: offered.snapshot.source, revision: offered.snapshot.revision)?
+                .state == .checking
+            {
+                network.set(.init(isNetworkExpensive: true, usesMobileData: false))
+            }
+        }
+        let availability = AvailabilityResolver(candidate: offered)
+        let start = clock.now
+        _ = await availabilityRunner(clock: clock, resolver: availability, network: network).runUntilDrained(
+            mode: .eligibleOnly)
+        queue.setChangeObserver(nil)
+
+        XCTAssertEqual(availability.calls, 0)
+        let pending = try XCTUnwrap(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+        XCTAssertEqual(pending.state, .discovered)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(pending.lastError))
+        XCTAssertEqual(issue.kind, .sourceMissing)
+        let nextCheck = try XCTUnwrap(issue.nextAttemptAt)
+        XCTAssertGreaterThan(nextCheck, start)
+        XCTAssertEqual(pending.updatedAt, nextCheck)
+    }
+
+    /// A recheck whose pass is cancelled during the read keeps its own wait too: the row returns with a later check
+    /// date, not as ordinary work.
+    func testDismissedSourceRecheckCancelledDuringItsReadWaitsUntilItsNextCheckDate() async throws {
+        let offered = try candidate("cancelled-during-read-with-date")
+        let clock = BackupTestClock()
+        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: "acknowledged missing"))
+        try await engine(clock: clock).enqueueChangedMissingSources([offered])
+        // The pass itself is cancelled while Photos reads the file, so the cancellation belongs to the pass.
+        let cancelled = AvailabilityResolver(
+            candidate: offered, failure: CancellationError(),
+            beforeResult: { withUnsafeCurrentTask { $0?.cancel() } })
+        let start = clock.now
+        _ = await availabilityRunner(clock: clock, resolver: cancelled).runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertEqual(cancelled.calls, 1)
+        let pending = try XCTUnwrap(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
+        XCTAssertEqual(pending.state, .discovered)
+        let issue = try XCTUnwrap(BackupIssueRecord.decode(pending.lastError))
+        XCTAssertEqual(issue.kind, .sourceMissing)
+        let nextCheck = try XCTUnwrap(issue.nextAttemptAt)
+        XCTAssertGreaterThan(nextCheck, start)
+        XCTAssertEqual(pending.updatedAt, nextCheck)
+    }
+
     func testDismissedSourceRecheckKeepsTheIncompleteDuplicateIndexWarningWhileThePassRuns() async throws {
         let offered = try candidate("permission-with-incomplete-index")
         let clock = BackupTestClock()

@@ -276,6 +276,11 @@ public actor BackupSyncRunner {
         _ = recordCancellation(CancellationError())
         for wait in networkWaits.values { wait.cancel() }
         let joins = Array(inFlightJoins.values)
+        await cancelAndJoin(joins)
+    }
+
+    /// Cancels each native transfer and waits until every one of them has ended.
+    private func cancelAndJoin(_ joins: [BackupUploadJoin]) async {
         await withTaskGroup(of: Void.self) { group in
             for join in joins {
                 group.addTask { await join.cancelAndJoin() }
@@ -314,11 +319,7 @@ public actor BackupSyncRunner {
         let removed = queue.removeSources(kind: kind, identifiers: identifiers)
         refreshProgressFromQueue()
         emitProgress()
-        await withTaskGroup(of: Void.self) { group in
-            for join in joins {
-                group.addTask { await join.cancelAndJoin() }
-            }
-        }
+        await cancelAndJoin(joins)
         return removed
     }
 
@@ -684,11 +685,7 @@ public actor BackupSyncRunner {
         policyCancelledTransfers.formUnion(inFlightJoins.keys)
         for wait in networkWaits.values { wait.cancel() }
         let joins = Array(inFlightJoins.values)
-        await withTaskGroup(of: Void.self) { group in
-            for join in joins {
-                group.addTask { await join.cancelAndJoin() }
-            }
-        }
+        await cancelAndJoin(joins)
     }
 
     private func setRemoteIndexPreparation(
@@ -1040,19 +1037,11 @@ public actor BackupSyncRunner {
                     omittingMissingPairedVideo: omitsMissingPairedVideo)
             }
         } catch is BackupWorkDeferredError {
-            if isSourceRecheck {
-                preserveDismissedSourceRecheck(checkingEntry)
-            } else {
-                revert(checkingEntry, from: persistedState)
-            }
+            putBack(checkingEntry, from: persistedState, isSourceRecheck: isSourceRecheck)
             return
         } catch {
             if recordCancellation(error, for: checkingEntry) {
-                if isSourceRecheck {
-                    preserveDismissedSourceRecheck(checkingEntry)
-                } else {
-                    revert(checkingEntry, from: persistedState)
-                }
+                putBack(checkingEntry, from: persistedState, isSourceRecheck: isSourceRecheck)
                 return
             }
             if isSourceRecheck {
@@ -1306,9 +1295,7 @@ public actor BackupSyncRunner {
                     // Respect the user's remote deletion: no upload, and explicitly not backed up.
                     // No preflight record either - the next scan re-checks, so restoring from the
                     // Proton trash naturally flips this to alreadyBackedUp later.
-                    finish(
-                        entry, from: persistedState, as: .skippedRemoteDeletion,
-                        message: L10n.string("backup.state_skipped_remote_deletion"), resolved: resolved)
+                    finishSkippedRemoteDeletion(entry, from: persistedState, resolved: resolved)
 
                 case .draftExists:
                     // Another upload (possibly our own crashed one) occupies the name.
@@ -1339,9 +1326,7 @@ public actor BackupSyncRunner {
     /// and its rows stay: `PendingSourceUnreadableError`. An unknown answer ends the pass without removing
     /// anything, so no photo uploads while its exclusion cannot be read.
     private func admitsTransfer(for source: UploadSourceIdentity) async throws -> Bool {
-        guard !removedSources.contains(Self.sourceKey(kind: source.kind, identifier: source.identifier)) else {
-            return false
-        }
+        guard !sourceWasRemoved(source) else { return false }
         guard let events else { return true }
         switch events.exclusion(of: source) {
         case .included?:
@@ -1721,13 +1706,7 @@ public actor BackupSyncRunner {
             case .blockedByDraft:
                 do {
                     if try await primaryWasDeletedAfterUpload(resolved.descriptor) {
-                        finish(
-                            entry,
-                            from: persistedState,
-                            as: .skippedRemoteDeletion,
-                            message: L10n.string("backup.state_skipped_remote_deletion"),
-                            resolved: resolved
-                        )
+                        finishSkippedRemoteDeletion(entry, from: persistedState, resolved: resolved)
                         return
                     }
                 } catch {
@@ -1738,18 +1717,9 @@ public actor BackupSyncRunner {
                     entry, from: persistedState, key: Self.key(entry), endsExecutionOnPermanentPark: false)
                 return
             case .skippedRemoteDeletion:
-                finish(
-                    entry,
-                    from: persistedState,
-                    as: .skippedRemoteDeletion,
-                    message: L10n.string("backup.state_skipped_remote_deletion"),
-                    resolved: resolved
-                )
+                finishSkippedRemoteDeletion(entry, from: persistedState, resolved: resolved)
                 return
-            case .cancelled:
-                revert(entry, from: persistedState)
-                return
-            case .sourceChanged:
+            case .cancelled, .sourceChanged:
                 revert(entry, from: persistedState)
                 return
             }
@@ -1829,9 +1799,7 @@ public actor BackupSyncRunner {
                 case .replacementGone:
                     // The person removed the photo that the earlier ones waited for. Like every deletion in
                     // Proton, it stays out of the backup until a restore.
-                    finish(
-                        entry, from: persistedState, as: .skippedRemoteDeletion,
-                        message: L10n.string("backup.state_skipped_remote_deletion"), resolved: resolved)
+                    finishSkippedRemoteDeletion(entry, from: persistedState, resolved: resolved)
                     return
                 case .kept:
                     break
@@ -2177,6 +2145,16 @@ public actor BackupSyncRunner {
         return newState
     }
 
+    /// The person deleted the photo in Proton. It stays out of the backup until they restore it.
+    private func finishSkippedRemoteDeletion(
+        _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState,
+        resolved: BackupResolvedResource?
+    ) {
+        finish(
+            entry, from: oldState, as: .skippedRemoteDeletion,
+            message: L10n.string("backup.state_skipped_remote_deletion"), resolved: resolved)
+    }
+
     private func finish(
         _ entry: UploadBackupSyncQueueEntry,
         from oldState: UploadBackupSyncQueueState,
@@ -2347,6 +2325,17 @@ public actor BackupSyncRunner {
         retained.state = .dismissedFailure
         retained.updatedAt = now()
         _ = transitionDismissedSourceRecheck(retained, matching: entry)
+    }
+
+    /// Returns a row whose check did not finish: a dismissed source keeps its recheck, and any other row reverts.
+    private func putBack(
+        _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState, isSourceRecheck: Bool
+    ) {
+        if isSourceRecheck {
+            preserveDismissedSourceRecheck(entry)
+        } else {
+            revert(entry, from: oldState)
+        }
     }
 
     private func preserveDismissedSourceRecheck(
@@ -3072,7 +3061,7 @@ public actor BackupSyncRunner {
         var itemEquivalents = 0.0
         for transfer in activeTransfers.values {
             totalBytes += transfer.totalBytes
-            completedBytes += Int64((Double(transfer.totalBytes) * transfer.byteFraction).rounded(.down))
+            completedBytes += Self.bytes(of: transfer, at: transfer.byteFraction)
             itemEquivalents += min(
                 0.999,
                 transfer.itemBaseFraction + transfer.itemFractionWeight * transfer.byteFraction
