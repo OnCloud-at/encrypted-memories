@@ -5381,7 +5381,12 @@ private final class CountingPendingJournal: EditReplacementJournaling, @unchecke
         lock.withLock { count += 1 }
         return EditReplacementJournalEntry()
     }
-    func keepDeleted(for source: UploadSourceIdentity) throws {}
+    func recordDeletionDecision(
+        _ choice: EditReplacementDeletionChoice, revisions: [UploadBackupRevision], for source: UploadSourceIdentity
+    ) throws -> DeletionDecisionIntent { DeletionDecisionIntent(revisions: revisions) }
+    func pendingDeletionDecisionSources() -> [StoreLookup<UploadSourceIdentity>] { [] }
+    func pendingDeletionDecision(for source: UploadSourceIdentity) throws -> [DeletionDecisionRow] { [] }
+    func settleDeletionDecision(id: UUID, for source: UploadSourceIdentity) throws {}
     func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws {}
     func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws {}
     func clearDeletionCheck(for source: UploadSourceIdentity) throws {}

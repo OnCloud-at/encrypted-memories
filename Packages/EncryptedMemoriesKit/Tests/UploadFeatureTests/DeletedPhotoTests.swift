@@ -77,7 +77,7 @@ final class DeletedPhotoTests: XCTestCase {
 
     func testContentUnderAnotherNameProvesLiveEvenAfterKeepDeleted() async throws {
         try addEarlierUpload()
-        try journal.keepDeleted(for: source)
+        try journal.recordKeptDeletionForFixture(for: source)
         let checker = FakeChecker()
         checker.remoteItemsByContentHash[contentHash] = .init(
             nameHash: "nh(renamed.heic)", contentHash: contentHash, linkState: .active, linkID: "live")
@@ -98,7 +98,7 @@ final class DeletedPhotoTests: XCTestCase {
         try addEarlierUpload()
         let unedited = try await pipeline().resolve(descriptor())
         XCTAssertEqual(unedited.decision, .awaitDeletionCheck)
-        try journal.keepDeleted(for: source)
+        try journal.recordKeptDeletionForFixture(for: source)
         let kept = try await pipeline().resolve(descriptor())
         XCTAssertEqual(kept.decision, .skip(.deletedRemotely, remoteLinkID: "gone"))
         try journal.backUpAgain(revision: .init(rawValue: 7), for: source)
@@ -133,7 +133,7 @@ final class DeletedPhotoTests: XCTestCase {
             try addEarlierUpload()
             try journal.settle(["gone"], related: [], trashed: true, for: source)
             if keep {
-                try journal.keepDeleted(for: source)
+                try journal.recordKeptDeletionForFixture(for: source)
             } else {
                 try journal.backUpAgain(revision: .init(rawValue: 7), for: source)
             }
@@ -160,7 +160,7 @@ final class DeletedPhotoTests: XCTestCase {
         XCTAssertFalse(EditReplacementJournalEntry(keptDeleted: true).isEmpty)
         XCTAssertFalse(EditReplacementJournalEntry(backUpAgainRevision: .init(rawValue: 7)).isEmpty)
         XCTAssertFalse(EditReplacementJournalEntry(deletionCheckStartedAt: date).isEmpty)
-        try journal.keepDeleted(for: source)
+        try journal.recordKeptDeletionForFixture(for: source)
         journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
         XCTAssertTrue(journal.entry(for: source).keptDeleted == true)
         try journal.backUpAgain(revision: .init(rawValue: 7), for: source)
@@ -819,7 +819,10 @@ final class DeletedPhotoTests: XCTestCase {
                         result.reloadedJournal, result.journalBefore, "\(label): the restored choice is on disk")
                     XCTAssertNotEqual(result.reloadedJournal.keptDeleted, true, label)
                     XCTAssertEqual(result.message, L10n.string("backup.error_local_state_unavailable"), label)
-                    XCTAssertFalse(result.lines.contains { $0.hasPrefix("decision.") }, label)
+                    XCTAssertEqual(
+                        result.lines.filter { $0.hasPrefix("decision.") },
+                        ["decision.notSaved choice=\(keepDeleted ? "keepDeleted" : "backUpAgain")"],
+                        "\(label): the choice came back, so only the refusal is logged")
                 }
             }
         }
@@ -839,20 +842,202 @@ final class DeletedPhotoTests: XCTestCase {
                 XCTAssertEqual(result.rowsAfter, result.rowsBefore.map(Optional.some), label)
                 XCTAssertEqual(result.restoreAttempts, 1, label)
                 XCTAssertEqual(result.message, L10n.string("backup.error_local_state_unavailable"), label)
+                let choice = keepDeleted ? "keepDeleted" : "backUpAgain"
                 XCTAssertEqual(
                     result.lines.filter { $0.hasPrefix("decision.") },
-                    ["decision.choiceNotRestored choice=\(keepDeleted ? "keepDeleted" : "backUpAgain")"], label)
+                    ["decision.choiceNotRestored choice=\(choice)", "decision.notSaved choice=\(choice)"], label)
                 for line in result.lines {
                     XCTAssertFalse(line.contains(source.identifier), label)
                     XCTAssertFalse(line.contains(directory.path), label)
                     XCTAssertFalse(line.contains("photo.heic"), label)
                 }
-                // The limit: a choice that the journal cannot take back stays until the person decides again.
+                // A choice that could not be taken back is replayed at the next start.
                 if keepDeleted {
                     XCTAssertEqual(result.journalAfter.keptDeleted, true, label)
                 } else {
                     XCTAssertEqual(result.journalAfter.backUpAgainRevision, result.rowsBefore.last?.revision, label)
                 }
+            }
+        }
+    #endif
+
+    /// The journal keeps a choice whose queue write failed and that it could not take back. The person made that
+    /// choice, so the next start writes it to every revision the decision saw, as a healthy decision does.
+    #if DEBUG
+        @MainActor
+        func testAChoiceThatCouldNotBeTakenBackIsAppliedAtTheNextStart() async throws {
+            for keepDeleted in [false, true] {
+                let label = keepDeleted ? "restart-keep" : "restart-again"
+                let result = try await decideWithSiblingWriteFault(
+                    keepDeleted: keepDeleted, failingWrite: 2, refusesRestore: true, name: label)
+                XCTAssertTrue(result.fired, label)
+                XCTAssertFalse(result.decided, label)
+                XCTAssertEqual(result.rowsAfter, result.rowsBefore.map(Optional.some), label)
+
+                let rowsAfterStart = try await rowsAfterRestart(name: label, revisions: result.rowsBefore)
+                XCTAssertEqual(
+                    rowsAfterStart.map { $0?.state },
+                    keepDeleted
+                        ? [.skippedRemoteDeletion, .skippedRemoteDeletion, .skippedRemoteDeletion]
+                        : [.dismissedFailure, .dismissedFailure, .discovered],
+                    "\(label): the next start applies the saved choice")
+                XCTAssertEqual(
+                    rowsAfterStart.map { BackupIssueRecord.decode($0?.lastError)?.kind },
+                    keepDeleted ? [.remoteDeletion, .remoteDeletion, .remoteDeletion] : [nil, nil, nil], label)
+            }
+        }
+    #endif
+
+    /// Starts a controller on the saved account, observes its replay write, then shuts down and reads the queue.
+    #if DEBUG
+        @MainActor
+        private func rowsAfterRestart(
+            name: String, revisions: [UploadBackupSyncQueueEntry]
+        ) async throws -> [UploadBackupSyncQueueEntry?] {
+            let account = directory.appendingPathComponent(name)
+            let files = StorageFaultFiles()
+            let journal = try XCTUnwrap(
+                EditReplacementJournalFileStore(
+                    accountDataDirectory: account.appendingPathComponent("journal"), fileSystem: files))
+            let replayed = expectation(description: "startup settles the recorded choice")
+            files.watch(failing: [], onStart: { _ in replayed.fulfill() })
+            let suite = "deletion-restart-\(name)-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(accountDataDirectory: account, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            await fulfillment(of: [replayed], timeout: 5)
+            files.stopWatching()
+            await controller.shutdown()
+            let observer = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: account.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { observer.close() }
+            return try revisions.map { try observer.entry(for: $0.source, revision: $0.revision) }
+        }
+    #endif
+
+    /// The replay at the start cannot read the recorded rows. The next pass replays before it scans, a full pass and a
+    /// refresh scan alike.
+    #if DEBUG
+        @MainActor
+        func testAPassReplaysAChoiceThatTheStartCouldNotRead() async throws {
+            for refresh in [false, true] {
+                let label = refresh ? "pass-join-refresh" : "pass-join-full"
+                let pass = try PassFixture(directory: directory, name: label, refusedPendingReads: 1)
+                defer { UserDefaults.standard.removePersistentDomain(forName: pass.suite) }
+                try pass.recordChoiceWithoutQueueWrite()
+                let controller = try pass.makeController()
+                if refresh {
+                    _ = await controller.backgroundRefreshScan()
+                } else {
+                    _ = await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+                }
+                await controller.shutdown()
+                XCTAssertEqual(pass.journal.refusedPendingReadsLeft, 0, "\(label): the start replay was refused")
+                XCTAssertEqual(try pass.parkedRowState(), .skippedRemoteDeletion, "\(label): the pass replayed")
+                XCTAssertNil(pass.fileJournal.entry(for: pass.source).deletionDecision, label)
+            }
+        }
+    #endif
+
+    /// The replay of this launch finished. A choice recorded later, whose queue write and restore both failed, waits
+    /// for the next launch or the next decision for its photo; a pass does not apply it.
+    #if DEBUG
+        @MainActor
+        func testAChoiceRecordedAfterTheFinishedStartReplayWaitsForTheNextLaunch() async throws {
+            let pass = try PassFixture(directory: directory, name: "pass-after-start", refusedPendingReads: 0)
+            defer { UserDefaults.standard.removePersistentDomain(forName: pass.suite) }
+            let controller = try pass.makeController()
+            _ = await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+            try pass.recordChoiceWithoutQueueWrite()
+            _ = await controller.backgroundCatchUp(owner: .iOSBackgroundTask)
+            await controller.shutdown()
+            XCTAssertEqual(try pass.parkedRowState(), .failedPermanent)
+            XCTAssertNotNil(pass.fileJournal.entry(for: pass.source).deletionDecision)
+            let next = try pass.makeController()
+            _ = await next.backgroundCatchUp(owner: .iOSBackgroundTask)
+            await next.shutdown()
+            XCTAssertEqual(try pass.parkedRowState(), .skippedRemoteDeletion, "the next launch applies it")
+        }
+    #endif
+
+    /// After shutdown the queue is closed. A tap from a problem list that is still on screen is refused without a
+    /// message, and neither the journal nor the queue changes.
+    #if DEBUG
+        @MainActor
+        func testADecisionAfterShutdownIsRefusedSilently() async throws {
+            let pass = try PassFixture(directory: directory, name: "decision-after-shutdown", refusedPendingReads: 0)
+            defer { UserDefaults.standard.removePersistentDomain(forName: pass.suite) }
+            let controller = try pass.makeController()
+            let items = try await photoBackupProblemItems(controller)
+            let item = try XCTUnwrap(items.first { $0.source == pass.source })
+            let entryBefore = pass.fileJournal.entry(for: pass.source)
+            XCTAssertNil(controller.lastMessage)
+            await controller.shutdown()
+
+            XCTAssertFalse(controller.keepDeleted(item))
+
+            XCTAssertNil(controller.lastMessage, "nothing can be done, so the app stays silent")
+            XCTAssertEqual(pass.fileJournal.entry(for: pass.source), entryBefore)
+            XCTAssertEqual(try pass.parkedRowState(), .failedPermanent)
+        }
+    #endif
+
+    /// One parked photo on its own account, with the real journal behind a journal that can refuse reads. A pass needs
+    /// backup on, full access, and a scan that does not ask PhotoKit. The app is in the background, as in a task window:
+    /// a refresh scan in the foreground would start a full pass after it, and that pass replays on its own.
+    #if DEBUG
+        @MainActor
+        private struct PassFixture {
+            let account: URL
+            let fileJournal: EditReplacementJournalFileStore
+            let journal: RefusingJournal
+            let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "pass-photo")
+            let row: UploadBackupSyncQueueEntry
+            let suite = "deletion-pass-\(UUID().uuidString)"
+
+            init(directory: URL, name: String, refusedPendingReads: Int) throws {
+                account = directory.appendingPathComponent(name)
+                let journalDirectory = account.appendingPathComponent("journal")
+                try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true)
+                fileJournal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: journalDirectory))
+                journal = RefusingJournal(inner: fileJournal, refusedPendingReads: refusedPendingReads)
+                row = UploadBackupSyncQueueEntry(
+                    source: source, revision: .init(rawValue: 1), originalFilename: "photo.heic",
+                    state: .failedPermanent,
+                    lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                    updatedAt: Date(timeIntervalSince1970: 1_720_000_001))
+                let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
+                defer { queue.close() }
+                XCTAssertTrue(queue.upsert(row))
+            }
+
+            var queueURL: URL { account.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName) }
+
+            /// The state that a decision leaves when its queue write and its restore both failed.
+            func recordChoiceWithoutQueueWrite() throws {
+                try fileJournal.recordDeletionDecision(.keptDeleted, revisions: [row.revision], for: source)
+            }
+
+            func makeController() throws -> PhotoLibraryBackupController {
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                let controller = PhotoLibraryBackupController(
+                    configuration: .init(
+                        accountDataDirectory: account, databasePolicy: .conservative, defaults: defaults,
+                        runtimeSignals: .wiFiInTheBackground),
+                    identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+                XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
+                controller.setAccessStateForTesting(.full)
+                controller.replaceScanForTesting {}
+                return controller
+            }
+
+            func parkedRowState() throws -> UploadBackupSyncQueueState? {
+                let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
+                defer { queue.close() }
+                return try queue.entry(for: source, revision: row.revision)?.state
             }
         }
     #endif
@@ -893,7 +1078,9 @@ final class DeletedPhotoTests: XCTestCase {
                 let label = keepDeleted ? "compaction-keep" : "compaction-again"
                 let result = try await decideWithSiblingWriteFault(
                     keepDeleted: keepDeleted, failingWrite: nil, name: label, journalLines: 1_000)
-                XCTAssertEqual(result.journalLines, 1_001, "\(label): the compaction must actually fail")
+                XCTAssertEqual(
+                    result.journalLines, 1_002, "\(label): the choice and settle lines survive failed compactions")
+                XCTAssertNil(result.reloadedJournal.deletionDecision)
                 XCTAssertTrue(result.decided, "\(label): a saved choice is the decision")
                 if !result.decided {
                     XCTAssertNotEqual(
@@ -925,7 +1112,10 @@ final class DeletedPhotoTests: XCTestCase {
                 XCTAssertFalse(result.decided, label)
                 XCTAssertEqual(result.rowsAfter, result.rowsBefore.map(Optional.some), label)
                 XCTAssertEqual(result.reloadedJournal, result.journalBefore, "\(label): the earlier choice is back")
-                XCTAssertFalse(result.lines.contains { $0.hasPrefix("decision.") }, label)
+                XCTAssertEqual(
+                    result.lines.filter { $0.hasPrefix("decision.") },
+                    ["decision.notSaved choice=\(keepDeleted ? "keepDeleted" : "backUpAgain")"],
+                    "\(label): no line says that the choice did not come back")
             }
         }
     #endif
@@ -937,7 +1127,7 @@ final class DeletedPhotoTests: XCTestCase {
         func testARestoreKeepsANewerChoiceWrittenDuringTheFailedQueueWrite() async throws {
             let result = try await decideWithSiblingWriteFault(
                 keepDeleted: false, failingWrite: 2, name: "newer-clear",
-                seed: { [source] journal, _ in try journal.keepDeleted(for: source) },
+                seed: { [source] journal, _ in try journal.recordKeptDeletionForFixture(for: source) },
                 duringFailedWrite: { [source] journal in try? journal.clearDeletionChoice(for: source) })
             XCTAssertTrue(result.fired)
             XCTAssertFalse(result.decided)
@@ -946,7 +1136,7 @@ final class DeletedPhotoTests: XCTestCase {
                 result.reloadedJournal.deletionChoice,
                 EditReplacementDeletionChoice(keptDeleted: nil, backUpAgainRevision: nil, deletionCheckStartedAt: nil),
                 "the newer cleared choice stays")
-            XCTAssertFalse(result.lines.contains { $0.hasPrefix("decision.") })
+            XCTAssertEqual(result.lines.filter { $0.hasPrefix("decision.") }, ["decision.notSaved choice=backUpAgain"])
         }
     #endif
 
@@ -975,7 +1165,7 @@ final class DeletedPhotoTests: XCTestCase {
                 keepDeleted: false, failingWrite: 2, name: "earlier-keep",
                 seed: { [source] journal, _ in
                     try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "gone"), for: source)
-                    try journal.keepDeleted(for: source)
+                    try journal.recordKeptDeletionForFixture(for: source)
                 })
             XCTAssertTrue(result.fired)
             XCTAssertFalse(result.decided)
@@ -1015,7 +1205,7 @@ final class DeletedPhotoTests: XCTestCase {
             let journalDirectory = account.appendingPathComponent("journal")
             try FileManager.default.createDirectory(at: journalDirectory, withIntermediateDirectories: true)
             let fileJournal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: journalDirectory))
-            let journal = RestoreRefusingJournal(inner: fileJournal, refusesRestore: refusesRestore)
+            let journal = RefusingJournal(inner: fileJournal, refusesRestore: refusesRestore)
             let revisions = [date, date.addingTimeInterval(60), date.addingTimeInterval(120)].map {
                 UploadBackupRevision(date: $0)
             }
@@ -1332,18 +1522,27 @@ final class DeletedPhotoTests: XCTestCase {
     }
 }
 
-/// The real journal file, with a restore that can refuse, so a test reaches the path where the earlier choice
-/// cannot be written back.
-private final class RestoreRefusingJournal: EditReplacementJournaling, @unchecked Sendable {
+/// The real journal file with three refusals a test can switch on: the restore of an earlier choice, the read of a
+/// photo's recorded rows after a new choice, and the first `refusedPendingReads` reads of a photo's recorded rows.
+final class RefusingJournal: EditReplacementJournaling, @unchecked Sendable {
     private let inner: EditReplacementJournalFileStore
     private let refusesRestore: Bool
+    private let refusesReadAfterRecord: Bool
+    private var recorded = false
     private let lock = NSLock()
     private var attempts = 0
+    private var refusedReads: Int
     var restoreAttempts: Int { lock.withLock { attempts } }
+    var refusedPendingReadsLeft: Int { lock.withLock { refusedReads } }
 
-    init(inner: EditReplacementJournalFileStore, refusesRestore: Bool) {
+    init(
+        inner: EditReplacementJournalFileStore, refusesRestore: Bool = false, refusesReadAfterRecord: Bool = false,
+        refusedPendingReads: Int = 0
+    ) {
         self.inner = inner
         self.refusesRestore = refusesRestore
+        self.refusesReadAfterRecord = refusesReadAfterRecord
+        refusedReads = refusedPendingReads
     }
 
     func restoreDeletionChoice(
@@ -1355,7 +1554,30 @@ private final class RestoreRefusingJournal: EditReplacementJournaling, @unchecke
         try inner.restoreDeletionChoice(previous, ifStill: written, for: source)
     }
 
-    func keepDeleted(for source: UploadSourceIdentity) throws { try inner.keepDeleted(for: source) }
+    func recordDeletionDecision(
+        _ choice: EditReplacementDeletionChoice, revisions: [UploadBackupRevision], for source: UploadSourceIdentity
+    ) throws -> DeletionDecisionIntent {
+        let intent = try inner.recordDeletionDecision(choice, revisions: revisions, for: source)
+        lock.withLock { recorded = true }
+        return intent
+    }
+    func pendingDeletionDecisionSources() -> [StoreLookup<UploadSourceIdentity>] {
+        inner.pendingDeletionDecisionSources()
+    }
+    func pendingDeletionDecision(for source: UploadSourceIdentity) throws -> [DeletionDecisionRow] {
+        let refuses = lock.withLock {
+            guard refusedReads == 0 else {
+                refusedReads -= 1
+                return true
+            }
+            return refusesReadAfterRecord && recorded
+        }
+        if refuses { throw UploadError.backend("refused read") }
+        return try inner.pendingDeletionDecision(for: source)
+    }
+    func settleDeletionDecision(id: UUID, for source: UploadSourceIdentity) throws {
+        try inner.settleDeletionDecision(id: id, for: source)
+    }
     func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws {
         try inner.backUpAgain(revision: revision, for: source)
     }

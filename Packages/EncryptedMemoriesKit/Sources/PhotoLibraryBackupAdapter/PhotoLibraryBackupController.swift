@@ -226,6 +226,8 @@ public final class PhotoLibraryBackupController {
     private let runtimeSignals: BackupRuntimeSignalSource
     private let retryPolicy: BackupRetryPolicy
     private var statusSetupTask: Task<Void, Never>?
+    private var deletionReplayTask: Task<Void, Never>?
+    private var deletionReplayCompleted = false
     private var syncTask: Task<Void, Never>?
     private var changeDebounceTask: Task<Void, Never>?
     /// Targeted enqueue fired by the change observer while a pass is running. A photo added mid-backup
@@ -451,6 +453,9 @@ public final class PhotoLibraryBackupController {
             runner = nil
         }
 
+        deletionReplayTask = Task { [weak self] in
+            await self?.replayDeletionDecisions()
+        }
         tempStore.sweep()
         if let statusProjector {
             let generation = statusProjectionGeneration
@@ -1013,17 +1018,27 @@ public final class PhotoLibraryBackupController {
     private func resolveRemoteDeletion(
         _ item: BackupFailedItem, keepDeleted: Bool, expectedRevisions: Set<UploadBackupRevision>? = nil
     ) -> Bool {
+        // After shutdown the queue is closed; a late tap is refused silently instead of reporting a local-state error.
         guard item.issue == .deletedElsewhere, let source = item.source, let revision = item.revision,
-            let queueStore, let journal = pendingReplacementJournal,
-            let row = PhotoPerformanceSignposts.database.interval(
-                "BackupDecisionEntry",
-                {
-                    (try? queueStore.entry(for: source, revision: revision))
-                }), row.state == .failedPermanent,
-            BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
+            !isShuttingDown, let queueStore, let journal = pendingReplacementJournal
         else { return false }
         // The choice is about the photo, so it settles every revision of it that waits for the same question.
         do {
+            let pending = try journal.pendingDeletionDecision(for: source)
+            defer {
+                if !pending.isEmpty {
+                    noteProblemListChange()
+                    refreshFromQueue()
+                }
+            }
+            try DeletionDecisionReplay.apply(
+                pending, queue: queueStore, journal: journal, at: Date())
+            guard
+                let row = try PhotoPerformanceSignposts.database.interval(
+                    "BackupDecisionEntry", { try queueStore.entry(for: source, revision: revision) }),
+                row.state == .failedPermanent,
+                BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
+            else { return false }
             let parked = try PhotoPerformanceSignposts.database.interval("BackupDecisionRows") {
                 try queueStore.decisionRows(kind: source.kind, identifiers: [source.identifier]).filter {
                     guard $0.source == source, $0.state == .failedPermanent else { return false }
@@ -1038,51 +1053,18 @@ public final class PhotoLibraryBackupController {
                     return false
                 }
             }
-            // The journal is a file, so it cannot share the queue transaction. It takes the choice first: a reopened
-            // revision without it would only wait for the question again. A failed queue write takes it back while
-            // the journal still holds it.
-            let previousChoice = journal.entry(for: source).deletionChoice
-            let writtenChoice: EditReplacementDeletionChoice = keepDeleted ? .keptDeleted : .backUpAgain(newest)
-            try PhotoPerformanceSignposts.database.interval("BackupDecisionJournal") {
-                if keepDeleted {
-                    try journal.keepDeleted(for: source)
-                } else {
-                    try journal.backUpAgain(revision: newest, for: source)
-                }
-            }
-            let lastError =
-                keepDeleted
-                ? BackupIssueRecord(
-                    kind: .remoteDeletion, detail: L10n.string("backup.state_skipped_remote_deletion")
-                ).persistedValue : nil
-            let updates = Set(parked + [revision]).sorted().map { parkedRevision in
-                let reopens = !keepDeleted && parkedRevision == newest
-                return UploadBackupSyncQueueManifestStore.StateUpdate(
-                    revision: parkedRevision,
-                    state: keepDeleted ? .skippedRemoteDeletion : reopens ? .discovered : .dismissedFailure,
-                    lastError: lastError)
-            }
-            // All revisions change together, or none does: a photo reported as unchanged has no reopened revision.
-            guard
-                PhotoPerformanceSignposts.database.interval(
-                    "BackupDecisionQueueWrite",
-                    { queueStore.updateStates(of: source, updates, updatedAt: Date()) })
-            else {
-                do {
-                    try journal.restoreDeletionChoice(previousChoice, ifStill: writtenChoice, for: source)
-                } catch {
-                    backgroundLog.notice(
-                        .photoBackup, "decision.choiceNotRestored",
-                        [(.init("choice"), .word(keepDeleted ? "keepDeleted" : "backUpAgain"))])
-                }
-                throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
-            }
+            try DeletionDecisionReplay.record(
+                keepDeleted ? .keptDeleted : .backUpAgain(newest), revisions: Set(parked + [revision]).sorted(),
+                for: source, queue: queueStore, journal: journal, at: Date(), log: backgroundLog)
             SupportEventTrail.shared.record(
                 keepDeleted ? .backupDeletionKept : .backupDeletionReopened, subject: source.identifier)
             noteProblemListChange()
             refreshFromQueue()
             return true
         } catch {
+            backgroundLog.notice(
+                .photoBackup, "decision.notSaved",
+                [(.init("choice"), .word(keepDeleted ? "keepDeleted" : "backUpAgain"))])
             lastMessage = L10n.string("backup.error_local_state_unavailable")
             refreshFromQueue()
             return false
@@ -1410,6 +1392,7 @@ public final class PhotoLibraryBackupController {
                     weak self, monitor, engine, runner, queueStore, catalogStore, catalogRetryRows, statusSetupTask,
                     scanBody
                 ] in
+                await self?.joinDeletionReplay()
                 await statusSetupTask?.value
                 self?.refreshFromQueue()
                 self?.beginScanPhase()
@@ -1450,6 +1433,7 @@ public final class PhotoLibraryBackupController {
                 statusSetupTask, scanBody,
                 identityResolver
             ] in
+            await self?.joinDeletionReplay()
             await statusSetupTask?.value
             self?.refreshFromQueue()
             // Scan and reconcile run concurrently. Reconcile drains existing work and newly enqueued
@@ -2178,6 +2162,8 @@ public final class PhotoLibraryBackupController {
         await activeStop?.value
         await activeSync?.value
         await activeStatusSetup?.value
+        await deletionReplayTask?.value
+        deletionReplayTask = nil
         await activeEnqueue?.value
         await joinInstantWorkTasksForShutdown()
         for context in restoredRechecks.values { await identityResolver?.endRestoredCompound(context) }
@@ -2669,6 +2655,22 @@ public final class PhotoLibraryBackupController {
     }
 
     // MARK: - Status projection
+
+    private func replayDeletionDecisions() async {
+        guard !deletionReplayCompleted else { return }
+        guard let queueStore, let journal = pendingReplacementJournal else { return }
+        deletionReplayCompleted = await DeletionDecisionReplay.run(
+            queue: queueStore, journal: journal, at: Date(), log: backgroundLog, shouldStop: { self.isShuttingDown })
+        noteProblemListChange()
+        refreshFromQueue()
+    }
+
+    /// A pass replays again only while the replay of this launch has not finished: a choice recorded later in this
+    /// launch waits for the next launch or the next decision for its photo.
+    private func joinDeletionReplay() async {
+        await deletionReplayTask?.value
+        await replayDeletionDecisions()
+    }
 
     private var projectionContext: BackupStatusProjectionContext {
         BackupStatusProjectionContext(

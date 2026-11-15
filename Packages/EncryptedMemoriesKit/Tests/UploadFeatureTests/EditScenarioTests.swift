@@ -354,7 +354,7 @@ final class EditScenarioTests: XCTestCase {
         let (earlier, entry) = try await personTrashesTheWaitingEarlierMain()
         let edited = try harness.liveMain()
         harness.server.personTrash(edited)
-        try harness.journal.keepDeleted(for: entry.source)
+        try harness.journal.recordKeptDeletionForFixture(for: entry.source)
         harness.server.personRestore(earlier)
         harness.assertSafety()
         let next = try await edit("render-after-kept-deleted")
@@ -695,7 +695,7 @@ final class EditScenarioTests: XCTestCase {
         harness.server.setModificationDate(otherDeviceEditIsNewer ? editTimeB : olderTime, of: headB.uid)
         if otherDeviceEditIsNewer {
             // An answer to an earlier deletion question must not outlive the proof that the photo is live.
-            try harness.journal.keepDeleted(for: source)
+            try harness.journal.recordKeptDeletionForFixture(for: source)
         }
 
         let steps = harness.server.steps.count
@@ -950,7 +950,7 @@ final class EditScenarioTests: XCTestCase {
         let entry = try await edit("deleted-edit")
         harness.clock.advance(by: 5)
         await harness.pass()
-        try harness.journal.keepDeleted(for: entry.source)
+        try harness.journal.recordKeptDeletionForFixture(for: entry.source)
         let next = try await edit("later-deleted-edit")
         harness.clock.advance(by: 5)
         await harness.pass()

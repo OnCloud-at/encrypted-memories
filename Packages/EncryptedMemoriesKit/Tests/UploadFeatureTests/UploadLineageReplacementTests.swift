@@ -154,7 +154,7 @@ final class UploadLineageReplacementTests: XCTestCase {
         server.personTrash(original)
         let head = try seed(
             "newer-edit", replacing: [original.nodeID], modificationDate: Date(timeIntervalSince1970: 1_720_000_020))
-        try journal.keepDeleted(for: source)
+        try journal.recordKeptDeletionForFixture(for: source)
 
         let older = descriptor("older-edit")
         let result = try await pipeline.resolve(older)
@@ -663,7 +663,7 @@ final class UploadLineageReplacementTests: XCTestCase {
         let head = try seed(
             "newer-edit", replacing: [original.nodeID], modificationDate: Date(timeIntervalSince1970: 1_720_000_020))
         server.setTags([7], of: head)
-        try journal.keepDeleted(for: source)
+        try journal.recordKeptDeletionForFixture(for: source)
 
         let older = descriptor("older-edit")
         let result = try await pipeline.resolve(older)

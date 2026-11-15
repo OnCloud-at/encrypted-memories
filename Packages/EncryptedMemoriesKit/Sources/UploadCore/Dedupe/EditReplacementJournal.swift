@@ -33,13 +33,14 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     public var keptDeleted: Bool?
     public var backUpAgainRevision: UploadBackupRevision?
     public var deletionCheckStartedAt: Date?
+    public var deletionDecision: DeletionDecisionIntent?
 
     public init(
         superseded: [PhotoUID] = [], retired: [String] = [], uploadedEdit: Bool? = nil,
         retireIntent: [String: [String]]? = nil, remoteSuperseded: [String]? = nil,
         keptDeleted: Bool? = nil, backUpAgainRevision: UploadBackupRevision? = nil,
         deletionCheckStartedAt: Date? = nil, proven: [String]? = nil, inherited: [String: [String]]? = nil,
-        gone: [String]? = nil
+        gone: [String]? = nil, deletionDecision: DeletionDecisionIntent? = nil
     ) {
         self.superseded = superseded
         self.remoteSuperseded = remoteSuperseded
@@ -52,6 +53,7 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
         self.deletionCheckStartedAt = deletionCheckStartedAt
         self.proven = proven
         self.inherited = inherited
+        self.deletionDecision = deletionDecision
     }
 
     /// Without the flag, a photo that already replaced an earlier upload counts as edited: only edits and undos
@@ -101,23 +103,28 @@ public struct EditReplacementJournalEntry: Sendable, Equatable, Codable {
     public var isEmpty: Bool {
         allSuperseded.isEmpty && retired.isEmpty && uploadedEdit != true && (retireIntent?.isEmpty ?? true)
             && (gone?.isEmpty ?? true) && keptDeleted != true && backUpAgainRevision == nil
-            && deletionCheckStartedAt == nil
+            && deletionCheckStartedAt == nil && deletionDecision == nil
     }
 }
 
-/// The three fields of an entry that a deletion decision writes.
+/// The choice and intent fields that a deletion decision writes together.
 public struct EditReplacementDeletionChoice: Sendable, Equatable {
     public var keptDeleted: Bool?
     public var backUpAgainRevision: UploadBackupRevision?
     public var deletionCheckStartedAt: Date?
+    public var deletionDecision: DeletionDecisionIntent?
 
-    public init(keptDeleted: Bool?, backUpAgainRevision: UploadBackupRevision?, deletionCheckStartedAt: Date?) {
+    public init(
+        keptDeleted: Bool?, backUpAgainRevision: UploadBackupRevision?, deletionCheckStartedAt: Date?,
+        deletionDecision: DeletionDecisionIntent? = nil
+    ) {
         self.keptDeleted = keptDeleted
         self.backUpAgainRevision = backUpAgainRevision
         self.deletionCheckStartedAt = deletionCheckStartedAt
+        self.deletionDecision = deletionDecision
     }
 
-    /// What `keepDeleted(for:)` writes.
+    /// The choice to keep the photo deleted.
     public static let keptDeleted = EditReplacementDeletionChoice(
         keptDeleted: true, backUpAgainRevision: nil, deletionCheckStartedAt: nil)
 
@@ -132,20 +139,20 @@ extension EditReplacementJournalEntry {
         get {
             EditReplacementDeletionChoice(
                 keptDeleted: keptDeleted, backUpAgainRevision: backUpAgainRevision,
-                deletionCheckStartedAt: deletionCheckStartedAt)
+                deletionCheckStartedAt: deletionCheckStartedAt, deletionDecision: deletionDecision)
         }
         set {
             keptDeleted = newValue.keptDeleted
             backUpAgainRevision = newValue.backUpAgainRevision
             deletionCheckStartedAt = newValue.deletionCheckStartedAt
+            deletionDecision = newValue.deletionDecision
         }
     }
 }
 
 /// Durable record of edited photos that replace their earlier upload. The dedupe pipeline adds the earlier
 /// photo before its manifest record forgets it; the backup runner retires it after the trash write.
-public protocol EditReplacementJournaling: Sendable {
-    func keepDeleted(for source: UploadSourceIdentity) throws
+public protocol EditReplacementJournaling: DeletionDecisionLog {
     func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws
     func startDeletionCheck(at date: Date, for source: UploadSourceIdentity) throws
     func clearDeletionCheck(for source: UploadSourceIdentity) throws
@@ -239,6 +246,8 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
     /// Runs a compaction of the log away from the caller: the app on a utility queue, a test when it chooses.
     typealias CompactionScheduler = @Sendable (@escaping @Sendable () -> Void) -> Void
     static let onUtilityQueue: CompactionScheduler = { DispatchQueue.global(qos: .utility).async(execute: $0) }
+    /// Only unsettled decisions participate in launch replay; historical entries cost no scan.
+    private var pendingDecisionKeys: Set<String> = []
 
     /// Nil when the journal exists but cannot be read. Edits then keep their earlier uploads instead of losing the
     /// photos that still wait for their replacement. The app opens it through `shared(accountDataDirectory:)`.
@@ -272,6 +281,7 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             entries = [:]
             lineCount = 0
         }
+        pendingDecisionKeys = Set(entries.compactMap { $0.value.deletionDecision == nil ? nil : $0.key })
     }
 
     /// Keeps earlier builds away from the log's history once the log exists.
@@ -408,8 +418,43 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
         }
     }
 
-    public func keepDeleted(for source: UploadSourceIdentity) throws {
-        try update(source) { entry in entry.deletionChoice = .keptDeleted }
+    @discardableResult
+    public func recordDeletionDecision(
+        _ choice: EditReplacementDeletionChoice, revisions: [UploadBackupRevision], for source: UploadSourceIdentity
+    ) throws -> DeletionDecisionIntent {
+        let intent = DeletionDecisionIntent(revisions: revisions)
+        var written = choice
+        written.deletionDecision = intent
+        var entry = EditReplacementJournalEntry()
+        entry.deletionChoice = written
+        _ = try DeletionDecisionRow.rows(key: Self.key(source), entry: entry)
+        try update(source) { $0.deletionChoice = written }
+        return intent
+    }
+
+    public func pendingDeletionDecisionSources() -> [StoreLookup<UploadSourceIdentity>] {
+        lock.withLock {
+            pendingDecisionKeys.sorted().map { key in
+                StoreLookup(catching: {
+                    let rows = try DeletionDecisionRow.rows(
+                        key: key, entry: entries[key] ?? EditReplacementJournalEntry())
+                    return rows.first?.source
+                })
+            }
+        }
+    }
+
+    public func pendingDeletionDecision(for source: UploadSourceIdentity) throws -> [DeletionDecisionRow] {
+        try lock.withLock {
+            try DeletionDecisionRow.rows(key: Self.key(source), entry: entries[Self.key(source)] ?? .init())
+        }
+    }
+
+    public func settleDeletionDecision(id: UUID, for source: UploadSourceIdentity) throws {
+        try update(source) { entry in
+            guard entry.deletionDecision?.id == id else { return }
+            entry.deletionDecision = nil
+        }
     }
 
     public func backUpAgain(revision: UploadBackupRevision, for source: UploadSourceIdentity) throws {
@@ -431,6 +476,7 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             entry.keptDeleted = nil
             entry.backUpAgainRevision = nil
             entry.deletionCheckStartedAt = nil
+            entry.deletionDecision = nil
         }
     }
 
@@ -464,6 +510,11 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
             guard next != entries[key] else { return nil }
             let line = try append(Line(key: key, entry: next))
             entries[key] = next
+            if next?.deletionDecision == nil {
+                pendingDecisionKeys.remove(key)
+            } else {
+                pendingDecisionKeys.insert(key)
+            }
             lineCount += 1
             compactionDelta?.append(line)
             // The change is saved in the log. The compaction runs away from the caller; a failed one loses nothing,

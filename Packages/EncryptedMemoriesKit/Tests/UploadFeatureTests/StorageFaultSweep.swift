@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import SQLite3
+import UploadCore
 import XCTest
 
 // Fault-injection sweep for storage-changing operations (#1141).
@@ -600,14 +601,17 @@ func withSQLiteDatabase<Result>(
     return try body(database)
 }
 
-/// A text that holds a JSON object or array, written with sorted keys. `JSONEncoder` writes keys in no fixed order, so
-/// two writes of the same value can differ in bytes; the stores read such a column only by decoding it.
+/// JSON objects and arrays compare by all their fields with sorted object keys. Backup issue records carry the
+/// same JSON behind their versioned Base64 prefix. Unknown fields, array order, values and invalid bytes stay.
 func canonicalJSON(_ text: String) -> String {
-    guard text.first == "{" || text.first == "[",
-        let value = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
+    let issuePrefix = BackupIssueRecord.storagePrefix
+    let isIssue = text.hasPrefix(issuePrefix)
+    guard isIssue || text.first == "{" || text.first == "[" else { return text }
+    let data: Data? = isIssue ? Data(base64Encoded: String(text.dropFirst(issuePrefix.count))) : Data(text.utf8)
+    guard let data, let value = try? JSONSerialization.jsonObject(with: data),
         let sorted = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
     else { return text }
-    return String(decoding: sorted, as: UTF8.self)
+    return isIssue ? issuePrefix + sorted.base64EncodedString() : String(decoding: sorted, as: UTF8.self)
 }
 
 /// Every row of `sql`, each as its columns joined with " | ", each column as "type:value", or as its text alone when
