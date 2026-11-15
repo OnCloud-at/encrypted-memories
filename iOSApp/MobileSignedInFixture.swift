@@ -38,6 +38,8 @@ import os
         private let cacheDirectory: URL
         private var backupFixture: PhotoLibraryBackupController?
         private var albumSyncFixture: AlbumSyncController?
+        /// Holds the offline scenario's network for the life of the fixture.
+        private var offlineNetwork: MobileFixtureOfflineNetwork?
 
         /// `includesVideo` adds one video as the newest item; the UI tests use it, the hosted tests count photos only.
         init(
@@ -200,7 +202,7 @@ import os
             case "pending", "later", "offline":
                 model.applyIsolatedLibraryLoadEventsForTesting([])
                 if scenario == "offline" {
-                    LibraryRuntimeState.shared.update { $0.network = LibraryNetworkState(isReachable: false) }
+                    offlineNetwork = MobileFixtureOfflineNetwork()
                 } else if scenario == "later" {
                     model.installIsolatedInitialLoadForTesting { [self] in
                         do { try await Task.sleep(for: .seconds(20)) } catch { return }
