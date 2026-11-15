@@ -266,6 +266,8 @@ final class ProjectHygieneTests: XCTestCase {
                 "at.oncloud.encryptedmemories.photo-backup.processing",
                 "at.oncloud.encryptedmemories.smart-search.processing",
                 "at.oncloud.encryptedmemories.photo-backup.refresh",
+                // One continued processing task per tap; each submission adds its own suffix (#1108).
+                "at.oncloud.encryptedmemories.photo-backup.continued.*",
             ])
         XCTAssertEqual(
             info["UIBackgroundModes"] as? [String], ["fetch", "processing"], "no keep-alive background mode")

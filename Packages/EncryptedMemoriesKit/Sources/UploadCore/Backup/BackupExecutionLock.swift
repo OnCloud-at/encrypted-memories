@@ -24,6 +24,9 @@ public struct BackupExecutionOwner: RawRepresentable, Sendable, Hashable, Codabl
     public static let iOSBackgroundTask = BackupExecutionOwner(rawValue: "iosBackgroundTask")
     /// iOS/iPadOS `BGAppRefreshTask` window, which only scans the photo library.
     public static let iOSRefreshTask = BackupExecutionOwner(rawValue: "iosRefreshTask")
+    /// iOS/iPadOS `BGContinuedProcessingTask` that a person started with a tap; it carries the backup after the app
+    /// leaves the foreground.
+    public static let iOSContinuedTask = BackupExecutionOwner(rawValue: "iosContinuedTask")
     /// macOS `NSBackgroundActivityScheduler` window.
     public static let macOSBackgroundActivity = BackupExecutionOwner(rawValue: "macosBackgroundActivity")
     /// A generic background window when the platform is not distinguished.

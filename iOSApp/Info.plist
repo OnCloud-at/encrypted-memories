@@ -7,6 +7,7 @@
 		<string>at.oncloud.encryptedmemories.photo-backup.processing</string>
 		<string>at.oncloud.encryptedmemories.smart-search.processing</string>
 		<string>at.oncloud.encryptedmemories.photo-backup.refresh</string>
+		<string>at.oncloud.encryptedmemories.photo-backup.continued.*</string>
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
