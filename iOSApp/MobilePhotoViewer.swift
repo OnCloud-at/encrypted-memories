@@ -1993,7 +1993,7 @@ private struct MobileVideoPage: View {
     @State private var streamingAsset: StreamingVideoAsset?
     /// The classified cause of the failure that the page shows; nil while nothing failed.
     @State private var failure: VideoPlaybackError?
-    /// Changes when the person taps Retry, so the preparation task starts again.
+    /// Changes when the person taps Try again, so the preparation task starts again.
     @State private var retryCount = 0
     @State private var poster: UIImage?
     @State private var pinch = ViewerPinchState()
@@ -2021,16 +2021,7 @@ private struct MobileVideoPage: View {
     var body: some View {
         ZStack {
             if let failure {
-                ContentUnavailableView {
-                    Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(failure.userMessage)
-                } actions: {
-                    if failure.isRetryable {
-                        RetryButton(.prominent) { retryCount += 1 }
-                    }
-                }
-                .foregroundStyle(.white)
+                PlaybackFailedView(failure) { retryCount += 1 }
             } else if let player {
                 MobileNativeVideoPlayer(
                     player: player,
