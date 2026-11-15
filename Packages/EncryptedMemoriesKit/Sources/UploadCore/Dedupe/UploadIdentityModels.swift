@@ -1123,6 +1123,15 @@ public struct UploadRemoteCommitReceipt: Sendable, Equatable, Codable {
         self.remoteVolumeID = remoteVolumeID
         self.remoteLinkID = remoteLinkID
     }
+
+    public init(_ uid: PhotoUID) {
+        self.init(remoteVolumeID: uid.volumeID, remoteLinkID: uid.nodeID)
+    }
+
+    /// The uploaded photo.
+    public var uid: PhotoUID {
+        PhotoUID(volumeID: remoteVolumeID, nodeID: remoteLinkID)
+    }
 }
 
 /// The only two legal exits from an operation passed to `withUploadDecision`: a decision that did

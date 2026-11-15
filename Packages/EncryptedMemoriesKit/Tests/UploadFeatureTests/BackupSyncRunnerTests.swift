@@ -123,6 +123,9 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
     private var preparationProgressIdentifiers: Set<String> = []
     private var capturedPreparationHandlers: [String: BackupResourcePreparationHandler] = [:]
     private var mismatchOnceIdentifiers: Set<String> = []
+    /// Secondaries, as "identifier#name", that export late; the ones in the second set export changed bytes once.
+    private var deferredSecondaries: Set<String> = []
+    private var mismatchOnceSecondaries: Set<String> = []
     private var materializeCounts: [String: Int] = [:]
     private var slowIdentifiers: Set<String> = []
     private var activeResolves: [String: Int] = [:]
@@ -170,6 +173,14 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
         lock.withLock {
             deferredIdentifiers.insert(identifier)
             if mismatchOnce { mismatchOnceIdentifiers.insert(identifier) }
+        }
+    }
+
+    /// Makes the secondary `name` of `identifier` export late, with changed bytes on its first export if asked.
+    func setDeferredSecondary(_ name: String, of identifier: String, mismatchOnce: Bool = false) {
+        lock.withLock {
+            deferredSecondaries.insert("\(identifier)#\(name)")
+            if mismatchOnce { mismatchOnceSecondaries.insert("\(identifier)#\(name)") }
         }
     }
 
@@ -351,20 +362,38 @@ final class ScriptedBackupResolver: BackupResourceResolving, @unchecked Sendable
                 additionalMetadata: additionalMetadata,
                 captureDate: modified,
                 secondaries: secondaries.map { name in
-                    BackupSecondaryResource(
-                        descriptor: UploadResourceDescriptor(
-                            source: UploadSourceIdentity(
-                                kind: entry.source.kind,
-                                identifier: entry.source.identifier,
-                                resource: secondaryResources[name] ?? .livePairedVideo
-                            ),
-                            fileURL: URL(fileURLWithPath: "\(entry.source.identifier)#\(name)"),
-                            filename: name,
-                            fileSize: 2,
-                            modificationDate: modified
+                    let key = "\(entry.source.identifier)#\(name)"
+                    let isDeferredSecondary = lock.withLock { deferredSecondaries.contains(key) }
+                    let descriptor = UploadResourceDescriptor(
+                        source: UploadSourceIdentity(
+                            kind: entry.source.kind,
+                            identifier: entry.source.identifier,
+                            resource: secondaryResources[name] ?? .livePairedVideo
                         ),
+                        fileURL: URL(fileURLWithPath: key),
+                        filename: name,
+                        fileSize: 2,
+                        modificationDate: modified,
+                        precomputedSHA1Digest: isDeferredSecondary ? Self.digest(seed: key) : nil
+                    )
+                    let materialize: (@Sendable () async throws -> UploadResourceDescriptor)? =
+                        isDeferredSecondary
+                        ? { @Sendable [self] in
+                            let mismatch = lock.withLock {
+                                materializeCounts[key, default: 0] += 1
+                                return mismatchOnceSecondaries.remove(key) != nil
+                            }
+                            return UploadResourceDescriptor(
+                                source: descriptor.source, fileURL: URL(fileURLWithPath: key + ".materialized"),
+                                filename: name, fileSize: 2, modificationDate: modified,
+                                precomputedSHA1Digest: mismatch
+                                    ? Data(repeating: 0xFF, count: 20) : Self.digest(seed: key))
+                        } : nil
+                    return BackupSecondaryResource(
+                        descriptor: descriptor,
                         mediaType: "video/quicktime",
-                        additionalMetadata: additionalMetadata
+                        additionalMetadata: additionalMetadata,
+                        materialize: materialize
                     )
                 }
                     + burstMembers.enumerated().map { ordinal, name in
@@ -4459,31 +4488,49 @@ final class BackupSyncRunnerTests: XCTestCase {
     /// A photo with a saved upload receipt whose pending row cannot be read keeps its receipt and is not exported
     /// again (#982).
     func testASavedReceiptOfAPhotoWithAnUnreadableRowStaysWithoutAnExport() async throws {
-        let pendingURL = tempDir.appendingPathComponent("pending-982-receipt.sqlite")
-        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
-        defer { pending.close() }
-        let parked = seedEntry("waiting.jpg", ageSeconds: 300)
-        let receipt = UploadRemoteCommitReconciliation(
-            source: parked.source,
-            identity: UploadIdentity(
-                correctedName: "waiting.jpg", nameHash: "nh", sha1Hex: String(repeating: "0", count: 40),
-                sha1Digest: Data(repeating: 0, count: 20), contentHash: "ch"),
-            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "vol", remoteLinkID: "earlier-upload"))
-        XCTAssertTrue(
-            queueStore.markNeedsRemoteReconciliation(
-                source: parked.source, revision: parked.revision, reconciliation: receipt, lastError: nil,
-                updatedAt: clock.now.addingTimeInterval(-300)))
-        try makePendingRowUnreadable(parked.source, in: pending, at: pendingURL)
-        let recorder = PendingBackupEventRecorder(store: pending)
-
-        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
-        recorder.finish()
+        let (parked, receipt) = try await runSavedReceiptOfAnUnreadableRow("waiting.jpg", shownReason: nil)
 
         XCTAssertEqual(resolver.resolveCount(for: parked.source.identifier), 0, "no export")
         let kept = try XCTUnwrap(queueStore.entry(for: parked.source, revision: parked.revision))
         XCTAssertEqual(kept.remoteCommitReconciliation, receipt, "the receipt stays")
         XCTAssertEqual(kept.attempts, parked.attempts, "waiting spends no attempt")
         XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
+    }
+
+    /// A photo with a saved receipt that waits for its unreadable row keeps the reason it already shows.
+    func testASavedReceiptOfAPhotoWithAnUnreadableRowKeepsItsShownReason() async throws {
+        let shown = BackupIssueRecord(kind: .unknown, detail: "The earlier reason").persistedValue
+        let (parked, receipt) = try await runSavedReceiptOfAnUnreadableRow("waiting-reason.jpg", shownReason: shown)
+
+        let kept = try XCTUnwrap(queueStore.entry(for: parked.source, revision: parked.revision))
+        XCTAssertEqual(kept.remoteCommitReconciliation, receipt, "the receipt stays")
+        XCTAssertEqual(BackupIssueRecord.decode(kept.lastError)?.detail, "The earlier reason")
+    }
+
+    /// Saves an upload receipt for a new photo, makes its pending row unreadable, and runs one eligible pass.
+    private func runSavedReceiptOfAnUnreadableRow(
+        _ name: String, shownReason: String?
+    ) async throws -> (parked: UploadBackupSyncQueueEntry, receipt: UploadRemoteCommitReconciliation) {
+        let pendingURL = tempDir.appendingPathComponent("pending-982-\(name).sqlite")
+        let pending = try XCTUnwrap(PendingBackupManifestStore(url: pendingURL))
+        defer { pending.close() }
+        let parked = seedEntry(name, ageSeconds: 300)
+        let receipt = UploadRemoteCommitReconciliation(
+            source: parked.source,
+            identity: UploadIdentity(
+                correctedName: name, nameHash: "nh", sha1Hex: String(repeating: "0", count: 40),
+                sha1Digest: Data(repeating: 0, count: 20), contentHash: "ch"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "vol", remoteLinkID: "earlier-upload"))
+        XCTAssertTrue(
+            queueStore.markNeedsRemoteReconciliation(
+                source: parked.source, revision: parked.revision, reconciliation: receipt, lastError: shownReason,
+                updatedAt: clock.now.addingTimeInterval(-300)))
+        try makePendingRowUnreadable(parked.source, in: pending, at: pendingURL)
+        let recorder = PendingBackupEventRecorder(store: pending)
+
+        _ = await makeRunner(events: recorder).runUntilDrained(mode: .eligibleOnly)
+        recorder.finish()
+        return (parked, receipt)
     }
 
     /// Excludes and includes the source, then writes a `desired` value that this build cannot read.
@@ -4957,6 +5004,25 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 1, "stale hash identity must never reach the uploader")
         XCTAssertEqual(state(of: entry), .completed)
         XCTAssertEqual(progress.uploaded, 1)
+    }
+
+    /// A Live Photo video whose late export differs from the checked bytes is never uploaded. The photo waits for the
+    /// next pass, like a changed main photo, and the video is exported and checked again.
+    func testDeferredSecondaryChangeIsRehashedBeforeItsUpload() async throws {
+        let entry = seedEntry("changing-live.heic")
+        resolver.setSecondaries(["changing-live.mov"], for: entry.source.identifier)
+        resolver.setDeferredSecondary("changing-live.mov", of: entry.source.identifier, mismatchOnce: true)
+
+        _ = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(
+            resolver.materializeCount(for: "\(entry.source.identifier)#changing-live.mov"), 2,
+            "a changed export must be discarded and exported again")
+        XCTAssertEqual(
+            uploader.requests.filter { $0.name == "changing-live.mov" }.count, 1,
+            "the changed bytes never reach the uploader")
+        // The first pass uploaded the main photo, so the second pass finds it and settles only the video.
+        XCTAssertEqual(state(of: entry), .alreadyBackedUp)
     }
 
     func testTrashIsRespectedAndMissingRemoteStateStaysUnknown() async throws {

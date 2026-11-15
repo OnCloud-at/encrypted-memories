@@ -119,6 +119,14 @@ public struct BackupSecondaryResource: BackupResourceMaterializing {
     }
 }
 
+extension BackupResolvedResource {
+    /// The descriptor of the primary or secondary resource of this source, or nil when the photo has none.
+    func descriptor(of source: UploadSourceIdentity) -> UploadResourceDescriptor? {
+        if descriptor.source == source { return descriptor }
+        return secondaries.first { $0.descriptor.source == source }?.descriptor
+    }
+}
+
 /// A queue entry rematerialized into everything the pipeline and uploader need. The queue stores
 /// only identities and revisions; adapters rebuild the concrete resource when work actually runs
 /// (after a relaunch the original export/URL may be gone, so this is the resume seam).
