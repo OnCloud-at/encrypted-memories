@@ -89,7 +89,7 @@ struct LivePhotoMotionLinks: Sendable {
                 }, rootKey: sharedRootKey, decrypt: decrypt)
             answer = Answer(files: files)
         } catch {
-            if FailureCancellation.isCancellation(error) { throw error }
+            try UploadError.rethrowIfCancelled(error)
             DebugLog.log("timeline: Live Photo video names unread, root key unavailable - \(error)")
             let files = try await RelatedFileRead.files(
                 in: links, decryptingNamesWhere: { _ in false }, rootKey: rootKey, decrypt: decrypt)
@@ -110,7 +110,7 @@ struct LivePhotoMotionLinks: Sendable {
             do {
                 answer.playback[id] = try decryptPlayback(link, try await sharedRootKey())
             } catch {
-                if FailureCancellation.isCancellation(error) { throw error }
+                try UploadError.rethrowIfCancelled(error)
             }
         }
         return answer
@@ -246,7 +246,7 @@ struct LivePhotoMotionLinks: Sendable {
                     if let known = answer.playback[linkID] { read.playback[linkID] = known }
                 }
             } catch {
-                if FailureCancellation.isCancellation(error) { throw error }
+                try UploadError.rethrowIfCancelled(error)
                 DebugLog.log("timeline: type or name of \(unread.count) Live Photo related files unread - \(error)")
             }
         }
