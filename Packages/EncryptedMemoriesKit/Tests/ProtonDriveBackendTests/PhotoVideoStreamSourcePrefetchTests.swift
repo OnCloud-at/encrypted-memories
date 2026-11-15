@@ -67,7 +67,7 @@ struct PhotoVideoStreamSourcePrefetchTests {
 
     @Test func aPrefetchWhoseBlockDownloadFailsLeavesNothingToReuse() async throws {
         let clip = PhotoUID(volumeID: "volume", nodeID: "block-\(UUID().uuidString)")
-        let fixture = try makeFixture(blockCount: 1, protocols: [FailingBlockProtocol.self])
+        let fixture = try makeFixture(blockCount: 1, protocols: [ScopeDenyHTTP.self])
 
         await #expect(throws: (any Error).self) { try await fixture.source.prefetchEncrypted(uid: clip) }
         _ = try await fixture.source.prepare(uid: clip)
@@ -153,16 +153,6 @@ struct PhotoVideoStreamSourcePrefetchTests {
                 uid: uid, totalSize: 16 * blockCount, contentTypeUTI: "com.apple.quicktime-movie", blocks: blocks,
                 sessionKey: sessionKey)
         }
-    }
-
-    /// Every request fails as if the device were offline.
-    private final class FailingBlockProtocol: URLProtocol {
-        override class func canInit(with request: URLRequest) -> Bool { true }
-        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-        override func startLoading() {
-            client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
-        }
-        override func stopLoading() {}
     }
 
     private final class TestInstantClock: @unchecked Sendable {

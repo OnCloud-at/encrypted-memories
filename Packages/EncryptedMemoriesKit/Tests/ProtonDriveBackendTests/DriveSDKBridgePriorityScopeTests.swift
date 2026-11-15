@@ -68,6 +68,26 @@ struct DriveSDKBridgePriorityScopeTests {
         }
     }
 
+    @Test func offlineProtocolIsLimitedToItsOwnSession() async throws {
+        let offlineConfiguration = URLSessionConfiguration.ephemeral
+        offlineConfiguration.protocolClasses = [ScopeDenyHTTP.self]
+        let offline = URLSession(configuration: offlineConfiguration)
+        let independent = URLSession(configuration: .ephemeral)
+        defer {
+            offline.invalidateAndCancel()
+            independent.invalidateAndCancel()
+        }
+        let url = try #require(URL(string: "data:text/plain,independent"))
+        do {
+            _ = try await offline.data(from: url)
+            Issue.record("The offline session unexpectedly succeeded")
+        } catch let error as URLError {
+            #expect(error.code == .notConnectedToInternet)
+        }
+        let (data, _) = try await independent.data(from: url)
+        #expect(String(data: data, encoding: .utf8) == "independent")
+    }
+
     /// A bridge whose every request fails as if the device were offline. Other bridge suites reuse it.
     static func makeBridge(directory: URL, governor: ProtonRequestGovernor) async throws -> DriveSDKBridge {
         let session = DriveSession(
