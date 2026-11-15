@@ -250,6 +250,38 @@ import Testing
         #expect(provider.writeCount == 0)
         #expect(!FileManager.default.fileExists(atPath: destination.path))
     }
+
+    /// The archive export reports byte-weighted progress and reads each original's metadata once.
+    @Test func theArchiveExportWeighsItsProgressByTheSizeOfEachOriginal() async throws {
+        let restoreLocation = keepLocationForThisTest()
+        defer { restoreLocation() }
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let small = item("small")
+        let large = item("large", mediaType: "video/mp4")
+        let jpeg = Self.jpegHeader
+        let provider = SizeGatedProvider(
+            FakeOriginalProvider(
+                payloads: [small.uid: jpeg, large.uid: jpeg],
+                metadata: [
+                    small.uid: PhotoMetadata(filename: "small.jpg", fileSize: 1_000),
+                    large.uid: PhotoMetadata(filename: "large.mp4", fileSize: 9_000),
+                ]),
+            recordedSizes: 2)
+        let reported = RecordLog<Double>()
+
+        try await OriginalExportWriter.writeArchive(
+            items: [small, large], to: directory.appendingPathComponent("Export.zip"), provider: provider,
+            freeBytes: { _ in Int64.max / 4 }, onMetadataRead: { _ in provider.sizeRecorded() },
+            onProgress: { reported.record($0) })
+
+        let values = reported.values
+        #expect(provider.metadataReads == 2, "each original's metadata is read once")
+        #expect(values.contains { abs($0 - 0.0425) < 1e-9 }, "half of the small download: \(values)")
+        #expect(values.contains { abs($0 - 0.1) < 1e-9 }, "the small original in the archive: \(values)")
+        #expect(values.last == 1)
+        #expect(zip(values, values.dropFirst()).allSatisfy { $0 <= $1 }, "the progress went back: \(values)")
+    }
 }
 
 private final class RecordLog<Value: Sendable>: @unchecked Sendable {
@@ -258,4 +290,53 @@ private final class RecordLog<Value: Sendable>: @unchecked Sendable {
 
     func record(_ value: Value) { lock.withLock { recorded.append(value) } }
     var values: [Value] { lock.withLock { recorded } }
+}
+
+/// Holds every download until the progress has recorded the given number of sizes, then reports half of the download
+/// before the rest. It counts the metadata reads.
+private final class SizeGatedProvider: OriginalFileProvider, PhotoMetadataProvider, @unchecked Sendable {
+    private let base: FakeOriginalProvider
+    private let expected: Int
+    private let lock = NSLock()
+    private var reads = 0
+    private var recorded = 0
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    init(_ base: FakeOriginalProvider, recordedSizes: Int) {
+        self.base = base
+        expected = recordedSizes
+    }
+
+    var metadataReads: Int { lock.withLock { reads } }
+
+    /// Called when the progress has recorded one more size.
+    func sizeRecorded() {
+        let ready = lock.withLock {
+            recorded += 1
+            guard recorded >= expected else { return [CheckedContinuation<Void, Never>]() }
+            defer { waiting = [] }
+            return waiting
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+        lock.withLock { reads += 1 }
+        return try await base.metadata(for: uid)
+    }
+
+    func writeOriginal(
+        for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        await withCheckedContinuation { continuation in
+            let ready = lock.withLock {
+                if recorded >= expected { return true }
+                waiting.append(continuation)
+                return false
+            }
+            if ready { continuation.resume() }
+        }
+        onProgress(0.5)
+        try await base.writeOriginal(for: uid, to: destination, onProgress: onProgress)
+    }
 }

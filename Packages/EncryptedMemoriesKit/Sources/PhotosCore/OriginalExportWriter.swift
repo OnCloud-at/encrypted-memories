@@ -73,7 +73,8 @@ public enum OriginalExportWriter {
     /// Streams several originals into one staged ZIP archive, one download at a time, then installs the archive.
     ///
     /// Each original is downloaded to a bounded sidecar file beside the staged archive, streamed once into the
-    /// archive, and erased. The write stops with ``Failure/lowDisk`` before the volume runs out of space.
+    /// archive, and erased. The write stops with ``Failure/lowDisk`` before the volume runs out of space. The progress
+    /// is weighted by the byte size of each original; the metadata of later originals is read ahead for their sizes.
     public static func writeArchive(
         items: [PhotoItem],
         to destination: URL,
@@ -81,7 +82,20 @@ public enum OriginalExportWriter {
         freeBytes: (URL) -> Int64? = DeviceStorage.availableCapacity(at:),
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        let total = Double(items.count)
+        try await writeArchive(
+            items: items, to: destination, provider: provider, freeBytes: freeBytes, onMetadataRead: { _ in },
+            onProgress: onProgress)
+    }
+
+    /// `onMetadataRead` learns the index of each original whose size the progress has recorded.
+    static func writeArchive(
+        items: [PhotoItem],
+        to destination: URL,
+        provider: any OriginalFileProvider & PhotoMetadataProvider,
+        freeBytes: (URL) -> Int64?,
+        onMetadataRead: @escaping @Sendable (Int) -> Void,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
         let stagingDirectory = try stagingDirectory(for: destination)
         defer { try? FileManager.default.removeItem(at: stagingDirectory) }
         let stagedArchive = stagingDirectory.appendingPathComponent(destination.lastPathComponent, isDirectory: false)
@@ -92,9 +106,16 @@ public enum OriginalExportWriter {
         // A Live Photo motion takes the entry name that its still received in this archive.
         let stillOfMotion = OutboundMedia.stillsByMotion(in: items)
         var entryNames: [PhotoUID: String] = [:]
+        let progress = ExportByteProgress(itemCount: items.count)
+        let prefetch = ExportMetadataPrefetch()
+        // Leaving the loop early cancels the read-ahead and waits for it.
+        async let readAhead: Void = prefetch.read(items, from: provider) { index, metadata in
+            progress.record(size: metadata?.fileSize, at: index)
+            onMetadataRead(index)
+        }
         for (index, item) in items.enumerated() {
             try Task.checkCancellation()
-            let metadata = try? await provider.metadata(for: item.uid)
+            let metadata = await prefetch.metadata(at: index)
             if let rawSize = metadata?.fileSize, rawSize > 0, rawSize <= Int(Int64.max / 2),
                 let free = freeBytes(stagingDirectory), free < Int64(rawSize) * 2 + archiveSafetyMargin
             {
@@ -106,7 +127,9 @@ public enum OriginalExportWriter {
             try await provider.writeOriginal(
                 for: item.uid,
                 to: sidecar,
-                onProgress: { progress in onProgress((Double(index) + progress * 0.85) / total) }
+                onProgress: { fraction in
+                    onProgress(progress.fraction(completedItems: index, currentItemProgress: fraction))
+                }
             )
             try Task.checkCancellation()
             let size = Int64(try sidecar.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
@@ -140,8 +163,9 @@ public enum OriginalExportWriter {
             let entryName = used.unique(archiveName)
             entryNames[item.uid] = entryName
             try writer.addFile(name: entryName, fileURL: archiveSource)
-            onProgress(Double(index + 1) / total)
+            onProgress(progress.fraction(completedItems: index + 1, currentItemProgress: 0))
         }
+        await readAhead
         try writer.finish()
         try installCompletedFile(stagedArchive, at: destination)
         success = true
