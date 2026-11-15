@@ -22,7 +22,6 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
 
     private var db: OpaquePointer?
     private let lock = NSLock()
-    private let transient = SQLiteStoreSchemaGate.transientDestructor
     private let cipher: any MLVectorCipher
 
     public init?(url: URL, policy: LibraryDatabasePolicy = .conservative, cipher: any MLVectorCipher) {
@@ -99,12 +98,15 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 }
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
-                bindText(stmt, 1, record.uid.volumeID)
-                bindText(stmt, 2, record.uid.nodeID)
-                bindText(stmt, 3, record.descriptor.identifier)
+                // A failed bind leaves its parameter NULL, and OR IGNORE would skip that row as already indexed (#1194).
+                guard bindUID(stmt, 1, record.uid), bindText(stmt, 3, record.descriptor.identifier),
+                    bindText(stmt, 6, Self.precision.rawValue)
+                else {
+                    failed += 1
+                    continue
+                }
                 sqlite3_bind_int64(stmt, 4, Int64(record.descriptor.version))
                 sqlite3_bind_int64(stmt, 5, Int64(record.descriptor.embeddingDimension))
-                bindText(stmt, 6, Self.precision.rawValue)
                 let plaintext = MLFloat16Codec.encodeLittleEndian(record.vector)
                 let ciphertext: Data
                 do {
@@ -116,8 +118,9 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                     failed += 1
                     continue
                 }
-                _ = ciphertext.withUnsafeBytes { buffer in
-                    sqlite3_bind_blob(stmt, 7, buffer.baseAddress, Int32(buffer.count), transient)
+                guard SQLiteBinding.blob(stmt, 7, ciphertext) == SQLITE_OK else {
+                    failed += 1
+                    continue
                 }
                 if let captureTime = record.captureTime {
                     sqlite3_bind_double(stmt, 8, captureTime.timeIntervalSince1970)
@@ -136,11 +139,11 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                     }
                     sqlite3_reset(clearFailureStmt)
                     sqlite3_clear_bindings(clearFailureStmt)
-                    bindText(clearFailureStmt, 1, record.descriptor.identifier)
                     sqlite3_bind_int64(clearFailureStmt, 2, Int64(record.descriptor.version))
-                    bindText(clearFailureStmt, 3, record.uid.volumeID)
-                    bindText(clearFailureStmt, 4, record.uid.nodeID)
-                    guard sqlite3_step(clearFailureStmt) == SQLITE_DONE else {
+                    guard bindText(clearFailureStmt, 1, record.descriptor.identifier),
+                        bindUID(clearFailureStmt, 3, record.uid),
+                        sqlite3_step(clearFailureStmt) == SQLITE_DONE
+                    else {
                         transactionFailed = true
                         break
                     }
@@ -207,15 +210,13 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 sqlite3_finalize(failures)
             }
 
-            bindDescriptor(embeddings, descriptor)
-            guard sqlite3_step(embeddings) == SQLITE_DONE else {
+            guard bindDescriptor(embeddings, descriptor), sqlite3_step(embeddings) == SQLITE_DONE else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return false
             }
             let removedEmbeddings = sqlite3_changes(db)
 
-            bindDescriptor(failures, descriptor)
-            guard sqlite3_step(failures) == SQLITE_DONE,
+            guard bindDescriptor(failures, descriptor), sqlite3_step(failures) == SQLITE_DONE,
                 removedEmbeddings == 0 || bumpGenerationLocked(for: descriptor),
                 sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
             else {
@@ -258,12 +259,8 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 defer {
                     if let stmt { sqlite3_finalize(stmt) }
                 }
-                bindEpochRead(stmt, descriptor)
-                var index: Int32 = 5
-                for uid in chunk {
-                    bindText(stmt, index, uid.volumeID)
-                    bindText(stmt, index + 1, uid.nodeID)
-                    index += 2
+                guard bindEpochRead(stmt, descriptor), bindUIDs(stmt, from: 5, chunk) else {
+                    throw MLIndexStoreReadError.storageUnavailable
                 }
                 var done = false
                 while !done {
@@ -317,8 +314,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 ) == SQLITE_OK
             else { return 0 }
             defer { sqlite3_finalize(stmt) }
-            bindDescriptor(stmt, descriptor)
-            guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+            guard bindDescriptor(stmt, descriptor), sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
             return UInt64(max(0, sqlite3_column_int64(stmt, 0)))
         }
     }
@@ -359,19 +355,16 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
             for record in records {
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
-                bindText(stmt, 1, record.uid.volumeID)
-                bindText(stmt, 2, record.uid.nodeID)
-                bindText(stmt, 3, record.descriptor.identifier)
                 sqlite3_bind_int64(stmt, 4, Int64(record.descriptor.version))
-                bindText(stmt, 5, record.kind.rawValue)
-                if let reason = record.reason { bindText(stmt, 6, reason) } else { sqlite3_bind_null(stmt, 6) }
                 sqlite3_bind_int64(stmt, 7, Int64(record.attempts))
                 sqlite3_bind_double(stmt, 8, record.updatedAt.timeIntervalSince1970)
-                bindText(stmt, 9, record.descriptor.identifier)
                 sqlite3_bind_int64(stmt, 10, Int64(record.descriptor.version))
-                bindText(stmt, 11, record.uid.volumeID)
-                bindText(stmt, 12, record.uid.nodeID)
-                guard sqlite3_step(stmt) == SQLITE_DONE else {
+                // A failed bind leaves its parameter NULL; the write must not run (#1194).
+                guard bindUID(stmt, 1, record.uid), bindText(stmt, 3, record.descriptor.identifier),
+                    bindText(stmt, 5, record.kind.rawValue), bindText(stmt, 6, record.reason),
+                    bindText(stmt, 9, record.descriptor.identifier), bindUID(stmt, 11, record.uid),
+                    sqlite3_step(stmt) == SQLITE_DONE
+                else {
                     sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                     return false
                 }
@@ -410,12 +403,8 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 defer {
                     if let stmt { sqlite3_finalize(stmt) }
                 }
-                bindDescriptor(stmt, descriptor)
-                var index: Int32 = 3
-                for uid in chunk {
-                    bindText(stmt, index, uid.volumeID)
-                    bindText(stmt, index + 1, uid.nodeID)
-                    index += 2
+                guard bindDescriptor(stmt, descriptor), bindUIDs(stmt, from: 3, chunk) else {
+                    throw MLIndexStoreReadError.storageUnavailable
                 }
                 var done = false
                 while !done {
@@ -486,11 +475,10 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                     throw MLIndexStoreReadError.storageUnavailable
                 }
                 defer { sqlite3_finalize(stmt) }
-                bindEpochRead(stmt, descriptor)
+                guard bindEpochRead(stmt, descriptor) else { throw MLIndexStoreReadError.storageUnavailable }
                 var limitIndex: Int32 = 5
                 if let lastUID {
-                    bindText(stmt, 5, lastUID.volumeID)
-                    bindText(stmt, 6, lastUID.nodeID)
+                    guard bindUID(stmt, 5, lastUID) else { throw MLIndexStoreReadError.storageUnavailable }
                     limitIndex = 7
                 }
                 sqlite3_bind_int64(stmt, limitIndex, Int64(maximumRows))
@@ -641,8 +629,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
             ) == SQLITE_OK
         else { return nil }
         defer { sqlite3_finalize(stmt) }
-        bindEpochRead(stmt, descriptor)
-        bindText(stmt, 5, descriptor.identifier)
+        guard bindEpochRead(stmt, descriptor), bindText(stmt, 5, descriptor.identifier) else { return nil }
         sqlite3_bind_int64(stmt, 6, Int64(descriptor.version))
 
         var uids: [PhotoUID] = []
@@ -716,12 +703,9 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                 ) == SQLITE_OK
             else { return nil }
 
-            bindDescriptor(stmt, descriptor)
-            var index: Int32 = 3
-            for uid in chunk {
-                bindText(stmt, index, uid.volumeID)
-                bindText(stmt, index + 1, uid.nodeID)
-                index += 2
+            guard bindDescriptor(stmt, descriptor), bindUIDs(stmt, from: 3, chunk) else {
+                sqlite3_finalize(stmt)
+                return nil
             }
             let result = sqlite3_step(stmt)
             if result == SQLITE_DONE {
@@ -747,8 +731,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
             ) == SQLITE_OK
         else { return 0 }
         defer { sqlite3_finalize(stmt) }
-        bindEpochRead(stmt, descriptor)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard bindEpochRead(stmt, descriptor), sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
@@ -773,10 +756,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
         for uid in uids {
             sqlite3_reset(stmt)
             sqlite3_clear_bindings(stmt)
-            bindDescriptor(stmt, descriptor)
-            bindText(stmt, 3, uid.volumeID)
-            bindText(stmt, 4, uid.nodeID)
-            guard sqlite3_step(stmt) == SQLITE_DONE else {
+            guard bindDescriptor(stmt, descriptor), bindUID(stmt, 3, uid), sqlite3_step(stmt) == SQLITE_DONE else {
                 sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
                 return
             }
@@ -805,23 +785,35 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
             ) == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        bindDescriptor(stmt, descriptor)
-        return sqlite3_step(stmt) == SQLITE_DONE
+        return bindDescriptor(stmt, descriptor) && sqlite3_step(stmt) == SQLITE_DONE
     }
 
-    private func bindDescriptor(_ stmt: OpaquePointer?, _ descriptor: MLModelDescriptor) {
-        bindText(stmt, 1, descriptor.identifier)
+    // Each bind helper returns false when a bind fails. A failed bind leaves its parameter NULL, so the caller must not
+    // step the statement and gives the answer of a failed statement (#1194).
+
+    private func bindDescriptor(_ stmt: OpaquePointer?, _ descriptor: MLModelDescriptor) -> Bool {
         sqlite3_bind_int64(stmt, 2, Int64(descriptor.version))
+        return bindText(stmt, 1, descriptor.identifier)
     }
 
-    private func bindEpochRead(_ stmt: OpaquePointer?, _ descriptor: MLModelDescriptor) {
-        bindDescriptor(stmt, descriptor)
+    private func bindEpochRead(_ stmt: OpaquePointer?, _ descriptor: MLModelDescriptor) -> Bool {
         sqlite3_bind_int64(stmt, 3, Int64(descriptor.embeddingDimension))
-        bindText(stmt, 4, Self.precision.rawValue)
+        return bindDescriptor(stmt, descriptor) && bindText(stmt, 4, Self.precision.rawValue)
     }
 
-    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) {
-        sqlite3_bind_text(stmt, index, value, -1, transient)
+    /// Binds the volume and node of `uid` to parameters `index` and `index + 1`.
+    private func bindUID(_ stmt: OpaquePointer?, _ index: Int32, _ uid: PhotoUID) -> Bool {
+        bindText(stmt, index, uid.volumeID) && bindText(stmt, index + 1, uid.nodeID)
+    }
+
+    /// Binds `uids` to consecutive parameter pairs from `index` on.
+    private func bindUIDs(_ stmt: OpaquePointer?, from index: Int32, _ uids: ArraySlice<PhotoUID>) -> Bool {
+        uids.enumerated().allSatisfy { offset, uid in bindUID(stmt, index + Int32(offset) * 2, uid) }
+    }
+
+    /// Binds TEXT, or SQL NULL for nil.
+    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) -> Bool {
+        SQLiteBinding.text(stmt, index, value) == SQLITE_OK
     }
 
     private func columnText(_ stmt: OpaquePointer?, _ index: Int32) -> String {

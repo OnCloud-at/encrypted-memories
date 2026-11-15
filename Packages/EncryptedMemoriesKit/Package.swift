@@ -352,7 +352,7 @@ let package = Package(
             name: "PrivacyFeatureTests", dependencies: ["PrivacyFeature"], swiftSettings: disableDynamicActorIsolation),
         .target(name: "MLSearchCore", dependencies: ["PhotosCore"], swiftSettings: disableDynamicActorIsolation),
         .testTarget(
-            name: "MLSearchCoreTests", dependencies: ["MLSearchCore", "PhotosCore"],
+            name: "MLSearchCoreTests", dependencies: ["MLSearchCore", "PhotosCore", "SQLiteTestSupport"],
             swiftSettings: disableDynamicActorIsolation),
         .target(
             name: "MLSearchAppleAdapter", dependencies: ["MLSearchCore", "MediaFeedCore", "PhotosCore"],
