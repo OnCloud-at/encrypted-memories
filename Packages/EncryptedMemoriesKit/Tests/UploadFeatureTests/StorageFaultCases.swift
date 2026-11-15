@@ -14,6 +14,10 @@ let storageFaultCases: [any StorageFaultCase] = [
     EditReplacementJournalUpdateCase(id: "journal.editReplacement.update", seededChanges: 2),
     EditReplacementJournalUpdateCase(id: "journal.editReplacement.compact", seededChanges: 1_000),
     EditReplacementJournalCreateCase(),
+    PhotoJournalCase(id: "journal.revert.save", journal: .revert, step: .save),
+    PhotoJournalCase(id: "journal.revert.remove", journal: .revert, step: .remove),
+    PhotoJournalCase(id: "journal.series.save", journal: .series, step: .save),
+    PhotoJournalCase(id: "journal.series.remove", journal: .series, step: .remove),
 ]
 
 /// The photo library before the operation (`seed`) and when it runs: asset-2 is edited, asset-3 is deleted, asset-4
@@ -283,5 +287,98 @@ struct EditReplacementJournalCreateCase: StorageFaultCase {
         state.tables["journal"] = [canonicalJSON(String(decoding: try JSONEncoder().encode(entry), as: UTF8.self))]
         state.records["superseded link"] = Set(entry.superseded.map(\.nodeID))
         return state
+    }
+}
+
+/// One write of a per-photo journal through the file-system seam (#1149): `save` replaces the file of a photo whose
+/// revert or series dissolution moves on, `remove` deletes the file of a finished one. Two photos have a journal before
+/// the run. The state is every file of the journal directory with its content, compared by JSON content.
+struct PhotoJournalCase: StorageFaultCase {
+    enum Journal: Sendable {
+        case revert
+        case series
+    }
+
+    enum Step: Sendable {
+        case save
+        case remove
+    }
+
+    struct World {
+        let directory: URL
+        let files: StorageFaultFiles
+    }
+
+    let id: String
+    let journal: Journal
+    let step: Step
+    let atomicity = StorageFaultAtomicity.allOrNothing
+    private static let photos = ["first", "second"].map { PhotoUID(volumeID: "volume", nodeID: $0) }
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        for photo in Self.photos {
+            try save(photo, advanced: false, in: directory, fileSystem: LocalDurableFileSystem())
+        }
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        World(directory: directory, files: StorageFaultFiles())
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.files] }
+
+    func run(_ world: World) async -> Bool {
+        do {
+            switch step {
+            case .save: try save(Self.photos[0], advanced: true, in: world.directory, fileSystem: world.files)
+            case .remove: try remove(Self.photos[0], in: world.directory, fileSystem: world.files)
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func close(_ world: World) {}
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let folder = directory.appendingPathComponent(
+            journal == .revert
+                ? EditedOriginalRevertJournalFileStore.directoryName : SeriesDissolutionJournalFileStore.directoryName)
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        var state = StorageFaultState()
+        state.tables["journal files"] = try names.sorted().map { name in
+            let text = String(decoding: try Data(contentsOf: folder.appendingPathComponent(name)), as: UTF8.self)
+            return "\(name): \(canonicalJSON(text))"
+        }
+        state.records["journal file"] = Set(names)
+        return state
+    }
+
+    private func save(
+        _ photo: PhotoUID, advanced: Bool, in directory: URL, fileSystem: any DurableFileSystem
+    ) throws {
+        switch journal {
+        case .revert:
+            try EditedOriginalRevertJournalFileStore(accountDataDirectory: directory, fileSystem: fileSystem).save(
+                EditedOriginalRevertJournal(
+                    editedMainUID: photo, originalLinkID: "original", phase: advanced ? .trashingEdit : .copying))
+        case .series:
+            try SeriesDissolutionJournalFileStore(accountDataDirectory: directory, fileSystem: fileSystem).save(
+                SeriesDissolutionJournal(
+                    seriesMainUID: photo, seriesUIDs: [photo], favorites: [],
+                    phase: advanced ? .trashingSeries : .copyingFavorites))
+        }
+    }
+
+    private func remove(_ photo: PhotoUID, in directory: URL, fileSystem: any DurableFileSystem) throws {
+        switch journal {
+        case .revert:
+            try EditedOriginalRevertJournalFileStore(accountDataDirectory: directory, fileSystem: fileSystem).remove(
+                forEditedMain: photo)
+        case .series:
+            try SeriesDissolutionJournalFileStore(accountDataDirectory: directory, fileSystem: fileSystem).remove(
+                forSeries: photo)
+        }
     }
 }

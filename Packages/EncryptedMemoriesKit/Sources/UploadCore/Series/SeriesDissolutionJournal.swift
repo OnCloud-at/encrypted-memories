@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import PhotosCore
 
@@ -86,40 +85,28 @@ public protocol SeriesDissolutionJournalStore: Sendable {
 public struct SeriesDissolutionJournalFileStore: SeriesDissolutionJournalStore {
     public static let directoryName = "series-dissolution"
 
-    private let directory: URL
+    private let files: PhotoJournalDirectory
 
-    public init(accountDataDirectory: URL) {
-        directory = accountDataDirectory.appendingPathComponent(Self.directoryName, isDirectory: true)
+    public init(accountDataDirectory: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem()) {
+        files = PhotoJournalDirectory(
+            accountDataDirectory: accountDataDirectory, name: Self.directoryName, fileSystem: fileSystem)
     }
 
     public func journal(forSeries mainUID: PhotoUID) throws -> SeriesDissolutionJournal? {
-        let url = fileURL(for: mainUID)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try JSONDecoder().decode(SeriesDissolutionJournal.self, from: Data(contentsOf: url))
+        guard let data = try files.data(for: mainUID) else { return nil }
+        return try JSONDecoder().decode(SeriesDissolutionJournal.self, from: data)
     }
 
     public func save(_ journal: SeriesDissolutionJournal) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try JSONEncoder().encode(journal).write(to: fileURL(for: journal.seriesMainUID), options: .atomic)
+        try files.save(JSONEncoder().encode(journal), for: journal.seriesMainUID)
     }
 
     public func remove(forSeries mainUID: PhotoUID) throws {
-        let url = fileURL(for: mainUID)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try FileManager.default.removeItem(at: url)
+        try files.remove(for: mainUID)
     }
 
+    /// A file that cannot be read or decoded throws.
     public func pendingJournals() throws -> [SeriesDissolutionJournal] {
-        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
-        return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "json" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            .map { try JSONDecoder().decode(SeriesDissolutionJournal.self, from: Data(contentsOf: $0)) }
-    }
-
-    private func fileURL(for mainUID: PhotoUID) -> URL {
-        let digest = SHA256.hash(data: Data("\(mainUID.volumeID)/\(mainUID.nodeID)".utf8))
-        let name = digest.map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent("\(name).json")
+        try files.allData().map { try JSONDecoder().decode(SeriesDissolutionJournal.self, from: $0) }
     }
 }

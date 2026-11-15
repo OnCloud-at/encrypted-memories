@@ -1,14 +1,16 @@
 import Foundation
 
-/// The file writes under a durable file: an atomic replacement and appends to an open file. Production writes to the
-/// local disk (`LocalDurableFileSystem`). A journal keeps its records through this seam, so every write it makes can
-/// be replaced, for example to make one of them fail.
+/// The file writes under a durable file: an atomic replacement, a removal and appends to an open file. Production
+/// writes to the local disk (`LocalDurableFileSystem`). A journal keeps its records through this seam, so every write
+/// it makes can be replaced, for example to make one of them fail.
 public protocol DurableFileSystem: Sendable {
     /// Replaces the file at `url` with `data` in one atomic step: a process that ends during the replacement leaves
     /// either the earlier bytes or `data`. No sync to disk is made, so a power loss can still lose a recent write.
     func replace(_ url: URL, with data: Data) throws
     /// Opens the existing file at `url` for writes at its end.
     func openForAppending(_ url: URL) throws -> any DurableFileAppending
+    /// Removes the file at `url`. A file that does not exist throws, as `FileManager.removeItem` does.
+    func remove(_ url: URL) throws
 }
 
 /// An open file that a durable writer appends to.
@@ -22,7 +24,8 @@ public protocol DurableFileAppending: AnyObject {
     func close() throws
 }
 
-/// The local disk: `Data.write(to:options: .atomic)` for a replacement and a `FileHandle` for appends.
+/// The local disk: `Data.write(to:options: .atomic)` for a replacement, `FileManager.removeItem` for a removal and a
+/// `FileHandle` for appends.
 public struct LocalDurableFileSystem: DurableFileSystem {
     public init() {}
 
@@ -32,6 +35,10 @@ public struct LocalDurableFileSystem: DurableFileSystem {
 
     public func openForAppending(_ url: URL) throws -> any DurableFileAppending {
         LocalFileAppender(handle: try FileHandle(forWritingTo: url))
+    }
+
+    public func remove(_ url: URL) throws {
+        try FileManager.default.removeItem(at: url)
     }
 }
 
