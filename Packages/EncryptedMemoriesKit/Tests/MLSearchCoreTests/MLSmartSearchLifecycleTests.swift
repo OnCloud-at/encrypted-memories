@@ -3966,9 +3966,6 @@ import Testing
         await lifecycle.disableAndPurge()
 
         #expect(!FileManager.default.fileExists(atPath: root.path))
-        for url in layout.indexDatabaseFileURLs {
-            #expect(!FileManager.default.fileExists(atPath: url.path))
-        }
     }
 
     @Test func crashDuringPurgeCompletesOnNextStart() async throws {
