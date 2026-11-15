@@ -262,7 +262,10 @@ enum FixtureWorkloads {
         let runtime = MLNativeSearchRuntime(
             configuration: configuration, store: store, executor: executor, runnerConfiguration: .init(chunkSize: 2))
         let revisions = try assets.map { try MLPipelineAssetRevision(uid: $0, sourceRevision: "r1") }
-        let result = await runtime.index(assets: revisions, shouldContinue: { true })
+        let result = await runtime.indexQuantum(
+            assets: revisions, libraryGeneration: 1, allowsDestructiveReconciliation: true,
+            destructiveReconciliationIsAuthorized: { true }, maximumAssets: .max, maximumConcurrentAssets: 1,
+            shouldContinue: { true }, observer: MLDerivedPipelineObserver())
         try fixtureRequire(result.reason == .drained, "Native indexing did not resume")
         let found = await runtime.search("synthetic", scope: .text, limit: 20)
         try fixtureRequire(Set(found) == Set(assets), "Native index lost searchable assets")

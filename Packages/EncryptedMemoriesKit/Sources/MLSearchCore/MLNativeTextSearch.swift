@@ -253,20 +253,6 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
         runnerConfiguration.maximumConcurrentDerivedAssets
     }
 
-    public func index(
-        assets: [MLPipelineAssetRevision],
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver = MLDerivedPipelineObserver()
-    ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            libraryGeneration: nil,
-            maximumAssets: nil,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
     public func indexQuantum(
         assets: [MLPipelineAssetRevision],
         libraryGeneration: UInt64,
@@ -277,29 +263,7 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
         shouldContinue: @escaping @Sendable () -> Bool,
         observer: MLDerivedPipelineObserver
     ) async -> MLDerivedPipelinePassOutcome {
-        await index(
-            assets: assets,
-            libraryGeneration: libraryGeneration,
-            allowsDestructiveReconciliation: allowsDestructiveReconciliation,
-            destructiveReconciliationIsAuthorized: destructiveReconciliationIsAuthorized,
-            maximumAssets: maximumAssets,
-            maximumConcurrentAssets: maximumConcurrentAssets,
-            shouldContinue: shouldContinue,
-            observer: observer
-        )
-    }
-
-    private func index(
-        assets: [MLPipelineAssetRevision],
-        libraryGeneration: UInt64?,
-        allowsDestructiveReconciliation: Bool = true,
-        destructiveReconciliationIsAuthorized: @escaping @Sendable () async -> Bool = { true },
-        maximumAssets: Int?,
-        maximumConcurrentAssets: Int? = nil,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        observer: MLDerivedPipelineObserver
-    ) async -> MLDerivedPipelinePassOutcome {
-        if libraryGeneration == nil || preparedLibraryGeneration != libraryGeneration {
+        if preparedLibraryGeneration != libraryGeneration {
             guard store.enqueue(assets, for: configuration.executionKey) else {
                 return MLDerivedPipelinePassOutcome(
                     reason: .storageFailure,
@@ -309,12 +273,10 @@ public actor MLNativeSearchRuntime: MLNativeSearchServing {
             preparedLibraryGeneration = libraryGeneration
         }
         var passConfiguration = runnerConfiguration
-        if let maximumConcurrentAssets {
-            passConfiguration.maximumConcurrentDerivedAssets = min(
-                runnerConfiguration.maximumConcurrentDerivedAssets,
-                max(1, maximumConcurrentAssets)
-            )
-        }
+        passConfiguration.maximumConcurrentDerivedAssets = min(
+            runnerConfiguration.maximumConcurrentDerivedAssets,
+            max(1, maximumConcurrentAssets)
+        )
         let outcome = await MLIndexRunner.runDerivedPass(
             key: configuration.executionKey,
             store: store,

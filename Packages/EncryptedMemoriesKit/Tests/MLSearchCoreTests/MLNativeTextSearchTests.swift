@@ -154,7 +154,7 @@ import Testing
             uid: PhotoUID(volumeID: "volume", nodeID: "photo"),
             sourceRevision: "photo"
         )
-        let outcome = await runtime.index(assets: [asset], shouldContinue: { true })
+        let outcome = await indexAll(runtime, [asset], generation: 1)
         #expect(outcome.reason == .drained)
         #expect(await runtime.search("Grüße", scope: .text, limit: 10) == [asset.uid])
         #expect(await runtime.search("qr-42", scope: .barcodes, limit: 10) == [asset.uid])
@@ -177,7 +177,7 @@ import Testing
         )
         let asset = try MLPipelineAssetRevision(uid: uid("document"), sourceRevision: "document-v1")
 
-        #expect(await runtime.index(assets: [asset], shouldContinue: { true }).reason == .drained)
+        #expect(await indexAll(runtime, [asset], generation: 1).reason == .drained)
         #expect(await runtime.search("rechnung", scope: .documents, limit: 10) == [asset.uid])
         #expect(await runtime.search("rechnung", scope: .text, limit: 10) == [asset.uid])
         #expect(await runtime.search("rechnung", scope: .barcodes, limit: 10).isEmpty)
@@ -197,10 +197,10 @@ import Testing
         let retained = try MLPipelineAssetRevision(uid: uid("retained"), sourceRevision: "retained")
         let deleted = try MLPipelineAssetRevision(uid: uid("deleted"), sourceRevision: "deleted")
 
-        #expect(await runtime.index(assets: [retained, deleted], shouldContinue: { true }).reason == .drained)
+        #expect(await indexAll(runtime, [retained, deleted], generation: 1).reason == .drained)
         #expect(Set(await runtime.search("grusse", scope: .text, limit: 10)) == [retained.uid, deleted.uid])
 
-        #expect(await runtime.index(assets: [retained], shouldContinue: { true }).reason == .drained)
+        #expect(await indexAll(runtime, [retained], generation: 2).reason == .drained)
         #expect(await runtime.search("grusse", scope: .text, limit: 10) == [retained.uid])
         #expect(await runtime.progress().total == 2)
     }
@@ -217,7 +217,7 @@ import Testing
         )
         let retained = try MLPipelineAssetRevision(uid: uid("retained"), sourceRevision: "retained")
         let removed = try MLPipelineAssetRevision(uid: uid("removed"), sourceRevision: "removed")
-        _ = await runtime.index(assets: [retained, removed], shouldContinue: { true })
+        _ = await indexAll(runtime, [retained, removed], generation: 1)
 
         let fenced = await runtime.indexQuantum(
             assets: [retained],
@@ -258,7 +258,7 @@ import Testing
         )
         let retained = try MLPipelineAssetRevision(uid: uid("retained"), sourceRevision: "retained")
         let removed = try MLPipelineAssetRevision(uid: uid("removed"), sourceRevision: "removed")
-        _ = await runtime.index(assets: [retained, removed], shouldContinue: { true })
+        _ = await indexAll(runtime, [retained, removed], generation: 1)
 
         let outcome = await runtime.indexQuantum(
             assets: [retained],
@@ -332,6 +332,24 @@ import Testing
         let c = uid("c")
         #expect(MLSearchRankFusion.interleaved([[a, b], [c, a]], limit: 10) == [a, c, b])
         #expect(MLSearchRankFusion.interleaved([[a, b], [c]], limit: 2) == [a, c])
+    }
+
+    /// One unlimited, authorized pass, as the lifecycle runs it for a library generation.
+    private func indexAll(
+        _ runtime: MLNativeSearchRuntime,
+        _ assets: [MLPipelineAssetRevision],
+        generation: UInt64
+    ) async -> MLDerivedPipelinePassOutcome {
+        await runtime.indexQuantum(
+            assets: assets,
+            libraryGeneration: generation,
+            allowsDestructiveReconciliation: true,
+            destructiveReconciliationIsAuthorized: { true },
+            maximumAssets: .max,
+            maximumConcurrentAssets: 1,
+            shouldContinue: { true },
+            observer: MLDerivedPipelineObserver()
+        )
     }
 
     private func capabilitySnapshot(kinds: Set<MLNativeAnalysisKind>) -> MLNativeAnalysisCapabilitySnapshot {
