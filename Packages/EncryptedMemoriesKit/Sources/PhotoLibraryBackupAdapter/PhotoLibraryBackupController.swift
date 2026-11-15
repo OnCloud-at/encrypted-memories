@@ -1744,7 +1744,9 @@ public final class PhotoLibraryBackupController {
     public func estimatedOutstandingBytes(limit: Int) async -> Int64? {
         guard let queueStore, let catalogStore else { return nil }
         return await Task.detached(priority: .utility) {
-            guard let rows = try? queueStore.decisionUnsettledRows() else { return nil }
+            guard case .found(let rows) = StoreLookup(catching: { try queueStore.decisionUnsettledRows() }) else {
+                return nil
+            }
             let identifiers = Set(
                 rows.lazy
                     .filter { $0.source.kind == .photoLibraryAsset && Self.sendsBytes($0.state) }
