@@ -34,6 +34,28 @@ final class BackupStatusStabilizerTests: XCTestCase {
         XCTAssertNil(d.wakeAt)
     }
 
+    func testPhotoKnowledgeTransitionsBypassPhaseDwellInBothDirections() {
+        var stabilizer = BackupStatusStabilizer(dwell: 1.2)
+        var known = uploading(value: 40, total: 100, fraction: 0.4)
+        known.photoTotalIsKnown = true
+        _ = stabilizer.ingest(known, now: t(0))
+        var unknown = BackupStatusPresentation(
+            headlineKey: "backup.phase_scanning", isActive: true, accessory: .activity, progressFraction: nil)
+        unknown.photoTotalIsKnown = false
+        let scanning = stabilizer.ingest(unknown, now: t(0.1))
+        XCTAssertEqual(scanning.display.headlineKey, "backup.phase_scanning")
+        XCTAssertNil(scanning.display.progressFraction)
+        XCTAssertNil(scanning.display.localizedSubtitle)
+        XCTAssertNil(scanning.wakeAt)
+
+        known.total = 200
+        let succeeded = stabilizer.ingest(known, now: t(0.2))
+        XCTAssertEqual(succeeded.display.headlineKey, "backup.phase_uploading")
+        XCTAssertEqual(succeeded.display.progressFraction, 0.4)
+        XCTAssertEqual(succeeded.display.total, 200)
+        XCTAssertNil(succeeded.wakeAt)
+    }
+
     func testActivePhaseDoesNotFlapWithinTheDwell() {
         var s = BackupStatusStabilizer(dwell: 1.0)
         XCTAssertEqual(s.ingest(checking(), now: t(0)).display.headlineKey, "backup.phase_checking")

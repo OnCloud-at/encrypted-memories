@@ -609,7 +609,6 @@ private struct PhotoLibraryBackupSection: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .contentTransition(.opacity)
                         subtitleSlot(display)
-                        transferSlot(display)
                         leftSlot(display)
                         if let reason = display.localizedWaitingForWiFiDetail {
                             Text(reason)
@@ -716,9 +715,9 @@ private struct PhotoLibraryBackupSection: View {
         .onDisappear { rowModel.cancel() }
     }
 
-    /// Active backup status keeps fixed subtitle, transfer, and progress slots so row geometry stays stable.
+    /// Known-total backup status reserves its count line while work runs.
     @ViewBuilder private func subtitleSlot(_ display: BackupStatusPresentation) -> some View {
-        if display.isActive {
+        if display.detailLayout == .progress {
             let subtitle = display.localizedSubtitle
             Text(verbatim: subtitle ?? "\u{00a0}")
                 .font(.footnote.monospacedDigit())
@@ -730,23 +729,6 @@ private struct PhotoLibraryBackupSection: View {
             Text(subtitle)
                 .font(.footnote.monospacedDigit())
                 .foregroundStyle(ProtonColor.textWeak)
-                .contentTransition(.numericText())
-        }
-    }
-
-    @ViewBuilder private func transferSlot(_ display: BackupStatusPresentation) -> some View {
-        if display.isActive {
-            let transfer = display.localizedTransferDetail
-            Text(verbatim: transfer ?? "\u{00a0}")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(ProtonColor.primary)
-                .contentTransition(.numericText())
-                .opacity(transfer == nil ? 0 : 1)
-                .accessibilityHidden(transfer == nil)
-        } else if let transfer = display.localizedTransferDetail {
-            Text(transfer)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(ProtonColor.primary)
                 .contentTransition(.numericText())
         }
     }
@@ -767,18 +749,22 @@ private struct PhotoLibraryBackupSection: View {
 
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
         Group {
-            if let fraction = display.progressBarFraction,
+            if let fraction = display.progressFraction,
                 display.isActive || display.accessory == .paused
             {
-                ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel)
-                    .controlSize(.small)
+                ActivityProgressBar(
+                    fraction: fraction, accessibilityLabel: display.localizedHeadline,
+                    accessibilityValue: display.localizedSubtitle ?? ""
+                )
+                .accessibilityIdentifier("backup.progress")
+                .controlSize(.small)
             } else {
                 Color.clear
             }
         }
         .frame(height: 4)
         .padding(.top, 3)
-        .accessibilityHidden(display.progressBarFraction == nil)
+        .accessibilityHidden(display.progressFraction == nil)
     }
 }
 

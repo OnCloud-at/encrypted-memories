@@ -5262,6 +5262,149 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
     #endif
 
+    #if DEBUG
+        private func makeWarmPhotoDisplayFixture(
+            prefix: String, runtimeSignals: BackupRuntimeSignalSource = .wiFiWithMobileDataOff
+        ) throws -> ControllerFixture {
+            let fixture = try makeControllerFixture(
+                prefix: prefix, identityResolver: FakeIdentityResolver(),
+                runtimeSignals: runtimeSignals)
+            let controller = fixture.controller
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            let later = Date().addingTimeInterval(3_600)
+            let issue = BackupIssueRecord(kind: .remoteDraft, detail: "waiting", nextAttemptAt: later).persistedValue
+            XCTAssertTrue(
+                queue.upsertBatch(
+                    (0..<10).map { index in
+                        UploadBackupSyncQueueEntry(
+                            source: .init(kind: .photoLibraryAsset, identifier: "warm-\(index)"),
+                            revision: .init(rawValue: 1), originalFilename: "photo.heic",
+                            state: index < 4 ? .alreadyBackedUp : .blockedByDraft,
+                            lastError: index < 4 ? nil : issue, updatedAt: Date())
+                    }))
+            controller.setEnabledForTesting()
+            controller.setAccessStateForTesting(.full)
+            controller.replaceScanForTesting {}
+            return fixture
+        }
+
+        func testWarmOrdinaryAndRefreshAdmissionHidePreviouslyKnownPhotoProgress() async throws {
+            let fixture = try makeWarmPhotoDisplayFixture(prefix: "backup-warm-photo-admission")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.syncNow()
+            let initialEnded = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(initialEnded)
+            await controller.waitForSyncRunCompletionForTesting()
+            XCTAssertEqual(controller.status.phase, .waiting, "The warm cycle must end nonterminally")
+            // In .waiting, .40 is the raw fractionCompleted, not the active/paused watermark.
+            XCTAssertEqual(BackupStatusPresentation(controller.status).progressFraction, 0.4)
+            XCTAssertNotNil(BackupStatusPresentation(controller.status).localizedSubtitle)
+
+            controller.syncNow()
+            XCTAssertTrue(controller.isSyncing)
+            let ordinaryAdmission = BackupStatusPresentation(controller.status)
+            XCTAssertNil(
+                ordinaryAdmission.progressFraction,
+                "Ordinary admission must hide the previous known bar synchronously")
+            XCTAssertNil(
+                ordinaryAdmission.localizedSubtitle,
+                "Ordinary admission must hide the previous known count synchronously")
+            let ordinaryEnded = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(ordinaryEnded)
+            await controller.waitForSyncRunCompletionForTesting()
+            // In .waiting, .40 is the raw fractionCompleted, not the active/paused watermark.
+            XCTAssertEqual(BackupStatusPresentation(controller.status).progressFraction, 0.4)
+            XCTAssertNotNil(BackupStatusPresentation(controller.status).localizedSubtitle)
+
+            var refreshAdmission: BackupStatusPresentation?
+            let end = await controller.backgroundRefreshScan { _ in
+                // This callback follows synchronous admission and precedes the first await of scan setup.
+                refreshAdmission = BackupStatusPresentation(controller.status)
+            }
+            let refresh = try XCTUnwrap(refreshAdmission)
+            XCTAssertNil(
+                refresh.progressFraction, "Refresh admission must hide the previous known bar synchronously")
+            XCTAssertNil(
+                refresh.localizedSubtitle, "Refresh admission must hide the previous known count synchronously")
+            XCTAssertEqual(end, .scanned)
+            await controller.waitForSyncRunCompletionForTesting()
+            await controller.shutdown()
+        }
+
+        func testAScanFromBeforeDisableCannotMakeTheNewCycleKnown() async throws {
+            let fixture = try makeWarmPhotoDisplayFixture(prefix: "backup-old-scan-cycle")
+            defer { fixture.cleanup() }
+            let controller = fixture.controller
+            controller.syncNow()
+            let ended = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(ended)
+            await controller.waitForSyncRunCompletionForTesting()
+            // In .waiting, .40 is the raw fractionCompleted, not the active/paused watermark.
+            XCTAssertEqual(BackupStatusPresentation(controller.status).progressFraction, 0.4)
+            let scan = NonCooperativeWriterLatch()
+            controller.replaceScanForTesting { await scan.waitUntilReleased() }
+            controller.syncNow()
+            await scan.waitUntilBlocked()
+            controller.disableBackup()
+            XCTAssertNil(BackupStatusPresentation(controller.status).progressFraction)
+            XCTAssertNil(BackupStatusPresentation(controller.status).localizedSubtitle)
+            controller.setEnabledForTesting()
+            await scan.release()
+            let stopped = await waitUntil { !controller.isSyncing }
+            XCTAssertTrue(stopped)
+            await controller.waitForSyncRunCompletionForTesting()
+            XCTAssertEqual(controller.status.photoDisplayProgress?.isTotalKnown, false)
+            XCTAssertNil(BackupStatusPresentation(controller.status).progressFraction)
+            XCTAssertNil(BackupStatusPresentation(controller.status).localizedSubtitle)
+            await controller.shutdown()
+        }
+
+        func testCancelledOrFailedPhotoScansStayUnknownAfterCleanup() async throws {
+            let outcomes: [any Error] = [CancellationError(), UploadError.backend("scan unavailable")]
+            for refreshOnly in [false, true] {
+                for error in outcomes {
+                    let runtime = LibraryRuntimeState.makeProcessState()
+                    runtime.update {
+                        $0.executionOpportunity = .foregroundActive
+                        $0.network = LibraryNetworkState(isReachable: true, isExpensive: false)
+                    }
+                    let fixture = try makeWarmPhotoDisplayFixture(
+                        prefix: "backup-incomplete-photo-scan",
+                        runtimeSignals: refreshOnly ? .mobileDataOff(runtime) : .wiFiWithMobileDataOff)
+                    defer { fixture.cleanup() }
+                    let controller = fixture.controller
+                    controller.syncNow()
+                    let known = await waitUntil { !controller.isSyncing }
+                    XCTAssertTrue(known)
+                    await controller.waitForSyncRunCompletionForTesting()
+                    // In .waiting, .40 is the raw fractionCompleted, not the active/paused watermark.
+                    XCTAssertEqual(BackupStatusPresentation(controller.status).progressFraction, 0.4)
+                    controller.replaceScanForTesting { throw error }
+                    if refreshOnly {
+                        runtime.update { $0.executionOpportunity = .backgroundPermitted }
+                        let end = await controller.backgroundRefreshScan()
+                        XCTAssertEqual(end, error is CancellationError ? .stopped : .failed)
+                    } else {
+                        controller.syncNow()
+                        let ended = await waitUntil { !controller.isSyncing }
+                        XCTAssertTrue(ended)
+                    }
+                    await controller.waitForSyncRunCompletionForTesting()
+                    XCTAssertFalse(controller.isSyncing, "Knowledge must describe the ended pass, not a follow-up")
+                    let outcome = "refreshOnly=\(refreshOnly), error=\(error)"
+                    XCTAssertEqual(controller.status.photoDisplayProgress?.isTotalKnown, false, outcome)
+                    XCTAssertNil(BackupStatusPresentation(controller.status).progressFraction, outcome)
+                    XCTAssertNil(BackupStatusPresentation(controller.status).localizedSubtitle, outcome)
+                    await controller.shutdown()
+                }
+            }
+        }
+    #endif
+
     private func waitUntil(timeout: Duration = .seconds(5), _ predicate: () -> Bool) async -> Bool {
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while ContinuousClock.now < deadline {

@@ -389,12 +389,11 @@ private struct MobilePhotoBackupSections: View {
     }
 
     /// Scanning and terminal states stay compact. A known-total active pass expands once, then
-    /// reserves its internal subtitle/transfer/bar slots so per-file updates cannot pump the row.
+    /// reserves its count and bar slots so resource changes cannot move the row.
     @ViewBuilder private func statusDetails(_ display: BackupStatusPresentation) -> some View {
         if display.detailLayout == .progress {
             VStack(alignment: .leading, spacing: 3) {
                 subtitleSlot(display, reservesSpace: true)
-                transferSlot(display, reservesSpace: true)
                 leftSlot(display)
                 progressSlot(display)
             }
@@ -402,7 +401,6 @@ private struct MobilePhotoBackupSections: View {
         } else {
             VStack(alignment: .leading, spacing: 3) {
                 subtitleSlot(display, reservesSpace: false)
-                transferSlot(display, reservesSpace: false)
             }
             .transition(.opacity.combined(with: .move(edge: .top)))
         }
@@ -432,28 +430,6 @@ private struct MobilePhotoBackupSections: View {
         }
     }
 
-    @ViewBuilder private func transferSlot(
-        _ display: BackupStatusPresentation,
-        reservesSpace: Bool
-    ) -> some View {
-        if reservesSpace {
-            let transfer = display.localizedTransferDetail
-            Text(verbatim: transfer ?? "\u{00a0}")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(ProtonColor.primary)
-                .contentTransition(.numericText())
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .opacity(transfer == nil ? 0 : 1)
-                .accessibilityHidden(transfer == nil)
-        } else if let transfer = display.localizedTransferDetail {
-            Text(transfer)
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(ProtonColor.primary)
-                .contentTransition(.numericText())
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
     /// Items left and upload speed. The slot is always present in the progress layout, so a changing speed or a
     /// vanishing count cannot move the bar.
     @ViewBuilder private func leftSlot(_ display: BackupStatusPresentation) -> some View {
@@ -469,12 +445,15 @@ private struct MobilePhotoBackupSections: View {
             .accessibilityIdentifier("backup.left")
     }
 
-    /// Determinate bar matching the percentage directly above it while bytes move; otherwise it shows
-    /// queue-wide completion. An empty reserved slot keeps the row stable. Scanning stays barless.
+    /// The durable-item bar stays below its actual count. Scanning stays indeterminate in the row's activity icon.
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
-        if let fraction = display.progressBarFraction, display.isActive || display.accessory == .paused {
-            ActivityProgressBar(fraction: fraction, accessibilityLabel: display.localizedProgressBarLabel)
-                .frame(height: 4)
+        if let fraction = display.progressFraction, display.isActive || display.accessory == .paused {
+            ActivityProgressBar(
+                fraction: fraction, accessibilityLabel: display.localizedHeadline,
+                accessibilityValue: display.localizedSubtitle ?? ""
+            )
+            .accessibilityIdentifier("backup.progress")
+            .frame(height: 4)
         } else {
             Color.clear.frame(height: 4)
         }

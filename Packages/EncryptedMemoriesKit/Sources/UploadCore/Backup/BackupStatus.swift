@@ -1,6 +1,19 @@
 import Foundation
 import PhotosCore
 
+/// Presentation-only photo progress. Raw queue totals and OS execution progress remain unchanged.
+public struct BackupPhotoDisplayProgress: Sendable, Equatable {
+    public var isTotalKnown: Bool
+    public var isChecking: Bool
+    public var fraction: Double?
+
+    public init(isTotalKnown: Bool, isChecking: Bool, fraction: Double?) {
+        self.isTotalKnown = isTotalKnown
+        self.isChecking = isChecking
+        self.fraction = fraction
+    }
+}
+
 /// Progress in units for an OS progress surface, such as the system card of the continued backup task and the catalog
 /// scan. It is never shown as a backed-up count.
 public struct BackupExecutionProgress: Sendable, Equatable {
@@ -57,6 +70,8 @@ public struct BackupStatus: Sendable, Equatable {
     }
 
     public var phase: Phase = .idle
+    /// Nil preserves unmanaged folder/manual presentation. The photo projector alone advances its fraction.
+    public var photoDisplayProgress: BackupPhotoDisplayProgress?
     /// Items considered so far. `nil` while scanning - any total would be a lie mid-enumeration.
     public var totalConsidered: Int?
     /// Items whose backup-status check finished (whatever the outcome).
