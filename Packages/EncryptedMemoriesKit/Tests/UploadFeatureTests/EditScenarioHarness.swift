@@ -450,7 +450,10 @@ final class EditScenarioHarness {
         }
         try openBackupStores()
         XCTAssertEqual(queue.summary()!.total, 0)
-        XCTAssertEqual(backupState.count(), 0)
+        XCTAssertEqual(
+            try firstText(
+                "SELECT COUNT(*) FROM backup_asset_state;",
+                inStoreAt: directory.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)), "0")
     }
 
     private func seedV105(_ asset: EditScenarioLibrary.Asset, remoteIdentity: Bool = false) throws {

@@ -46,7 +46,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         queue = try XCTUnwrap(
             UploadBackupSyncQueueManifestStore(
                 url: tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)))
-        stateStore = MemoryBackupStateStore()
+        stateStore = MemoryBackupStateStore(removesRecords: false)
         preflight = UploadBackupPreflightIndex(store: stateStore, now: { [clock] in clock!.now })
         engine = UploadBackupSyncEngine(preflight: preflight, queue: queue, now: { [clock] in clock!.now })
 
@@ -1530,25 +1530,6 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
                 expired = false
                 liveRescanRequested = false
             }
-        }
-    }
-
-    private final class MemoryBackupStateStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { rows[record.source, default: [:]][record.revision] = record }
-            return true
-        }
-        func count() -> Int {
-            lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
         }
     }
 }

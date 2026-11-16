@@ -535,3 +535,99 @@ func queueEntryForTesting(
         return nil
     }
 }
+
+/// State-store fakes keep their single-row probes in the test target. Production stores implement the batch contract.
+protocol UploadBackupStateTestStore: UploadBackupStateStore {
+    func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord?
+    func hasAnyRecord(for source: UploadSourceIdentity) -> Bool
+}
+
+extension UploadBackupStateTestStore {
+    func lookupBatch(_ snapshots: [UploadBackupAssetSnapshot]) -> [UploadBackupStateLookup] {
+        snapshots.map { snapshot in
+            let direct = record(for: snapshot.source, revision: snapshot.revision)
+            let editRecord: UploadBackupAssetRecord? =
+                if case .revision(let editRevision) = snapshot.editRevision {
+                    record(for: snapshot.source, revision: editRevision)
+                } else {
+                    nil
+                }
+            return UploadBackupStateLookup(
+                directRecord: direct,
+                hasAnyRecord: direct != nil || hasAnyRecord(for: snapshot.source),
+                editRecord: editRecord
+            )
+        }
+    }
+
+    func upsertBatch(_ records: [UploadBackupAssetRecord]) -> Bool {
+        records.allSatisfy(upsert)
+    }
+
+    /// An unsupported removal keeps every record and reports failure.
+    func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
+        false
+    }
+}
+
+final class MemoryBackupStateStore: UploadBackupStateTestStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
+    private var writesSucceed = true
+    private var writes = 0
+    private let removesRecords: Bool
+    private let onWrite: @Sendable (UploadBackupAssetRecord) -> Void
+
+    init(removesRecords: Bool = true, onWrite: @escaping @Sendable (UploadBackupAssetRecord) -> Void = { _ in }) {
+        self.removesRecords = removesRecords
+        self.onWrite = onWrite
+    }
+
+    var upsertCount: Int { lock.withLock { writes } }
+
+    func failWrites() {
+        lock.withLock { writesSucceed = false }
+    }
+
+    func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
+        lock.withLock { rows[source]?[revision] }
+    }
+
+    func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
+        lock.withLock { !(rows[source]?.isEmpty ?? true) }
+    }
+
+    func upsert(_ record: UploadBackupAssetRecord) -> Bool {
+        let written = lock.withLock {
+            guard writesSucceed else { return false }
+            writes += 1
+            rows[record.source, default: [:]][record.revision] = record
+            return true
+        }
+        if written { onWrite(record) }
+        return written
+    }
+
+    func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
+        guard removesRecords else { return false }
+        lock.withLock { rows[source] = rows[source]?.filter { revisions.contains($0.key) } }
+        return true
+    }
+
+    func count() -> Int {
+        lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
+    }
+}
+
+extension UploadBackupStateManifestStore {
+    /// A test probe through the production batch reader. A failed read must never look like a missing record.
+    func record(
+        for source: UploadSourceIdentity, revision: UploadBackupRevision,
+        file: StaticString = #filePath, line: UInt = #line
+    ) -> UploadBackupAssetRecord? {
+        let read = lookupBatch([.init(source: source, revision: revision, resourceCount: 1)])
+        XCTAssertEqual(read.count, 1, file: file, line: line)
+        XCTAssertEqual(read.first?.succeeded, true, "The backup state probe must succeed", file: file, line: line)
+        return read.first?.directRecord
+    }
+}

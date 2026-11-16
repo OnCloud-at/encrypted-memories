@@ -119,8 +119,6 @@ public struct UploadBackupAssetRecord: Sendable, Equatable {
 }
 
 public protocol UploadBackupStateStore: Sendable {
-    func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord?
-    func hasAnyRecord(for source: UploadSourceIdentity) -> Bool
     /// Reads every row needed to classify a discovery chunk. `succeeded == false` is distinct from
     /// an empty store: duplicate safety must stop on a DB read error instead of treating assets as new.
     func lookupBatch(_ snapshots: [UploadBackupAssetSnapshot]) -> [UploadBackupStateLookup]
@@ -133,7 +131,6 @@ public protocol UploadBackupStateStore: Sendable {
     /// Removes every state of `source` except `revisions`. Returns false when nothing was durably removed.
     @discardableResult
     func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool
-    func count() -> Int
 }
 
 public struct UploadBackupStateLookup: Sendable {
@@ -152,34 +149,6 @@ public struct UploadBackupStateLookup: Sendable {
         self.directRecord = directRecord
         self.hasAnyRecord = hasAnyRecord
         self.editRecord = editRecord
-    }
-}
-
-public extension UploadBackupStateStore {
-    func lookupBatch(_ snapshots: [UploadBackupAssetSnapshot]) -> [UploadBackupStateLookup] {
-        snapshots.map { snapshot in
-            let direct = record(for: snapshot.source, revision: snapshot.revision)
-            let editRecord: UploadBackupAssetRecord? =
-                if case .revision(let editRevision) = snapshot.editRevision {
-                    record(for: snapshot.source, revision: editRevision)
-                } else {
-                    nil
-                }
-            return UploadBackupStateLookup(
-                directRecord: direct,
-                hasAnyRecord: direct != nil || hasAnyRecord(for: snapshot.source),
-                editRecord: editRecord
-            )
-        }
-    }
-
-    func upsertBatch(_ records: [UploadBackupAssetRecord]) -> Bool {
-        records.allSatisfy(upsert)
-    }
-
-    /// Stores without removal fail, so a caller never trusts a state it could not forget.
-    func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
-        false
     }
 }
 

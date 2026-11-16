@@ -1271,33 +1271,6 @@ final class BackupSyncRunnerTests: XCTestCase {
     private var resolver: ScriptedBackupResolver!
     private var uploader: MockUploader!
 
-    private final class MemoryBackupStateStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { rows[record.source, default: [:]][record.revision] = record }
-            return true
-        }
-
-        func removeRecords(for source: UploadSourceIdentity, keeping revisions: Set<UploadBackupRevision>) -> Bool {
-            lock.withLock { rows[source] = rows[source]?.filter { revisions.contains($0.key) } }
-            return true
-        }
-
-        func count() -> Int {
-            lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
-        }
-    }
-
     override func setUpWithError() throws {
         tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("backup-sync-runner-tests-\(UUID().uuidString)", isDirectory: true)

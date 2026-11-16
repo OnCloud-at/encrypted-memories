@@ -912,7 +912,7 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         let queueURL = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: queueURL))
         let engine = UploadBackupSyncEngine(
-            preflight: UploadBackupPreflightIndex(store: MemoryBackupStateStore()),
+            preflight: UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false)),
             queue: queue,
             now: { Date(timeIntervalSince1970: 100) }
         )
@@ -1261,28 +1261,6 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
         }
 
         func synchronizeQueueToDisk() -> Bool { true }
-    }
-
-    private final class MemoryBackupStateStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock { rows[record.source, default: [:]][record.revision] = record }
-            return true
-        }
-
-        func count() -> Int {
-            lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
-        }
     }
 
     /// Yields the given chunks, then finishes with `thenThrow` - models a scan that aborts partway

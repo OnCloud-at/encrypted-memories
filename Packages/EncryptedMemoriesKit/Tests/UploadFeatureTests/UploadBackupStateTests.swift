@@ -5,36 +5,6 @@ import XCTest
 @testable import UploadCore
 
 final class UploadBackupStateTests: XCTestCase {
-    private final class MemoryStore: UploadBackupStateStore, @unchecked Sendable {
-        private let lock = NSLock()
-        private var rows: [UploadSourceIdentity: [UploadBackupRevision: UploadBackupAssetRecord]] = [:]
-        private var writesSucceed = true
-
-        func failWrites() {
-            lock.withLock { writesSucceed = false }
-        }
-
-        func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord? {
-            lock.withLock { rows[source]?[revision] }
-        }
-
-        func hasAnyRecord(for source: UploadSourceIdentity) -> Bool {
-            lock.withLock { !(rows[source]?.isEmpty ?? true) }
-        }
-
-        func upsert(_ record: UploadBackupAssetRecord) -> Bool {
-            lock.withLock {
-                guard writesSucceed else { return false }
-                rows[record.source, default: [:]][record.revision] = record
-                return true
-            }
-        }
-
-        func count() -> Int {
-            lock.withLock { rows.values.reduce(0) { $0 + $1.count } }
-        }
-    }
-
     private var tempDir: URL!
 
     override func setUpWithError() throws {
@@ -69,6 +39,56 @@ final class UploadBackupStateTests: XCTestCase {
         )
     }
 
+    func testStateStoreDefaultsKeepFullKeysAndDistinctRemovalPolicies() {
+        let store = MemoryBackupStateStore(removesRecords: false)
+        let old = UploadBackupAssetRecord(
+            source: source(), revision: revision(5), resourceCount: 2, pendingResourceCount: 1,
+            updatedAt: Date(timeIntervalSince1970: 101))
+        let current = UploadBackupAssetRecord(
+            source: source(), revision: revision(10), resourceCount: 2, pendingResourceCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 102))
+        let video = UploadBackupAssetRecord(
+            source: .init(kind: .photoLibraryAsset, identifier: source().identifier, resource: .livePairedVideo),
+            revision: revision(10), resourceCount: 1, pendingResourceCount: 1,
+            updatedAt: Date(timeIntervalSince1970: 103))
+        let file = UploadBackupAssetRecord(
+            source: .init(kind: .fileURL, identifier: source().identifier),
+            revision: revision(10), resourceCount: 3, pendingResourceCount: 2,
+            updatedAt: Date(timeIntervalSince1970: 104))
+        let records = [old, current, video, file]
+        XCTAssertTrue(store.upsertBatch(records))
+        let snapshots = [
+            snapshot(revision: 10, editRevision: .revision(revision(5)), resources: 2),
+            snapshot(revision: 20, editRevision: .revision(revision(5)), resources: 2),
+            UploadBackupAssetSnapshot(source: video.source, revision: video.revision, resourceCount: 1),
+            UploadBackupAssetSnapshot(source: file.source, revision: file.revision, resourceCount: 3),
+            snapshot(id: "missing", revision: 10),
+        ]
+        let read = store.lookupBatch(snapshots)
+        XCTAssertEqual(read.map(\.succeeded), [true, true, true, true, true])
+        XCTAssertEqual(read.map(\.directRecord), [current, nil, video, file, nil])
+        XCTAssertEqual(read.map(\.editRecord), [old, old, nil, nil, nil])
+        XCTAssertEqual(read.map(\.hasAnyRecord), [true, true, true, true, false])
+        XCTAssertFalse(store.removeRecords(for: source(), keeping: []))
+        XCTAssertEqual(store.count(), 4, "The default refusal must keep every stored revision")
+        store.failWrites()
+        let refused = UploadBackupAssetRecord(
+            source: source(), revision: revision(30), resourceCount: 4, pendingResourceCount: 3,
+            updatedAt: Date(timeIntervalSince1970: 105))
+        XCTAssertFalse(store.upsertBatch([refused]))
+        XCTAssertNil(store.record(for: refused.source, revision: refused.revision))
+        XCTAssertEqual(store.count(), 4)
+
+        let removable = MemoryBackupStateStore()
+        XCTAssertTrue(removable.upsertBatch(records))
+        XCTAssertTrue(removable.removeRecords(for: source(), keeping: [current.revision]))
+        XCTAssertNil(removable.record(for: old.source, revision: old.revision))
+        XCTAssertEqual(removable.record(for: current.source, revision: current.revision), current)
+        XCTAssertEqual(removable.record(for: video.source, revision: video.revision), video)
+        XCTAssertEqual(removable.record(for: file.source, revision: file.revision), file)
+        XCTAssertEqual(removable.count(), 3)
+    }
+
     func testDateRevisionsKeepTheirStoredQuantization() {
         let cases: [(Double, Int64, Int64)] = [
             (0, 0, 0),
@@ -95,7 +115,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testNewAssetWhenSourceWasNeverSeen() async throws {
-        let index = UploadBackupPreflightIndex(store: MemoryStore())
+        let index = UploadBackupPreflightIndex(store: MemoryBackupStateStore(removesRecords: false))
 
         let result = try await index.classify(snapshot(revision: 10, resources: 2))
 
@@ -103,7 +123,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testCompletedRevisionSkipsDirectly() async throws {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store, now: { Date(timeIntervalSince1970: 100) })
         let asset = snapshot(revision: 10, resources: 2)
         try await index.markBackedUp(asset)
@@ -115,7 +135,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testPendingRevisionReportsRemainingResources() async throws {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store)
         let asset = snapshot(revision: 10, resources: 2)
         try await index.markPending(asset, pendingResourceCount: 1)
@@ -126,7 +146,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testMetadataRevisionDriftWithoutReliableEditEvidenceRequiresBackendCheck() async throws {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store)
         try await index.markBackedUp(snapshot(revision: 10))
 
@@ -139,7 +159,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testKnownEditRevisionSkipsAndSeedsCurrentRevision() async throws {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store)
         let edit = revision(15)
         try await index.markBackedUp(snapshot(revision: 10))
@@ -173,7 +193,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testUnknownEditRevisionRequiresBackendCheck() async throws {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store)
         try await index.markBackedUp(snapshot(revision: 10))
 
@@ -184,7 +204,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testUnavailableEditRevisionRequiresBackendCheck() async throws {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store)
         try await index.markBackedUp(snapshot(revision: 10))
 
@@ -195,7 +215,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testCompletionWriteFailureThrowsInsteadOfPublishingSuccess() async {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         store.failWrites()
         let index = UploadBackupPreflightIndex(store: store)
 
@@ -208,7 +228,7 @@ final class UploadBackupStateTests: XCTestCase {
     }
 
     func testMetadataDriftClassificationFailsWhenSeedCannotPersist() async throws {
-        let store = MemoryStore()
+        let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store)
         try await index.markBackedUp(snapshot(revision: 10))
         store.failWrites()
@@ -236,9 +256,51 @@ final class UploadBackupStateTests: XCTestCase {
         store.upsert(record)
 
         XCTAssertEqual(store.record(for: source(), revision: revision(10)), record)
-        XCTAssertTrue(store.hasAnyRecord(for: source()))
-        XCTAssertFalse(store.hasAnyRecord(for: source("other")))
-        XCTAssertEqual(store.count(), 1)
+        let lookups = store.lookupBatch([snapshot(revision: 10), snapshot(id: "other", revision: 10)])
+        XCTAssertEqual(lookups.map(\.succeeded), [true, true])
+        XCTAssertEqual(lookups.map(\.hasAnyRecord), [true, false])
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 1)
+    }
+
+    /// The SQLite store reads the record of a known edit revision that differs from the current revision.
+    func testSQLiteStoreReadsTheRecordOfAnEditRevisionThatDiffersFromTheRevision() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        defer { store.close() }
+        let earlier = UploadBackupAssetRecord(
+            source: source(), revision: revision(15), resourceCount: 1, pendingResourceCount: 0,
+            updatedAt: Date(timeIntervalSince1970: 100))
+        XCTAssertTrue(store.upsert(earlier))
+
+        let edited = snapshot(revision: 20, editRevision: .revision(revision(15)))
+        let lookup = try XCTUnwrap(store.lookupBatch([edited]).first)
+
+        XCTAssertTrue(lookup.succeeded)
+        XCTAssertNil(lookup.directRecord)
+        XCTAssertEqual(lookup.editRecord, earlier)
+    }
+
+    /// A write that SQLite refuses at its step is no stored record, also while the store stays open.
+    func testSQLiteStoreReportsAWriteThatSQLiteRefuses() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        defer { store.close() }
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle,
+                "CREATE TRIGGER refuse_state BEFORE INSERT ON backup_asset_state BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+                nil, nil, nil),
+            SQLITE_OK)
+
+        XCTAssertFalse(
+            store.upsert(
+                UploadBackupAssetRecord(
+                    source: source(), revision: revision(10), resourceCount: 1, pendingResourceCount: 0,
+                    updatedAt: Date())))
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 0)
     }
 
     func testSQLiteStoreReportsWriteFailureAfterClose() throws {
@@ -282,10 +344,12 @@ final class UploadBackupStateTests: XCTestCase {
         store.close()
         store.close()
 
-        XCTAssertNil(store.record(for: source(), revision: revision(10)))
-        XCTAssertFalse(store.hasAnyRecord(for: source()))
-        XCTAssertEqual(store.count(), 0)
-        XCTAssertEqual(store.lookupBatch([snapshot(revision: 10)]).first?.succeeded, false)
+        let closedRead = store.lookupBatch([snapshot(revision: 10)])
+        XCTAssertEqual(closedRead.count, 1)
+        XCTAssertEqual(closedRead.first?.succeeded, false)
+        XCTAssertNil(closedRead.first?.directRecord)
+        XCTAssertEqual(closedRead.first?.hasAnyRecord, false)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 1, "Closing preserves the stored row")
         XCTAssertFalse(store.upsert(record))
         XCTAssertFalse(store.upsertBatch([record]))
         XCTAssertFalse(store.removeRecords(for: source(), keeping: []))
@@ -293,10 +357,10 @@ final class UploadBackupStateTests: XCTestCase {
         let reopened = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
         defer { reopened.close() }
         XCTAssertEqual(reopened.record(for: source(), revision: revision(10)), record)
-        XCTAssertEqual(reopened.count(), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 1)
         XCTAssertEqual(reopened.lookupBatch([snapshot(revision: 10)]).first?.succeeded, true)
         XCTAssertTrue(reopened.removeRecords(for: source(), keeping: []))
-        XCTAssertEqual(reopened.count(), 0)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 0)
     }
 
     func testEmptyBatchCallsPreserveOpenAndClosedStoreBehavior() throws {
@@ -309,7 +373,7 @@ final class UploadBackupStateTests: XCTestCase {
 
         XCTAssertTrue(store.upsertBatch([]))
         XCTAssertTrue(store.lookupBatch([]).isEmpty)
-        XCTAssertEqual(store.count(), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 1)
         XCTAssertEqual(store.record(for: source(), revision: revision(10)), record)
         XCTAssertTrue(store.upsertBatch([record]))
         XCTAssertEqual(store.lookupBatch([snapshot(revision: 10)]).first?.succeeded, true)
@@ -323,7 +387,7 @@ final class UploadBackupStateTests: XCTestCase {
 
         let reopened = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
         defer { reopened.close() }
-        XCTAssertEqual(reopened.count(), 1)
+        XCTAssertEqual(sqliteCount(url: url, table: "backup_asset_state"), 1)
         XCTAssertEqual(reopened.record(for: source(), revision: revision(10)), record)
         XCTAssertTrue(reopened.upsert(record))
         XCTAssertEqual(reopened.lookupBatch([snapshot(revision: 10)]).first?.succeeded, true)
