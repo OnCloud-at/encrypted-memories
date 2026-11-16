@@ -88,13 +88,7 @@ final class MobileViewerTransportPlacementTests: XCTestCase {
         let item = try XCTUnwrap(player.currentItem)
         let pager = try XCTUnwrap(transportPager(in: viewer))
         XCTAssertGreaterThan(item.duration.seconds, 30, "SETUP: the stream outlasts the transitions")
-        player.pause()
-        let sought = await player.seek(
-            to: CMTime(seconds: 8, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
-        XCTAssertTrue(sought, "SETUP: native seek completes")
-        try await requireTransport("SETUP: paused position is eight seconds") {
-            player.timeControlStatus == .paused && abs(player.currentTime().seconds - 8) < 0.1
-        }
+        try await pauseAndSeek(player, to: 8)
         if playing {
             player.play()
             try await requireTransport("SETUP: playback advances before the arrangement changes") {

@@ -1,3 +1,4 @@
+import AVFoundation
 import AlbumCore
 import LibrarySourceRuntime
 import MLSearchCore
@@ -34,6 +35,37 @@ func pollUntil(
 ) async throws -> Bool {
     try await poll(timeout: timeout, isolation: isolation, pause: { try await Task.sleep(for: interval) }, condition)
 }
+
+/// Pauses `player` and moves it to `seconds` without waiting for the seek completion handler, as the viewer's scrubber
+/// does, then waits until the paused player shows that time. AVPlayer documents no time limit for calling that handler.
+/// A hosted run of a video test made no progress for 68 minutes; the blocked call was not identified, and this wait
+/// had no time limit then (#1406).
+/// Fails the test with the observed time and status, and throws, when the target is not reached within `timeout`.
+@MainActor func pauseAndSeek(_ player: AVPlayer, to seconds: Double, timeout: Duration = .seconds(10)) async throws {
+    player.pause()
+    player.seek(
+        to: CMTime(seconds: seconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero,
+        completionHandler: { _ in })
+    let reached = try await pollUntil(timeout: timeout, every: .milliseconds(50)) {
+        player.timeControlStatus == .paused && abs(player.currentTime().seconds - seconds) < 0.1
+    }
+    guard reached else {
+        let status =
+            switch player.timeControlStatus {
+            case .paused: "paused"
+            case .waitingToPlayAtSpecifiedRate: "waiting to play"
+            case .playing: "playing"
+            @unknown default: "unknown"
+            }
+        let message =
+            "SETUP: the paused player must reach \(seconds) s; observed \(player.currentTime().seconds) s, \(status)"
+        XCTFail(message)
+        throw VideoSeekSetupTimeout()
+    }
+}
+
+/// `pauseAndSeek` did not reach its target; the test failure carries the details.
+struct VideoSeekSetupTimeout: Error {}
 
 /// Like `pollUntil`, but yields to other tasks between checks instead of sleeping.
 func yieldUntil(
