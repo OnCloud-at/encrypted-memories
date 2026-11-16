@@ -111,9 +111,13 @@ public struct BackupSyncProgress: Sendable, Equatable {
         return Double(settled) / Double(total)
     }
 
-    /// Items the user should look at. A proven remote deletion is an intentional policy success,
-    /// not an error; the UI reports its count separately without an attention state.
+    /// Parked rows that are not backed up: failed, final and missing. A proven remote deletion is an intentional
+    /// policy success, not an error; the UI reports its count separately without an attention state.
     public var needsAttention: Int { failed + sourceMissing }
+
+    /// The part of `needsAttention` that waits for the person's decision or for a cause only the person can fix. The
+    /// queue summary sets it; a pass that parks a row changes only `failed` until the next summary read.
+    public var attention = 0
 
     public var hasOutstandingWork: Bool {
         waiting + checking + uploading + blocked + pendingSourceRechecks > 0
@@ -147,5 +151,6 @@ public struct BackupSyncProgress: Sendable, Equatable {
         dismissedFailures = summary.dismissedFailures
         pendingSourceRechecks = summary.pendingSourceRechecks
         paused = summary.paused
+        attention = summary.attention
     }
 }

@@ -134,13 +134,20 @@ public struct BackupStatus: Sendable, Equatable {
     public var backupTargetCount: Int? {
         totalConsidered.map { max(0, $0 - skippedRemoteDeletions) }
     }
-    public var needsAttentionCount: Int { failed + sourceMissing }
+    /// Rows that are not backed up and need the person: a decision, or a cause that only the person can fix. Only
+    /// these raise the orange attention line.
+    public var needsAttentionCount = 0
+    /// Rows that are not backed up although nothing the person can fix is known. They show in a calm line.
+    public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
     /// list reloads only when its content can differ.
     public var problemListKey: ProblemListKey {
         ProblemListKey(
             phase: phase,
-            counts: [failed, sourceMissing, waitingRetry, dismissedFailures, skippedRemoteDeletions, outstandingCount],
+            counts: [
+                failed, sourceMissing, needsAttentionCount, waitingRetry, dismissedFailures, skippedRemoteDeletions,
+                outstandingCount,
+            ],
             issue: outstandingIssue, nextAttemptAt: nextAttemptAt)
     }
 
@@ -155,6 +162,10 @@ public struct BackupStatus: Sendable, Equatable {
         pendingSourceRechecks > 0 && outstandingCount == pendingSourceRechecks
             && !isPreparingRemoteIndex && !remoteIndexPreparationFailed && remoteIndexPreparationIssue == nil
     }
+
+    /// A finished backup that left rows out: dismissed ones, or rows that are not backed up without anything the
+    /// person can fix. It never says that all files are backed up.
+    public var hasOmissions: Bool { dismissedFailures > 0 || notBackedUpCount > 0 }
 
     public var isActive: Bool {
         phase == .scanning || phase == .checking || phase == .uploading
@@ -182,6 +193,7 @@ public struct BackupStatus: Sendable, Equatable {
         pendingSourceRechecks = progress.pendingSourceRechecks
         skippedRemoteDeletions = progress.skippedRemoteDeletions
         sourceMissing = progress.sourceMissing
+        needsAttentionCount = min(max(0, progress.attention), progress.needsAttention)
         waitingRetry = progress.blocked
         remainingCount = progress.waiting + progress.checking + progress.uploading
         hasOutstandingWork = progress.hasOutstandingWork
@@ -248,7 +260,7 @@ public struct BackupStatus: Sendable, Equatable {
             } else {
                 phase = .checking
             }
-        } else if progress.needsAttention > 0 {
+        } else if needsAttentionCount > 0 {
             phase = .needsAttention
         } else if progress.hasOutstandingWork {
             phase = .waiting
@@ -271,6 +283,8 @@ public struct BackupStatus: Sendable, Equatable {
         alreadyBackedUp = status.skippedDuplicates
         skippedRemoteDeletions = status.skippedRemoteDeletions
         failed = status.failed
+        // A failed manual upload is in the person's own upload list, so each one asks the person.
+        needsAttentionCount = status.failed
         fractionCompleted = status.hasItems ? status.progressFraction : nil
 
         if !status.hasItems {
@@ -302,7 +316,7 @@ public struct BackupStatus: Sendable, Equatable {
         case .waiting:
             hasOnlyDismissedSourceRechecks ? "backup.phase_waiting_photos" : "backup.phase_waiting"
         case .completed:
-            dismissedFailures > 0 ? "backup.phase_completed_with_omissions" : "backup.phase_completed"
+            hasOmissions ? "backup.phase_completed_with_omissions" : "backup.phase_completed"
         case .needsAttention: "backup.phase_attention"
         }
     }
@@ -321,7 +335,7 @@ public struct BackupStatus: Sendable, Equatable {
             hasOnlyDismissedSourceRechecks
                 ? L10n.string("backup.phase_waiting_photos") : L10n.string("backup.phase_waiting")
         case .completed:
-            dismissedFailures > 0
+            hasOmissions
                 ? L10n.string("backup.phase_completed_with_omissions")
                 : L10n.string("backup.phase_completed")
         case .needsAttention: L10n.string("backup.phase_attention")

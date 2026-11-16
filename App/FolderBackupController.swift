@@ -152,6 +152,7 @@ final class FolderBackupController {
         // The failing subtree has no queue row. Surface one run-level attention item rather than
         // claiming that the successfully enumerated prefix represents the complete tree.
         status.failed = max(1, status.failed)
+        status.needsAttentionCount = max(1, status.needsAttentionCount)
         status.fractionCompleted = nil
         status.currentItemName = nil
         return status

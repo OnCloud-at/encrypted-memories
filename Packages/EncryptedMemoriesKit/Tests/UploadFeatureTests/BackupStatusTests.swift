@@ -11,11 +11,12 @@ final class BackupStatusTests: XCTestCase {
         total: Int = 0, waiting: Int = 0, uploadQueued: Int = 0, checking: Int = 0,
         uploading: Int = 0, uploaded: Int = 0, alreadyBackedUp: Int = 0,
         skippedRemoteDeletions: Int = 0, sourceMissing: Int = 0, blocked: Int = 0,
-        failed: Int = 0, currentItemName: String? = nil,
+        failed: Int = 0, attention: Int = 0, currentItemName: String? = nil,
         isRunning: Bool = false, isPausedByPolicy: Bool = false,
         activeTransfer: BackupActiveTransferProgress? = nil
     ) -> BackupSyncProgress {
         var p = BackupSyncProgress()
+        p.attention = attention
         p.total = total
         p.waiting = waiting
         p.uploadQueued = uploadQueued
@@ -117,7 +118,7 @@ final class BackupStatusTests: XCTestCase {
     }
 
     func testFailureSummaryIsStableAndRecoverableLooking() {
-        let p = progress(total: 4, uploaded: 2, sourceMissing: 1, failed: 1)
+        let p = progress(total: 4, uploaded: 2, sourceMissing: 1, failed: 1, attention: 2)
         let first = BackupStatus(progress: p, isScanning: false)
         let second = BackupStatus(progress: p, isScanning: false)
         XCTAssertEqual(first, second, "same durable input must derive the identical summary")
@@ -130,7 +131,7 @@ final class BackupStatusTests: XCTestCase {
         let status = BackupStatus(
             progress: progress(
                 total: 20, uploaded: 8, alreadyBackedUp: 9,
-                skippedRemoteDeletions: 0, sourceMissing: 1, blocked: 2),
+                skippedRemoteDeletions: 0, sourceMissing: 1, blocked: 2, attention: 1),
             isScanning: false
         )
 
@@ -199,6 +200,7 @@ final class BackupStatusTests: XCTestCase {
         summary.include(.sourceMissing)
         summary.include(.blockedByDraft)
         summary.include(.failed)
+        summary.attention = 2
 
         XCTAssertEqual(summary.waiting, 5, "queued-for-upload rows still count as waiting overall")
         XCTAssertEqual(summary.queuedForUpload, 2)

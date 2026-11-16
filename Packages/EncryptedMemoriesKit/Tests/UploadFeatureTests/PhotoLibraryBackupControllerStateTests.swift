@@ -43,7 +43,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
         let cases: [(BackupIssueKind, UploadBackupSyncQueueState, BackupIssueCategory, String)] = [
             (.network, .discovered, .automatic, "backup.issue_network"),
-            (.remoteService, .discovered, .automatic, "backup.issue_remote_service"),
+            (.remoteService, .discovered, .automatic, "backup.issue_unknown_waiting"),
             (.deviceStorage, .discovered, .automatic, "backup.issue_device_storage"),
             (.remoteDraft, .blockedByDraft, .automatic, "backup.issue_remote_draft"),
             (.accountStorage, .discovered, .userResolvable, "backup.issue_account_storage"),
@@ -52,12 +52,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             (.remoteDraftStale, .failedPermanent, .permanent, "backup.issue_remote_draft_stale"),
             (.sourceMissing, .sourceMissing, .permanent, "backup.issue_source_missing"),
             (.unsupported, .failed, .permanent, "backup.issue_unsupported"),
-            (.unknown, .failed, .userResolvable, "backup.fail_reason_generic"),
+            (.unknown, .failed, .userResolvable, "backup.issue_after_several_tries"),
             (.unknown, .discovered, .automatic, "backup.issue_unknown_waiting"),
-            (.remoteService, .failed, .userResolvable, "backup.issue_remote_service"),
+            (.remoteService, .failed, .userResolvable, "backup.issue_after_several_tries"),
             (.network, .failed, .userResolvable, "backup.issue_network"),
             (.localState, .failed, .userResolvable, "backup.error_local_state_unavailable"),
-            (.unknown, .failedPermanent, .permanent, "backup.issue_permanent"),
+            (.unknown, .failedPermanent, .permanent, "backup.issue_after_several_tries"),
         ]
         for (index, testCase) in cases.enumerated() {
             let (kind, state, category, key) = testCase

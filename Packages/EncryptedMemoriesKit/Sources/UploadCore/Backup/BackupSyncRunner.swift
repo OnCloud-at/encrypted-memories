@@ -487,7 +487,7 @@ public actor BackupSyncRunner {
                 return progress
             }
             let issue = automaticRetryIssue(
-                kind: Self.issueKind(for: error),
+                kind: Self.indexPreparationIssueKind(for: error),
                 detail: message,
                 previous: previous
             )
@@ -2888,6 +2888,14 @@ public actor BackupSyncRunner {
         default:
             return .unknown
         }
+    }
+
+    /// The stored kind of a failed index preparation. Its record always counts automatic retries, so remoteService is
+    /// kept only for a temporary Proton failure; any other backend error would otherwise read as a Proton wait.
+    static func indexPreparationIssueKind(for error: any Error) -> BackupIssueKind {
+        if case UploadError.retryableBackend = error { return .remoteService }
+        let kind = issueKind(for: error)
+        return kind == .remoteService ? .unknown : kind
     }
 
     /// Repeated automatic failures keep a durable backoff ordinal. Network and remote-service outages

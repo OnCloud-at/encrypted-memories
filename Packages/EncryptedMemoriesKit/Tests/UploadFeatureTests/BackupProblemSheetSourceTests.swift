@@ -186,7 +186,7 @@ final class BackupProblemSheetSourceTests: XCTestCase {
             XCTAssertEqual(source.id, "backup-\(ObjectIdentifier(controller))")
             XCTAssertTrue(source.backupController === controller)
             XCTAssertTrue(source.isSelected, "the backup is always the listed source")
-            XCTAssertFalse(source.expectsItems, "a new backup counts no photo that needs attention")
+            XCTAssertFalse(source.expectsItems, "a new backup counts no photo that is not backed up")
             let session = source.makeSession()
             let before = source.followKey(for: session)
 
@@ -194,7 +194,7 @@ final class BackupProblemSheetSourceTests: XCTestCase {
 
             // The status follows the queue asynchronously.
             try await pollUntilOrFail { source.expectsItems }
-            XCTAssertTrue(source.expectsItems, "the backup now counts a photo that needs attention")
+            XCTAssertTrue(source.expectsItems, "the backup now counts a photo that is not backed up")
             XCTAssertNotEqual(source.followKey(for: session), before, "a new backup status follows again")
             let following = Task { await source.follow(session, madeFor: source.id) }
             try await pollUntilOrFail { session.hasRead && !session.isReading }

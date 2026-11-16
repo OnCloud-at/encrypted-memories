@@ -187,6 +187,9 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     /// Subset of dismissedFailures that still owes an admitted source check. Never another photo or upload.
     public var pendingSourceRechecks = 0
     public var paused = 0
+    /// Parked rows (failed, final or missing) that wait for the person's decision or for a cause only the person can
+    /// fix. A subset of `failed + sourceMissing`; the rest is not backed up without anything the person can do.
+    public var attention = 0
 
     public init() {}
 

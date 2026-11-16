@@ -321,6 +321,10 @@ import os
                         kinds = [.accountStorage]
                     } else if arguments.contains("-EncryptedMemoriesNoUserResolvableBackupFixture") {
                         kinds = [.network, .deletedElsewhere, .unsupported]
+                    } else if arguments.contains("-EncryptedMemoriesStoppedRefusalBackupFixture") {
+                        kinds = [.remoteService, .permission]
+                    } else if arguments.contains("-EncryptedMemoriesCalmOnlyBackupFixture") {
+                        kinds = [.remoteService]
                     } else {
                         kinds = [.network, .accountStorage, .deletedElsewhere, .unsupported]
                     }

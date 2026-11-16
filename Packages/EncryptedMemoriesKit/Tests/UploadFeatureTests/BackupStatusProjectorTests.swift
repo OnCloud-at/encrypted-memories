@@ -648,6 +648,30 @@ final class BackupStatusProjectorTests: XCTestCase {
         await projector.stop()
     }
 
+    /// A backend error is stored as remoteService also when it is local or a sign-in failure. Only a temporary Proton
+    /// failure counts automatic retries, so only that one names Proton in the waiting headline.
+    func testOnlyATemporaryProtonFailureWaitsForProton() async throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let due = now.addingTimeInterval(600)
+        for (attempt, headline) in [(0, "backup.phase_waiting"), (1, "backup.phase_waiting_proton")] {
+            var row = entry(id: "service-\(attempt)", state: .discovered)
+            row.updatedAt = due
+            row.lastError =
+                BackupIssueRecord(
+                    kind: .remoteService, detail: "backend", nextAttemptAt: due, automaticRetryAttempt: attempt
+                ).persistedValue
+            XCTAssertTrue(queue.upsert(row))
+            let projector = BackupStatusProjector(queue: queue, now: { now })
+            let recorder = Recorder()
+            await projector.start(generation: UUID(), context: .init()) { recorder.append($0) }
+            let projection = try XCTUnwrap(recorder.values.last)
+            XCTAssertEqual(projection.status.outstandingIssue, attempt == 0 ? .unknown : .remoteService)
+            XCTAssertEqual(BackupStatusPresentation(projection.status).headlineKey, headline)
+            await projector.stop()
+            XCTAssertTrue(queue.removeMissingSource(source: row.source, revision: row.revision))
+        }
+    }
+
     func testDismissedSourceRechecksUsePhotosWordingWithoutAProblemListAction() async throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let due = now.addingTimeInterval(600)

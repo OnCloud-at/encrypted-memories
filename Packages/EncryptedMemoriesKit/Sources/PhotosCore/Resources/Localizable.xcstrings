@@ -631,10 +631,18 @@
         "de": { "stringUnit": { "state": "translated", "value": "Noch nicht fertig." } }
       }
     },
-    "backup.issue_permanent": {
+    "backup.issue_service_rejected": {
+      "comment": "Backup problem reason: Proton refused this photo again and again over several days, so the backup stopped trying it.",
       "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "This photo cannot be backed up." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Dieses Foto kann nicht gesichert werden." } }
+        "en": { "stringUnit": { "state": "translated", "value": "Proton did not accept this photo." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Proton hat dieses Foto nicht angenommen." } }
+      }
+    },
+    "backup.issue_after_several_tries": {
+      "comment": "Backup problem reason: the photo failed every attempt and no specific cause is proven.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Not backed up after several tries." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Nach mehreren Versuchen nicht gesichert." } }
       }
     },
     "backup.issue_source_not_ready": {
@@ -669,14 +677,36 @@
     },
     "backup.section_not_possible": {
       "localizations": {
-        "en": {"stringUnit": {"state": "translated", "value": "Not possible"}},
-        "de": {"stringUnit": {"state": "translated", "value": "Nicht möglich"}}
+        "en": {"stringUnit": {"state": "translated", "value": "No further attempts"}},
+        "de": {"stringUnit": {"state": "translated", "value": "Keine weiteren Versuche"}}
       }
     },
     "backup.phase_waiting_proton": {
       "localizations": {
         "en": {"stringUnit": {"state": "translated", "value": "Waiting for Proton"}},
         "de": {"stringUnit": {"state": "translated", "value": "Warten auf Proton"}}
+      }
+    },
+    "backup.progress_not_backed_up %lld": {
+      "extractionState": "manual",
+      "comment": "Calm backup status line that opens the problem list: files that are not backed up although nothing the person can fix is known.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld file not backed up" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld files not backed up" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Datei nicht gesichert" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Dateien nicht gesichert" } }
+            }
+          }
+        }
       }
     },
     "backup.phase_not_backed_up %lld": {

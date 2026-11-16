@@ -105,7 +105,10 @@ public enum PhotoLibraryContinuedBackupEnd: String, Sendable, BackgroundLogName 
     public static func after(
         goal: PhotoLibraryContinuedBackupGoal, settled: BackupStatus, didExpire: Bool, backupRuns: Bool
     ) -> Self {
-        if goal.isReached(by: settled) { return settled.needsAttentionCount > 0 ? .needsAttention : .completed }
+        // Every row that is not backed up keeps the system card from reporting success, also a calm one.
+        if goal.isReached(by: settled) {
+            return settled.needsAttentionCount + settled.notBackedUpCount > 0 ? .needsAttention : .completed
+        }
         if didExpire { return .stopped }
         return backupRuns ? .waiting : .turnedOff
     }

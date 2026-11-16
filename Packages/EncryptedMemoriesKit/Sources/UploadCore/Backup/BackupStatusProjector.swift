@@ -482,7 +482,7 @@ public actor BackupStatusProjector {
             candidates.append(
                 (
                     BackupFailedItem.effectiveNextAttempt(record, entry: entry) ?? entry.updatedAt,
-                    record?.kind ?? .unknown
+                    record.map { $0.isUnprovenServiceWait ? .unknown : $0.kind } ?? .unknown
                 ))
         }
         if let entry = queue.earliestEntry(in: .blockedByDraft) {

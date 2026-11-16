@@ -25,6 +25,11 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// True while `temp.backup_local_read_failure` holds the list that background claims read (#274). The list lives
     /// with this connection only; the queue file and its schema never contain it. Read and write under the lock.
     private var localReadFailureHintsLoaded = false
+    /// Whether a parked row raises attention, by state and stored error. The summary runs on every status refresh;
+    /// this decodes each stored error once. An entry stays valid: the answer depends only on its key. Guarded by the
+    /// connection lock.
+    private var attentionByStoredError: [String: Bool] = [:]
+    static let attentionCacheLimit = 16_384
 
     public init?(
         url: URL, policy: LibraryDatabasePolicy = .conservative, supportTrail: SupportEventTrail = .shared
@@ -1288,8 +1293,55 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 }
                 return true
             }
-            return completed == true ? summary : nil
+            guard completed == true else { return nil }
+            if summary.failed + summary.sourceMissing > 0 {
+                guard let attention = parkedAttentionLocked() else { return nil }
+                summary.attention = attention
+            }
+            return summary
         }
+    }
+
+    /// The parked rows (failed, final, missing) that raise attention; nil when the read could not run. Their stored
+    /// errors are free text, so they are read row by row: grouping the whole-queue count by that text costs more than
+    /// the count itself. Call it with the connection lock held.
+    private func parkedAttentionLocked() -> Int? {
+        var stmt: OpaquePointer?
+        guard
+            requireOperational(
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT state, last_error FROM backup_sync_queue
+                    WHERE state IN ('failed','failedPermanent','sourceMissing');
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK)
+        else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        var attention = 0
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            let rawState = columnText(stmt, 0) ?? ""
+            let storedError = columnText(stmt, 1)
+            let key = rawState + "\u{0}" + (storedError ?? "")
+            let raises: Bool
+            if let cached = attentionByStoredError[key] {
+                raises = cached
+            } else {
+                guard let state = UploadBackupSyncQueueState(rawValue: rawState) else {
+                    connection.markFailed()
+                    return nil
+                }
+                raises = BackupItemOutcome(state: state, record: BackupIssueRecord.decode(storedError)).raisesAttention
+                // A full cache keeps its entries, so more distinct errors than the limit never empty it on each read.
+                if attentionByStoredError.count < Self.attentionCacheLimit { attentionByStoredError[key] = raises }
+            }
+            if raises { attention += 1 }
+            stepResult = sqlite3_step(stmt)
+        }
+        guard requireOperational(stepResult == SQLITE_DONE) else { return nil }
+        return attention
     }
 
     /// One row of the whole-queue count: state, source kind, the stored error of a waiting or checking row, count.

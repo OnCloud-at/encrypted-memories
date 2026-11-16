@@ -31,11 +31,12 @@ final class BackupStatusPresentationTests: XCTestCase {
         total: Int = 0, waiting: Int = 0, uploadQueued: Int = 0, checking: Int = 0,
         uploading: Int = 0, uploaded: Int = 0, alreadyBackedUp: Int = 0,
         skippedRemoteDeletions: Int = 0, sourceMissing: Int = 0, blocked: Int = 0,
-        failed: Int = 0, dismissedFailures: Int = 0,
+        failed: Int = 0, dismissedFailures: Int = 0, attention: Int = 0,
         isRunning: Bool = false, isPausedByPolicy: Bool = false,
         activeTransfer: BackupActiveTransferProgress? = nil
     ) -> BackupSyncProgress {
         var p = BackupSyncProgress()
+        p.attention = attention
         p.total = total
         p.waiting = waiting
         p.uploadQueued = uploadQueued
@@ -271,7 +272,7 @@ final class BackupStatusPresentationTests: XCTestCase {
             status(progress(total: 10, checking: 1, alreadyBackedUp: 5, isRunning: true)))
         XCTAssertNil(clean.localizedAttention, "nothing failed => no attention line")
 
-        let s = status(progress(total: 10, uploaded: 5, sourceMissing: 1, failed: 2))
+        let s = status(progress(total: 10, uploaded: 5, sourceMissing: 1, failed: 2, attention: 3))
         let p = BackupStatusPresentation(s)
         XCTAssertEqual(p.headlineKey, "backup.phase_attention")
         XCTAssertEqual(p.attentionCount, s.needsAttentionCount)
@@ -280,7 +281,8 @@ final class BackupStatusPresentationTests: XCTestCase {
     }
 
     func testAttentionCountExcludesRetryableDraftsWhenFailuresCoexist() {
-        let s = status(progress(total: 20, uploaded: 8, alreadyBackedUp: 9, sourceMissing: 1, blocked: 2))
+        let s = status(
+            progress(total: 20, uploaded: 8, alreadyBackedUp: 9, sourceMissing: 1, blocked: 2, attention: 1))
         let p = BackupStatusPresentation(s)
 
         XCTAssertEqual(s.phase, .needsAttention)
@@ -379,7 +381,7 @@ final class BackupStatusPresentationTests: XCTestCase {
     }
 
     func testFailedHeadlineStatesTheCountAndOffersReasons() {
-        let presentation = BackupStatusPresentation(status(progress(total: 3, uploaded: 1, failed: 2)))
+        let presentation = BackupStatusPresentation(status(progress(total: 3, uploaded: 1, failed: 2, attention: 2)))
         XCTAssertEqual(presentation.localizedHeadline, PhotosCore.L10n.string("backup.phase_not_backed_up \(2)"))
     }
 

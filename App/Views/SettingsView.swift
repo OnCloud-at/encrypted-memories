@@ -660,6 +660,22 @@ private struct PhotoLibraryBackupSection: View {
                             .buttonStyle(.plain)
                             .transition(.opacity.combined(with: .move(edge: .top)))
                         }
+                        if let notBackedUp = display.localizedNotBackedUp {
+                            Button {
+                                showFailedList = true
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(notBackedUp)
+                                        .font(.caption)
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                }
+                                .foregroundStyle(ProtonColor.textWeak)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("backup.notBackedUpItems")
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                         if let waiting = display.localizedWaitingDetail {
                             Button {
                                 showFailedList = true

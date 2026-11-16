@@ -13,10 +13,16 @@ public struct BackupItemOutcome: Sendable, Equatable {
     /// Retrying cannot help: the item is in a final state or its cause never changes.
     public let isPermanent: Bool
     public let isRetryable: Bool
-    /// The list section of the row.
+    /// The list section of the row. A decision asks the person; a final row gets no further attempt; a cause that the
+    /// person can fix asks the person; every other row runs again in a later pass or after the next launch.
     public let section: BackupIssueSection
-    /// The row counts toward the attention line of the status.
+    /// The row counts toward the orange attention line of the status: a parked row that waits for the person's
+    /// decision or for a cause only the person can fix. Every other row that is not backed up stays calm.
     public let raisesAttention: Bool
+
+    /// Causes that only the person can fix: access to the photos, the Proton account storage, and a backup that
+    /// cannot continue until the app restarts.
+    private static let personFixableIssues: Set<BackupIssueKind> = [.permission, .accountStorage, .localState]
 
     /// A reason without a queue row.
     public init(issue: BackupIssueKind) {
@@ -49,7 +55,13 @@ public struct BackupItemOutcome: Sendable, Equatable {
         }
         let reason: String
         if category == .permanent && Self.category(of: issue) != .permanent {
-            reason = L10n.string("backup.issue_permanent")
+            // Only a photo that stopped after proven refusals names Proton as the cause.
+            reason =
+                state == .failedPermanent && record?.serviceRejection?.stopsRetrying == true
+                ? L10n.string("backup.issue_service_rejected") : L10n.string("backup.issue_after_several_tries")
+        } else if state == .failed && category == .userResolvable && (issue == .remoteService || issue == .unknown) {
+            // The stored kind of a parked row also covers local and sign-in errors; it proves no Proton cause.
+            reason = L10n.string("backup.issue_after_several_tries")
         } else if isSourceWait {
             reason =
                 waitsForOriginal
@@ -58,12 +70,29 @@ public struct BackupItemOutcome: Sendable, Equatable {
                     ? L10n.string("backup.issue_source_unavailable") : L10n.string("backup.issue_source_not_ready")
         } else if issue == .unknown && category == .automatic {
             reason = L10n.string("backup.issue_unknown_waiting")
+        } else if record?.isUnprovenServiceWait == true {
+            reason = L10n.string("backup.issue_unknown_waiting")
         } else {
             reason = Self.reason(of: issue)
         }
+        let isFinal = isPermanentState || category == .permanent
+        let section: BackupIssueSection =
+            if category == .decision {
+                .actionNeeded
+            } else if isFinal {
+                .notPossible
+            } else if Self.personFixableIssues.contains(issue) {
+                .actionNeeded
+            } else {
+                .continuesByItself
+            }
+        let isParked = state == .failed || isPermanentState
+        let raisesAttention =
+            isParked
+            && (category == .decision || (state == .failed && !isFinal && Self.personFixableIssues.contains(issue)))
         self.init(
-            issue: issue, category: category, reason: reason, isPermanent: isPermanentState,
-            section: category.section, raisesAttention: state == .failed || isPermanentState)
+            issue: issue, category: category, reason: reason, isPermanent: isPermanentState, section: section,
+            raisesAttention: raisesAttention)
     }
 
     private init(

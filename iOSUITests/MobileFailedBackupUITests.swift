@@ -26,13 +26,17 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertTrue(backup.waitForExistence(timeout: 10))
         backup.tap()
         let attention = app.buttons["backup.failedItems"]
+        let notBackedUp = app.buttons["backup.notBackedUpItems"]
         let waiting = app.buttons["backup.waitingItems"]
-        let details = attention.waitForExistence(timeout: 5) ? attention : waiting
+        let details =
+            attention.waitForExistence(timeout: 5)
+            ? attention : notBackedUp.waitForExistence(timeout: 5) ? notBackedUp : waiting
         XCTAssertTrue(details.waitForExistence(timeout: 10))
         details.tap()
         XCTAssertTrue(
             section("continuesByItself").waitForExistence(timeout: 5)
-                || section("actionNeeded").waitForExistence(timeout: 5))
+                || section("actionNeeded").waitForExistence(timeout: 5)
+                || section("notPossible").waitForExistence(timeout: 5))
     }
 
     private func section(_ name: String) -> XCUIElement {
@@ -60,7 +64,7 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertTrue(row("network fixture.heic").label.contains("Connection interrupted."))
         app.swipeUp()
         XCTAssertTrue(section("notPossible").waitForExistence(timeout: 5))
-        XCTAssertEqual(section("notPossible").label, "Not possible")
+        XCTAssertEqual(section("notPossible").label, "No further attempts")
         let permanent = row("unsupported fixture.heic")
         XCTAssertTrue(permanent.waitForExistence(timeout: 5))
         XCTAssertTrue(permanent.label.contains("This file type cannot be backed up."))
@@ -149,8 +153,33 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertEqual(section("continuesByItself").label, "Läuft von selbst weiter")
         app.swipeUp()
         XCTAssertTrue(section("notPossible").waitForExistence(timeout: 5))
-        XCTAssertEqual(section("notPossible").label, "Nicht möglich")
+        XCTAssertEqual(section("notPossible").label, "Keine weiteren Versuche")
         XCTAssertTrue(row("unsupported fixture.heic").label.contains("Dieser Dateityp kann nicht gesichert werden."))
+    }
+
+    /// A photo that Proton refused over three days gets no further attempt and no Try again; a photo without access
+    /// keeps asking the person.
+    func testAStoppedRefusalIsFinalWhileAMissingAccessAsksThePerson() {
+        openSheet(mode: "-EncryptedMemoriesStoppedRefusalBackupFixture")
+        XCTAssertEqual(section("actionNeeded").label, "Action needed")
+        XCTAssertTrue(row("permission fixture.heic").exists)
+        XCTAssertTrue(app.buttons["backup.retryUserResolvable.sheet"].exists)
+        XCTAssertTrue(section("notPossible").waitForExistence(timeout: 5))
+        XCTAssertEqual(section("notPossible").label, "No further attempts")
+        let refused = row("remoteService fixture.heic")
+        XCTAssertTrue(refused.waitForExistence(timeout: 5))
+        XCTAssertTrue(refused.label.contains("Proton did not accept this photo."))
+    }
+
+    /// Nothing the person can fix: the status shows a calm line instead of the orange one, and the list has no
+    /// Try again.
+    func testOnlyCalmRowsOpenFromTheCalmLineWithoutTryAgain() {
+        openSheet(mode: "-EncryptedMemoriesCalmOnlyBackupFixture")
+        XCTAssertFalse(app.buttons["backup.failedItems"].exists)
+        XCTAssertTrue(section("notPossible").waitForExistence(timeout: 5))
+        XCTAssertTrue(row("remoteService fixture.heic").label.contains("Proton did not accept this photo."))
+        XCTAssertFalse(section("actionNeeded").exists)
+        XCTAssertFalse(app.buttons["backup.retryUserResolvable.sheet"].exists)
     }
 
     func testAutomaticWaitHasNoTryAgain() {

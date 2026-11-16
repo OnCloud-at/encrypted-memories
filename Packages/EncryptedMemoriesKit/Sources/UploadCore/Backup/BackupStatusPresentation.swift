@@ -50,6 +50,8 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var backedUp: Int
     public var total: Int
     public var attentionCount: Int
+    /// Rows that are not backed up although nothing the person can fix is known; never worded as attention.
+    public var notBackedUpCount: Int
     /// Retryable work waiting on external state. It may open details, but is never worded as failure.
     public var waitingCount: Int
     /// Exact-content matches deliberately not restored after Proton reported them deleted.
@@ -85,6 +87,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         backedUp: Int = 0,
         total: Int = 0,
         attentionCount: Int = 0,
+        notBackedUpCount: Int = 0,
         waitingCount: Int = 0,
         skippedRemoteDeletions: Int = 0,
         nextAttemptAt: Date? = nil,
@@ -99,6 +102,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         self.backedUp = backedUp
         self.total = total
         self.attentionCount = attentionCount
+        self.notBackedUpCount = max(0, notBackedUpCount)
         self.waitingCount = waitingCount
         self.skippedRemoteDeletions = skippedRemoteDeletions
         self.nextAttemptAt = nextAttemptAt
@@ -165,8 +169,10 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                     default: "backup.phase_waiting"
                     }
             }
+            // A full Proton storage is the person's to fix (D5), so its wait asks the person.
             self.init(
-                headlineKey: headlineKey, isActive: false, accessory: .waiting,
+                headlineKey: headlineKey, isActive: false,
+                accessory: headlineKey == "backup.phase_waiting_account_storage" ? .attention : .waiting,
                 progressFraction: status.fractionCompleted,
                 backedUp: status.backedUp, total: backupTarget,
                 waitingCount: max(0, status.outstandingCount - status.pendingSourceRechecks),
@@ -175,13 +181,13 @@ public struct BackupStatusPresentation: Sendable, Equatable {
 
         case .completed:
             self.init(
-                headlineKey: status.dismissedFailures > 0
+                headlineKey: status.hasOmissions
                     ? "backup.phase_completed_with_omissions"
                     : status.skippedRemoteDeletions > 0
                         ? "backup.phase_completed_with_remote_deletions"
                         : "backup.phase_completed",
                 isActive: false,
-                accessory: status.dismissedFailures > 0 ? .notice : .success,
+                accessory: status.hasOmissions ? .notice : .success,
                 progressFraction: nil,
                 backedUp: status.backedUp,
                 total: backupTarget,
@@ -207,6 +213,10 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         }
         executionOpportunityIssue = status.executionOpportunityIssue
         remainingCount = status.remainingCount
+        // A running pass changes the parked counts before the summary sorts them, so only a resting status shows them.
+        if !isActive && status.phase != .paused {
+            notBackedUpCount = status.notBackedUpCount
+        }
         // A speed belongs to a sending phase only; a stale value never shows while paused or waiting.
         if status.phase == .checking || status.phase == .uploading {
             uploadSpeedBytesPerSecond = status.uploadSpeedBytesPerSecond
@@ -290,8 +300,18 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         accessory == .waitingForWiFi ? L10n.string("backup.detail_waiting_wifi") : nil
     }
 
+    /// Calm and tappable: the rows that are not backed up without anything the person can fix. Nil when none.
+    public var localizedNotBackedUp: String? {
+        guard notBackedUpCount > 0 else { return nil }
+        return L10n.string("backup.progress_not_backed_up \(notBackedUpCount)")
+    }
+
+    /// Names Proton only while the rows wait for a temporary Proton failure to end.
     public var localizedWaitingDetail: String? {
         guard waitingCount > 0 else { return nil }
+        guard headlineKey == "backup.phase_waiting_proton" else {
+            return L10n.string("backup.detail_waiting \(waitingCount)")
+        }
         return L10n.string("backup.progress_waiting \(waitingCount)")
     }
 
