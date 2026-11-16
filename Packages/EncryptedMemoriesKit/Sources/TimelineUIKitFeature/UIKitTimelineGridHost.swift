@@ -1344,7 +1344,7 @@
 
         /// The largest valid vertical content offset given the current content size and bottom inset.
         var maxContentOffsetY: CGFloat {
-            max(0, scrollView.contentSize.height - bounds.height + scrollView.contentInset.bottom)
+            max(0, scrollView.verticalOffsetRange.upperBound)
         }
 
         func refreshContentSize() {
@@ -2221,7 +2221,7 @@
                 if UIKitTimelineScrollDateLabelTesting.exposesLabel, accessibilityProvider.testElements == nil {
                     accessibilityProvider.testElements = { [weak self] in
                         guard let self, scrollDateLabel.isEnabled else { return [] }
-                        return [scrollDateLabel.testElement]
+                        return scrollDateLabel.testElements
                     }
                 }
             #endif

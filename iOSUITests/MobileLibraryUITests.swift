@@ -14,7 +14,9 @@ final class MobileLibraryUITests: XCTestCase {
             "-AppleLanguages", "(en)",
             "-AppleLocale", "en_US",
         ]
-        if name.contains("testBriskSwipeShowsTheMonthBesideTheScrollIndicator") {
+        if name.contains("testBriskSwipeShowsTheMonthBesideTheScrollIndicator")
+            || name.contains("testNativeIndicatorGestureShowsTheLabelAndLeavesItAtTheUsualEdge")
+        {
             app.launchArguments += ["-EncryptedMemoriesScrollDateLabelProbe"]
         }
         if name.contains("testLargeGridFixtureRetainsSelectionWhileDenseRowScrolls") {
@@ -104,6 +106,50 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertTrue(
             wait(for: label, "value == 'hidden 1 1'", timeout: 10),
             "the label fades out after the scrolling stops")
+    }
+
+    /// The native indicator owns the gesture; the label only observes it. The probe retains its last placed frame.
+    func testNativeIndicatorGestureShowsTheLabelAndLeavesItAtTheUsualEdge() throws {
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
+        let label = app.descendants(matching: .any)["timeline.scrollDateLabel"]
+        XCTAssertTrue(label.waitForExistence(timeout: 10))
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 300)),
+            withVelocity: XCUIGestureVelocity(1_500), thenHoldForDuration: 0.1)
+        XCTAssertTrue(wait(for: label, "value == 'hidden 1 1'", timeout: 10))
+        let normalRight = label.frame.maxX
+        // The press targets the native thumb itself; the label and the window edge can sit apart from it.
+        let thumb = app.descendants(matching: .any)["timeline.scrollIndicatorThumb"]
+        XCTAssertFalse(thumb.frame.isEmpty, "the probe exposes the native thumb frame")
+        let target = thumb.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        // Show the native indicator with a slow scroll; the label stays hidden. A shorter movement is a tap, which
+        // opens the photo below the finger.
+        start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 60)),
+            withVelocity: XCUIGestureVelocity(200), thenHoldForDuration: 0.1)
+        // One label query only: the indicator fades soon after the scroll, and the press below needs it visible. The
+        // press resolves the moved thumb frame when it starts.
+        XCTAssertEqual(label.value as? String, "hidden 1 1", "a slow scroll shows no date label")
+
+        target.press(
+            forDuration: 0.6, thenDragTo: target.withOffset(CGVector(dx: 0, dy: -100)),
+            withVelocity: XCUIGestureVelocity(100), thenHoldForDuration: 0.2)
+        XCTAssertTrue(
+            wait(for: label, "value == 'visible 2 2' OR value == 'hidden 2 2'", timeout: 10),
+            "the indicator gesture shows the label; host tests distinguish contact-driven and speed-driven shows")
+        XCTAssertEqual(
+            label.frame.maxX, normalRight, accuracy: 1,
+            "after release the label is at the usual edge; this does not prove an outward slide")
+        XCTAssertTrue(app.buttons["Select"].exists, "the native gesture keeps the library open")
+        XCTAssertTrue(wait(for: label, "value == 'hidden 2 2'", timeout: 10))
+        start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 200)),
+            withVelocity: XCUIGestureVelocity(1_500), thenHoldForDuration: 0.1)
+        XCTAssertTrue(wait(for: label, "value == 'visible 3 3' OR value == 'hidden 3 3'", timeout: 10))
+        XCTAssertEqual(
+            label.frame.maxX, normalRight, accuracy: 1, "normal scrolling leaves the label at the usual edge")
     }
 
     func testAPhotoOpensInTheViewerAndClosesAgain() throws {

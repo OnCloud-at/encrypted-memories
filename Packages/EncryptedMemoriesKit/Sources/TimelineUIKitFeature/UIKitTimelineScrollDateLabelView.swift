@@ -1,4 +1,5 @@
 #if canImport(UIKit)
+    import TimelineAppleAdapter
     import TimelineCore
     import UIKit
 
@@ -57,6 +58,11 @@
             super.layoutSubviews()
             glass.frame = bounds
             label.frame = textSize.contentFrame(in: bounds)
+        }
+
+        /// Horizontal motion is independent of the viewport position, which continues to update every scroll event.
+        func setDragOffset(_ offset: CGFloat, duration: TimeInterval?, tracking: Bool) {
+            LayerPresentation.setTranslationX(-offset, on: layer, duration: duration, tracking: tracking)
         }
 
         /// Fades the glass in or out. Glass materializes by animating its effect, not the view's alpha. Reduce Motion
