@@ -15,6 +15,10 @@ extension GridLevelProfile {
 }
 
 extension SquareTileGridEngine {
+    /// The width at which the exact-fill slot side of a level, less half a point, rounds to the nominal column
+    /// count of the level.
+    static let testReferenceWidth: CGFloat = 1280
+
     static var testRegularLevels: [GridLevelMetrics] { GridLevelProfile.testRegularTimeline.levels }
 
     static func testRegular(sectionCounts: [Int]) -> SquareTileGridEngine {

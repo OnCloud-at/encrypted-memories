@@ -75,7 +75,7 @@ import TimelineCore
             }
             #expect(sides.first! < sides.last!, "L\(level) tile must SCALE with width (fixed-columns, no reflow)")
             #expect(
-                e.resolvedMetrics(level: level, width: GridSizePolicy.referenceWidth).columns
+                e.resolvedMetrics(level: level, width: SquareTileGridEngine.testReferenceWidth).columns
                     == e.metrics(level: level).nominalColumns,
                 "L\(level) must reproduce nominalColumns at the reference width")
         }
