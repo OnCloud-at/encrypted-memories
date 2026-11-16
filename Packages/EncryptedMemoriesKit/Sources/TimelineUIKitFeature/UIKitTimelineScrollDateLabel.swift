@@ -4,8 +4,9 @@
     import UIKit
 
     #if DEBUG
-        /// UI tests read the label state through one accessibility element. Only a UI test that passes
-        /// `launchArgument` turns it on; the label stays hidden from VoiceOver in every other build and launch.
+        /// UI tests read the label state and the native thumb frame through accessibility elements. Only a UI test
+        /// that passes `launchArgument` turns them on; the label stays hidden from VoiceOver in every other build and
+        /// launch.
         @MainActor
         public enum UIKitTimelineScrollDateLabelTesting {
             public nonisolated static let launchArgument = "-EncryptedMemoriesScrollDateLabelProbe"
@@ -44,6 +45,9 @@
             scrollView.onVerticalIndicatorLayout = { [weak self, weak host, weak scrollView] rect in
                 guard let self, let host, let scrollView else { return }
                 indicatorDragObserver.thumbDidLayout(rect.map { host.convert($0, from: scrollView) })
+                #if DEBUG
+                    noteThumbForTests()
+                #endif
                 layout()
             }
             indicatorDragObserver.attach(to: host, scrollView: scrollView)
@@ -184,6 +188,19 @@
                 element.accessibilityValue = "hidden 0 0"
                 return element
             }()
+            /// The native thumb frame, so a UI test presses the thumb itself. Near a safe-area edge or a reserved
+            /// region the label sits apart from the thumb, and a tab column can sit between the grid and the window edge.
+            private(set) lazy var thumbTestElement: UIAccessibilityElement = {
+                let element = UIAccessibilityElement(accessibilityContainer: host as Any)
+                element.accessibilityIdentifier = "timeline.scrollIndicatorThumb"
+                return element
+            }()
+            var testElements: [UIAccessibilityElement] { [testElement, thumbTestElement] }
+
+            private func noteThumbForTests() {
+                guard UIKitTimelineScrollDateLabelTesting.exposesLabel else { return }
+                thumbTestElement.accessibilityFrameInContainerSpace = indicatorDragObserver.thumbRect ?? .zero
+            }
 
             private func notePlacementForTests() {
                 guard UIKitTimelineScrollDateLabelTesting.exposesLabel, let host else { return }

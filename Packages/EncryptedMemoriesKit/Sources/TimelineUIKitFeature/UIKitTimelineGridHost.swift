@@ -2221,7 +2221,7 @@
                 if UIKitTimelineScrollDateLabelTesting.exposesLabel, accessibilityProvider.testElements == nil {
                     accessibilityProvider.testElements = { [weak self] in
                         guard let self, scrollDateLabel.isEnabled else { return [] }
-                        return [scrollDateLabel.testElement]
+                        return scrollDateLabel.testElements
                     }
                 }
             #endif

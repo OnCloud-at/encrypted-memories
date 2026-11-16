@@ -120,14 +120,17 @@ final class MobileLibraryUITests: XCTestCase {
             withVelocity: XCUIGestureVelocity(1_500), thenHoldForDuration: 0.1)
         XCTAssertTrue(wait(for: label, "value == 'hidden 1 1'", timeout: 10))
         let normalRight = label.frame.maxX
-        let target = window.coordinate(withNormalizedOffset: .zero).withOffset(
-            CGVector(dx: window.frame.width - 3, dy: label.frame.midY - window.frame.minY))
+        // The press targets the native thumb itself; the label and the window edge can sit apart from it.
+        let thumb = app.descendants(matching: .any)["timeline.scrollIndicatorThumb"]
+        XCTAssertFalse(thumb.frame.isEmpty, "the probe exposes the native thumb frame")
+        let target = thumb.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
         // Show the native indicator with a slow scroll; the label stays hidden. A shorter movement is a tap, which
         // opens the photo below the finger.
         start.press(
             forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 60)),
             withVelocity: XCUIGestureVelocity(200), thenHoldForDuration: 0.1)
-        // One query only: the indicator fades soon after the scroll, and the press below needs it visible.
+        // One label query only: the indicator fades soon after the scroll, and the press below needs it visible. The
+        // press resolves the moved thumb frame when it starts.
         XCTAssertEqual(label.value as? String, "hidden 1 1", "a slow scroll shows no date label")
 
         target.press(
