@@ -150,8 +150,15 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         print("[Album narrow window] regular window=\(regularWindow.bounds) presented=\(regularFrame)")
         XCTAssertGreaterThanOrEqual(regularFrame.width, 300, "The regular picker must have usable width")
         XCTAssertGreaterThan(regularFrame.height, 0)
-        XCTAssertGreaterThanOrEqual(regularFrame.height, 380, "The regular picker must show its content")
-        XCTAssertLessThanOrEqual(regularFrame.height, 391, "The regular picker must keep its height bounded")
+        // Measure from the picker's navigation bar down: on iOS 26 the popover's view also reaches 13 pt up under
+        // its arrow, while the bar and the content below it keep their place. This measure is 10 pt shorter than the
+        // whole view on iOS 27 (380 instead of 390), so both bounds keep their margins 10 pt lower.
+        let bar = try XCTUnwrap(
+            descendants(regularPicker.view).compactMap { $0 as? UINavigationBar }.first,
+            "The regular picker must show its navigation bar")
+        let pickerHeight = regularFrame.maxY - bar.convert(bar.bounds, to: regularWindow).minY
+        XCTAssertGreaterThanOrEqual(pickerHeight, 370, "The regular picker must show its content")
+        XCTAssertLessThanOrEqual(pickerHeight, 381, "The regular picker must keep its height bounded")
         XCTAssertGreaterThanOrEqual(regularFrame.minX, regularWindow.bounds.minX - 1)
         XCTAssertLessThanOrEqual(regularFrame.maxX, regularWindow.bounds.maxX + 1)
     }
