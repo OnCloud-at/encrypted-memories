@@ -513,9 +513,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
             try await startScanPass(history: history)
             XCTFail("the rescan must stop at the damaged key", file: file, line: line)
         } catch {
-            XCTAssertEqual(
-                error as? UploadError, .backend("Photo library scan snapshot could not be read"), file: file,
-                line: line)
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .scanSnapshotNotRead, file: file, line: line)
         }
         XCTAssertFalse(catalog.isOperational(), file: file, line: line)
 
@@ -799,7 +797,7 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
                 commitChanges: {})
             XCTFail("the pass must stop")
         } catch {
-            XCTAssertEqual(error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")))
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .localStateUnavailable)
         }
     }
 

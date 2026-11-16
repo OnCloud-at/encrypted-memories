@@ -1584,7 +1584,7 @@ public final class PhotoLibraryBackupController {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw PhotoLibraryCatalogSyncError.localStateUnavailable
         }
     }
 
@@ -2975,20 +2975,21 @@ public final class PhotoLibraryBackupController {
         lastMessage = message
     }
 
-    /// The catalog sync throws technical English text. People see the localized local-state message, as for the
-    /// missing-source recovery; the technical text stays in the diagnostics.
+    /// A failed scan shows the localized local-state message, as the missing-source recovery does. The technical
+    /// wording of a typed catalog sync error, or the text of a backend error, stays in the diagnostics.
     private func reportScanFailure(_ error: Error) {
         PhotoDiagnostics.shared.increment("backup.scan.failed")
-        let detail: String
-        if let error = error as? UploadError, case .backend(let text) = error {
-            detail = text
-        } else {
-            // The domain and the code are fixed values; the description of a system error can hold a path.
-            let bridged = error as NSError
-            detail = "\(bridged.domain) \(bridged.code)"
-        }
-        PhotoDiagnostics.shared.emitDebug("BackupSync", ["scanError": detail])
-        reportSyncMessage(L10n.string("backup.error_local_state_unavailable"))
+        PhotoDiagnostics.shared.emitDebug("BackupSync", ["scanError": Self.scanFailureDetail(error)])
+        reportSyncMessage(PhotoLibraryCatalogSyncError.localStateMessage)
+    }
+
+    /// The fixed technical wording that the diagnostics keep for a failed scan.
+    nonisolated static func scanFailureDetail(_ error: Error) -> String {
+        if let error = error as? PhotoLibraryCatalogSyncError { return error.diagnosticText }
+        if let error = error as? UploadError, case .backend(let text) = error { return text }
+        // The domain and the code are fixed values; the description of a system error can hold a path.
+        let bridged = error as NSError
+        return "\(bridged.domain) \(bridged.code)"
     }
 
     private func refreshFromQueue() {
