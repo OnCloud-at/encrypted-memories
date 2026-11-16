@@ -1,0 +1,58 @@
+name: Measure macOS runner and build storage
+on:
+  pull_request:
+    paths:
+      - .github/workflows/macos26-build-measure.yml
+permissions:
+  contents: read
+concurrency:
+  group: macos26-build-measure-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+jobs:
+  measure:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Record runner and toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown}"
+          sw_vers
+          uname -m
+          ls -la /Applications
+          echo 'Default Xcode:'
+          xcodebuild -version || true
+          echo 'Installed Simulator runtimes:'
+          xcrun simctl list runtimes --json || true
+          echo 'Free disk before preparation:'
+          df -Pk "$HOME"
+          if [[ ! -d /Applications/Xcode_27.1.app/Contents/Developer ]]; then
+            echo 'Xcode 27.1 is absent; availability for installation and the build remain unverified.'
+            exit 1
+          fi
+          DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer xcodebuild -version
+          [[ "$(DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer xcodebuild -version)" == $'Xcode 27.1\nBuild version 27A9275' ]]
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-apple-build
+        with:
+          build-profile: app
+          save-cache: 'false'
+      - name: Build for testing and record disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/build-paths.sh
+          echo 'Free disk before build:'
+          df -Pk "$HOME"
+          trap 'echo "Free disk after build:"; df -Pk "$HOME"' EXIT
+          xcodebuild -project EncryptedMemories.xcodeproj -scheme EncryptedMemoriesMobileCI \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/measure-derived-data" \
+            -clonedSourcePackagesDirPath "$ENCRYPTED_MEMORIES_XCODE_SOURCE_PACKAGES" \
+            -packageCachePath "$ENCRYPTED_MEMORIES_XCODE_PACKAGE_CACHE" \
+            -disableAutomaticPackageResolution -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO build-for-testing
