@@ -1556,8 +1556,12 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 PhotoLibraryCatalogSyncError.catalogNotUpdated, PhotoLibraryCatalogSyncError.localStateUnavailable,
             ]
             for failure in failures {
+                let failedScans = PhotoDiagnostics.shared.counter("backup.scan.failed")
                 let message = try await messageAfterAScan(throwing: failure)
                 XCTAssertEqual(message, L10n.string("backup.error_local_state_unavailable"), "\(failure)")
+                XCTAssertEqual(
+                    PhotoDiagnostics.shared.counter("backup.scan.failed"), failedScans + 1,
+                    "a failed scan is counted once: \(failure)")
             }
             let key = "backup.error_local_state_unavailable"
             for language in ["en", "de"] {

@@ -16,6 +16,14 @@ final class PhotoLibraryScanFailureDetailTests: XCTestCase {
             PhotoLibraryBackupController.scanFailureDetail(CocoaError(.fileWriteUnknown)), "NSCocoaErrorDomain 512")
     }
 
+    func testAnotherUploadFailureKeepsNeitherItsTextNorItsFileName() {
+        let error = UploadError.fileMissing("private-name.heic")
+        let bridged = error as NSError
+        let detail = PhotoLibraryBackupController.scanFailureDetail(error)
+        XCTAssertEqual(detail, "\(bridged.domain) \(bridged.code)")
+        XCTAssertFalse(detail.contains("private-name"), detail)
+    }
+
     func testEveryCatalogSyncFailureKeepsItsTechnicalWording() {
         for error in PhotoLibraryCatalogSyncError.allCases {
             XCTAssertEqual(PhotoLibraryBackupController.scanFailureDetail(error), error.diagnosticText, "\(error)")

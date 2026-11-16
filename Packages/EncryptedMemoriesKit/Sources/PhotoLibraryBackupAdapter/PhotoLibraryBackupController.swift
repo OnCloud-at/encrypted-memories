@@ -2965,12 +2965,12 @@ public final class PhotoLibraryBackupController {
         lastMessage = message
     }
 
-    /// The catalog sync throws technical English text. People see the localized local-state message, as for the
-    /// missing-source recovery; the technical text stays in the diagnostics.
+    /// A failed scan shows the localized local-state message, as the missing-source recovery does. The technical
+    /// wording of a typed catalog sync error, or the text of a backend error, stays in the diagnostics.
     private func reportScanFailure(_ error: Error) {
         PhotoDiagnostics.shared.increment("backup.scan.failed")
         PhotoDiagnostics.shared.emitDebug("BackupSync", ["scanError": Self.scanFailureDetail(error)])
-        reportSyncMessage(L10n.string("backup.error_local_state_unavailable"))
+        reportSyncMessage(PhotoLibraryCatalogSyncError.localStateMessage)
     }
 
     /// The fixed technical wording that the diagnostics keep for a failed scan.
