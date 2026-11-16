@@ -13,11 +13,17 @@ public struct BackupItemOutcome: Sendable, Equatable {
     /// Retrying cannot help: the item is in a final state or its cause never changes.
     public let isPermanent: Bool
     public let isRetryable: Bool
+    /// The list section of the row.
+    public let section: BackupIssueSection
+    /// The row counts toward the attention line of the status.
+    public let raisesAttention: Bool
 
     /// A reason without a queue row.
     public init(issue: BackupIssueKind) {
         let category = Self.category(of: issue)
-        self.init(issue: issue, category: category, reason: Self.reason(of: issue), isPermanent: false)
+        self.init(
+            issue: issue, category: category, reason: Self.reason(of: issue), isPermanent: false,
+            section: category.section, raisesAttention: false)
     }
 
     /// A stored queue row.
@@ -55,15 +61,22 @@ public struct BackupItemOutcome: Sendable, Equatable {
         } else {
             reason = Self.reason(of: issue)
         }
-        self.init(issue: issue, category: category, reason: reason, isPermanent: isPermanentState)
+        self.init(
+            issue: issue, category: category, reason: reason, isPermanent: isPermanentState,
+            section: category.section, raisesAttention: state == .failed || isPermanentState)
     }
 
-    private init(issue: BackupIssueKind, category: BackupIssueCategory, reason: String, isPermanent: Bool) {
+    private init(
+        issue: BackupIssueKind, category: BackupIssueCategory, reason: String, isPermanent: Bool,
+        section: BackupIssueSection, raisesAttention: Bool
+    ) {
         self.issue = issue
         self.category = category
         self.reason = reason
         self.isPermanent = isPermanent || category == .permanent
         self.isRetryable = !self.isPermanent && Self.isRetryable(issue)
+        self.section = section
+        self.raisesAttention = raisesAttention
     }
 
     private static func category(of issue: BackupIssueKind) -> BackupIssueCategory {

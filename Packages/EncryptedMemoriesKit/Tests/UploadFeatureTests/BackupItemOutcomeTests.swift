@@ -16,6 +16,8 @@ struct BackupItemOutcomeTests {
         .remoteService, .localState, .remoteDeletion, .deletedElsewhere, .accountStorage, .unknown,
     ]
 
+    private static let refusalStart = Date(timeIntervalSince1970: 1_790_000_000)
+
     /// Stored `last_error` values: a record of each kind, the persisted wait details, and the formats of older builds.
     private static let storedReasons: [(label: String, lastError: String?)] =
         allKinds.map { ($0.rawValue, BackupIssueRecord(kind: $0, detail: "PRIVATE DETAIL").persistedValue) }
@@ -31,6 +33,28 @@ struct BackupItemOutcomeTests {
             ),
         ].map { ("unknown/\($0.0)", BackupIssueRecord(kind: .unknown, detail: $0.1).persistedValue) }
         + [
+            (
+                "remoteService/temporary",
+                BackupIssueRecord(kind: .remoteService, detail: "PRIVATE DETAIL", automaticRetryAttempt: 1)
+                    .persistedValue
+            ),
+            (
+                "remoteService/refused",
+                BackupIssueRecord(
+                    kind: .remoteService, detail: "PRIVATE DETAIL",
+                    serviceRejection: .init(rounds: 1, firstRoundAt: refusalStart, lastRoundAt: refusalStart)
+                ).persistedValue
+            ),
+            (
+                "remoteService/stopped",
+                BackupIssueRecord(
+                    kind: .remoteService, detail: "PRIVATE DETAIL",
+                    serviceRejection: .init(
+                        rounds: 3, firstRoundAt: refusalStart, lastRoundAt: refusalStart.addingTimeInterval(72 * 3600))
+                ).persistedValue
+            ),
+        ]
+        + [
             ("none", nil),
             ("plain-text", "PRIVATE SERVER TEXT"),
             ("damaged-record", BackupIssueRecord.storagePrefix + "not base64"),
@@ -44,11 +68,19 @@ struct BackupItemOutcomeTests {
         "issue_source_unavailable", "issue_source_not_ready", "issue_unknown_waiting",
     ]
 
-    private static func describe(_ item: BackupFailedItem) -> String {
+    private static func describe(state: UploadBackupSyncQueueState, lastError: String?) -> String {
+        let item = Self.item(state: state, lastError: lastError)
         let key = reasonKeys.first { L10n.string(dynamicKey: "backup." + $0) == item.reason } ?? "UNMAPPED"
         let retry = item.isPermanent ? "permanent" : item.isRetryable ? "retryable" : "notRetryable"
         #expect(!item.isPermanent || !item.isRetryable)
         return "\(item.issue.rawValue) \(item.category.rawValue) \(key) \(retry)"
+    }
+
+    /// The list section of a stored row, and whether it counts toward the attention line.
+    private static func placement(state: UploadBackupSyncQueueState, lastError: String?) -> String {
+        let outcome = BackupItemOutcome(state: state, record: BackupIssueRecord.decode(lastError))
+        #expect(Self.item(state: state, lastError: lastError).section == outcome.section)
+        return "\(outcome.section.rawValue) \(outcome.raisesAttention ? "attention" : "calm")"
     }
 
     private static func item(state: UploadBackupSyncQueueState, lastError: String?) -> BackupFailedItem {
@@ -61,19 +93,30 @@ struct BackupItemOutcomeTests {
     @Test func everyStoredRowKeepsItsOutcome() {
         let actual = Self.distinctStates.flatMap { state in
             Self.storedReasons.map { reason in
-                let item = Self.item(state: state, lastError: reason.lastError)
-                return "\(state.rawValue) \(reason.label) -> \(Self.describe(item))"
+                "\(state.rawValue) \(reason.label) -> \(Self.describe(state: state, lastError: reason.lastError))"
             }
         }
         #expect(actual == Self.storedRowOutcomes)
+    }
+
+    @Test func everyStoredRowKeepsItsSection() {
+        let actual = Self.distinctStates.flatMap { state in
+            Self.storedReasons.map { reason in
+                "\(state.rawValue) \(reason.label) -> \(Self.placement(state: state, lastError: reason.lastError))"
+            }
+        }
+        #expect(actual == Self.storedRowSections)
     }
 
     @Test(arguments: UploadBackupSyncQueueState.allCases.filter { !distinctStates.contains($0) })
     func everyOtherStateKeepsTheOutcomeOfAWaitingRow(state: UploadBackupSyncQueueState) {
         for reason in Self.storedReasons {
             #expect(
-                Self.describe(Self.item(state: state, lastError: reason.lastError))
-                    == Self.describe(Self.item(state: .discovered, lastError: reason.lastError)), "\(reason.label)")
+                Self.describe(state: state, lastError: reason.lastError)
+                    == Self.describe(state: .discovered, lastError: reason.lastError), "\(reason.label)")
+            #expect(
+                Self.placement(state: state, lastError: reason.lastError)
+                    == Self.placement(state: .discovered, lastError: reason.lastError), "\(reason.label)")
         }
     }
 
@@ -117,6 +160,9 @@ struct BackupItemOutcomeTests {
         "discovered unknown/original -> unknown automatic issue_waiting_original retryable",
         "discovered unknown/originalEN -> unknown automatic issue_waiting_original retryable",
         "discovered unknown/originalDE -> unknown automatic issue_waiting_original retryable",
+        "discovered remoteService/temporary -> remoteService automatic issue_remote_service retryable",
+        "discovered remoteService/refused -> remoteService automatic issue_remote_service retryable",
+        "discovered remoteService/stopped -> remoteService automatic issue_remote_service retryable",
         "discovered none -> unknown automatic issue_unknown_waiting retryable",
         "discovered plain-text -> unknown automatic issue_unknown_waiting retryable",
         "discovered damaged-record -> unknown automatic issue_unknown_waiting retryable",
@@ -139,6 +185,9 @@ struct BackupItemOutcomeTests {
         "blockedByDraft unknown/original -> unknown automatic issue_waiting_original retryable",
         "blockedByDraft unknown/originalEN -> unknown automatic issue_waiting_original retryable",
         "blockedByDraft unknown/originalDE -> unknown automatic issue_waiting_original retryable",
+        "blockedByDraft remoteService/temporary -> remoteService automatic issue_remote_service retryable",
+        "blockedByDraft remoteService/refused -> remoteService automatic issue_remote_service retryable",
+        "blockedByDraft remoteService/stopped -> remoteService automatic issue_remote_service retryable",
         "blockedByDraft none -> remoteDraft automatic issue_remote_draft retryable",
         "blockedByDraft plain-text -> remoteDraft automatic issue_remote_draft retryable",
         "blockedByDraft damaged-record -> unknown automatic issue_unknown_waiting retryable",
@@ -161,6 +210,9 @@ struct BackupItemOutcomeTests {
         "failed unknown/original -> unknown automatic issue_waiting_original retryable",
         "failed unknown/originalEN -> unknown automatic issue_waiting_original retryable",
         "failed unknown/originalDE -> unknown automatic issue_waiting_original retryable",
+        "failed remoteService/temporary -> remoteService userResolvable issue_remote_service retryable",
+        "failed remoteService/refused -> remoteService userResolvable issue_remote_service retryable",
+        "failed remoteService/stopped -> remoteService userResolvable issue_remote_service retryable",
         "failed none -> unknown userResolvable fail_reason_generic retryable",
         "failed plain-text -> unknown userResolvable fail_reason_generic retryable",
         "failed damaged-record -> unknown userResolvable fail_reason_generic retryable",
@@ -183,6 +235,9 @@ struct BackupItemOutcomeTests {
         "failedPermanent unknown/original -> unknown permanent issue_permanent permanent",
         "failedPermanent unknown/originalEN -> unknown permanent issue_permanent permanent",
         "failedPermanent unknown/originalDE -> unknown permanent issue_permanent permanent",
+        "failedPermanent remoteService/temporary -> remoteService permanent issue_permanent permanent",
+        "failedPermanent remoteService/refused -> remoteService permanent issue_permanent permanent",
+        "failedPermanent remoteService/stopped -> remoteService permanent issue_permanent permanent",
         "failedPermanent none -> remoteDraftStale permanent issue_remote_draft_stale permanent",
         "failedPermanent plain-text -> remoteDraftStale permanent issue_remote_draft_stale permanent",
         "failedPermanent damaged-record -> unknown permanent issue_permanent permanent",
@@ -205,6 +260,9 @@ struct BackupItemOutcomeTests {
         "sourceMissing unknown/original -> unknown permanent issue_permanent permanent",
         "sourceMissing unknown/originalEN -> unknown permanent issue_permanent permanent",
         "sourceMissing unknown/originalDE -> unknown permanent issue_permanent permanent",
+        "sourceMissing remoteService/temporary -> remoteService permanent issue_permanent permanent",
+        "sourceMissing remoteService/refused -> remoteService permanent issue_permanent permanent",
+        "sourceMissing remoteService/stopped -> remoteService permanent issue_permanent permanent",
         "sourceMissing none -> sourceMissing permanent issue_source_missing permanent",
         "sourceMissing plain-text -> sourceMissing permanent issue_source_missing permanent",
         "sourceMissing damaged-record -> unknown permanent issue_permanent permanent",
@@ -227,8 +285,164 @@ struct BackupItemOutcomeTests {
         "skippedRemoteDeletion unknown/original -> unknown automatic issue_waiting_original retryable",
         "skippedRemoteDeletion unknown/originalEN -> unknown automatic issue_waiting_original retryable",
         "skippedRemoteDeletion unknown/originalDE -> unknown automatic issue_waiting_original retryable",
+        "skippedRemoteDeletion remoteService/temporary -> remoteService automatic issue_remote_service retryable",
+        "skippedRemoteDeletion remoteService/refused -> remoteService automatic issue_remote_service retryable",
+        "skippedRemoteDeletion remoteService/stopped -> remoteService automatic issue_remote_service retryable",
         "skippedRemoteDeletion none -> remoteDeletion decision state_skipped_remote_deletion notRetryable",
         "skippedRemoteDeletion plain-text -> remoteDeletion decision state_skipped_remote_deletion notRetryable",
         "skippedRemoteDeletion damaged-record -> unknown automatic issue_unknown_waiting retryable",
+    ]
+
+    private static let storedRowSections = [
+        "discovered network -> continuesByItself calm",
+        "discovered deviceStorage -> continuesByItself calm",
+        "discovered remoteDraft -> continuesByItself calm",
+        "discovered remoteDraftStale -> notPossible calm",
+        "discovered sourceMissing -> notPossible calm",
+        "discovered permission -> actionNeeded calm",
+        "discovered unsupported -> notPossible calm",
+        "discovered remoteService -> continuesByItself calm",
+        "discovered localState -> actionNeeded calm",
+        "discovered remoteDeletion -> actionNeeded calm",
+        "discovered deletedElsewhere -> actionNeeded calm",
+        "discovered accountStorage -> actionNeeded calm",
+        "discovered unknown -> continuesByItself calm",
+        "discovered unknown/notReady -> continuesByItself calm",
+        "discovered unknown/unavailable -> continuesByItself calm",
+        "discovered unknown/reportedMissing -> continuesByItself calm",
+        "discovered unknown/original -> continuesByItself calm",
+        "discovered unknown/originalEN -> continuesByItself calm",
+        "discovered unknown/originalDE -> continuesByItself calm",
+        "discovered remoteService/temporary -> continuesByItself calm",
+        "discovered remoteService/refused -> continuesByItself calm",
+        "discovered remoteService/stopped -> continuesByItself calm",
+        "discovered none -> continuesByItself calm",
+        "discovered plain-text -> continuesByItself calm",
+        "discovered damaged-record -> continuesByItself calm",
+        "blockedByDraft network -> continuesByItself calm",
+        "blockedByDraft deviceStorage -> continuesByItself calm",
+        "blockedByDraft remoteDraft -> continuesByItself calm",
+        "blockedByDraft remoteDraftStale -> notPossible calm",
+        "blockedByDraft sourceMissing -> notPossible calm",
+        "blockedByDraft permission -> actionNeeded calm",
+        "blockedByDraft unsupported -> notPossible calm",
+        "blockedByDraft remoteService -> continuesByItself calm",
+        "blockedByDraft localState -> actionNeeded calm",
+        "blockedByDraft remoteDeletion -> actionNeeded calm",
+        "blockedByDraft deletedElsewhere -> actionNeeded calm",
+        "blockedByDraft accountStorage -> actionNeeded calm",
+        "blockedByDraft unknown -> continuesByItself calm",
+        "blockedByDraft unknown/notReady -> continuesByItself calm",
+        "blockedByDraft unknown/unavailable -> continuesByItself calm",
+        "blockedByDraft unknown/reportedMissing -> continuesByItself calm",
+        "blockedByDraft unknown/original -> continuesByItself calm",
+        "blockedByDraft unknown/originalEN -> continuesByItself calm",
+        "blockedByDraft unknown/originalDE -> continuesByItself calm",
+        "blockedByDraft remoteService/temporary -> continuesByItself calm",
+        "blockedByDraft remoteService/refused -> continuesByItself calm",
+        "blockedByDraft remoteService/stopped -> continuesByItself calm",
+        "blockedByDraft none -> continuesByItself calm",
+        "blockedByDraft plain-text -> continuesByItself calm",
+        "blockedByDraft damaged-record -> continuesByItself calm",
+        "failed network -> actionNeeded attention",
+        "failed deviceStorage -> actionNeeded attention",
+        "failed remoteDraft -> actionNeeded attention",
+        "failed remoteDraftStale -> notPossible attention",
+        "failed sourceMissing -> notPossible attention",
+        "failed permission -> actionNeeded attention",
+        "failed unsupported -> notPossible attention",
+        "failed remoteService -> actionNeeded attention",
+        "failed localState -> actionNeeded attention",
+        "failed remoteDeletion -> actionNeeded attention",
+        "failed deletedElsewhere -> actionNeeded attention",
+        "failed accountStorage -> actionNeeded attention",
+        "failed unknown -> actionNeeded attention",
+        "failed unknown/notReady -> continuesByItself attention",
+        "failed unknown/unavailable -> continuesByItself attention",
+        "failed unknown/reportedMissing -> continuesByItself attention",
+        "failed unknown/original -> continuesByItself attention",
+        "failed unknown/originalEN -> continuesByItself attention",
+        "failed unknown/originalDE -> continuesByItself attention",
+        "failed remoteService/temporary -> actionNeeded attention",
+        "failed remoteService/refused -> actionNeeded attention",
+        "failed remoteService/stopped -> actionNeeded attention",
+        "failed none -> actionNeeded attention",
+        "failed plain-text -> actionNeeded attention",
+        "failed damaged-record -> actionNeeded attention",
+        "failedPermanent network -> notPossible attention",
+        "failedPermanent deviceStorage -> notPossible attention",
+        "failedPermanent remoteDraft -> notPossible attention",
+        "failedPermanent remoteDraftStale -> notPossible attention",
+        "failedPermanent sourceMissing -> notPossible attention",
+        "failedPermanent permission -> notPossible attention",
+        "failedPermanent unsupported -> notPossible attention",
+        "failedPermanent remoteService -> notPossible attention",
+        "failedPermanent localState -> notPossible attention",
+        "failedPermanent remoteDeletion -> notPossible attention",
+        "failedPermanent deletedElsewhere -> actionNeeded attention",
+        "failedPermanent accountStorage -> notPossible attention",
+        "failedPermanent unknown -> notPossible attention",
+        "failedPermanent unknown/notReady -> notPossible attention",
+        "failedPermanent unknown/unavailable -> notPossible attention",
+        "failedPermanent unknown/reportedMissing -> notPossible attention",
+        "failedPermanent unknown/original -> notPossible attention",
+        "failedPermanent unknown/originalEN -> notPossible attention",
+        "failedPermanent unknown/originalDE -> notPossible attention",
+        "failedPermanent remoteService/temporary -> notPossible attention",
+        "failedPermanent remoteService/refused -> notPossible attention",
+        "failedPermanent remoteService/stopped -> notPossible attention",
+        "failedPermanent none -> notPossible attention",
+        "failedPermanent plain-text -> notPossible attention",
+        "failedPermanent damaged-record -> notPossible attention",
+        "sourceMissing network -> notPossible attention",
+        "sourceMissing deviceStorage -> notPossible attention",
+        "sourceMissing remoteDraft -> notPossible attention",
+        "sourceMissing remoteDraftStale -> notPossible attention",
+        "sourceMissing sourceMissing -> notPossible attention",
+        "sourceMissing permission -> notPossible attention",
+        "sourceMissing unsupported -> notPossible attention",
+        "sourceMissing remoteService -> notPossible attention",
+        "sourceMissing localState -> notPossible attention",
+        "sourceMissing remoteDeletion -> notPossible attention",
+        "sourceMissing deletedElsewhere -> actionNeeded attention",
+        "sourceMissing accountStorage -> notPossible attention",
+        "sourceMissing unknown -> notPossible attention",
+        "sourceMissing unknown/notReady -> notPossible attention",
+        "sourceMissing unknown/unavailable -> notPossible attention",
+        "sourceMissing unknown/reportedMissing -> notPossible attention",
+        "sourceMissing unknown/original -> notPossible attention",
+        "sourceMissing unknown/originalEN -> notPossible attention",
+        "sourceMissing unknown/originalDE -> notPossible attention",
+        "sourceMissing remoteService/temporary -> notPossible attention",
+        "sourceMissing remoteService/refused -> notPossible attention",
+        "sourceMissing remoteService/stopped -> notPossible attention",
+        "sourceMissing none -> notPossible attention",
+        "sourceMissing plain-text -> notPossible attention",
+        "sourceMissing damaged-record -> notPossible attention",
+        "skippedRemoteDeletion network -> continuesByItself calm",
+        "skippedRemoteDeletion deviceStorage -> continuesByItself calm",
+        "skippedRemoteDeletion remoteDraft -> continuesByItself calm",
+        "skippedRemoteDeletion remoteDraftStale -> notPossible calm",
+        "skippedRemoteDeletion sourceMissing -> notPossible calm",
+        "skippedRemoteDeletion permission -> actionNeeded calm",
+        "skippedRemoteDeletion unsupported -> notPossible calm",
+        "skippedRemoteDeletion remoteService -> continuesByItself calm",
+        "skippedRemoteDeletion localState -> actionNeeded calm",
+        "skippedRemoteDeletion remoteDeletion -> actionNeeded calm",
+        "skippedRemoteDeletion deletedElsewhere -> actionNeeded calm",
+        "skippedRemoteDeletion accountStorage -> actionNeeded calm",
+        "skippedRemoteDeletion unknown -> continuesByItself calm",
+        "skippedRemoteDeletion unknown/notReady -> continuesByItself calm",
+        "skippedRemoteDeletion unknown/unavailable -> continuesByItself calm",
+        "skippedRemoteDeletion unknown/reportedMissing -> continuesByItself calm",
+        "skippedRemoteDeletion unknown/original -> continuesByItself calm",
+        "skippedRemoteDeletion unknown/originalEN -> continuesByItself calm",
+        "skippedRemoteDeletion unknown/originalDE -> continuesByItself calm",
+        "skippedRemoteDeletion remoteService/temporary -> continuesByItself calm",
+        "skippedRemoteDeletion remoteService/refused -> continuesByItself calm",
+        "skippedRemoteDeletion remoteService/stopped -> continuesByItself calm",
+        "skippedRemoteDeletion none -> actionNeeded calm",
+        "skippedRemoteDeletion plain-text -> actionNeeded calm",
+        "skippedRemoteDeletion damaged-record -> continuesByItself calm",
     ]
 }

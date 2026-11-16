@@ -9,6 +9,8 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
     public let filename: String
     public let reason: String
     public let category: BackupIssueCategory
+    /// The list section. A queue row takes it from its outcome; a row without a queue row takes its category's.
+    public let section: BackupIssueSection
     /// Raw detail is for support reports, never for the list.
     public let technicalDetail: String?
     public let isPermanent: Bool
@@ -35,10 +37,12 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         source: UploadSourceIdentity? = nil,
         revision: UploadBackupRevision? = nil,
         category: BackupIssueCategory? = nil,
-        technicalDetail: String? = nil
+        technicalDetail: String? = nil,
+        section: BackupIssueSection? = nil
     ) {
         let outcome = BackupItemOutcome(issue: issue)
         self.category = category ?? outcome.category
+        self.section = section ?? self.category.section
         self.technicalDetail = technicalDetail
         self.id = id
         self.filename = filename
@@ -60,7 +64,7 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
             filename: entry.originalFilename, reason: outcome.reason, isPermanent: outcome.isPermanent,
             issue: outcome.issue, nextAttemptAt: Self.effectiveNextAttempt(record, entry: entry),
             isRetryable: outcome.isRetryable, source: entry.source, revision: entry.revision,
-            category: outcome.category, technicalDetail: record?.detail ?? entry.lastError)
+            category: outcome.category, technicalDetail: record?.detail ?? entry.lastError, section: outcome.section)
     }
 
     /// A manual retry makes a row due before the date that its reason names; the row's own date then wins.
