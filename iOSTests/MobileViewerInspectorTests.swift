@@ -88,6 +88,30 @@ final class MobileViewerInspectorTests: XCTestCase {
         try await verifyVideoContinuity(playing: true)
     }
 
+    /// AVPlayer documents no time limit for calling a seek completion handler (#1406). The shared seek setup of the
+    /// video tests must still end once the seek takes effect.
+    @MainActor func testSeekSetupEndsWithoutTheSeekCompletionHandler() async throws {
+        let clip = try await makeVideoClip(frameCount: 60)
+        defer { try? FileManager.default.removeItem(at: clip) }
+        let player = CompletionDroppingPlayer(playerItem: AVPlayerItem(url: clip))
+        try await waitForVideo("SETUP: the local clip becomes ready") { player.currentItem?.status == .readyToPlay }
+        let setup = SeekSetupProbe()
+        Task { @MainActor in
+            do {
+                try await pauseAndSeek(player, to: 8)
+            } catch {
+                setup.error = error
+            }
+            setup.ended = true
+        }
+        // Longer than the setup's own bound, so a failing setup reports its own message first.
+        let ended = try await pollUntil(timeout: .seconds(20), every: .milliseconds(50)) { setup.ended }
+        XCTAssertTrue(ended, "The seek setup must end without a call of the seek completion handler")
+        if let error = setup.error { throw error }
+        XCTAssertEqual(player.timeControlStatus, .paused)
+        XCTAssertEqual(player.currentTime().seconds, 8, accuracy: 0.1)
+    }
+
     /// Window resizing is a hosted baseline, not a simulated fold or display handoff.
     @MainActor private func verifyVideoContinuity(playing: Bool) async throws {
         let clip = try await makeVideoClip(frameCount: 60)
@@ -142,13 +166,7 @@ final class MobileViewerInspectorTests: XCTestCase {
         let player = try XCTUnwrap(controller.player)
         let playerItem = try XCTUnwrap(player.currentItem)
         XCTAssertGreaterThan(playerItem.duration.seconds, 30, "SETUP: clip must outlast the resize sequence")
-        player.pause()
-        let seekCompleted = await player.seek(
-            to: CMTime(seconds: 8, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
-        XCTAssertTrue(seekCompleted, "SETUP: native seek must complete")
-        try await waitForVideo("SETUP: pause and seek reach the requested position") {
-            player.timeControlStatus == .paused && abs(player.currentTime().seconds - 8) < 0.1
-        }
+        try await pauseAndSeek(player, to: 8)
         if playing {
             player.play()
             try await waitForVideo("SETUP: video actually progresses before resizing") {
@@ -523,6 +541,21 @@ final class MobileViewerInspectorTests: XCTestCase {
         add(attachment)
         writeArtifact("viewer-inspector-report.txt", Data(text.utf8))
     }
+}
+
+/// A player whose seek with a completion handler moves the playhead but never calls the handler.
+private final class CompletionDroppingPlayer: AVPlayer {
+    override func seek(
+        to time: CMTime, toleranceBefore: CMTime, toleranceAfter: CMTime,
+        completionHandler: @escaping @Sendable (Bool) -> Void
+    ) {
+        super.seek(to: time, toleranceBefore: toleranceBefore, toleranceAfter: toleranceAfter)
+    }
+}
+
+@MainActor private final class SeekSetupProbe {
+    var ended = false
+    var error: (any Error)?
 }
 
 private final class ViewerVideoLifetimeProbe: VideoStreamLifetime, @unchecked Sendable {
