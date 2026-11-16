@@ -513,6 +513,12 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private var unknownEntryReads: Int
     var refusesMissingRemoval = false
     private var unknownEntryReadCount = 0
+    /// An error other than a failed read, which the keyed read throws once it is set.
+    var entryReadFailure: (any Error)? {
+        get { lock.withLock { foreignEntryReadFailure } }
+        set { lock.withLock { foreignEntryReadFailure = newValue } }
+    }
+    private var foreignEntryReadFailure: (any Error)?
     var failedEntryReads: Int { lock.withLock { unknownEntryReadCount } }
     private var reconciliationHook: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)?
     private var stateWriteHook: (@Sendable (UploadSourceIdentity, UploadBackupSyncQueueState) -> Bool)?
@@ -554,6 +560,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
 
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
+        if let foreign = entryReadFailure { throw foreign }
         let unknown = lock.withLock {
             guard unknownEntryReads > 0 else { return false }
             unknownEntryReads -= 1
