@@ -56,7 +56,7 @@ final class CatalogReadFailClosedTests: XCTestCase {
     }
 
     private func sync(
-        _ store: PhotoLibraryCatalogManifestStore, infos: [PhotoBackupAssetInfo] = [], at seconds: TimeInterval = 100,
+        _ store: any PhotoLibraryCatalogStore, infos: [PhotoBackupAssetInfo] = [], at seconds: TimeInterval = 100,
         chunkSize: Int = 10
     ) -> PhotoLibraryCatalogSync {
         PhotoLibraryCatalogSync(
@@ -192,6 +192,146 @@ final class CatalogReadFailClosedTests: XCTestCase {
         try await assertScan(
             failing: { $0.contains("'completed_full_scan', 1") }, expecting: .scanNotCompleted,
             scan: fullScan([photo("a")]))
+    }
+
+    // MARK: - Typed failure of each remaining site
+
+    /// Matches the write of one info value, not the read of the same key.
+    private func writing(_ keyAndValue: String) -> (String) -> Bool {
+        { $0.contains("INSERT INTO photo_catalog_info") && $0.contains(keyAndValue) }
+    }
+
+    /// Runs `scan` on a catalog that answers `isOperational()` with false from its `call`-th call on.
+    private func assertNotOperational(
+        fromCall call: Int, expecting expected: PhotoLibraryCatalogSyncError,
+        seed: (PhotoLibraryCatalogManifestStore) -> Void = { _ in },
+        scan: (PageCatalog) async throws -> Void,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let store = try makeCatalog()
+        seed(store)
+        let catalog = PageCatalog(inner: store)
+        catalog.failsOperationalFromCall = call
+        do {
+            try await scan(catalog)
+            XCTFail("a catalog that stops being operational must stop the scan", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, expected, file: file, line: line)
+        }
+    }
+
+    func testAStoreThatFailsAfterTheResumeReadIsTheScanStateUnavailable() async throws {
+        try await assertNotOperational(fromCall: 2, expecting: .scanStateUnavailable) {
+            _ = try await self.sync($0, infos: [self.photo("a")]).run(engine: Enqueuer())
+        }
+    }
+
+    func testAStoreThatFailsAfterTheSnapshotReadIsTheScanStateUnavailable() async throws {
+        try await assertNotOperational(fromCall: 3, expecting: .scanStateUnavailable) {
+            _ = try await self.sync($0, infos: [self.photo("a")]).run(engine: Enqueuer())
+        }
+    }
+
+    func testAStoreThatFailsAfterTheClassificationIsTheCatalogNotRead() async throws {
+        try await assertNotOperational(
+            fromCall: 3, expecting: .catalogNotRead,
+            seed: { XCTAssertTrue($0.upsertBatch([self.entry(self.photo("a"))])) },
+            scan: {
+                _ = try await self.sync($0, infos: [self.photo("a", modified: 1_700_000_200)])
+                    .run(engine: Enqueuer(), identifiers: ["a"])
+            })
+    }
+
+    func testAStoreThatFailsBeforeTheMissingSourceSweepIsTheCatalogNotRead() async throws {
+        try await assertNotOperational(fromCall: 1, expecting: .catalogNotRead) {
+            try await self.sync($0).reconcileMissingSources(engine: Enqueuer())
+        }
+    }
+
+    func testAFailedSnapshotCountIsTheScanSnapshotNotRead() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["a"]))
+        XCTAssertTrue(store.finishFullScanSnapshot())
+        let fault = try SQLiteReadInterrupt(in: store, matching: "SELECT COUNT(*) FROM photo_full_scan_snapshot")
+        defer { fault.stop() }
+        do {
+            _ = try await sync(store, infos: [photo("a")]).run(engine: Enqueuer())
+            XCTFail("an unknown snapshot size must stop the scan")
+        } catch {
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .scanSnapshotNotRead)
+        }
+        XCTAssertTrue(fault.fired)
+    }
+
+    func testAFailedRemovalOfAPhotoMissingFromTheScanIsTheRemovalsNotSaved() async throws {
+        try await assertScan(
+            failing: { $0.contains("UPDATE photo_catalog SET is_removed=1") && $0.contains("local_id=") },
+            expecting: .removalsNotSaved,
+            seed: { store in
+                XCTAssertTrue(store.upsertBatch([self.entry(self.photo("gone"))]))
+                XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+                XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["a", "gone"]))
+                XCTAssertTrue(store.finishFullScanSnapshot())
+            },
+            scan: { store in _ = try await self.sync(store, infos: [self.photo("a")]).run(engine: Enqueuer()) })
+    }
+
+    func testAFailedLateRenderResumePointIsTheCatalogNotUpdated() async throws {
+        try await assertScan(
+            failing: writing("'late_render_sweep_resume_point'"),
+            expecting: .catalogNotUpdated,
+            seed: { XCTAssertTrue($0.upsertBatch(["a", "b"].map { self.entry(self.edit($0)) })) },
+            scan: { try await self.sync($0, chunkSize: 1).reconcileLateRendersOnce(engine: Enqueuer()) })
+    }
+
+    func testAFailedLateRenderCompletionIsTheCatalogNotUpdated() async throws {
+        try await assertScan(
+            failing: { $0.contains("'reconciled_late_renders', 1") }, expecting: .catalogNotUpdated,
+            seed: { XCTAssertTrue($0.upsertBatch([self.entry(self.photo("a"))])) },
+            scan: { try await self.sync($0).reconcileLateRendersOnce(engine: Enqueuer()) })
+    }
+
+    func testAFailedFirstSweepRecordIsTheCatalogNotUpdated() async throws {
+        try await assertScan(
+            failing: writing("'missing_source_sweep_generation'"),
+            expecting: .catalogNotUpdated,
+            scan: { try await self.sync($0).reconcileMissingSources(engine: Enqueuer()) })
+    }
+
+    func testAFailedSweepProgressIsTheCatalogNotUpdated() async throws {
+        try await assertScan(
+            failing: writing("'missing_source_sweep_resume_point'"),
+            expecting: .catalogNotUpdated,
+            seed: { XCTAssertTrue($0.upsertBatch(["a", "b"].map { self.entry(self.photo($0)) })) },
+            scan: { try await self.sync($0, chunkSize: 1).reconcileMissingSources(engine: Enqueuer()) })
+    }
+
+    func testAFailedSweepRestartAfterADiscardIsTheCatalogNotUpdated() async throws {
+        try await assertScan(
+            failing: writing("'missing_source_sweep_generation', 1"),
+            expecting: .catalogNotUpdated,
+            seed: { store in
+                XCTAssertTrue(store.upsertBatch(["a", "broken"].map { self.entry(self.photo($0)) }))
+                XCTAssertTrue(
+                    store.recordMissingSourceSweepProgress(PhotoLibraryMissingSourceSweepProgress(generation: 0)))
+                try? self.corrupt("broken", in: store)
+            },
+            scan: { try await self.sync($0).reconcileMissingSources(engine: Enqueuer()) })
+    }
+
+    func testAFailedSweepCompletionIsTheCatalogNotUpdated() async throws {
+        try await assertScan(
+            failing: writing("'reconciled_missing_source_generation'"),
+            expecting: .catalogNotUpdated,
+            seed: { XCTAssertTrue($0.upsertBatch([self.entry(self.photo("a"))])) },
+            scan: { try await self.sync($0).reconcileMissingSources(engine: Enqueuer()) })
+    }
+
+    func testAFailedCatalogWriteOfAScannedPhotoIsTheCatalogNotUpdated() async throws {
+        try await assertScan(
+            failing: { $0.contains("INSERT INTO photo_catalog(") }, expecting: .catalogNotUpdated,
+            scan: { _ = try await self.sync($0, infos: [self.photo("a")]).run(engine: Enqueuer(), identifiers: ["a"]) })
     }
 
     // MARK: - Full scan (H1-H3): hazards that appear once recovery clears a transient failure
