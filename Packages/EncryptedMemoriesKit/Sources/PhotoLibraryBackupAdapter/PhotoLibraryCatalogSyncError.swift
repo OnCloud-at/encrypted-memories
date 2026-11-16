@@ -1,5 +1,6 @@
 import Foundation
 import PhotosCore
+import UploadCore
 
 /// Why the catalog sync stopped. Every case is a failure of the app's own stores: Photos and the network did not
 /// fail. The person sees one localized local-state message for each case; `diagnosticText` is the technical wording
@@ -28,7 +29,7 @@ public enum PhotoLibraryCatalogSyncError: Error, Equatable, Sendable, CaseIterab
     case localStateUnavailable
 
     /// The localized message that a person sees for every failed scan. One place names its key.
-    public static var localStateMessage: String { L10n.string("backup.error_local_state_unavailable") }
+    public static var localStateMessage: String { UploadError.InternalFailure.localStateMessage }
 
     /// The technical wording of the failure. Only the diagnostics read it; it never reaches a label.
     public var diagnosticText: String {

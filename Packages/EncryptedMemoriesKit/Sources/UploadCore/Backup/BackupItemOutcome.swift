@@ -92,7 +92,7 @@ public struct BackupItemOutcome: Sendable, Equatable {
         case .permission: L10n.string("backup.issue_permission")
         case .unsupported: L10n.string("backup.issue_unsupported")
         case .remoteService: L10n.string("backup.issue_remote_service")
-        case .localState: L10n.string("backup.error_local_state_unavailable")
+        case .localState: UploadError.InternalFailure.localStateMessage
         case .remoteDeletion: L10n.string("backup.state_skipped_remote_deletion")
         case .deletedElsewhere: L10n.string("backup.issue_deleted_elsewhere")
         case .accountStorage: L10n.string("backup.issue_account_storage")

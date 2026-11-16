@@ -14,6 +14,7 @@ extension UploadError: FailureClassifiable {
         case .accountStorageFull: .accountStorage
         case .tagAdderUnavailable: .localState
         case .sourceNotReady, .sourceUnavailable: .sourceTemporarilyUnavailable
+        case .internalFailure(let failure): failure.failureCause
         case .backend, .albumStep: .unknown
         }
     }

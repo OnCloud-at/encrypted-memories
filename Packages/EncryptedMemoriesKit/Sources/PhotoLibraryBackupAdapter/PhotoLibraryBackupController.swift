@@ -2990,6 +2990,7 @@ public final class PhotoLibraryBackupController {
     /// The fixed technical wording that the diagnostics keep for a failed scan.
     nonisolated static func scanFailureDetail(_ error: Error) -> String {
         if let error = error as? PhotoLibraryCatalogSyncError { return error.diagnosticText }
+        if let error = error as? UploadError, case .internalFailure(let failure) = error { return failure.message }
         if let error = error as? UploadError, case .backend(let text) = error { return text }
         // The domain and the code are fixed values; the description of a system error can hold a path.
         let bridged = error as NSError
