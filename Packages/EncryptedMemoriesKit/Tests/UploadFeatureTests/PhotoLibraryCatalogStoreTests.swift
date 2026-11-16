@@ -819,7 +819,7 @@ final class PhotoLibraryCatalogStoreTests: XCTestCase {
             )
             XCTFail("an unavailable catalog must stop the scan")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("unavailable"))
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .catalogUnavailable)
         }
 
         XCTAssertTrue(enqueuer.enqueued.isEmpty)

@@ -185,13 +185,13 @@ public struct PhotoLibraryCatalogSync: Sendable {
     ) async throws {
         let needsFullScan = changes.requiresFullRescan || !store.hasCompletedFullScan()
         guard store.isOperational() else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw PhotoLibraryCatalogSyncError.localStateUnavailable
         }
         // A rescan can follow a completed scan, for example after an expired change history. It is the only proof
         // that no asset was missed, so it stays owed even when a later pass stores a newer token.
         if changes.requiresFullRescan {
             guard store.markFullScanOwed() else {
-                throw UploadError.backend("Photo library scan state could not be saved")
+                throw PhotoLibraryCatalogSyncError.scanStateNotSaved
             }
         }
 
@@ -211,7 +211,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         }
         if changes.requiresFullRescan {
             guard store.clearFullScanResumePoint() else {
-                throw UploadError.backend("Photo library scan state could not be reset")
+                throw PhotoLibraryCatalogSyncError.scanStateNotReset
             }
         }
         _ = try await runFullScan(engine: engine, onSnapshotReady: commitChanges)
@@ -225,7 +225,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         engine: any UploadBackupCandidateEnqueueing, identifiers: [String]? = nil
     ) async throws -> PhotoLibraryCatalogProgress {
         guard store.isOperational() else {
-            throw UploadError.backend("Photo library catalog is unavailable")
+            throw PhotoLibraryCatalogSyncError.catalogUnavailable
         }
         let observedAt = now()
         var progress = PhotoLibraryCatalogProgress()
@@ -249,7 +249,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             if !missing.isEmpty {
                 let result = store.markRemoved(Array(missing), removedAt: observedAt)
                 guard result.succeeded else {
-                    throw UploadError.backend("Photo library removals could not be saved")
+                    throw PhotoLibraryCatalogSyncError.removalsNotSaved
                 }
                 await onRemoved?(Array(missing))
                 progress.removed += result.affectedRows
@@ -279,19 +279,19 @@ public struct PhotoLibraryCatalogSync: Sendable {
         // An unknown resume point must not start a new epoch over the saved one (#1004).
         let existingProgress = try readOrUnavailable { try store.fullScanProgress() }
         guard store.isOperational() else {
-            throw UploadError.backend("Photo library scan state is unavailable")
+            throw PhotoLibraryCatalogSyncError.scanStateUnavailable
         }
         var snapshotWorkUnits = 0
         let buildsSnapshotThisPass = existingProgress == nil
         if buildsSnapshotThisPass {
             guard store.beginFullScanSnapshot(epochStart: observedAt) else {
-                throw UploadError.backend("Photo library scan snapshot could not be started")
+                throw PhotoLibraryCatalogSyncError.scanSnapshotNotStarted
             }
             do {
                 for try await chunk in enumerator.identifierChunks(chunkSize: chunkSize) {
                     try Task.checkCancellation()
                     guard store.appendFullScanSnapshotIdentifiers(chunk.identifiers) else {
-                        throw UploadError.backend("Photo library scan snapshot could not be saved")
+                        throw PhotoLibraryCatalogSyncError.scanSnapshotNotSaved
                     }
                     snapshotWorkUnits += chunk.identifiers.count
                     if let totalCount = chunk.totalCount {
@@ -302,7 +302,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
                 }
                 try Task.checkCancellation()
                 guard store.finishFullScanSnapshot() else {
-                    throw UploadError.backend("Photo library scan snapshot could not be published")
+                    throw PhotoLibraryCatalogSyncError.scanSnapshotNotPublished
                 }
             } catch {
                 _ = store.clearFullScanResumePoint()
@@ -311,10 +311,10 @@ public struct PhotoLibraryCatalogSync: Sendable {
         }
 
         guard let resume = try readOrUnavailable({ try store.fullScanProgress() }) else {
-            throw UploadError.backend("Photo library scan snapshot is unavailable")
+            throw PhotoLibraryCatalogSyncError.scanSnapshotUnavailable
         }
         guard store.isOperational() else {
-            throw UploadError.backend("Photo library scan state is unavailable")
+            throw PhotoLibraryCatalogSyncError.scanStateUnavailable
         }
         // The token may move past the reason for this scan only when the owed scan, its snapshot, and the queue of this
         // pass survive a power loss; SQLite keeps most WAL commits durable only across app crashes.
@@ -323,7 +323,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         let epochStart = resume.epochStart
         // An unknown size is no empty snapshot: it must never reach the removal sweep or complete the scan (#1004).
         guard let total = store.fullScanSnapshotCount(), store.isOperational() else {
-            throw UploadError.backend("Photo library scan snapshot could not be read")
+            throw PhotoLibraryCatalogSyncError.scanSnapshotNotRead
         }
         var cursor = resume.cursor
         let metadataWorkBase = buildsSnapshotThisPass ? total : 0
@@ -336,11 +336,11 @@ public struct PhotoLibraryCatalogSync: Sendable {
             guard let identifiers = store.fullScanSnapshotIdentifiers(startingAt: cursor, limit: chunkSize),
                 store.isOperational()
             else {
-                throw UploadError.backend("Photo library scan snapshot could not be read")
+                throw PhotoLibraryCatalogSyncError.scanSnapshotNotRead
             }
             guard !identifiers.isEmpty else {
                 _ = store.clearFullScanResumePoint()
-                throw UploadError.backend("Photo library scan snapshot is incomplete")
+                throw PhotoLibraryCatalogSyncError.scanSnapshotIncomplete
             }
 
             var seen: Set<String>? = []
@@ -354,7 +354,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             if !missing.isEmpty {
                 let result = store.markRemoved(Array(missing), removedAt: observedAt)
                 guard result.succeeded else {
-                    throw UploadError.backend("Photo library removals could not be saved")
+                    throw PhotoLibraryCatalogSyncError.removalsNotSaved
                 }
                 await onRemoved?(Array(missing))
                 try Task.checkCancellation()
@@ -363,7 +363,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             cursor += identifiers.count
             guard store.recordFullScanProgress(PhotoLibraryFullScanProgress(epochStart: epochStart, cursor: cursor))
             else {
-                throw UploadError.backend("Photo library scan progress could not be saved")
+                throw PhotoLibraryCatalogSyncError.scanProgressNotSaved
             }
             progress.executionCompletedUnitCount = Int64(metadataWorkBase + cursor)
             onProgress?(progress)
@@ -373,11 +373,11 @@ public struct PhotoLibraryCatalogSync: Sendable {
         try Task.checkCancellation()
         let sweep = store.sweepRemoved(notSeenAfter: epochStart, removedAt: observedAt)
         guard sweep.succeeded else {
-            throw UploadError.backend("Photo library removal sweep could not be saved")
+            throw PhotoLibraryCatalogSyncError.removalSweepNotSaved
         }
         progress.removed += sweep.affectedRows
         guard store.completeFullScan() else {
-            throw UploadError.backend("Photo library scan could not be completed")
+            throw PhotoLibraryCatalogSyncError.scanNotCompleted
         }
         // A token that stays is safe: the next pass reads the same changes again.
         let completionIsDurable = await synchronizeQueueThenCatalog(engine: engine)
@@ -412,7 +412,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             guard let page = progress.readPage(from: store, limit: chunkSize),
                 store.isOperational()
             else {
-                throw UploadError.backend("Photo library catalog could not be read")
+                throw PhotoLibraryCatalogSyncError.catalogNotRead
             }
             guard case .advanced(let resumePoint) = progress.advance(past: page) else { break }
             let reopenings = page.entries.compactMap { entry -> UploadBackupReopening? in
@@ -437,7 +437,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             // retries the unknown rows through its memory after the walk finishes (#1201).
             if let resumePoint {
                 guard store.recordLateRenderSweepResumePoint(resumePoint) else {
-                    throw UploadError.backend("Photo library catalog could not be updated")
+                    throw PhotoLibraryCatalogSyncError.catalogNotUpdated
                 }
             }
         }
@@ -445,7 +445,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         // While a row is unknown, the pass cannot be recorded as reconciled; it stays owed (#1160).
         guard progress.mayComplete(countingUnknownRowsAs: "backup.lateRenders.undecodableRow") else { return }
         guard store.markLateRendersReconciled() else {
-            throw UploadError.backend("Photo library catalog could not be updated")
+            throw PhotoLibraryCatalogSyncError.catalogNotUpdated
         }
     }
 
@@ -456,12 +456,12 @@ public struct PhotoLibraryCatalogSync: Sendable {
         let generation = try await engine.missingSourceDiscardGeneration()
         let completed = store.reconciledMissingSourceGeneration()
         let savedProgress = store.missingSourceSweepProgress()
-        guard store.isOperational() else { throw UploadError.backend("Photo library catalog could not be read") }
+        guard store.isOperational() else { throw PhotoLibraryCatalogSyncError.catalogNotRead }
         var sweep: PhotoLibraryMissingSourceSweepProgress
         if retryRows.needsMissingSourceRestart(for: generation) {
             sweep = PhotoLibraryMissingSourceSweepProgress(generation: generation)
             guard store.recordMissingSourceSweepProgress(sweep) else {
-                throw UploadError.backend("Photo library catalog could not be updated")
+                throw PhotoLibraryCatalogSyncError.catalogNotUpdated
             }
             retryRows.forgetMissingSources()
         } else if let savedProgress {
@@ -470,7 +470,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             guard completed != generation else { return }
             sweep = PhotoLibraryMissingSourceSweepProgress(generation: generation)
             guard store.recordMissingSourceSweepProgress(sweep) else {
-                throw UploadError.backend("Photo library catalog could not be updated")
+                throw PhotoLibraryCatalogSyncError.catalogNotUpdated
             }
         }
         var progress = PhotoLibraryCatalogPassProgress(
@@ -480,7 +480,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             // An unknown page is not the end of the catalog; the sweep stays owed (#1004).
             guard let page = progress.readPage(from: store, limit: chunkSize),
                 store.isOperational()
-            else { throw UploadError.backend("Photo library catalog could not be read") }
+            else { throw PhotoLibraryCatalogSyncError.catalogNotRead }
             guard case .advanced(let resumePoint) = progress.advance(past: page) else { break }
             let candidates = page.entries.compactMap {
                 PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: $0))
@@ -491,7 +491,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
             if let resumePoint {
                 sweep.afterLocalIdentifier = resumePoint
                 guard store.recordMissingSourceSweepProgress(sweep) else {
-                    throw UploadError.backend("Photo library catalog could not be updated")
+                    throw PhotoLibraryCatalogSyncError.catalogNotUpdated
                 }
             }
             await Task.yield()
@@ -504,13 +504,13 @@ public struct PhotoLibraryCatalogSync: Sendable {
             if generation != sweep.generation {
                 let restart = PhotoLibraryMissingSourceSweepProgress(generation: generation)
                 guard store.recordMissingSourceSweepProgress(restart) else {
-                    throw UploadError.backend("Photo library catalog could not be updated")
+                    throw PhotoLibraryCatalogSyncError.catalogNotUpdated
                 }
             }
             return
         }
         guard store.completeMissingSourceSweep(generation: sweep.generation) else {
-            throw UploadError.backend("Photo library catalog could not be updated")
+            throw PhotoLibraryCatalogSyncError.catalogNotUpdated
         }
     }
 
@@ -527,7 +527,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         let entries = chunk.map { PhotoLibraryCatalogMapper.entry(for: $0, observedAt: observedAt) }
         let changes = store.classifyBatch(entries)
         guard store.isOperational(), changes.count == entries.count else {
-            throw UploadError.backend("Photo library catalog classification was incomplete")
+            throw PhotoLibraryCatalogSyncError.catalogClassificationIncomplete
         }
         var candidates: [UploadBackupAssetCandidate] = []
         var reopened: [UploadBackupReopening] = []
@@ -556,14 +556,14 @@ public struct PhotoLibraryCatalogSync: Sendable {
             }
         }
         guard store.isOperational() else {
-            throw UploadError.backend("Photo library catalog could not be read")
+            throw PhotoLibraryCatalogSyncError.catalogNotRead
         }
         if !reopened.isEmpty { try await engine.reopenBackedUpRevisions(reopened) }
         if !unchanged.isEmpty { try await engine.enqueueChangedMissingSources(unchanged) }
         _ = try await engine.enqueueBatch(candidates)
         try Task.checkCancellation()
         guard store.upsertBatch(entries) else {
-            throw UploadError.backend("Photo library catalog could not be updated")
+            throw PhotoLibraryCatalogSyncError.catalogNotUpdated
         }
     }
 
@@ -580,7 +580,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
         } catch is PhotoLibraryCatalogUndecodableRowError {
             return true
         } catch {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw PhotoLibraryCatalogSyncError.localStateUnavailable
         }
         guard let stored else { return false }
         return !PhotoBackupAssetPlanner.listsRender(PhotoLibraryCatalogMapper.info(for: stored))
@@ -589,7 +589,7 @@ public struct PhotoLibraryCatalogSync: Sendable {
     /// A strict catalog read; its unknown result stops the pass with the local-state error.
     private func readOrUnavailable<Value>(_ read: () throws -> Value) throws -> Value {
         do { return try read() } catch {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw PhotoLibraryCatalogSyncError.localStateUnavailable
         }
     }
 }

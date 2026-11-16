@@ -155,7 +155,7 @@ final class CatalogRetryRowsTests: XCTestCase {
             try await sync.reconcileLateRendersOnce(engine: engine)
             XCTFail("a failed retry read must throw, even after the health probe recovers")
         } catch {
-            XCTAssertEqual(error as? UploadError, .backend("Photo library catalog could not be read"))
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .catalogNotRead)
         }
         fault.stop()
         XCTAssertEqual(fault.firedCount, 1)
@@ -221,7 +221,7 @@ final class CatalogRetryRowsTests: XCTestCase {
             try await sync.reconcileMissingSources(engine: engine)
             XCTFail("the generation reset must be durable before the retry rows are forgotten")
         } catch {
-            XCTAssertEqual(error as? UploadError, .backend("Photo library catalog could not be updated"))
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .catalogNotUpdated)
         }
         fault.stop()
         XCTAssertEqual(fault.firedCount, 1)

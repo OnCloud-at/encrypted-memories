@@ -202,8 +202,8 @@ final class CatalogReadFailClosedTests: XCTestCase {
         do {
             _ = try await sync(store, infos: [photo("a")]).run(engine: engine, identifiers: ["a"])
             XCTFail("a short classification must stop the chunk")
-        } catch let error as UploadError {
-            XCTAssertEqual(error, .backend("Photo library catalog classification was incomplete"))
+        } catch let error as PhotoLibraryCatalogSyncError {
+            XCTAssertEqual(error, .catalogClassificationIncomplete)
         }
         fault.stop()
 
@@ -706,8 +706,7 @@ final class CatalogReadFailClosedTests: XCTestCase {
 
         guard case .failure(let error) = try XCTUnwrap(outcome, "the pass must end, not page the same row forever")
         else { return XCTFail("a damaged key must stop the pass", file: file, line: line) }
-        XCTAssertEqual(
-            error as? UploadError, .backend("Photo library catalog could not be read"), file: file, line: line)
+        XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .catalogNotRead, file: file, line: line)
         XCTAssertEqual(
             engine.reopened, reached, "the pass reached the rows before the damaged key", file: file, line: line)
         XCTAssertFalse(store.hasReconciledLateRenders(), file: file, line: line)
@@ -733,8 +732,7 @@ final class CatalogReadFailClosedTests: XCTestCase {
             try await sync(store, chunkSize: 1).reconcileLateRendersOnce(engine: engine)
             XCTFail("a key before every text key leaves the end of the catalog unknown", file: file, line: line)
         } catch {
-            XCTAssertEqual(
-                error as? UploadError, .backend("Photo library catalog could not be read"), file: file, line: line)
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .catalogNotRead, file: file, line: line)
         }
 
         XCTAssertEqual(
@@ -759,7 +757,7 @@ final class CatalogReadFailClosedTests: XCTestCase {
             try await sync(store, chunkSize: 1).reconcileMissingSources(engine: engine)
             XCTFail("a row without a key leaves the end of the catalog unknown")
         } catch {
-            XCTAssertEqual(error as? UploadError, .backend("Photo library catalog could not be read"))
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .catalogNotRead)
         }
 
         XCTAssertEqual(engine.recovered, ["b"], "the sweep still reached the rows before the end")

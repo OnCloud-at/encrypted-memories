@@ -1600,7 +1600,7 @@ public final class PhotoLibraryBackupController {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw PhotoLibraryCatalogSyncError.localStateUnavailable
         }
     }
 

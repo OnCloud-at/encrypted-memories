@@ -1552,7 +1552,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let technical = "Photo library scan state could not be saved"
             let failures: [Error] = [
                 UploadError.backend(technical), UploadError.backend("Photo library catalog could not be updated"),
-                CocoaError(.fileWriteUnknown),
+                CocoaError(.fileWriteUnknown), PhotoLibraryCatalogSyncError.scanStateNotSaved,
+                PhotoLibraryCatalogSyncError.catalogNotUpdated, PhotoLibraryCatalogSyncError.localStateUnavailable,
             ]
             for failure in failures {
                 let message = try await messageAfterAScan(throwing: failure)
