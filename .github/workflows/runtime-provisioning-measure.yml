@@ -1,0 +1,84 @@
+name: Measure iOS runtime provisioning
+on:
+  pull_request:
+    paths:
+      - .github/workflows/runtime-provisioning-measure.yml
+permissions:
+  contents: read
+concurrency:
+  group: runtime-provisioning-measure-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+jobs:
+  measure:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - name: Measure runtime provisioning
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown}"
+          uname -m
+          xcodebuild -version
+          [[ "$(xcodebuild -version)" == $'Xcode 27.1\nBuild version 27A9275' ]]
+          echo 'Runtimes before:'
+          xcrun simctl list runtimes --json
+          scratch="$(mktemp -d "$RUNNER_TEMP/runtime-measure.XXXXXX")"
+          samples="$scratch/free-kib"
+          sample() { df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }'; }
+          sample | tee "$samples"
+          (while :; do sample >> "$samples"; sleep 2; done) &
+          sampler=$!
+          finish() {
+            kill "$sampler" 2>/dev/null || true
+            wait "$sampler" 2>/dev/null || true
+            sample >> "$samples"
+            echo "Free disk KiB start/min-sampled/end: $(head -1 "$samples") / $(sort -n "$samples" | head -1) / $(tail -1 "$samples")"
+            echo 'Runtimes after:'
+            xcrun simctl list runtimes --json || true
+          }
+          trap finish EXIT
+          start=$SECONDS
+          set +e
+          xcodebuild -downloadPlatform iOS -exportPath "$scratch" -buildVersion 26.5 -architectureVariant arm64
+          export_rc=$?
+          set -e
+          echo "Export elapsed seconds: $((SECONDS - start)); exit: $export_rc"
+          [[ $export_rc -eq 0 ]]
+          python3 - "$scratch" <<'PY'
+          import pathlib, plistlib, sys
+          root = pathlib.Path(sys.argv[1])
+          bundles = list(root.glob('*.exportedBundle'))
+          if len(bundles) != 1:
+              raise SystemExit('Expected exactly one exported runtime bundle')
+          bundle = bundles[0]
+          with (bundle / 'ExportedMetadata.plist').open('rb') as stream:
+              metadata = plistlib.load(stream)['MobileAssetProperties']
+          if metadata.get('SimulatorVersion') != '26.5' or metadata.get('Build') != '23F77':
+              raise SystemExit('Exported runtime does not match the candidate pin')
+          images = list((bundle / 'Restore').glob('*.dmg'))
+          if len(images) != 1:
+              raise SystemExit('Expected exactly one runtime image')
+          (root / 'image-path').write_text(str(images[0]))
+          PY
+          start=$SECONDS
+          set +e
+          xcodebuild -importPlatform "$(cat "$scratch/image-path")"
+          import_rc=$?
+          set -e
+          echo "Import elapsed seconds: $((SECONDS - start)); exit: $import_rc"
+          [[ $import_rc -eq 0 ]]
+          xcrun simctl list runtimes --json > "$scratch/runtimes.json"
+          python3 - "$scratch/runtimes.json" <<'PY'
+          import json, sys
+          runtimes = json.load(open(sys.argv[1]))['runtimes']
+          selected = [r for r in runtimes if r.get('identifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-26-5']
+          if len(selected) != 1:
+              raise SystemExit('Expected exactly one iOS 26.5 runtime')
+          runtime = selected[0]
+          if runtime.get('version') != '26.5' or runtime.get('buildversion') != '23F77' or runtime.get('isAvailable') is not True:
+              raise SystemExit('Runtime version, build or availability does not match')
+          print('Verified runtime:', json.dumps(runtime, sort_keys=True))
+          PY
