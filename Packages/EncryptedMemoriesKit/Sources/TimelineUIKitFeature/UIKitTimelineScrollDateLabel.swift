@@ -186,10 +186,13 @@
             }()
 
             private func notePlacementForTests() {
-                guard UIKitTimelineScrollDateLabelTesting.exposesLabel, placedCount < showCount, let host else {
+                guard UIKitTimelineScrollDateLabelTesting.exposesLabel, let host else { return }
+                // Layout moves the label without a presentation change. The frame follows every layout, so a hidden
+                // label reports where it, and the thumb beside it, came to rest.
+                testElement.accessibilityFrameInContainerSpace = view.frame
+                guard placedCount < showCount, view.alpha == 1, !view.isHidden, host.bounds.contains(view.frame) else {
                     return
                 }
-                guard view.alpha == 1, !view.isHidden, host.bounds.contains(view.frame) else { return }
                 placedCount = showCount
                 updateTestElement()
             }

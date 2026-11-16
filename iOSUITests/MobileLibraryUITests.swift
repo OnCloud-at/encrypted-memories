@@ -122,10 +122,13 @@ final class MobileLibraryUITests: XCTestCase {
         let normalRight = label.frame.maxX
         let target = window.coordinate(withNormalizedOffset: .zero).withOffset(
             CGVector(dx: window.frame.width - 3, dy: label.frame.midY - window.frame.minY))
-        // Flash the native indicator with a tiny slow movement, while the label remains hidden.
+        // Show the native indicator with a slow scroll; the label stays hidden. A shorter movement is a tap, which
+        // opens the photo below the finger.
         start.press(
-            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 2)),
-            withVelocity: XCUIGestureVelocity(50), thenHoldForDuration: 0.1)
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: 60)),
+            withVelocity: XCUIGestureVelocity(200), thenHoldForDuration: 0.1)
+        // One query only: the indicator fades soon after the scroll, and the press below needs it visible.
+        XCTAssertEqual(label.value as? String, "hidden 1 1", "a slow scroll shows no date label")
 
         target.press(
             forDuration: 0.6, thenDragTo: target.withOffset(CGVector(dx: 0, dy: -100)),
