@@ -65,7 +65,7 @@ public struct BackupStatusStabilizer: Sendable {
 
         // Structural change - entering/leaving active, or any non-active target (completed, paused,
         // waiting, attention, idle) - is never delayed.
-        if !incoming.isActive || !current.isActive {
+        if !incoming.isActive || !current.isActive || incoming.photoTotalIsKnown != current.photoTotalIsKnown {
             clearPendingDenominator()
             apply(incoming, at: now)
             return Decision(display: incoming, wakeAt: nil)

@@ -1844,14 +1844,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "%lld warten auf Proton" } }
       }
     },
-    "backup.progress_transferring %lld": {
-      "extractionState": "manual",
-      "comment": "Ephemeral byte progress for the resources actively transferring right now; separate from the durable backed-up item count.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Transferring data · %lld%%" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Überträgt Daten · %lld %%" } }
-      }
-    },
     "backup.detail_left %lld": {
       "extractionState": "manual",
       "comment": "Backup status line while a pass runs: how many photos and videos are still to back up (waiting, being checked or being uploaded).",

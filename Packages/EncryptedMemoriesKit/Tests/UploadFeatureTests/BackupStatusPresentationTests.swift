@@ -58,6 +58,58 @@ final class BackupStatusPresentationTests: XCTestCase {
         BackupStatus(progress: p, isScanning: isScanning)
     }
 
+    func testUnknownPhotoScanPreservesWiFiAndAttentionReasons() throws {
+        let context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID()))
+        for phase in [BackupStatus.Phase.waitingForWiFi, .needsAttention] {
+            var status = BackupStatus()
+            status.phase = phase
+            status.totalConsidered = 10
+            status.fractionCompleted = 0.4
+            status.alreadyBackedUp = 4
+            status.photoDisplayProgress = context.photoProgress(for: status, fraction: 0.4)
+            XCTAssertEqual(status.photoDisplayProgress?.isChecking, false, "\(phase)")
+            let display = BackupStatusPresentation(status)
+            XCTAssertEqual(
+                display.headlineKey, phase == .waitingForWiFi ? "backup.phase_waiting_wifi" : "backup.phase_attention")
+            XCTAssertEqual(display.accessory, phase == .waitingForWiFi ? .waitingForWiFi : .attention)
+            XCTAssertFalse(display.isActive)
+            XCTAssertNil(display.progressFraction)
+            XCTAssertNil(display.localizedSubtitle)
+        }
+    }
+
+    /// A pass that waits for a reason is not checking: between its start and its scan, and after a failed scan, the row
+    /// keeps the real reason (for example a full Proton storage) instead of "Checking".
+    func testUnknownPhotoScanPreservesEveryWaitingReason() throws {
+        let context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID()))
+        let reasons: [(BackupIssueKind, String)] = [
+            (.network, "backup.phase_waiting_network"),
+            (.remoteService, "backup.phase_waiting_proton"),
+            (.deviceStorage, "backup.phase_waiting_storage"),
+            (.accountStorage, "backup.phase_waiting_account_storage"),
+            (.remoteDraft, "backup.phase_waiting_draft"),
+        ]
+        for (issue, headlineKey) in reasons {
+            var status = BackupStatus()
+            status.phase = .waiting
+            status.outstandingIssue = issue
+            status.outstandingCount = 6
+            status.totalConsidered = 10
+            status.fractionCompleted = 0.4
+            status.alreadyBackedUp = 4
+            status.photoDisplayProgress = context.photoProgress(for: status, fraction: 0.4)
+            XCTAssertEqual(status.photoDisplayProgress?.isChecking, false, "\(issue)")
+            let display = BackupStatusPresentation(status)
+            XCTAssertEqual(display.headlineKey, headlineKey, "\(issue)")
+            XCTAssertEqual(display.accessory, .waiting, "\(issue)")
+            XCTAssertFalse(display.isActive, "\(issue)")
+            XCTAssertNil(display.progressFraction, "\(issue)")
+            XCTAssertNil(display.localizedSubtitle, "\(issue)")
+        }
+    }
+
     func testCheckingHeadlineWhenNoBytesAreMoving() {
         // A running pass with no in-flight upload is checking - never "backing up".
         let s = status(progress(total: 100, uploadQueued: 5, checking: 1, alreadyBackedUp: 20, isRunning: true))
@@ -88,29 +140,60 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertEqual(subtitle?.contains("%"), false)
     }
 
-    func testTransferLivenessIsSeparateFromStableBackedUpCount() throws {
+    func testTransferLivenessIsSeparateFromStableBackedUpCount() async throws {
         let transfer = BackupActiveTransferProgress(
             activeItemCount: 2,
             completedBytes: 51,
             totalBytes: 100,
             completedItemEquivalents: 0.75
         )
-        let presentation = BackupStatusPresentation(
-            status(
-                progress(
-                    total: 100, uploading: 2, alreadyBackedUp: 20, isRunning: true,
-                    activeTransfer: transfer
-                )))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(url: directory.appendingPathComponent("queue.sqlite")))
+        defer { queue.close() }
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<100).map { index in
+                    UploadBackupSyncQueueEntry(
+                        source: .init(kind: .photoLibraryAsset, identifier: "photo-\(index)", resource: .primary),
+                        revision: .init(date: Date(timeIntervalSinceReferenceDate: 42)),
+                        originalFilename: "photo.heic",
+                        state: index < 20 ? .alreadyBackedUp : index < 22 ? .uploading : .discovered,
+                        updatedAt: Date())
+                }))
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        let context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await projector.start(generation: generation, context: context) { _ in }
+        var live = BackupSyncProgress()
+        live.activeTransfer = transfer
+        projector.submit(live, generation: generation)
+        await projector.drainSubmittedEvents()
+        let projected = await projector.projectNow(context: context, generation: generation, revision: 1)
+        let raw = try XCTUnwrap(projected?.status)
+        let presentation = BackupStatusPresentation(raw)
 
         XCTAssertEqual(presentation.backedUp, 20)
-        XCTAssertEqual(presentation.activeTransferPercent, 51)
-        XCTAssertEqual(presentation.activeTransferFraction, 0.51)
-        XCTAssertEqual(
-            presentation.progressBarFraction, 0.51,
-            "the visible bar must follow the transfer percentage immediately above it")
+        XCTAssertEqual(raw.activeTransfer, transfer)
+        XCTAssertEqual(raw.activeTransfer?.fraction, 0.51)
+        XCTAssertEqual(raw.fractionCompleted, projected?.progress.fraction)
+        XCTAssertEqual(presentation.progressFraction, 0.20)
         XCTAssertTrue(try XCTUnwrap(presentation.localizedSubtitle).contains("20"))
-        XCTAssertTrue(try XCTUnwrap(presentation.localizedTransferDetail).contains("51"))
-        XCTAssertEqual(presentation.localizedProgressBarLabel, presentation.localizedTransferDetail)
+        for (index, bytes) in [2, 98].enumerated() {
+            live.activeTransfer = .init(
+                activeItemCount: 1, completedBytes: Int64(bytes), totalBytes: 100, completedItemEquivalents: 0.1)
+            projector.submit(live, generation: generation)
+            await projector.drainSubmittedEvents()
+            let changed = await projector.projectNow(
+                context: context, generation: generation, revision: UInt64(index + 2))
+            let changedStatus = try XCTUnwrap(changed?.status)
+            XCTAssertEqual(changedStatus.activeTransfer, live.activeTransfer)
+            XCTAssertEqual(BackupStatusPresentation(changedStatus).progressFraction, 0.20)
+        }
+        await projector.stop()
     }
 
     func testScanningHasNoFakeProgressAndNoSubtitle() {
@@ -148,7 +231,7 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertFalse(p.isActive)
         XCTAssertEqual(p.accessory, .success)
         XCTAssertEqual(p.detailLayout, .compact, "completion must collapse the active progress slots")
-        XCTAssertNil(p.progressBarFraction)
+        XCTAssertNil(p.progressFraction)
     }
 
     func testCompletedRemoteDeletionsAreInformationalAndExcludedFromBackupTarget() throws {

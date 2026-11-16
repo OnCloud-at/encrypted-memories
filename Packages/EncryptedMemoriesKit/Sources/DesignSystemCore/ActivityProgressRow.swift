@@ -68,17 +68,28 @@ public struct ActivityProgressRow: View {
 public struct ActivityProgressBar: View {
     private let fraction: Double
     private let accessibilityLabel: String?
+    private let accessibilityValue: String?
 
-    public init(fraction: Double, accessibilityLabel: String? = nil) {
+    /// `accessibilityValue` replaces the bar's percentage for VoiceOver, for example with a count the bar can run
+    /// ahead of. Without it, the native bar keeps its own accessibility.
+    public init(fraction: Double, accessibilityLabel: String? = nil, accessibilityValue: String? = nil) {
         self.fraction = Self.clamped(fraction)
         self.accessibilityLabel = accessibilityLabel
+        self.accessibilityValue = accessibilityValue
     }
 
     public var body: some View {
         let bar = ProgressView(value: fraction)
             .progressViewStyle(.linear)
             .tint(ProtonColor.primary)
-        if let accessibilityLabel {
+        if let accessibilityValue {
+            // One element with the label and the value; the native bar and its percentage leave the tree.
+            bar.accessibilityRepresentation {
+                Text(accessibilityLabel ?? "")
+                    .accessibilityValue(accessibilityValue)
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
+        } else if let accessibilityLabel {
             bar.accessibilityLabel(accessibilityLabel)
         } else {
             bar

@@ -98,6 +98,368 @@ final class BackupStatusProjectorTests: XCTestCase {
         await projector.stop()
     }
 
+    func testThePhotoBarNeverFallsWhenTheQueueAndTransfersGrow() async throws {
+        let rows =
+            (0..<32).map { entry(id: "safe-\($0)", state: .completed) }
+            + (0..<67).map { entry(id: "waiting-\($0)", state: .discovered) }
+            + [entry(id: "sending", state: .uploading)]
+        XCTAssertTrue(queue.upsertBatch(rows))
+        let projector = BackupStatusProjector(queue: queue, coalescingInterval: 0)
+        let generation = UUID()
+        let context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await projector.start(generation: generation, context: context) { _ in }
+        var live = BackupSyncProgress()
+        live.isRunning = true
+        live.activeTransfer = .init(
+            activeItemCount: 1, completedBytes: 32, totalBytes: 100, completedItemEquivalents: 0.32)
+        projector.submit(live, generation: generation)
+        await projector.drainSubmittedEvents()
+        let first = await projector.projectNow(context: context, generation: generation, revision: 1)
+        let firstStatus = try XCTUnwrap(first?.status)
+        XCTAssertEqual(firstStatus.backedUp, 32)
+        XCTAssertEqual(firstStatus.backupTargetCount, 100)
+        XCTAssertEqual(BackupStatusPresentation(firstStatus).progressFraction, 0.32)
+
+        XCTAssertTrue(queue.upsertBatch((0..<100).map { entry(id: "added-\($0)", state: .discovered) }))
+        live.activeTransfer = .init(
+            activeItemCount: 2, completedBytes: 32, totalBytes: 200, completedItemEquivalents: 0.32)
+        projector.submit(live, generation: generation)
+        await projector.drainSubmittedEvents()
+        let next = await projector.projectNow(context: context, generation: generation, revision: 2)
+        let nextStatus = try XCTUnwrap(next?.status)
+        XCTAssertEqual(nextStatus.backedUp, 32)
+        XCTAssertEqual(nextStatus.backupTargetCount, 200)
+        XCTAssertEqual(
+            BackupStatusPresentation(nextStatus).progressFraction, 0.32,
+            "New work must not lower the visible photo backup bar")
+        XCTAssertTrue(queue.upsertBatch((0..<32).map { entry(id: "waiting-\($0)", state: .completed) }))
+        let caughtUp = await projector.projectNow(context: context, generation: generation, revision: 3)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(caughtUp?.status)).progressFraction, 0.32)
+        XCTAssertTrue(queue.upsertBatch((32..<34).map { entry(id: "waiting-\($0)", state: .completed) }))
+        let advanced = await projector.projectNow(context: context, generation: generation, revision: 4)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(advanced?.status)).progressFraction, 0.33)
+        XCTAssertEqual(queue.removeSources(kind: .photoLibraryAsset, identifiers: (0..<100).map { "added-\($0)" }), 100)
+        let shrunk = await projector.projectNow(context: context, generation: generation, revision: 5)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(shrunk?.status)).progressFraction, 0.66)
+        XCTAssertTrue(setQueueState(id: "safe-0", state: .discovered))
+        let edited = await projector.projectNow(context: context, generation: generation, revision: 6)
+        XCTAssertEqual(edited?.status.backedUp, 65)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(edited?.status)).progressFraction, 0.66)
+        await projector.stop()
+    }
+
+    func testScanningWithActiveBytesShowsOnlyTheCheckingIndicator() async throws {
+        XCTAssertTrue(queue.upsert(entry(id: "sending-during-scan", state: .uploading)))
+        let projector = BackupStatusProjector(queue: queue, coalescingInterval: 0)
+        let generation = UUID()
+        let context = BackupStatusProjectionContext(
+            isScanning: true, isRunning: true, photoDisplay: .init(cycleID: UUID()))
+        await projector.start(generation: generation, context: context) { _ in }
+        var live = BackupSyncProgress()
+        live.isRunning = true
+        live.activeTransfer = .init(
+            activeItemCount: 1, completedBytes: 32, totalBytes: 100, completedItemEquivalents: 0.32)
+        projector.submit(live, generation: generation)
+        await projector.drainSubmittedEvents()
+        let projected = await projector.projectNow(context: context, generation: generation, revision: 1)
+        let display = BackupStatusPresentation(try XCTUnwrap(projected?.status))
+        XCTAssertTrue(display.isActive)
+        XCTAssertEqual(display.accessory, .activity)
+        XCTAssertNil(display.progressFraction, "An incomplete scan must never show a byte progress bar")
+        XCTAssertNil(display.localizedSubtitle)
+        await projector.stop()
+    }
+
+    func testPhotoScanKnowledgeHidesImmediatelyAndCancellationDoesNotRevealTheHeldBar() async throws {
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<4).map { entry(id: "known-\($0)", state: .completed) }
+                    + (0..<6).map { entry(id: "pending-\($0)", state: .discovered) }))
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        var context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await projector.start(generation: generation, context: context) { _ in }
+        let known = await projector.projectNow(context: context, generation: generation, revision: 1)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(known?.status)).progressFraction, 0.4)
+
+        // Admission is unknown even before scan setup changes the raw scanning flag.
+        context.photoDisplay?.scanFinished = false
+        let admitted = await projector.projectNow(context: context, generation: generation, revision: 2)
+        let admissionStatus = try XCTUnwrap(admitted?.status)
+        let admission = BackupStatusPresentation(admissionStatus)
+        XCTAssertEqual(admissionStatus.totalConsidered, 10, "Display knowledge must not rewrite raw totals")
+        XCTAssertTrue(admission.isActive)
+        XCTAssertEqual(admission.accessory, .activity)
+        XCTAssertNil(admission.progressFraction)
+        XCTAssertNil(admission.localizedSubtitle)
+
+        context.isScanning = true
+        _ = await projector.projectNow(context: context, generation: generation, revision: 3)
+        context.isScanning = false  // A cancelled scan cleans up without a successful outcome.
+        let cancelled = await projector.projectNow(context: context, generation: generation, revision: 4)
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(cancelled?.status)).progressFraction)
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(cancelled?.status)).localizedSubtitle)
+
+        XCTAssertTrue(queue.upsertBatch((0..<10).map { entry(id: "new-\($0)", state: .discovered) }))
+        context.photoDisplay?.scanFinished = true
+        let succeeded = await projector.projectNow(context: context, generation: generation, revision: 5)
+        let display = BackupStatusPresentation(try XCTUnwrap(succeeded?.status))
+        XCTAssertEqual(display.total, 20)
+        XCTAssertEqual(display.backedUp, 4)
+        XCTAssertEqual(display.progressFraction, 0.4, "Later scans retain the single internal watermark")
+        await projector.stop()
+    }
+
+    func testPhotoPauseFreezesTheBarWhileActualCountsChange() async throws {
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<10).map {
+                    entry(id: "pause-\($0)", state: $0 < 2 ? .completed : .discovered)
+                }))
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        var context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await projector.start(generation: generation, context: context) { _ in }
+        context.isUserPaused = true
+        XCTAssertTrue(queue.upsert(entry(id: "pause-2", state: .completed)))
+        let paused = await projector.projectNow(context: context, generation: generation, revision: 1)
+        let status = try XCTUnwrap(paused?.status)
+        XCTAssertEqual(status.phase, .paused)
+        XCTAssertEqual(status.totalConsidered, 10)
+        XCTAssertEqual(BackupStatusPresentation(status).backedUp, 3)
+        XCTAssertEqual(BackupStatusPresentation(status).progressFraction, 0.2)
+        XCTAssertTrue(queue.upsertBatch((0..<10).map { entry(id: "pause-added-\($0)", state: .discovered) }))
+        let grown = await projector.projectNow(context: context, generation: generation, revision: 2)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(grown?.status)).progressFraction, 0.2)
+        context.photoDisplay?.scanFinished = false
+        let unknown = await projector.projectNow(context: context, generation: generation, revision: 3)
+        XCTAssertEqual(unknown?.status.phase, .paused, "Raw pause precedence is unchanged")
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(unknown?.status)).progressFraction)
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(unknown?.status)).localizedSubtitle)
+        context.isUserPaused = false
+        let resumedScan = await projector.projectNow(context: context, generation: generation, revision: 4)
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(resumedScan?.status)).progressFraction)
+        context.photoDisplay?.scanFinished = true
+        let resumed = await projector.projectNow(context: context, generation: generation, revision: 5)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(resumed?.status)).progressFraction, 0.2)
+        await projector.stop()
+    }
+
+    func testOnlyAnIdleTerminalPassResetsThePhotoWatermark() async throws {
+        XCTAssertTrue(queue.upsertBatch((0..<10).map { entry(id: "terminal-\($0)", state: .discovered) }))
+        for terminal in [UploadBackupSyncQueueState.failed, .completed] {
+            for index in 0..<10 {
+                XCTAssertTrue(setQueueState(id: "terminal-\(index)", state: index < 8 ? .completed : .discovered))
+            }
+            let projector = BackupStatusProjector(queue: queue)
+            let generation = UUID()
+            var context = BackupStatusProjectionContext(
+                isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+            await projector.start(generation: generation, context: context) { _ in }
+            XCTAssertTrue(queue.upsertBatch((8..<10).map { entry(id: "terminal-\($0)", state: terminal) }))
+            let runningTerminal = await projector.projectNow(context: context, generation: generation, revision: 1)
+            XCTAssertEqual(runningTerminal?.status.phase, terminal == .failed ? .needsAttention : .completed)
+            XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(runningTerminal?.status)).progressFraction)
+            for index in 0..<10 {
+                XCTAssertTrue(setQueueState(id: "terminal-\(index)", state: index < 4 ? .completed : .discovered))
+            }
+            let microDrain = await projector.projectNow(context: context, generation: generation, revision: 2)
+            XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(microDrain?.status)).progressFraction, 0.8)
+
+            XCTAssertTrue(queue.upsertBatch((4..<10).map { entry(id: "terminal-\($0)", state: terminal) }))
+            context.isRunning = false
+            let idleTerminal = await projector.projectNow(context: context, generation: generation, revision: 3)
+            XCTAssertEqual(idleTerminal?.status.phase, terminal == .failed ? .needsAttention : .completed)
+            context.isRunning = true
+            for index in 4..<10 {
+                XCTAssertTrue(setQueueState(id: "terminal-\(index)", state: .discovered))
+            }
+            let nextCycle = await projector.projectNow(context: context, generation: generation, revision: 4)
+            XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(nextCycle?.status)).progressFraction, 0.4)
+            await projector.stop()
+        }
+    }
+
+    func testPhotoBarCapsWholeLibraryCountsAndAStillRunningPreparationAtPoint99() async throws {
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<10_050).map {
+                    entry(id: "large-\($0)", state: $0 < 10_000 ? .completed : .discovered)
+                }))
+        let projector = BackupStatusProjector(queue: queue, coalescingInterval: 0)
+        let generation = UUID()
+        let context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await projector.start(generation: generation, context: context) { _ in }
+        let incremental = await projector.projectNow(context: context, generation: generation, revision: 1)
+        let display = BackupStatusPresentation(try XCTUnwrap(incremental?.status))
+        XCTAssertEqual(display.progressFraction, 0.99)
+        XCTAssertEqual(display.backedUp, 10_000)
+        XCTAssertEqual(display.total, 10_050)
+        XCTAssertTrue(queue.upsertBatch((10_000..<10_050).map { entry(id: "large-\($0)", state: .completed) }))
+        var live = BackupSyncProgress()
+        live.remoteIndexPreparation = .init(phase: .loading)
+        projector.submit(live, generation: generation)
+        await projector.drainSubmittedEvents()
+        let preparing = await projector.projectNow(context: context, generation: generation, revision: 2)
+        let preparingStatus = try XCTUnwrap(preparing?.status)
+        XCTAssertEqual(preparingStatus.phase, .checking)
+        XCTAssertEqual(preparingStatus.backedUp, preparingStatus.backupTargetCount)
+        XCTAssertEqual(BackupStatusPresentation(preparingStatus).progressFraction, 0.99)
+        await projector.stop()
+    }
+
+    func testPhotoBarHidesAnEmptyTargetWithoutDiscardingItsWatermark() async throws {
+        let identifiers = (0..<10).map { "empty-target-\($0)" }
+        XCTAssertTrue(
+            queue.upsertBatch(
+                identifiers.enumerated().map {
+                    entry(id: $0.element, state: $0.offset < 4 ? .completed : .discovered)
+                }))
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        let context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await projector.start(generation: generation, context: context) { _ in }
+        XCTAssertEqual(queue.removeSources(kind: .photoLibraryAsset, identifiers: identifiers), 10)
+        var live = BackupSyncProgress()
+        live.remoteIndexPreparation = .init(phase: .loading)
+        projector.submit(live, generation: generation)
+        await projector.drainSubmittedEvents()
+        let empty = await projector.projectNow(context: context, generation: generation, revision: 1)
+        let emptyStatus = try XCTUnwrap(empty?.status)
+        XCTAssertEqual(emptyStatus.phase, .checking)
+        XCTAssertEqual(emptyStatus.backupTargetCount, 0)
+        XCTAssertNil(BackupStatusPresentation(emptyStatus).progressFraction)
+        XCTAssertNil(BackupStatusPresentation(emptyStatus).localizedSubtitle)
+        XCTAssertTrue(
+            queue.upsertBatch(
+                identifiers.enumerated().map {
+                    entry(id: $0.element, state: $0.offset < 1 ? .completed : .discovered)
+                }))
+        let restored = await projector.projectNow(context: context, generation: generation, revision: 2)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(restored?.status)).progressFraction, 0.4)
+        await projector.stop()
+    }
+
+    func testUnmanagedFolderProjectionKeepsRawProgressDefaults() async throws {
+        XCTAssertTrue(
+            queue.upsertBatch(
+                [entry(id: "folder-safe", state: .completed), entry(id: "folder-active", state: .uploading)]))
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        await projector.start(generation: generation, context: .init()) { _ in }
+        for (index, context) in [
+            BackupStatusProjectionContext(isScanning: true, isRunning: true),
+            BackupStatusProjectionContext(isRunning: true),
+            BackupStatusProjectionContext(isRunning: true, isUserPaused: true),
+            BackupStatusProjectionContext(),
+        ].enumerated() {
+            let projection = await projector.projectNow(
+                context: context, generation: generation, revision: UInt64(index + 1))
+            let result = try XCTUnwrap(projection)
+            let raw = BackupStatus(
+                progress: result.progress, isScanning: context.isScanning, isUserPaused: context.isUserPaused)
+            XCTAssertNil(result.status.photoDisplayProgress)
+            XCTAssertEqual(result.status, raw)
+        }
+        await projector.stop()
+    }
+
+    func testPhotoCycleIdentityAndStaleContextsCannotRestoreOldKnowledge() async throws {
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<10).map {
+                    entry(id: "identity-\($0)", state: $0 < 4 ? .completed : .discovered)
+                }))
+        let projector = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        let old = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await projector.start(generation: generation, context: old) { _ in }
+        let fresh = BackupStatusProjectionContext(isRunning: true, photoDisplay: .init(cycleID: UUID()))
+        let reset = await projector.projectNow(context: fresh, generation: generation, revision: 2)
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(reset?.status)).progressFraction)
+        let staleRevision = await projector.projectNow(context: old, generation: generation, revision: 1)
+        XCTAssertNil(staleRevision)
+        let staleGeneration = await projector.projectNow(context: old, generation: UUID(), revision: 3)
+        XCTAssertNil(staleGeneration)
+        for index in 2..<4 {
+            XCTAssertTrue(setQueueState(id: "identity-\(index)", state: .discovered))
+        }
+        var succeeded = fresh
+        succeeded.photoDisplay?.scanFinished = true
+        let lower = await projector.projectNow(context: succeeded, generation: generation, revision: 3)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(lower?.status)).progressFraction, 0.2)
+        await projector.stop()
+    }
+
+    func testANewProjectorStartsUnknownAndDoesNotRestoreThePreviousWatermark() async throws {
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<10).map {
+                    entry(id: "relaunch-\($0)", state: $0 < 4 ? .completed : .discovered)
+                }))
+        let context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        let first = BackupStatusProjector(queue: queue)
+        let firstGeneration = UUID()
+        await first.start(generation: firstGeneration, context: context) { _ in }
+        for index in 2..<4 {
+            XCTAssertTrue(setQueueState(id: "relaunch-\(index)", state: .discovered))
+        }
+        let held = await first.projectNow(context: context, generation: firstGeneration, revision: 1)
+        let reopened = BackupStatusPresentation(try XCTUnwrap(held?.status))
+        XCTAssertEqual(reopened.progressFraction, 0.4, "Reopening presentation does not reset the controller")
+        await first.stop()
+
+        let relaunched = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        var unknown = context
+        unknown.photoDisplay?.scanFinished = false
+        await relaunched.start(generation: generation, context: unknown) { _ in }
+        let initial = await relaunched.projectNow(context: unknown, generation: generation, revision: 1)
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(initial?.status)).progressFraction)
+        XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(initial?.status)).localizedSubtitle)
+        let scanned = await relaunched.projectNow(context: context, generation: generation, revision: 2)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(scanned?.status)).progressFraction, 0.2)
+        await relaunched.stop()
+    }
+
+    func testPauseAfterRelaunchKeepsCountsHiddenUntilAScanSucceeds() async throws {
+        XCTAssertTrue(
+            queue.upsertBatch(
+                (0..<10).map {
+                    entry(id: "paused-relaunch-\($0)", state: $0 < 4 ? .completed : .discovered)
+                }))
+        let first = BackupStatusProjector(queue: queue)
+        let firstGeneration = UUID()
+        var context = BackupStatusProjectionContext(
+            isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
+        await first.start(generation: firstGeneration, context: context) { _ in }
+        context.isUserPaused = true
+        let paused = await first.projectNow(context: context, generation: firstGeneration, revision: 1)
+        XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(paused?.status)).progressFraction, 0.4)
+        await first.stop()
+
+        let relaunched = BackupStatusProjector(queue: queue)
+        let generation = UUID()
+        context.isRunning = false
+        context.photoDisplay = .init(cycleID: UUID())
+        await relaunched.start(generation: generation, context: context) { _ in }
+        let initial = await relaunched.projectNow(context: context, generation: generation, revision: 1)
+        let display = BackupStatusPresentation(try XCTUnwrap(initial?.status))
+        XCTAssertEqual(display.headlineKey, "backup.phase_paused")
+        XCTAssertEqual(display.accessory, .paused)
+        XCTAssertFalse(display.isActive)
+        XCTAssertNil(display.progressFraction)
+        XCTAssertNil(display.localizedSubtitle)
+        await relaunched.stop()
+    }
+
     func testEveryQueueCounterReplacesRunnerCountsAndKeepsLiveProgress() async throws {
         let extraRows: [UploadBackupSyncQueueState: Int] = [.alreadyBackedUp: 12, .blockedByDraft: 10, .paused: 2]
         for (index, state) in UploadBackupSyncQueueState.allCases.enumerated() {
@@ -594,6 +956,12 @@ final class BackupStatusProjectorTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return condition()
+    }
+
+    private func setQueueState(id: String, state: UploadBackupSyncQueueState) -> Bool {
+        let row = entry(id: id, state: state)
+        return queue.updateState(
+            source: row.source, revision: row.revision, state: state, attempts: nil, lastError: nil, updatedAt: Date())
     }
 
     private func entry(

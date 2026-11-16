@@ -38,8 +38,11 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     /// True while a run is active - drives the one spinning icon.
     public var isActive: Bool
     public var accessory: Accessory
-    /// Determinate overall fraction (settled/total), or nil = indeterminate (scanning) / none.
+    /// Known active or paused photo progress uses the durable-item watermark. Other known phases
+    /// retain the raw phase mapping; unknown photo totals hide this fraction.
     public var progressFraction: Double?
+    /// Nil for unmanaged consumers. A knowledge transition must bypass active-phase dwell.
+    public var photoTotalIsKnown: Bool?
 
     // Subtitle inputs kept raw so the localized strings are compiler-checked, not built from a
     // dynamic key. `backedUp`/`total` render "<n> of <m>"; `attentionCount` drives the optional
@@ -51,12 +54,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var waitingCount: Int
     /// Exact-content matches deliberately not restored after Proton reported them deleted.
     public var skippedRemoteDeletions: Int
-    /// Quantized percentage of the resources moving right now. This is a liveness line, not the
-    /// library completion percentage and never replaces the backed-up count.
-    public var activeTransferPercent: Int?
-    /// Exact aggregate byte fraction behind `activeTransferPercent`. When present, the visible progress
-    /// bar represents this same transfer instead of an imperceptible one-item step across a large library.
-    public var activeTransferFraction: Double?
     public var nextAttemptAt: Date?
     /// Rows still to work on (waiting, checking, uploading). See `BackupStatus.remainingCount`.
     public var remainingCount = 0
@@ -88,8 +85,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         attentionCount: Int = 0,
         waitingCount: Int = 0,
         skippedRemoteDeletions: Int = 0,
-        activeTransferPercent: Int? = nil,
-        activeTransferFraction: Double? = nil,
         nextAttemptAt: Date? = nil,
         remoteIndexPreparationFailed: Bool = false,
         degradedDedupeUnresolvedCount: Int = 0,
@@ -104,8 +99,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         self.attentionCount = attentionCount
         self.waitingCount = waitingCount
         self.skippedRemoteDeletions = skippedRemoteDeletions
-        self.activeTransferPercent = activeTransferPercent
-        self.activeTransferFraction = activeTransferFraction.map { min(1, max(0, $0)) }
         self.nextAttemptAt = nextAttemptAt
         self.remoteIndexPreparationFailed = remoteIndexPreparationFailed
         self.degradedDedupeUnresolvedCount = max(0, degradedDedupeUnresolvedCount)
@@ -210,10 +203,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 headlineKey: "backup.phase_idle", isActive: false, accessory: .idle,
                 progressFraction: nil)
         }
-        if let fraction = status.activeTransfer?.fraction {
-            activeTransferFraction = fraction
-            activeTransferPercent = min(100, max(0, Int((fraction * 100).rounded(.down))))
-        }
         executionOpportunityIssue = status.executionOpportunityIssue
         remainingCount = status.remainingCount
         // A speed belongs to a sending phase only; a stale value never shows while paused or waiting.
@@ -224,6 +213,22 @@ public struct BackupStatusPresentation: Sendable, Equatable {
             degradedDedupeUnresolvedCount = status.remoteContentIndexHealth.unresolvedCount
         }
         remoteIndexPreparationFailed = status.remoteIndexPreparationFailed
+        if let photo = status.photoDisplayProgress {
+            photoTotalIsKnown = photo.isTotalKnown
+            if photo.isTotalKnown {
+                if isActive || accessory == .paused {
+                    progressFraction = photo.fraction
+                }
+            } else {
+                progressFraction = nil
+                total = 0
+                if photo.isChecking {
+                    headlineKey = status.phase == .scanning ? "backup.phase_scanning" : "backup.phase_checking"
+                    isActive = true
+                    accessory = .activity
+                }
+            }
+        }
     }
 
     // MARK: - Localized accessors (finite key sets; no dynamic-key lookups)
@@ -315,13 +320,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         BackupRetryPresentation.localizedDescription(for: nextAttemptAt)
     }
 
-    /// Honest active-transfer liveness for large resources. Kept separate from the stable
-    /// "N of M backed up" subtitle so fractional bytes can never inflate the backed-up count.
-    public var localizedTransferDetail: String? {
-        guard let activeTransferPercent else { return nil }
-        return L10n.string("backup.progress_transferring \(activeTransferPercent)")
-    }
-
     /// "3,766 left · 3.2 MB/s", or "3,766 left" without a speed. Only in the progress layout, so the row reserves
     /// its slot; nil when nothing is left.
     public var localizedLeftLine: String? {
@@ -340,15 +338,5 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     private var speedText: String? {
         guard let speed = uploadSpeedBytesPerSecond, speed >= 1 else { return nil }
         return L10n.fileSize(Int64(speed.rounded()))
-    }
-
-    /// The bar follows the percentage immediately above it while bytes move. Otherwise it remains the
-    /// determinate queue-wide fraction. The durable "N of M" count is never inflated by active bytes.
-    public var progressBarFraction: Double? {
-        activeTransferFraction ?? progressFraction
-    }
-
-    public var localizedProgressBarLabel: String? {
-        activeTransferFraction == nil ? localizedSubtitle : localizedTransferDetail
     }
 }

@@ -211,6 +211,7 @@ public final class PhotoLibraryBackupController {
     private let statusProjectionGeneration = UUID()
     private var statusProjectionRevision: UInt64 = 0
     private var lastAppliedStatusProjectionRevision: UInt64 = 0
+    @ObservationIgnored private var photoDisplayContext = BackupPhotoDisplayContext(cycleID: UUID())
     private let tempStore: BackupTempFileStore
     private let bulkResourceResolver: any BackupResourceResolving
     private let bulkResourceCoordinator: LibraryResourceCoordinator
@@ -684,6 +685,7 @@ public final class PhotoLibraryBackupController {
 
     public func disableBackup() {
         isEnabled = false
+        photoDisplayContext = BackupPhotoDisplayContext(cycleID: UUID())
         defaults.set(false, forKey: Self.enabledDefaultsKey)
         isUserPaused = false
         defaults.set(false, forKey: Self.userPausedDefaultsKey)
@@ -693,9 +695,8 @@ public final class PhotoLibraryBackupController {
         changeSubscription?.cancel()
         changeSubscription = nil
         stopSync()
-        if !isSyncing {
-            refreshFromQueue()
-        }
+        publishDirectStatus(progress: lastProjectedProgress)
+        refreshFromQueue()
         reportNoIndexBuild()
     }
 
@@ -1388,15 +1389,14 @@ public final class PhotoLibraryBackupController {
         backedUpAtRunStart = lastProjectedProgress.backedUp
         updateIdleTimerIfNeeded()
         isScanning = false
+        photoDisplayContext.scanFinished = false
         lastMessage = nil
-        status = BackupStatus(
-            progress: lastProjectedProgress, isScanning: false,
-            executionOpportunityIssue: executionOpportunityIssue
-        )
+        publishDirectStatus(progress: lastProjectedProgress)
         refreshFromQueue()
         startHeartbeat(runID: runID)
         startStatusRefresh()
         let statusSetupTask = self.statusSetupTask
+        let displayCycleID = photoDisplayContext.cycleID
         #if DEBUG
             let scanBody = scanBodyForTesting
         #else
@@ -1408,7 +1408,7 @@ public final class PhotoLibraryBackupController {
             let task = Task {
                 [
                     weak self, monitor, engine, runner, queueStore, catalogStore, catalogRetryRows, statusSetupTask,
-                    scanBody
+                    scanBody, displayCycleID
                 ] in
                 await statusSetupTask?.value
                 self?.refreshFromQueue()
@@ -1424,7 +1424,7 @@ public final class PhotoLibraryBackupController {
                     end = .failed
                     self?.reportScanFailure(error)
                 }
-                self?.finishScanPhase()
+                self?.finishScanPhase(scanFinished: end == .scanned, displayCycleID: displayCycleID)
                 refreshScan.end = end == .stopped && refreshScan.yielded ? .yielded : end
                 await self?.finishSync(runID: runID)
             }
@@ -1448,7 +1448,7 @@ public final class PhotoLibraryBackupController {
             [
                 weak self, monitor, tempStore, engine, runner, queueStore, catalogStore, catalogRetryRows,
                 statusSetupTask, scanBody,
-                identityResolver
+                identityResolver, displayCycleID
             ] in
             await statusSetupTask?.value
             self?.refreshFromQueue()
@@ -1477,7 +1477,7 @@ public final class PhotoLibraryBackupController {
             } catch {
                 self?.reportScanFailure(error)
             }
-            self?.finishScanPhase()
+            self?.finishScanPhase(scanFinished: scanFinished, displayCycleID: displayCycleID)
 
             await scanDone.markDone()
             let finalProgress = await reconcile  // drains the tail enqueued during the scan, then returns
@@ -2675,12 +2675,14 @@ public final class PhotoLibraryBackupController {
             isScanning: isScanning,
             isRunning: isSyncing,
             isUserPaused: isUserPaused,
-            executionOpportunityIssue: executionOpportunityIssue
+            executionOpportunityIssue: executionOpportunityIssue,
+            photoDisplay: photoDisplayContext
         )
     }
 
     private func applyStatusProjection(_ projection: BackupStatusProjection) {
         guard projection.generation == statusProjectionGeneration,
+            projection.revision >= statusProjectionRevision,
             projection.revision >= lastAppliedStatusProjectionRevision
         else { return }
         lastAppliedStatusProjectionRevision = projection.revision
@@ -2699,9 +2701,21 @@ public final class PhotoLibraryBackupController {
         refreshFromQueue()
     }
 
-    private func finishScanPhase() {
+    private func finishScanPhase(scanFinished: Bool, displayCycleID: UUID) {
         isScanning = false
+        if displayCycleID == photoDisplayContext.cycleID {
+            photoDisplayContext.scanFinished = scanFinished
+        }
         refreshFromQueue()
+    }
+
+    private func publishDirectStatus(progress: BackupSyncProgress) {
+        var snapshot = BackupStatus(
+            progress: progress, isScanning: isScanning, isUserPaused: isUserPaused,
+            executionOpportunityIssue: executionOpportunityIssue)
+        snapshot.photoDisplayProgress = projectionContext.photoProgress(
+            for: snapshot, fraction: status.photoDisplayProgress?.fraction)
+        status = snapshot
     }
 
     /// Cancels every targeted writer and waits briefly before deciding whether retirement is needed.
@@ -2930,10 +2944,7 @@ public final class PhotoLibraryBackupController {
             // repeat the whole pass while every upload still waits for Wi-Fi. A wait that already ended keeps the
             // timer, because its restart could not start.
             nextAutomaticAttemptAt = nil
-            status = BackupStatus(
-                progress: p, isScanning: false, isUserPaused: isUserPaused,
-                executionOpportunityIssue: executionOpportunityIssue
-            )
+            publishDirectStatus(progress: p)
             return
         }
         guard
@@ -2948,10 +2959,7 @@ public final class PhotoLibraryBackupController {
         nextAutomaticAttemptAt = wakeAt
         var scheduledProgress = p
         scheduledProgress.outstanding.nextAttemptAt = wakeAt
-        status = BackupStatus(
-            progress: scheduledProgress, isScanning: false, isUserPaused: isUserPaused,
-            executionOpportunityIssue: executionOpportunityIssue
-        )
+        publishDirectStatus(progress: scheduledProgress)
         autoResumeTask = Task { @MainActor [weak self] in
             let delay = max(0, wakeAt.timeIntervalSinceNow)
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))

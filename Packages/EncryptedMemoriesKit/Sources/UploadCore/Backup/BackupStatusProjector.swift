@@ -1,5 +1,17 @@
 import Foundation
 
+/// Photo-only display knowledge. The controller carries its existing scan outcome and resets the
+/// identity when backup is disabled. Folder and manual backup keep their existing defaults.
+public struct BackupPhotoDisplayContext: Sendable, Equatable {
+    public var cycleID: UUID
+    public var scanFinished: Bool
+
+    public init(cycleID: UUID, scanFinished: Bool = false) {
+        self.cycleID = cycleID
+        self.scanFinished = scanFinished
+    }
+}
+
 /// Runtime-only context needed to turn durable queue truth into the shared user-facing status.
 /// It deliberately contains no platform types and no asset identifiers.
 public struct BackupStatusProjectionContext: Sendable, Equatable {
@@ -7,17 +19,37 @@ public struct BackupStatusProjectionContext: Sendable, Equatable {
     public var isRunning: Bool
     public var isUserPaused: Bool
     public var executionOpportunityIssue: BackupExecutionOpportunityIssue?
+    public var photoDisplay: BackupPhotoDisplayContext?
 
     public init(
         isScanning: Bool = false,
         isRunning: Bool = false,
         isUserPaused: Bool = false,
-        executionOpportunityIssue: BackupExecutionOpportunityIssue? = nil
+        executionOpportunityIssue: BackupExecutionOpportunityIssue? = nil,
+        photoDisplay: BackupPhotoDisplayContext? = nil
     ) {
         self.isScanning = isScanning
         self.isRunning = isRunning
         self.isUserPaused = isUserPaused
         self.executionOpportunityIssue = executionOpportunityIssue
+        self.photoDisplay = photoDisplay
+    }
+
+    public var photoTotalIsKnown: Bool? {
+        photoDisplay.map { $0.scanFinished && !isScanning }
+    }
+
+    /// Phases in which a running pass without a known total reads "Checking". A paused or waiting pass, and one that
+    /// needs attention, keeps its real reason instead.
+    private static let checkingPhases: Set<BackupStatus.Phase> = [.idle, .scanning, .checking, .uploading, .completed]
+
+    /// Direct controller publications use the same knowledge gate, but never advance the projector's watermark.
+    public func photoProgress(for status: BackupStatus, fraction: Double?) -> BackupPhotoDisplayProgress? {
+        guard let known = photoTotalIsKnown else { return nil }
+        return BackupPhotoDisplayProgress(
+            isTotalKnown: known,
+            isChecking: !known && isRunning && Self.checkingPhases.contains(status.phase),
+            fraction: known && (status.backupTargetCount ?? 0) > 0 ? fraction : nil)
     }
 }
 
@@ -91,6 +123,8 @@ public actor BackupStatusProjector {
     /// The last queue summary and the change token read before it. A runner tick whose token is unchanged reuses it.
     private var cachedSummary: (token: UploadBackupSyncQueueChangeToken, summary: UploadBackupSyncQueueSummary)?
     private var speedEstimator = BackupUploadSpeedEstimator()
+    private var photoDisplayCycleID: UUID?
+    private var photoDisplayHighWatermark: Double?
     private var lastConsumedSequence: UInt64 = 0
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
     /// Identifies the current stream consumer; a new `start` bumps the epoch, so a drain that
@@ -186,6 +220,8 @@ public actor BackupStatusProjector {
         lastPublishedAt = .distantPast
         cachedSummary = nil
         speedEstimator.reset()
+        photoDisplayCycleID = nil
+        photoDisplayHighWatermark = nil
 
         let stream = self.stream
         streamConsumerEpoch += 1
@@ -233,6 +269,8 @@ public actor BackupStatusProjector {
         latestRunnerProgress = nil
         generation = UUID()
         contextRevision = 0
+        photoDisplayCycleID = nil
+        photoDisplayHighWatermark = nil
     }
 
     /// Single entry point of the stream consumer: gate, ingest, notify.
@@ -387,6 +425,7 @@ public actor BackupStatusProjector {
         } else {
             speedEstimator.reset()
         }
+        decoratePhotoDisplay(&status)
         let projection = BackupStatusProjection(
             generation: generation,
             revision: contextRevision,
@@ -398,6 +437,24 @@ public actor BackupStatusProjector {
             await handler(projection)
         }
         return projection
+    }
+
+    /// One runtime watermark for the whole photo display cycle. Resource turnover and runner
+    /// micro-drains cannot reset it; only a controller terminal pass or an explicit identity change can.
+    private func decoratePhotoDisplay(_ status: inout BackupStatus) {
+        guard let photo = context.photoDisplay else { return }
+        if photoDisplayCycleID != photo.cycleID {
+            photoDisplayCycleID = photo.cycleID
+            photoDisplayHighWatermark = nil
+        }
+        if !context.isRunning && (status.phase == .completed || status.phase == .needsAttention) {
+            photoDisplayHighWatermark = nil
+        }
+        if context.photoTotalIsKnown == true, status.isActive, let total = status.backupTargetCount, total > 0 {
+            let fraction = min(0.99, max(0, Double(status.backedUp) / Double(total)))
+            photoDisplayHighWatermark = max(photoDisplayHighWatermark ?? 0, fraction)
+        }
+        status.photoDisplayProgress = context.photoProgress(for: status, fraction: photoDisplayHighWatermark)
     }
 
     /// Only these phases can show an upload speed. Every other phase makes the next resume start fresh.
