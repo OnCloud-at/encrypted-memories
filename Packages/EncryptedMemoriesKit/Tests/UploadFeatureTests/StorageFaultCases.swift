@@ -18,7 +18,96 @@ let storageFaultCases: [any StorageFaultCase] = [
     PhotoJournalCase(id: "journal.revert.remove", journal: .revert, step: .remove),
     PhotoJournalCase(id: "journal.series.save", journal: .series, step: .save),
     PhotoJournalCase(id: "journal.series.remove", journal: .series, step: .remove),
+    DeletionDecisionCase(keepDeleted: true, startsWithIntent: false),
+    DeletionDecisionCase(keepDeleted: false, startsWithIntent: false),
+    DeletionDecisionCase(keepDeleted: true, startsWithIntent: true),
+    DeletionDecisionCase(keepDeleted: false, startsWithIntent: true),
 ]
+
+/// A deletion decision followed by launch replay, or launch replay of an already recorded intent. Both call the
+/// production operation on the real queue and journal. The second replay also settles a best-effort settle that
+/// failed after the queue committed. The separate unit test pins that retained intent before the next launch.
+struct DeletionDecisionCase: StorageFaultCase {
+    struct World {
+        let queue: UploadBackupSyncQueueManifestStore
+        let journal: EditReplacementJournalFileStore
+        let files: StorageFaultFiles
+    }
+    let keepDeleted: Bool
+    let startsWithIntent: Bool
+    var id: String {
+        "backup.\(startsWithIntent ? "replayRemoteDeletion" : "resolveRemoteDeletion").\(keepDeleted ? "keep" : "backUpAgain")"
+    }
+    let atomicity = StorageFaultAtomicity.convergesAfterRestart
+    private let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "decision-photo")
+    private let revisions = [UploadBackupRevision(rawValue: 1), UploadBackupRevision(rawValue: 2)]
+    private let date = Date(timeIntervalSince1970: 1_720_000_001)
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let world = try open(directory, remote: remote)
+        defer { close(world) }
+        for revision in revisions {
+            XCTAssertTrue(
+                world.queue.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: source, revision: revision,
+                        originalFilename: "photo.heic", state: .failedPermanent,
+                        lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                        updatedAt: date)))
+        }
+        try world.journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "gone"), for: source)
+        if startsWithIntent {
+            try world.journal.recordDeletionDecision(
+                keepDeleted ? .keptDeleted : .backUpAgain(revisions[1]),
+                revisions: revisions, for: source)
+        }
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        let files = StorageFaultFiles()
+        return World(
+            queue: try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: directory.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName))),
+            journal: try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory, fileSystem: files)),
+            files: files)
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.queue, world.files] }
+
+    func run(_ world: World) async -> Bool {
+        guard await DeletionDecisionReplay.run(queue: world.queue, journal: world.journal, at: date) else {
+            return false
+        }
+        do {
+            let row = try world.queue.entry(for: source, revision: revisions[1])
+            if row?.state == .failedPermanent {
+                try await DeletionDecisionReplay.record(
+                    keepDeleted ? .keptDeleted : .backUpAgain(revisions[1]),
+                    revisions: revisions, for: source, queue: world.queue, journal: world.journal, at: date)
+            }
+            return await DeletionDecisionReplay.run(queue: world.queue, journal: world.journal, at: date)
+        } catch { return false }
+    }
+
+    func close(_ world: World) { world.queue.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let url = directory.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: url)
+        try state.addRecords("queue revision", of: url, sql: "SELECT revision_us FROM backup_sync_queue;")
+        let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        state.tables["decision journal"] = [
+            canonicalJSON(
+                String(
+                    decoding:
+                        try JSONEncoder().encode(journal.entry(for: source)), as: UTF8.self))
+        ]
+        state.records["superseded link"] = Set(journal.entry(for: source).superseded.map(\.nodeID))
+        return state
+    }
+}
 
 /// The photo library before the operation (`seed`) and when it runs: asset-2 is edited, asset-3 is deleted, asset-4
 /// and asset-5 are new, asset-1 is unchanged.

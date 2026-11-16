@@ -12,6 +12,14 @@ extension BackupRuntimeSignalSource {
         mobileDataOff(LibraryRuntimeState(initial: LibraryRuntimeSnapshot(network: LibraryNetworkState())))
     }
 
+    /// A satisfied, determined Wi-Fi path while no scene is in the foreground, as in a background task window. A pass
+    /// that ends then starts no further pass.
+    static var wiFiInTheBackground: BackupRuntimeSignalSource {
+        BackupRuntimeSignalSource(
+            current: { BackupThrottleInputs(usesMobileData: false, isAppInBackground: true) },
+            updates: { AsyncStream { _ in } })
+    }
+
     /// The network of `runtime` with mobile data off. Updates of `runtime` reach the backup as network changes.
     static func mobileDataOff(_ runtime: LibraryRuntimeState) -> BackupRuntimeSignalSource {
         BackupRuntimeSignalSource(

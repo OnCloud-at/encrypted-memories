@@ -180,7 +180,7 @@ final class UploadDraftContentLookupTests: XCTestCase {
         let restored = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
         try harness.journal.addSuperseded(restored, for: source)
         try harness.journal.settle([restored.nodeID], related: [], trashed: true, for: source)
-        try harness.journal.keepDeleted(for: source)
+        try harness.journal.recordKeptDeletionForFixture(for: source)
         XCTAssertEqual(harness.journal.entry(for: source).retired, [restored.nodeID])
         XCTAssertEqual(harness.journal.entry(for: source).keptDeleted, true)
         let draft = harness.server.seedDraft(
@@ -214,7 +214,7 @@ final class UploadDraftContentLookupTests: XCTestCase {
         let restored = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
         try harness.journal.addSuperseded(restored, for: source)
         try harness.journal.settle([restored.nodeID], related: [], trashed: true, for: source)
-        try harness.journal.keepDeleted(for: source)
+        try harness.journal.recordKeptDeletionForFixture(for: source)
         let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)
         let draft = harness.server.seedDraft(
             name: descriptor.filename, digest: Data(repeating: 3, count: 20), clientUID: "other-uploader")
@@ -379,7 +379,7 @@ final class UploadDraftContentLookupTests: XCTestCase {
         let restored = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
         try harness.journal.addSuperseded(restored, for: source)
         try harness.journal.settle([restored.nodeID], related: [], trashed: true, for: source)
-        try harness.journal.keepDeleted(for: source)
+        try harness.journal.recordKeptDeletionForFixture(for: source)
         let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)
         let draft = harness.server.seedDraft(
             name: descriptor.filename, digest: Data(repeating: 3, count: 20),
@@ -625,7 +625,7 @@ final class UploadDraftContentLookupTests: XCTestCase {
         let retired = harness.server.seedLink(digest: Data(repeating: 2, count: 20))
         try harness.journal.addSuperseded(retired, for: source)
         try harness.journal.settle([retired.nodeID], related: [], trashed: true, for: source)
-        try harness.journal.keepDeleted(for: source)
+        try harness.journal.recordKeptDeletionForFixture(for: source)
         let before = harness.journal.entry(for: source)
         harness.server.setVisibility(.init(isActive: false, mainPhotoLinkID: nil), for: retired.nodeID)
         let active = harness.server.seedLink(digest: descriptor.precomputedSHA1Digest!)

@@ -5,6 +5,27 @@ import XCTest
 /// Runs the fault-injection sweep over every registered storage operation (#1141), and proves with deliberately flawed
 /// probe operations that each fixed rule catches its class of defect.
 final class StorageFaultSweepTests: XCTestCase {
+    func testEncodedIssueComparisonKeepsAllFieldsValuesAndArrayOrder() {
+        let prefix = "encryptedmemories-backup-issue-v1:"
+        func record(_ json: String) -> String { prefix + Data(json.utf8).base64EncodedString() }
+        let first = record(#"{"kind":"remoteDeletion","detail":"same","future":{"a":[1,3],"b":2}}"#)
+        let reordered = record(#"{"future":{"b":2,"a":[1,3]},"detail":"same","kind":"remoteDeletion"}"#)
+        XCTAssertEqual(canonicalJSON(first), canonicalJSON(reordered))
+        for changed in [
+            #"{"kind":"deletedElsewhere","detail":"same","future":{"a":[1,3],"b":2}}"#,
+            #"{"kind":"remoteDeletion","detail":"different","future":{"a":[1,3],"b":2}}"#,
+            #"{"kind":"remoteDeletion","detail":"same","future":{"a":[3,1],"b":2}}"#,
+            #"{"kind":"remoteDeletion","detail":"same","future":{"a":[1,3],"b":3}}"#,
+            #"{"kind":"remoteDeletion","detail":"same","future":{"a":[1,3],"b":2},"extra":true}"#,
+        ] { XCTAssertNotEqual(canonicalJSON(first), canonicalJSON(record(changed))) }
+        for invalid in [prefix + "not-base64!", record("not JSON"), "other:" + first] {
+            XCTAssertEqual(canonicalJSON(invalid), invalid)
+            XCTAssertNotEqual(canonicalJSON(first), canonicalJSON(invalid))
+        }
+        XCTAssertNotEqual(canonicalJSON(prefix + "not-base64!"), canonicalJSON(prefix + "different-invalid!"))
+        XCTAssertEqual(canonicalJSON(#"{"a":1,"b":2}"#), canonicalJSON(#"{"b":2,"a":1}"#))
+    }
+
     /// One assertion over all cases, so a failing case never hides behind an earlier one in the test log.
     func testEveryRegisteredOperationKeepsTheRulesAtEveryPoint() async throws {
         XCTAssertFalse(storageFaultCases.isEmpty)
