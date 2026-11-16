@@ -418,15 +418,32 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(800))
             return
         }
-        let index = MobileTab.allCases.firstIndex(of: tab) ?? 0
         if let controller = viewControllers(in: window).compactMap({ $0 as? UITabBarController }).first {
+            // The tab bar's own titles give the index, so a tab the app hides (Map) cannot shift it.
+            let titles: [String?] =
+                controller.tabs.isEmpty
+                ? (controller.viewControllers ?? []).map(\.tabBarItem.title) : controller.tabs.map(\.title)
+            let index = titles.firstIndex(of: tab.title) ?? -1
             if controller.tabs.indices.contains(index) {
                 controller.selectedTab = controller.tabs[index]
+                note("selected tab '\(tab.title)' through UITabBarController (tabs=\(controller.tabs.count))")
+            } else if let controllers = controller.viewControllers, controllers.indices.contains(index),
+                controller.delegate?.tabBarController?(controller, shouldSelect: controllers[index]) ?? true
+            {
+                let target = controllers[index]
+                // Select the way a tap does: a bare selectedIndex change bypasses the delegate, and SwiftUI then
+                // restores its own tab selection on iPadOS 26.
+                controller.selectedViewController = target
+                controller.delegate?.tabBarController?(controller, didSelect: target)
+                note("selected tab '\(tab.title)' through the tab bar delegate (tabs=0)")
             } else {
-                controller.selectedIndex = index
+                note("tab '\(tab.title)' not selected: index \(index) in \(titles), or the delegate refused")
             }
-            note("selected tab '\(tab.title)' through UITabBarController (tabs=\(controller.tabs.count))")
             try await Task.sleep(for: .milliseconds(800))
+            try await waitUntil("tab '\(tab.title)' is selected") {
+                controller.tabs.indices.contains(index)
+                    ? controller.selectedTab === controller.tabs[index] : controller.selectedIndex == index
+            }
             return
         }
         note(
