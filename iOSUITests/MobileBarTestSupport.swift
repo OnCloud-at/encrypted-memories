@@ -1,6 +1,13 @@
 import CoreGraphics
 import XCTest
 
+/// Whether a bar frame from the accessibility tree covers content in `window`. iOS 27 also reports a toolbar container
+/// as large as the window; it covers nothing. A real bar is much narrower or much lower than the window, also the
+/// vertical bar of iPhone Duo.
+func barCoversContent(_ bar: CGRect, in window: CGRect) -> Bool {
+    !bar.isEmpty && !(bar.width >= window.width * 0.9 && bar.height >= window.height * 0.9)
+}
+
 extension XCUIApplication {
     /// The viewer's menu button. It reports its long accessibility name or the short system name, in English or
     /// German ("More actions" or "More", "Weitere Aktionen" or "Weitere").
@@ -17,10 +24,60 @@ extension XCUIApplication {
 
     /// Opens Recently Deleted from the visible Collections list, which may need scrolling first.
     func openRecentlyDeleted() {
-        let recentlyDeleted = buttons["Recently Deleted"].firstMatch
-        for _ in 0..<4 where !recentlyDeleted.waitForExistence(timeout: 3) { swipeUp() }
-        XCTAssertTrue(recentlyDeleted.waitForExistence(timeout: 10))
-        recentlyDeleted.tap()
+        openCollectionsRow(buttons["Recently Deleted"].firstMatch)
+    }
+
+    /// Opens a row of the Collections list, which may need scrolling first, with `tapOnScreen(_:)`.
+    func openCollectionsRow(_ row: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        for _ in 0..<6 {
+            guard row.waitForExistence(timeout: 3) else {
+                swipeUp()
+                continue
+            }
+            if liesOnScreenClearOfBars(row.frame) { break }
+            if row.frame.midY > windows.firstMatch.frame.midY { swipeUp() } else { swipeDown() }
+        }
+        tapOnScreen(row, file: file, line: line)
+    }
+
+    /// Taps an element at its centre after checking that it lies fully in the window and clear of every bar and the
+    /// keyboard. On iOS 26.5 XCTest reports an element of a SwiftUI list as not hittable, and its own scroll into view
+    /// moves the list back to the top.
+    func tapOnScreen(_ element: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(element.waitForExistence(timeout: 10), file: file, line: line)
+        let frame = element.frame
+        XCTAssertTrue(
+            liesOnScreenClearOfBars(frame), "\(frame) lies in the window, clear of \(coveringFrames())", file: file,
+            line: line)
+        element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+    }
+
+    func liesOnScreenClearOfBars(_ frame: CGRect) -> Bool {
+        windows.firstMatch.frame.contains(frame) && !coveringFrames().contains { $0.intersects(frame) }
+    }
+
+    /// Every navigation bar, tab bar, toolbar and keyboard on screen that covers content, in any column, and the
+    /// vertical tab bar of iPhone Duo.
+    private func coveringFrames() -> [CGRect] {
+        let window = windows.firstMatch.frame
+        let bars = [navigationBars, tabBars, toolbars, keyboards].flatMap(\.allElementsBoundByIndex).filter(\.exists)
+            .map(\.frame)
+        return (bars + [verticalTabStrip()].compactMap { $0 }).filter { barCoversContent($0, in: window) }
+    }
+
+    /// The strip of a vertical tab bar, as iPhone Duo shows it beside the content: the column of the tab buttons
+    /// over the full window height. The system reports no tab bar or toolbar element for it. Nil for horizontal tabs.
+    func verticalTabStrip() -> CGRect? {
+        let window = windows.firstMatch.frame
+        for titles in [["Library", "Collections", "Search"], ["Mediathek", "Sammlungen", "Suchen"]] {
+            let frames = titles.map { barButton(titled: $0) }.filter(\.exists).map(\.frame).filter { !$0.isEmpty }
+            guard frames.count == titles.count else { continue }
+            // Horizontal tabs sit side by side; vertical tabs share one column.
+            guard frames.dropFirst().allSatisfy({ abs($0.midX - frames[0].midX) <= 2 }) else { return nil }
+            let column = frames.dropFirst().reduce(frames[0]) { $0.union($1) }
+            return CGRect(x: column.minX, y: window.minY, width: column.width, height: window.height)
+        }
+        return nil
     }
 
     /// Read a rendered screen pixel in window coordinates, outside the native button backgrounds.
