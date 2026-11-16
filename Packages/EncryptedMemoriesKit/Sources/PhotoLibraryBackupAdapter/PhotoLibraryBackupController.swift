@@ -2969,16 +2969,17 @@ public final class PhotoLibraryBackupController {
     /// missing-source recovery; the technical text stays in the diagnostics.
     private func reportScanFailure(_ error: Error) {
         PhotoDiagnostics.shared.increment("backup.scan.failed")
-        let detail: String
-        if let error = error as? UploadError, case .backend(let text) = error {
-            detail = text
-        } else {
-            // The domain and the code are fixed values; the description of a system error can hold a path.
-            let bridged = error as NSError
-            detail = "\(bridged.domain) \(bridged.code)"
-        }
-        PhotoDiagnostics.shared.emitDebug("BackupSync", ["scanError": detail])
+        PhotoDiagnostics.shared.emitDebug("BackupSync", ["scanError": Self.scanFailureDetail(error)])
         reportSyncMessage(L10n.string("backup.error_local_state_unavailable"))
+    }
+
+    /// The fixed technical wording that the diagnostics keep for a failed scan.
+    nonisolated static func scanFailureDetail(_ error: Error) -> String {
+        if let error = error as? PhotoLibraryCatalogSyncError { return error.diagnosticText }
+        if let error = error as? UploadError, case .backend(let text) = error { return text }
+        // The domain and the code are fixed values; the description of a system error can hold a path.
+        let bridged = error as NSError
+        return "\(bridged.domain) \(bridged.code)"
     }
 
     private func refreshFromQueue() {
