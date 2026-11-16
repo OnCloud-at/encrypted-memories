@@ -8,9 +8,12 @@ import Testing
 
 /// The iOS request call of both background tasks, and how a Smart Search window ends.
 @Suite @MainActor struct MobileBackgroundWindowTests {
-    @Test func fromIOS27BothBackgroundTasksSubmitWithTheCallOffTheMainThread() throws {
-        let iOS27 = OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
-        try #require(ProcessInfo.processInfo.isOperatingSystemAtLeast(iOS27))
+    @Test(
+        .enabled(
+            if: ProcessInfo.processInfo.isOperatingSystemAtLeast(
+                OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)),
+            "The off-main submission exists from iOS 27"))
+    func fromIOS27BothBackgroundTasksSubmitWithTheCallOffTheMainThread() {
         #expect(PhotoBackupBackgroundCoordinator.offMainSubmission(earliestBeginDate: nil) != nil)
         #expect(PhotoBackupBackgroundCoordinator.offMainRefreshSubmission(earliestBeginDate: Date()) != nil)
         #expect(AppleSmartSearchBackgroundCoordinator.offMainSubmission(earliestBeginDate: Date()) != nil)
