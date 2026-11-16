@@ -1,0 +1,6 @@
+// Host decision canary (#1157): this core file sits below a directory called App that lies above the checkout. The
+// host rules must not treat it as a host file, so nothing may be reported here.
+func leak(_ error: any Error) {
+    _ = error as? AlbumError
+    _ = pendingStore?.isOperational()
+}

@@ -1,0 +1,75 @@
+// Host decision canary (#1157). `scripts/verify-swift-style.sh` copies this file below `App/` and lints it.
+// Each `expect` comment names the rule that must report the next line; no other line may be reported.
+func forbidden() {
+    do {
+        try work()
+        // expect: no_domain_error_decision_in_host
+    } catch let error as AlbumError {
+        show(error)
+        // expect: no_domain_error_decision_in_host
+    } catch is any UploadError {
+        retry()
+        // expect: no_domain_error_decision_in_host
+    } catch UploadError.quotaExceeded {
+        retry()
+        // expect: no_domain_error_decision_in_host
+    } catch let error as UploadCore.UploadError {
+        show(error)
+        // expect: no_domain_error_decision_in_host
+    } catch UploadCore.UploadError.quotaExceeded {
+        retry()
+    } catch {
+        // expect: no_domain_error_decision_in_host
+        if error is StorageFailure { retry() }
+        // expect: no_domain_error_decision_in_host
+        let album = error as? AlbumError
+        // expect: no_domain_error_decision_in_host
+        let forced = error as! SeriesDissolutionError
+        // expect: no_domain_error_decision_in_host
+        let qualified = error as? UploadCore.UploadError
+        // expect: no_domain_error_decision_in_host
+        let deep = error as? Module.Sub.StorageFailure
+        // expect: no_domain_error_decision_in_host
+        if error is (any StorageFailure) { retry() }
+        // expect: no_domain_error_decision_in_host
+        if case let typed as StorageFailure = error { show(typed) }
+        switch value {
+        // expect: no_domain_error_decision_in_host
+        case let typed as AlbumError: show(typed)
+        // expect: no_domain_error_decision_in_host
+        case is UploadError: retry()
+        default: break
+        }
+        // expect: no_domain_error_decision_in_host
+        switch error {
+        default: break
+        }
+        // expect: no_domain_error_decision_in_host
+        switch err {
+        default: break
+        }
+        // expect: no_domain_error_decision_in_host
+        switch error.code {
+        default: break
+        }
+        // expect: no_domain_error_decision_in_host
+        switch (error as? Unclassified) {
+        default: break
+        }
+        // expect: no_domain_error_decision_in_host
+        switch result.failure {
+        default: break
+        }
+        // A web address in a string does not hide the site behind it.
+        // expect: no_domain_error_decision_in_host
+        _ = (URL(string: "https://example.invalid"), error as? AlbumError)
+    }
+    // expect: no_store_health_check_in_host
+    _ = pendingStore?.isOperational() == true
+    // expect: no_store_health_check_in_host
+    guard queueStore.isOperational() else { return }
+    // expect: no_store_health_check_in_host
+    if pendingRestore?.isReadable == false { return }
+    // expect: no_store_health_check_in_host
+    _ = (URL(string: "https://example.invalid"), pendingStore?.isOperational())
+}
