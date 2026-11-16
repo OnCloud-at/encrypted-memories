@@ -3905,6 +3905,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                     ?? false
             }
             XCTAssertTrue(carried, "the task carries the pass that the path started")
+            // The protection starts with the pass; the scan records its owner later, before its start count rises.
+            _ = await waitUntil { scan.starts.count == 1 }
             XCTAssertEqual(scan.owners.values, [.manual])
             XCTAssertTrue(probe.results.isEmpty, "the task does not end while the pass runs")
             scan.open.value = true
