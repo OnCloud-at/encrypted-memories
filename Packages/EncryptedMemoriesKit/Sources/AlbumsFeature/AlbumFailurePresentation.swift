@@ -27,4 +27,26 @@ public struct AlbumFailurePresentation: Sendable, Equatable {
         // An unclassified failure is not proof that another read cannot succeed.
         return Self(message: L10n.string("albums.load_failed_message"), canRetry: true)
     }
+
+    /// The alert text of a failed album-cover change; nil shows no alert. An album outcome that names its reason
+    /// shows that reason. Every other failure shows the generic text that the host supplies.
+    public static func coverMessage(
+        for error: any Error, text: (LibraryActionFailureMessage.Text) -> String
+    ) -> String? {
+        let albumError = error as? AlbumError
+        return LibraryActionFailureMessage.message(
+            for: error, action: .albumCover, specificAlbumReason: albumError?.coverReason,
+            underlyingError: albumError?.underlyingCause, text: text)
+    }
+}
+
+extension AlbumError {
+    fileprivate var coverReason: String? {
+        switch self {
+        case .unsupported, .sharedAlbumReadOnly, .albumCreatedButPhotosNotAdded, .partialAdd, .partialAddWithCauses:
+            errorDescription
+        case .backend, .requestFailed:
+            nil
+        }
+    }
 }

@@ -191,6 +191,80 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
         XCTAssertEqual(result.errorMessage, "terminal refresh failure")
     }
 
+    /// A background refresh (remote change, backup upload) never replaces the grid. With nothing loaded the grid keeps
+    /// its loading state, and the next refresh tries again.
+    @MainActor
+    func testFailedBackgroundRefreshWithNothingLoadedKeepsTheLoadingState() async {
+        for error: any Error in [TerminalRefreshError(), PendingVisibilityError(), ScopeLossError()] {
+            let model = TimelineViewModel(repository: FailingRefreshRepository(error: error), feed: makeFeed().feedCore)
+
+            _ = await model.refreshLibraryInBackground()
+
+            guard case .loading = model.state else {
+                XCTFail("A failed background refresh must leave the loading state alone: \(error)")
+                continue
+            }
+        }
+    }
+
+    /// A refresh that the person starts (menu refresh, refresh after a manual upload) is awaited: with nothing loaded
+    /// its failure shows the failed library, as before.
+    @MainActor
+    func testFailedRefreshThatAPersonStartedShowsTheFailedLibraryWhenNothingIsLoaded() async {
+        let started: [(String, @MainActor (TimelineViewModel) async -> TimelineRefreshResult)] = [
+            ("menu refresh", { await $0.refreshLibrary() }),
+            ("refresh after a manual upload", { await $0.refreshAfterUpload(uploadedUID: nil) }),
+        ]
+        for (name, refresh) in started {
+            let model = TimelineViewModel(repository: TerminalFailureRepository(), feed: makeFeed().feedCore)
+
+            let result = await refresh(model)
+
+            XCTAssertEqual(result.failureReason, .other, name)
+            guard case .failed(let message, _) = model.state else {
+                XCTFail("\(name): a refresh that a person waits for shows its failure")
+                continue
+            }
+            XCTAssertEqual(message, "terminal refresh failure", name)
+        }
+    }
+
+    @MainActor
+    func testFailedRefreshKeepsTheFailedScreenOfTheFirstLoad() async {
+        let model = TimelineViewModel(repository: TerminalFailureRepository(), feed: makeFeed().feedCore)
+        await model.load()
+        guard case .failed(let firstMessage, let firstRetryable) = model.state else {
+            return XCTFail("The failed first load shows its failed screen")
+        }
+
+        _ = await model.refreshLibrary()
+
+        guard case .failed(let message, let retryable) = model.state else {
+            return XCTFail("A failed refresh must keep the screen of the first load")
+        }
+        XCTAssertEqual(message, firstMessage)
+        XCTAssertEqual(retryable, firstRetryable)
+    }
+
+    @MainActor
+    func testFailedRefreshKeepsTheLoadedGridAndTheNextRefreshRecovers() async {
+        let shown = photo("shown", seconds: 1)
+        let added = photo("added", seconds: 2)
+        let repository = FailingRefreshRepository(
+            error: TerminalRefreshError(),
+            steps: [.sections([section([shown])]), .fail, .sections([section([shown, added])])])
+        let model = TimelineViewModel(repository: repository, feed: makeFeed().feedCore)
+        await model.load()
+
+        let failed = await model.refreshLibrary()
+        XCTAssertEqual(failed.failureReason, .other)
+        XCTAssertEqual(model.allItems.map(\.uid), [shown.uid])
+
+        let recovered = await model.refreshLibrary()
+        XCTAssertNil(recovered.failureReason)
+        XCTAssertEqual(model.allItems.map(\.uid), [shown.uid, added.uid])
+    }
+
     @MainActor
     func testScopeLossDuringRefreshRequestsBackendRecovery() async {
         let model = TimelineViewModel(repository: ScopeLossRepository(), feed: makeFeed().feedCore)
@@ -523,6 +597,31 @@ private struct ScopeLossRepository: PhotosRepository {
 }
 
 private struct ScopeLossError: LibraryChangeTerminalError {}
+
+/// Plays its steps in order, then throws `error` for every further load.
+private final class FailingRefreshRepository: PhotosRepository, @unchecked Sendable {
+    enum Step {
+        case sections([TimelineSection])
+        case fail
+    }
+
+    private let lock = NSLock()
+    private let error: any Error
+    private var steps: [Step]
+
+    init(error: any Error, steps: [Step] = []) {
+        self.error = error
+        self.steps = steps
+    }
+
+    func loadTimeline() async throws -> [TimelineSection] {
+        let step = lock.withLock { steps.isEmpty ? Step.fail : steps.removeFirst() }
+        switch step {
+        case .sections(let sections): return sections
+        case .fail: throw error
+        }
+    }
+}
 
 private struct ScopeLossLibrary: PhotoLibraryProvider {
     func timeline(filter: PhotoFilter) async throws -> [TimelineSection] {

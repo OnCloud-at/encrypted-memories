@@ -164,14 +164,42 @@ import Testing
         #expect(state.message == .refreshed)
 
         state.beginBackupUploadRefresh()
-        #expect(state.applyBackupUploadRefresh(.failed) != nil)
-        #expect(!state.isBusy)
-        #expect(state.message == .refreshFailed)
-
-        state.beginBackupUploadRefresh()
         #expect(state.applyBackupUploadRefresh(.cancelled) == nil)
         #expect(!state.isBusy)
         #expect(state.message == nil)
+    }
+
+    /// A backup upload starts this refresh in the background. Its failure stays silent and the next refresh tries
+    /// again; the menu refresh keeps its failure banner because the person asked for it.
+    @Test func failedBackupRefreshStaysSilentAndReleasesTheGate() {
+        var state = LibraryRefreshBannerState()
+        state.beginBackupUploadRefresh()
+        #expect(state.message == .refreshing)
+
+        #expect(state.applyBackupUploadRefresh(.failed) == nil)
+
+        #expect(!state.isBusy)
+        #expect(state.message == nil)
+    }
+
+    @Test func failedBackupRefreshRemovesTheWaitingMessageOfEarlierRetries() {
+        var state = LibraryRefreshBannerState()
+        state.beginBackupUploadRefresh()
+        _ = state.applyBackupUploadRefresh(.retry(after: .zero))
+        #expect(state.message == .waitingForRefresh)
+
+        #expect(state.applyBackupUploadRefresh(.failed) == nil)
+
+        #expect(state.message == nil)
+    }
+
+    @Test func failedMenuRefreshKeepsItsFailureBanner() {
+        var state = LibraryRefreshBannerState()
+        _ = state.beginManualRefresh()
+
+        #expect(state.finishManualRefresh(succeeded: false) != nil)
+
+        #expect(state.message == .refreshFailed)
     }
 
     @Test func scopeLossClearsBannerAndGate() {

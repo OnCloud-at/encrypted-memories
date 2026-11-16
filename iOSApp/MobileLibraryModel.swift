@@ -1646,7 +1646,11 @@ final class MobileLibraryModel {
                 let timeline = self.makeTimeline(backend: backend, feed: feed, loadGeneration: loadGeneration)
                 await self.loadInitialTimeline(
                     timeline, feed: feed, session: session, store: store, loadGeneration: loadGeneration)
-            } catch let error as any LibraryChangeTerminalError {
+            } catch {
+                guard TimelineRefreshFailurePolicy.reason(for: error) == .scopeAccessLost else {
+                    handleAccountOpenFailure(error, session: session, loadGeneration: loadGeneration)
+                    return
+                }
                 guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 DebugLog.log("timeline: terminal scope failure during initial load - \(error)")
                 // The recovery task must not join the load task that schedules it. Remove this completed owner
@@ -1657,8 +1661,6 @@ final class MobileLibraryModel {
                     failedStore: store,
                     failedLoadGeneration: loadGeneration
                 )
-            } catch {
-                handleAccountOpenFailure(error, session: session, loadGeneration: loadGeneration)
             }
         }
     }
@@ -1848,15 +1850,15 @@ final class MobileLibraryModel {
         else { return .init(outcome: .retry, failureReason: .cancelled) }
         isRefreshingLibrary = true
         defer { isRefreshingLibrary = false }
-        let result = await timeline.refreshLibrary()
+        let result = await timeline.refreshLibraryInBackground()
         // A refresh that ends after sign-out, a retry or a scope recovery belongs to a retired runtime.
         guard refreshLease.isCurrent(loadToken: loadToken, sessionUID: session?.uid), self.timeline === timeline else {
             return .init(outcome: .retry, failureReason: .cancelled)
         }
-        if result.failureReason == .scopeAccessLost {
-            return .init(outcome: .terminal, failureReason: .scopeAccessLost)
+        // The shared model already decided silent and terminal; the monitor outcome comes from its result.
+        guard result.failureReason == nil else {
+            return .init(outcome: result.monitorOutcome, failureReason: result.failureReason)
         }
-        guard result.errorMessage == nil else { return .init(outcome: .retry, failureReason: result.failureReason) }
         if let thumbnailFeed { reconcileNewAssetThumbnails(addedUIDs: result.addedUIDs, feed: thumbnailFeed) }
         // The same opaque server event token covers album mutations. Reuse this central foreground
         // refresh instead of adding a second poller; Collections reloads through its existing revision key.
@@ -1865,7 +1867,7 @@ final class MobileLibraryModel {
         favoriteState.observeLibraryToken(result.publishedLibraryChangeToken)
         refreshLibrarySources()
         return .init(
-            outcome: result.refreshedOutcome,
+            outcome: result.monitorOutcome,
             failureReason: nil,
             contentUnchanged: result.contentUnchanged
         )
