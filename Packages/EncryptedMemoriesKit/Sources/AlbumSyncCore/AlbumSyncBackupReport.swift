@@ -33,7 +33,13 @@ public extension AlbumSyncBackupReport {
             if row.state == .skippedRemoteDeletion,
                 problems[id] == nil || row.source.resource == .primary
             {
-                switch StoreLookup(catching: { try queue.entry(for: row.source, revision: row.revision) }) {
+                let lookup: StoreLookup<UploadBackupSyncQueueEntry>
+                do {
+                    lookup = try queue.decisionEntry(for: row.source, revision: row.revision)
+                } catch {
+                    throw AlbumSyncError.mappingStoreUnavailable
+                }
+                switch lookup {
                 case .found(let entry): problems[id] = BackupFailedItem(entry: entry)
                 // An absent row left the queue after the state read, so the report would miss its problem.
                 case .absent, .unknown: throw AlbumSyncError.mappingStoreUnavailable
