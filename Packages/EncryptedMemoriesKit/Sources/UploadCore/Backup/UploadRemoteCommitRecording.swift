@@ -18,10 +18,7 @@ enum UploadRemoteCommitRecording {
             events?.recordHandoff(
                 source: entry.source,
                 revision: entry.revision,
-                remote: PhotoUID(
-                    volumeID: reconciliation.receipt.remoteVolumeID,
-                    nodeID: reconciliation.receipt.remoteLinkID
-                ),
+                remote: reconciliation.receipt.uid,
                 kind: .uploaded
             ) == .failed
         {

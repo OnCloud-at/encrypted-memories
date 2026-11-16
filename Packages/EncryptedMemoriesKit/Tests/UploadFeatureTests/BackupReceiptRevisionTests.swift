@@ -157,6 +157,29 @@ final class BackupReceiptRevisionTests: XCTestCase {
         XCTAssertNil(try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }
 
+    /// The main photo of a Live Photo settles from its saved receipt. Its video then uploads as a related photo of the
+    /// photo that the receipt names.
+    func testAReplayedMainPhotoReceiptRelatesTheVideoToThePhotoOfTheReceipt() async throws {
+        let entry = seedEntry("replayed-live.jpg", kind: .photoLibraryAsset)
+        resolver.setSecondaries(["replayed-live.mov"], for: entry.source.identifier)
+        let pipeline = makePipeline()
+        _ = await makeRunner(
+            identityResolver: RecordFailingIdentityResolver(
+                inner: pipeline, failures: 2, failureFilename: "replayed-live.jpg")
+        ).runUntilDrained(mode: .eligibleOnly)
+        let receipt = try XCTUnwrap(
+            try queueStore.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
+        XCTAssertEqual(receipt.source, entry.source, "the main photo keeps its receipt")
+        XCTAssertTrue(
+            uploader.requests.filter { $0.name == "replayed-live.mov" }.isEmpty, "the video waits for its main photo")
+
+        clock.advance(by: 3600)
+        _ = await makeRunner(identityResolver: pipeline).runUntilDrained(mode: .eligibleOnly)
+
+        let video = try XCTUnwrap(uploader.requests.last { $0.name == "replayed-live.mov" })
+        XCTAssertEqual(video.mainPhotoUID, receipt.receipt.uid)
+    }
+
     // MARK: - Route: the source returned to the queued revision after another one was uploaded
 
     /// The scan queued A, the pass uploaded B, and the source returned to A with the same date and size. The receipt

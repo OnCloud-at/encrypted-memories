@@ -988,10 +988,7 @@ public actor UploadManager {
             if settlementStore != nil {
                 jobs[id]?.remoteCommitReceipt = settlement.receipt
             }
-            let uid = PhotoUID(
-                volumeID: settlement.receipt.remoteVolumeID,
-                nodeID: settlement.receipt.remoteLinkID
-            )
+            let uid = settlement.receipt.uid
             setUploadedUID(id, uid)
             emitCompletedUpload(id)
             switch durableSettlement(for: id) {
@@ -1044,10 +1041,7 @@ public actor UploadManager {
             let uid = try await upload(effectiveRequest, reportingProgressFor: id)
             return .remoteCommitted(
                 .uploaded(uid),
-                receipt: UploadRemoteCommitReceipt(
-                    remoteVolumeID: uid.volumeID,
-                    remoteLinkID: uid.nodeID
-                )
+                receipt: UploadRemoteCommitReceipt(uid)
             )
 
         case .awaitDeletionCheck:

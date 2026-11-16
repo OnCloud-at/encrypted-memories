@@ -197,7 +197,7 @@ public struct UploadManualSettlementRecord: Codable, Sendable, Equatable {
     }
 
     public var uploadedUID: PhotoUID {
-        PhotoUID(volumeID: receipt.remoteVolumeID, nodeID: receipt.remoteLinkID)
+        receipt.uid
     }
 
     public var isPending: Bool { stage != .terminal }

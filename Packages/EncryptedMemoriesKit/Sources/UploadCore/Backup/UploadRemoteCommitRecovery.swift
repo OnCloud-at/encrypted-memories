@@ -89,13 +89,7 @@ public struct UploadRemoteCommitRecovery: Sendable {
         else {
             throw UploadRemoteCommitRecoveryError.descriptorMismatch(entry.source, entry.revision)
         }
-        let descriptor: UploadResourceDescriptor?
-        if resolved.descriptor.source == reconciliation.source {
-            descriptor = resolved.descriptor
-        } else {
-            descriptor = resolved.secondaries.first { $0.descriptor.source == reconciliation.source }?.descriptor
-        }
-        guard let descriptor else {
+        guard let descriptor = resolved.descriptor(of: reconciliation.source) else {
             throw UploadRemoteCommitRecoveryError.descriptorUnavailable(entry.source, entry.revision)
         }
         try validate(

@@ -980,10 +980,7 @@ public actor BackupSyncRunner {
                 rememberDeferredSource(checkingEntry)
                 preserveDismissedSourceRecheck(checkingEntry)
             } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
-                parkRemoteReconciliation(
-                    checkingEntry, reconciliation: reconciliation, from: persistedState,
-                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
-                        ?? L10n.string("error.upload_cancelled"))
+                keepSavedReceipt(checkingEntry, reconciliation: reconciliation, from: persistedState)
             } else {
                 retryOrPark(checkingEntry, from: persistedState, error: PendingSourceUnreadableError())
             }
@@ -997,10 +994,7 @@ public actor BackupSyncRunner {
             if isSourceRecheck {
                 preserveDismissedSourceRecheck(checkingEntry)
             } else if let reconciliation = checkingEntry.remoteCommitReconciliation {
-                parkRemoteReconciliation(
-                    checkingEntry, reconciliation: reconciliation, from: persistedState,
-                    message: BackupIssueRecord.decode(checkingEntry.lastError)?.detail
-                        ?? L10n.string("error.upload_cancelled"))
+                keepSavedReceipt(checkingEntry, reconciliation: reconciliation, from: persistedState)
             } else {
                 deferInterruptedSource(checkingEntry, from: persistedState)
             }
@@ -1025,11 +1019,7 @@ public actor BackupSyncRunner {
                 }
             }
             resolved = try await resourceCoordinator.withHeavyPermit(
-                LibraryWorkRequest(
-                    workload: .backupMaterialization,
-                    intent: workIntent,
-                    memoryClass: .large
-                )
+                Self.materializationRequest(workIntent)
             ) { _ in
                 try readAdmission()
                 return try await resolver.resolve(
@@ -1154,7 +1144,7 @@ public actor BackupSyncRunner {
                         events?.recordHandoff(
                             source: entry.source,
                             revision: entry.revision,
-                            remote: PhotoUID(volumeID: receipt.remoteVolumeID, nodeID: receipt.remoteLinkID),
+                            remote: receipt.uid,
                             kind: .uploaded
                         ) == .failed
                     {
@@ -1387,6 +1377,34 @@ public actor BackupSyncRunner {
         return false
     }
 
+    /// The heavy permit for reading or exporting a photo's bytes.
+    private static func materializationRequest(_ intent: LibraryWorkIntent) -> LibraryWorkRequest {
+        LibraryWorkRequest(workload: .backupMaterialization, intent: intent, memoryClass: .large)
+    }
+
+    /// The descriptor to upload for a primary or secondary resource that the duplicate check sent to upload.
+    /// Before the original is copied: a file that cannot fit into the account is neither copied nor sent. Replacing
+    /// a draft is left to Proton, because the draft's own blocks may be what fills the account. A late materialized
+    /// file whose bytes differ from the checked ones throws `BackupWorkDeferredError`: the photo waits for the next
+    /// pass. The progress handler is made once the permit is granted, as before.
+    nonisolated private func uploadDescriptor(
+        for resource: some BackupResourceMaterializing,
+        checked result: UploadPreflightResult,
+        workIntent: LibraryWorkIntent,
+        preparationProgress: @escaping @Sendable () async -> BackupResourcePreparationHandler
+    ) async throws -> UploadResourceDescriptor {
+        if result.decision != .uploadReplacingDraft {
+            try await uploader.ensureRemoteCapacity(
+                forBytes: resource.descriptor.fileSize, filename: resource.descriptor.filename)
+        }
+        guard resource.hasDeferredMaterialization else { return resource.descriptor }
+        let descriptor = try await resourceCoordinator.withHeavyPermit(Self.materializationRequest(workIntent)) { _ in
+            try await resource.materializedDescriptor(onPreparationProgress: await preparationProgress())
+        }
+        guard descriptor.precomputedSHA1Digest == result.identity.sha1Digest else { throw BackupWorkDeferredError() }
+        return descriptor
+    }
+
     private func performPrimaryUpload(
         _ entry: UploadBackupSyncQueueEntry,
         from state: UploadBackupSyncQueueState,
@@ -1395,31 +1413,9 @@ public actor BackupSyncRunner {
         workIntent: LibraryWorkIntent,
         preparationProgress: @escaping BackupResourcePreparationHandler
     ) async throws -> UploadDecisionOperationResult<PrimaryScopedOutcome> {
-        // Before the original is copied: a file that cannot fit into the account is neither copied nor sent. Replacing
-        // a draft is left to Proton, because the draft's own blocks may be what fills the account.
-        if preflightResult.decision != .uploadReplacingDraft {
-            try await uploader.ensureRemoteCapacity(
-                forBytes: resolved.descriptor.fileSize, filename: resolved.descriptor.filename)
-        }
-        let descriptor: UploadResourceDescriptor
-        if resolved.hasDeferredMaterialization {
-            descriptor = try await resourceCoordinator.withHeavyPermit(
-                LibraryWorkRequest(
-                    workload: .backupMaterialization,
-                    intent: workIntent,
-                    memoryClass: .large
-                )
-            ) { _ in
-                try await resolved.materializedDescriptor(onPreparationProgress: preparationProgress)
-            }
-        } else {
-            descriptor = resolved.descriptor
-        }
-        if resolved.hasDeferredMaterialization,
-            descriptor.precomputedSHA1Digest != preflightResult.identity.sha1Digest
-        {
-            throw BackupWorkDeferredError()
-        }
+        let descriptor = try await uploadDescriptor(
+            for: resolved, checked: preflightResult, workIntent: workIntent,
+            preparationProgress: { preparationProgress })
         // Materialization can take a while; an exclusion saved meanwhile must still stop the transfer.
         guard try await admitsTransfer(for: entry.source) else { throw CancellationError() }
         let network = try transferNetwork()
@@ -1465,10 +1461,7 @@ public actor BackupSyncRunner {
         )
         return .remoteCommitted(
             .uploaded(uid),
-            receipt: UploadRemoteCommitReceipt(
-                remoteVolumeID: uid.volumeID,
-                remoteLinkID: uid.nodeID
-            )
+            receipt: UploadRemoteCommitReceipt(uid)
         )
     }
 
@@ -1490,16 +1483,7 @@ public actor BackupSyncRunner {
             let recorded = try await UploadRemoteCommitRecording.record(
                 reconciliation, for: entry, events: events, identityResolver: identityResolver,
                 descriptorOrPark: {
-                    let descriptor: UploadResourceDescriptor?
-                    if resolved.descriptor.source == reconciliation.source {
-                        descriptor = resolved.descriptor
-                    } else {
-                        descriptor =
-                            resolved.secondaries.first {
-                                $0.descriptor.source == reconciliation.source
-                            }?.descriptor
-                    }
-                    guard let descriptor else {
+                    guard let descriptor = resolved.descriptor(of: reconciliation.source) else {
                         parkRemoteReconciliation(
                             entry, reconciliation: reconciliation, from: state,
                             message: "Committed resource is not currently available for local reconciliation.")
@@ -1530,10 +1514,7 @@ public actor BackupSyncRunner {
                 entry,
                 from: state,
                 resolved: resolved,
-                primaryUID: PhotoUID(
-                    volumeID: reconciliation.receipt.remoteVolumeID,
-                    nodeID: reconciliation.receipt.remoteLinkID
-                ),
+                primaryUID: reconciliation.receipt.uid,
                 terminal: .completed,
                 workIntent: workIntent
             )
@@ -1588,6 +1569,17 @@ public actor BackupSyncRunner {
         emitProgress()
     }
 
+    /// A photo that waits before its read keeps its saved upload receipt and the reason it already shows.
+    private func keepSavedReceipt(
+        _ entry: UploadBackupSyncQueueEntry,
+        reconciliation: UploadRemoteCommitReconciliation,
+        from state: UploadBackupSyncQueueState
+    ) {
+        parkRemoteReconciliation(
+            entry, reconciliation: reconciliation, from: state,
+            message: BackupIssueRecord.decode(entry.lastError)?.detail ?? L10n.string("error.upload_cancelled"))
+    }
+
     /// The first local settlement failure uses the same backoff as a later reconciliation failure.
     private func parkPersistedRemoteCommit(
         _ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState, message: String
@@ -1629,7 +1621,6 @@ public actor BackupSyncRunner {
         case blockedByDraft
         case skippedRemoteDeletion
         case cancelled
-        case sourceChanged
     }
 
     /// A series uploads its frames as related photos of its main photo.
@@ -1719,7 +1710,7 @@ public actor BackupSyncRunner {
             case .skippedRemoteDeletion:
                 finishSkippedRemoteDeletion(entry, from: persistedState, resolved: resolved)
                 return
-            case .cancelled, .sourceChanged:
+            case .cancelled:
                 revert(entry, from: persistedState)
                 return
             }
@@ -1952,31 +1943,9 @@ public actor BackupSyncRunner {
                         case .skip(.inconsistentRemoteState, _), .uploadMissingSecondaries, .awaitDeletionCheck:
                             return .noUpload(.inconsistent)
                         case .upload, .uploadReplacingDraft:
-                            if result.decision != .uploadReplacingDraft {
-                                try await self.uploader.ensureRemoteCapacity(
-                                    forBytes: secondary.descriptor.fileSize, filename: secondary.descriptor.filename)
-                            }
-                            let uploadDescriptor: UploadResourceDescriptor
-                            if secondary.hasDeferredMaterialization {
-                                uploadDescriptor = try await self.resourceCoordinator.withHeavyPermit(
-                                    LibraryWorkRequest(
-                                        workload: .backupMaterialization,
-                                        intent: workIntent,
-                                        memoryClass: .large
-                                    )
-                                ) { _ in
-                                    try await secondary.materializedDescriptor(
-                                        onPreparationProgress: preparationHandler(for: entryKey)
-                                    )
-                                }
-                            } else {
-                                uploadDescriptor = secondary.descriptor
-                            }
-                            if secondary.hasDeferredMaterialization,
-                                uploadDescriptor.precomputedSHA1Digest != result.identity.sha1Digest
-                            {
-                                throw SecondarySourceChangedError()
-                            }
+                            let uploadDescriptor = try await self.uploadDescriptor(
+                                for: secondary, checked: result, workIntent: workIntent,
+                                preparationProgress: { await self.preparationHandler(for: entryKey) })
                             let uid = try await self.performSecondaryUpload(
                                 secondary,
                                 descriptor: uploadDescriptor,
@@ -1989,10 +1958,7 @@ public actor BackupSyncRunner {
                             )
                             return .remoteCommitted(
                                 .settled,
-                                receipt: UploadRemoteCommitReceipt(
-                                    remoteVolumeID: uid.volumeID,
-                                    remoteLinkID: uid.nodeID
-                                )
+                                receipt: UploadRemoteCommitReceipt(uid)
                             )
                         }
                     }
@@ -2031,8 +1997,6 @@ public actor BackupSyncRunner {
             } catch is SQLiteStoreUnknownReadError {
                 stopRequested = true
                 return .storeUnavailable
-            } catch is SecondarySourceChangedError {
-                return .sourceChanged
             } catch let settlement as UploadRemoteCommitSettlementError {
                 if let cancellation = settlement.cancellation { _ = recordCancellation(cancellation, for: entry) }
                 if settlement.reconciliationPersisted {
@@ -2084,8 +2048,6 @@ public actor BackupSyncRunner {
         case skippedRemoteDeletion
         case inconsistent
     }
-
-    private struct SecondarySourceChangedError: Error {}
 
     private func performSecondaryUpload(
         _ secondary: BackupSecondaryResource,
