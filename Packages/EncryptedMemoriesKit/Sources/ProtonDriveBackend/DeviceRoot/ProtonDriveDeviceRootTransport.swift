@@ -28,8 +28,7 @@ struct ProtonDriveDeviceRootTransport: DeviceRootSDKTransport {
         } catch {
             let partial = collected.snapshot()
             if partial.elements.isEmpty, partial.failure == nil,
-                let sdkError = error as? ProtonDriveSDKError,
-                let httpCode = sdkError.asAPINetworkError?.httpCode,
+                let httpCode = ProtonFailureClassifier.rootAPIHTTPCode(error),
                 [404, 410, 501].contains(httpCode)
             {
                 throw DeviceRootOperationError.unsupported

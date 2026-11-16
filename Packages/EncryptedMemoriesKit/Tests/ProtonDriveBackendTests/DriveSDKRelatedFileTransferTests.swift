@@ -317,7 +317,7 @@ struct DriveSDKRelatedFileTransferTests {
             operations: .init(
                 transfer: transfer(directory: directory),
                 uploadTransport: { _, _, _ in
-                    throw DriveSDKBridge.uploadError(from: URLError(code), filename: "related.jpg")
+                    throw ProtonFailureClassifier.uploadError(from: URLError(code), filename: "related.jpg")
                 })
         ) { bridge in
             let remote: any ExactDuplicateRemote = bridge
@@ -478,6 +478,37 @@ struct DriveSDKRelatedFileTransferTests {
         #expect(sink.lines.isEmpty)
     }
 
+    @Test func normalUploadClassifiesTheSDKFailure() async throws {
+        RelatedFileDenyHTTP.reset()
+        defer { RelatedFileDenyHTTP.reset() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("fixture.jpg")
+        try Data("abc".utf8).write(to: file)
+        let bridge = try await makeBridge(
+            directory: directory, operations: .init(transfer: transfer(directory: directory)))
+        let reservation = try await bridge.reserveNetwork(allowsExpensiveNetwork: false)
+        defer { reservation.release() }
+        var upload = try request(file: file, allowsExpensiveNetwork: false)
+        upload.networkReservation = reservation
+        do {
+            _ = try await bridge.upload(upload, onProgress: { _ in })
+            Issue.record("The offline upload must fail")
+        } catch {
+            guard case .backend(let message)? = error as? UploadCore.UploadError else {
+                Issue.record("Expected a classified backend failure: \(error)")
+                reservation.release()
+                await bridge.shutdown()
+                return
+            }
+            #expect(!message.isEmpty)
+        }
+        reservation.release()
+        await bridge.shutdown()
+        #expect(RelatedFileDenyHTTP.requestCount == 1)
+    }
+
     @Test func streamOriginalBytesKeepsTheViewerDefaultOnTheActualBlockRequest() async throws {
         _ = relatedStreamCryptoReady
         let boot = DriveCrypto(addressKeys: [], signers: [])
@@ -560,15 +591,7 @@ struct DriveSDKRelatedFileTransferTests {
                         serialized.domain = .network
                         serialized.primaryCode = Int64(code.rawValue)
                     }
-                    if wrapped {
-                        let inner = serialized
-                        serialized = Proton_Drive_Sdk_Error.with {
-                            $0.type = "fixture-outer"
-                            $0.domain = .undefined
-                            $0.message = "fixture"
-                            $0.innerError = inner
-                        }
-                    }
+                    if wrapped { serialized = ProtonFailureTestFixture.wrapped(serialized) }
                     let failure = ProtonDriveSDKError(protoError: serialized)
                     try await withBridge(
                         directory: directory,
@@ -606,15 +629,7 @@ struct DriveSDKRelatedFileTransferTests {
         for code in [POSIXErrorCode.ENOSPC, .EDQUOT, .EACCES] {
             for wrapped in [false, true] {
                 var serialized = Proton_Drive_Sdk_Error.from(nsError: POSIXError(code) as NSError)
-                if wrapped {
-                    let inner = serialized
-                    serialized = Proton_Drive_Sdk_Error.with {
-                        $0.type = "fixture-outer"
-                        $0.message = "fixture"
-                        $0.domain = .undefined
-                        $0.innerError = inner
-                    }
-                }
+                if wrapped { serialized = ProtonFailureTestFixture.wrapped(serialized) }
                 let failure = ProtonDriveSDKError(protoError: serialized)
                 let full = code != .EACCES
                 #expect(failure.underlyingFileSystemErrorCode == (full ? .outOfSpace : .permissionDenied))

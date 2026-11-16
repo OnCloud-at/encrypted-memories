@@ -262,7 +262,8 @@ extension DriveSessionStubSuite {
             #expect(restoreError?.retryableLinkIDs.isEmpty == false, "an unanswered link is worth another attempt")
         }
 
-        @Test func aFailedLaterRequestKeepsEveryUnansweredAndUnsentLinkRetryable() async throws {
+        @Test(arguments: [423, 425, 503])
+        func aFailedLaterRequestKeepsEveryUnansweredAndUnsentLinkRetryable(status: Int) async throws {
             StubURLProtocol.reset()
             let links = (0..<60).map { "l\($0)" }
             // The first 50 links get no per-item answer; the request for the last 10 fails for a transient reason.
@@ -270,7 +271,7 @@ extension DriveSessionStubSuite {
                 "PUT /drive/v2/volumes/vol1/trash/restore_multiple",
                 responses: [
                     (status: 200, json: #"{"Code":1001,"Responses":[]}"#),
-                    (status: 503, json: #"{"Code":503,"Error":"unavailable"}"#),
+                    (status: status, json: #"{"Code":\#(status),"Error":"unavailable"}"#),
                 ])
 
             let error = await #expect(throws: DriveBatchActionError.self) {

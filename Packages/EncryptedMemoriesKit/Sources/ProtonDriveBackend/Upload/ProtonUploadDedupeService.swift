@@ -155,7 +155,9 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         let entries: [PhotoDuplicateEntry]
         do {
             entries = try await session.findPhotoDuplicates(volumeID: context.volumeID, nameHashes: nameHashes)
-        } catch ProtonAuthError.apiError(let code, let message) where Self.isBusyService(code) {
+        } catch ProtonAuthError.apiError(let code, let message)
+            where ProtonFailureClassifier.httpStatus(code) == .temporary
+        {
             throw UploadError.retryableBackend(code: code, message: message)
         }
         DebugLog.log("[Dedupe] duplicates query hashes=\(nameHashes.count) matches=\(entries.count)")
@@ -185,15 +187,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             return matches.map { PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID) }
         } catch {
             if UploadError.isCancellation(error) { throw error }
-            var sdkError = error as? ProtonDriveSDKError
-            while let current = sdkError {
-                if current.domain == .successfulCancellation
-                    || (current.domain == .network && current.type == NSURLErrorDomain && current.primaryCode == -999)
-                {
-                    throw CancellationError()
-                }
-                sdkError = current.innerError
-            }
+            if ProtonFailureClassifier.containsSDKCancellation(error) { throw CancellationError() }
             // Keep the already-proven detailed endpoint as a compatibility fallback if the
             // fresh wrapper/native route fails.
             DebugLog.log("[Dedupe] SDK exact query unavailable; using detailed fallback - \(error)")
@@ -320,14 +314,11 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         do {
             return try await session.fetchLinkVisibility(
                 shareID: context.shareID, linkIDs: linkIDs, requiresCompleteResponse: requiresCompleteResponse)
-        } catch ProtonAuthError.apiError(let code, let message) where Self.isBusyService(code) {
+        } catch ProtonAuthError.apiError(let code, let message)
+            where ProtonFailureClassifier.httpStatus(code) == .temporary
+        {
             throw UploadError.retryableBackend(code: code, message: message)
         }
-    }
-
-    /// HTTP 408, 429 and 5xx: a busy service must not use up the retry budget of a photo.
-    private static func isBusyService(_ code: Int) -> Bool {
-        code == 408 || code == 429 || (500...599).contains(code)
     }
 
     func linkStateSnapshot(of linkIDs: [String]) async throws -> UploadLinkStateSnapshot {

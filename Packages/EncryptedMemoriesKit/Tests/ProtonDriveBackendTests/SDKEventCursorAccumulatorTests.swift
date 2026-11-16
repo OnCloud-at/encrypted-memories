@@ -137,19 +137,19 @@ struct SDKEventCursorAccumulatorTests {
 @Suite("SDK upload file-system error policy")
 struct SDKUploadFileSystemErrorPolicyTests {
     @Test func notFoundUsesExistingSourceMissingDomain() {
-        let mapped = DriveSDKBridge.uploadFileSystemError(.notFound, filename: "photo.heic")
+        let mapped = ProtonFailureClassifier.uploadFileSystemError(.notFound, filename: "photo.heic")
 
         #expect(mapped as? UploadCore.UploadError == .fileMissing("photo.heic"))
     }
 
     @Test func permissionDeniedUsesExistingPermissionDomain() {
-        let mapped = DriveSDKBridge.uploadFileSystemError(.permissionDenied, filename: "photo.heic")
+        let mapped = ProtonFailureClassifier.uploadFileSystemError(.permissionDenied, filename: "photo.heic")
 
         #expect(mapped as? UploadCore.UploadError == .permissionDenied("photo.heic"))
     }
 
     @Test func outOfSpaceUsesDurableDeviceStoragePressureDomain() {
-        let mapped = DriveSDKBridge.uploadFileSystemError(.outOfSpace, filename: "video.mov")
+        let mapped = ProtonFailureClassifier.uploadFileSystemError(.outOfSpace, filename: "video.mov")
 
         #expect(mapped as? BackupTempFileStore.BackupTempFileError == .diskBudgetExceeded)
     }
@@ -164,6 +164,6 @@ struct SDKUploadFileSystemErrorPolicyTests {
     }
 
     @Test func unknownFileSystemCodeKeepsGenericFallbackAvailable() {
-        #expect(DriveSDKBridge.uploadFileSystemError(.unknown, filename: "photo.heic") == nil)
+        #expect(ProtonFailureClassifier.uploadFileSystemError(.unknown, filename: "photo.heic") == nil)
     }
 }

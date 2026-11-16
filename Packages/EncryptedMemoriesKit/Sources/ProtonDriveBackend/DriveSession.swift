@@ -573,7 +573,7 @@ extension DriveSession {
                 // A single request keeps its own error for the caller. Otherwise every link settles on its own: a final
                 // rejection refuses this request's links, and links of a transient failure or of unsent requests retry.
                 guard chunks.count > 1 else { throw error }
-                if DriveBatchActionError.isFinal(error) {
+                if ProtonFailureClassifier.isFinal(error) {
                     refused += chunk.count
                 } else {
                     retryable.formUnion(chunk)
@@ -818,11 +818,6 @@ struct DriveBatchActionError: LocalizedError {
     let retryableLinkIDs: Set<String>
     let total: Int
 
-    /// Proton refused the request itself (a 4xx answer other than 408 and 429); repeating it cannot succeed.
-    static func isFinal(_ error: any Error) -> Bool {
-        guard case .apiError(let code, _)? = error as? ProtonAuthError else { return false }
-        return (400...499).contains(code) && code != 408 && code != 429
-    }
     var errorDescription: String? {
         L10n.string("error.batch_action_incomplete \(failed) \(total)")
     }

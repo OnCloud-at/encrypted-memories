@@ -199,14 +199,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             do {
                 return try await uploadTransport(bridge, request, UploadLogging(logFileDetails: false, log: log))
             } catch {
-                var sdkError = error as? ProtonDriveSDKError
-                while let current = sdkError {
-                    if current.domain == .successfulCancellation { throw CancellationError() }
-                    if current.domain == .network, current.type == NSURLErrorDomain, let code = current.primaryCode {
-                        throw URLError(URLError.Code(rawValue: code))
-                    }
-                    sdkError = current.innerError
-                }
+                if let signal = ProtonFailureClassifier.relatedTransferSignal(error) { throw signal }
                 if DeviceStorage.isOutOfSpace(DriveSDKBridge.originalTransferError(from: error)) {
                     throw ExactDuplicateRelatedFileTransferError.copyFailed(.capacity)
                 }
@@ -1832,8 +1825,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
     /// Exports stop on a full device through `DeviceStorage.isOutOfSpace`, which cannot read the SDK's own
     /// error chain. Give that case the platform error and keep every other error unchanged.
     nonisolated static func originalTransferError(from error: any Error) -> any Error {
-        guard let sdkError = error as? ProtonDriveSDKError else { return error }
-        return originalTransferError(error, fileSystemCode: sdkError.underlyingFileSystemErrorCode)
+        originalTransferError(error, fileSystemCode: ProtonFailureClassifier.fileSystemError(error))
     }
 
     nonisolated static func originalTransferError(
@@ -3013,7 +3005,7 @@ extension DriveSDKBridge: PhotoUploading {
                 // The SDK deliberately keeps a cancelled operation's server draft so callers that
                 // retain the operation can resume it. We do not support relaunch-resume, therefore
                 // losing this local operation without disposal would strand the name indefinitely.
-                if error is CancellationError || Self.isSDKCancellation(error) {
+                if error is CancellationError || ProtonFailureClassifier.isSDKCancellation(error) {
                     do {
                         try await operation.cleanUpTemporaryState()
                     } catch let cleanupError {
@@ -3039,12 +3031,12 @@ extension DriveSDKBridge: PhotoUploading {
             return uid
         } catch {
             logging.failed(filename: request.name, error: error)
-            if error is CancellationError || Self.isSDKCancellation(error) {
+            if error is CancellationError || ProtonFailureClassifier.isSDKCancellation(error) {
                 throw CancellationError()
             }
             // The related-file boundary maps typed codes; never format an SDK/filesystem message for it.
             guard logging.logFileDetails else { throw error }
-            throw Self.uploadError(from: error, filename: request.name)
+            throw ProtonFailureClassifier.uploadError(from: error, filename: request.name)
         }
     }
 
@@ -3064,72 +3056,6 @@ extension DriveSDKBridge: PhotoUploading {
             tags.remove(LibraryPhotoTag.videos.rawValue)
         }
         return tags.sorted()
-    }
-
-    /// Preserve the SDK's typed failure domain at the Core boundary. URL/socket failures retry as network problems.
-    /// HTTP 408, 423, 425, 429 and 5xx retry as temporary service failures. A proven API refusal becomes serviceRejected
-    /// without the server text; other API answers keep backend(message).
-    nonisolated static func uploadError(from error: Error, filename: String) -> any Error {
-        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        let nsError = error as NSError
-        if nsError.domain == NSURLErrorDomain {
-            return UploadCore.UploadError.transport(code: nsError.code, message: message)
-        }
-        guard let sdkError = error as? ProtonDriveSDKError else {
-            return UploadCore.UploadError.backend(message)
-        }
-        if let fileSystemError = sdkError.underlyingFileSystemErrorCode,
-            let mapped = uploadFileSystemError(fileSystemError, filename: filename)
-        {
-            return mapped
-        }
-        if sdkError.underlyingSocketNetworkError != nil {
-            return UploadCore.UploadError.transport(code: NSURLErrorNetworkConnectionLost, message: message)
-        }
-        if let transport = sdkError.underlyingHTTPNetworkError {
-            if let code = transport.httpCode, ProtonFailureClassifier.httpStatus(code) == .temporary {
-                return UploadCore.UploadError.retryableBackend(code: code, message: message)
-            }
-            switch transport.errorType {
-            case .userAuthenticationError, .configurationLimitExceeded:
-                return UploadCore.UploadError.backend(message)
-            default:
-                return UploadCore.UploadError.transport(
-                    code: NSURLErrorNetworkConnectionLost,
-                    message: message
-                )
-            }
-        }
-        if let code = sdkError.underlyingAPINetworkError?.httpCode {
-            switch ProtonFailureClassifier.httpStatus(code) {
-            case .temporary: return UploadCore.UploadError.retryableBackend(code: code, message: message)
-            case .serviceRejection: return UploadCore.UploadError.serviceRejected(code: code)
-            case .unproven: break
-            }
-        }
-        return UploadCore.UploadError.backend(message)
-    }
-
-    /// Maps SDK 0.25's normalized local-file failures into the existing queue domains. In
-    /// particular, low disk space reuses the backup runner's durable resource-pressure policy.
-    nonisolated static func uploadFileSystemError(
-        _ code: ProtonDriveSDKError.FileSystemErrorCode,
-        filename: String
-    ) -> (any Error)? {
-        switch code {
-        case .notFound:
-            UploadCore.UploadError.fileMissing(filename)
-        case .permissionDenied:
-            UploadCore.UploadError.permissionDenied(filename)
-        case .outOfSpace:
-            BackupTempFileStore.BackupTempFileError.diskBudgetExceeded
-        case .unknown:
-            nil
-        }
-    }
-
-    private nonisolated static func isSDKCancellation(_ error: Error) -> Bool {
-        (error as? ProtonDriveSDKError)?.domain == .successfulCancellation
     }
 
     func cancel(token: UUID) async {
@@ -3434,7 +3360,7 @@ extension DriveSDKBridge: LibrarySyncSupportSource {
     }
 
     private static func supportLoadErrorKind(_ error: Error) -> LibrarySyncSupportSnapshot.ErrorKind {
-        if error is CancellationError || isSDKCancellation(error) { return .cancellation }
+        if error is CancellationError || ProtonFailureClassifier.isSDKCancellation(error) { return .cancellation }
         if error is TimelineInventoryVisibilityError { return .inventoryVisibility }
         if error is DriveEventScopeAccessLostError { return .scopeAccessLost }
         if (error as NSError).domain == NSURLErrorDomain { return .network }

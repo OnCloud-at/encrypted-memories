@@ -63,13 +63,13 @@ public struct ProtonPendingRemoteEffects: PendingRemoteEffects {
         }
     }
 
-    /// Transport errors, 408, 429 and 5xx retry, as do unknown errors and batch answers without a status for
-    /// every photo. Proton's per-item rejection of a batch (for example a photo already in or out of the trash)
-    /// and other 4xx answers are final.
+    /// Transport errors and the statuses that `ProtonFailureClassifier.httpStatus` calls temporary retry, as do
+    /// unknown errors and batch answers without a status for every photo. Proton's per-item rejection of a batch
+    /// (for example a photo already in or out of the trash) and every other 4xx answer are final.
     static func classify(_ error: any Error) -> PendingEffectResult {
         if let batch = error as? DriveBatchActionError {
             return batch.retryableLinkIDs.isEmpty ? .permanentFailure : .retry
         }
-        return DriveBatchActionError.isFinal(error) ? .permanentFailure : .retry
+        return ProtonFailureClassifier.isFinal(error) ? .permanentFailure : .retry
     }
 }
