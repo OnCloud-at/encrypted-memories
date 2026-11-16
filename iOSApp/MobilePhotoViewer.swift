@@ -40,6 +40,7 @@ struct MobilePhotoViewer: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var index: Int
     @State private var chromeVisible = true
     /// Whether the system put the media and the lower part side by side: the folded layout of a partly open device.
@@ -68,6 +69,7 @@ struct MobilePhotoViewer: View {
     @State private var restoreTask: Task<Void, Never>?
     @State private var restoreRequestGeneration: UInt64 = 0
     @State private var showInfo = false
+    @State private var infoReshow: MobileViewerInfoReshow
     @State private var metadataLoadState: PhotoMetadataLoadState = .idle
     @State private var metadataRequestGeneration: UInt64 = 0
     @State private var showAlbumPicker = false
@@ -107,6 +109,9 @@ struct MobilePhotoViewer: View {
     ) {
         _videoTransport = State(initialValue: videoTransport ?? ViewerVideoTransport())
         _showInfo = State(initialValue: showsInfoInitially)
+        _infoReshow = State(
+            initialValue: MobileViewerInfoReshow(
+                isPhone: UIDevice.current.userInterfaceIdiom == .phone, showInfo: showsInfoInitially))
         _items = State(initialValue: items)
         self.startIndex = startIndex
         self.context = context
@@ -268,6 +273,8 @@ struct MobilePhotoViewer: View {
         .task(id: metadataTaskID) {
             await resolveCurrentTitleMetadata()
         }
+        .onChange(of: horizontalSizeClass) { _, _ in followWidthChange() }
+        .onChange(of: showInfo) { _, isShown in followInfoChange(to: isShown) }
         .onChange(of: mapAndPlacesEnabled) { _, _ in
             titleMetadataCoordinator.cancelAll()
             metadataRequestGeneration &+= 1
@@ -511,6 +518,35 @@ struct MobilePhotoViewer: View {
             .accessibilityLabel(String(localized: "viewer.close_a11y"))
         }
         .mobileVisibilityPriority(.high)
+    }
+
+    /// Starts an iOS 26 iPhone width change for `MobileViewerInfoReshow` and ends it after its settle time. The system
+    /// can close Info about half a second after the width change; iOS 27 keeps Info in the new form itself.
+    private func followWidthChange() {
+        if #available(iOS 27.0, *) { return }
+        guard let generation = infoReshow.widthClassDidChange() else { return }
+        keepUsersInfo(after: generation)
+        let widthChange = infoReshow.widthChanges
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            guard let wanted = infoReshow.widthChangeDidSettle(widthChange, showInfo: showInfo) else { return }
+            showInfo = wanted
+        }
+    }
+
+    private func followInfoChange(to isShown: Bool) {
+        if #available(iOS 27.0, *) { return }
+        guard let generation = infoReshow.showInfoDidChange(to: isShown) else { return }
+        keepUsersInfo(after: generation)
+    }
+
+    /// Puts Info back to the user's state shortly after the latest event of a width change.
+    private func keepUsersInfo(after generation: Int) {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard let wanted = infoReshow.correction(checking: generation, showInfo: showInfo) else { return }
+            showInfo = wanted
+        }
     }
 
     /// The system overflow menu owns the ellipsis on iOS 27 (HIG: reserve the ellipsis for overflow). iOS 26 has
