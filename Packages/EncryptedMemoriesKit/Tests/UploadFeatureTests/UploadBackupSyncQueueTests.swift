@@ -145,7 +145,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             } catch {
                 needsChangedRetry = route == "changed"
                 XCTAssertEqual(
-                    error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")), route)
+                    error as? UploadError, .internalFailure(.localStateUnavailable), route)
             }
 
             XCTAssertTrue(fault.fired, route)
@@ -221,7 +221,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 }
             } catch {
                 if change == "unknown" || change == "decode" {
-                    XCTAssertEqual(error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")))
+                    XCTAssertEqual(error as? UploadError, .internalFailure(.localStateUnavailable))
                 } else {
                     XCTFail("A changed or removed row must not fail reopening: \(error)")
                 }
@@ -2098,9 +2098,10 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 _ = try await engine.enqueue(latest)
             }
             XCTFail("A failed cleanup must stop the caller")
-        } catch UploadError.backend(let message) {
+        } catch UploadError.internalFailure(let failure) {
+            XCTAssertEqual(failure, .localStateUnavailable)
             XCTAssertFalse(queue.isOperational())
-            if checkLocalizedMessage { try assertLocalStateMessage(UploadError.backend(message)) }
+            if checkLocalizedMessage { try assertLocalStateMessage(UploadError.internalFailure(failure)) }
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
@@ -2247,8 +2248,8 @@ extension UploadBackupSyncQueueTests {
             _ = try await engine.reopenRestoredCompound(photo, isCurrent: { true })
             XCTFail("An unsupported terminal recheck must fail, rather than return a temporary wait")
         } catch let error as UploadError {
-            guard case .backend(let message) = error else { return XCTFail("Unexpected error: \(error)") }
-            XCTAssertEqual(message, L10n.string("backup.error_local_state_unavailable"))
+            guard case .internalFailure(let failure) = error else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertEqual(failure.message, L10n.string("backup.error_local_state_unavailable"))
         }
         XCTAssertEqual(state.upsertCount, 0, "Refusal must precede markPending")
         XCTAssertEqual(state.count(), 0)

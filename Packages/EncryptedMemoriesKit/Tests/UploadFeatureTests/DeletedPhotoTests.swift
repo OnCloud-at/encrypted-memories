@@ -704,7 +704,7 @@ final class DeletedPhotoTests: XCTestCase {
                     catalogStore: catalog, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
                 XCTFail("An unknown \(route) must stop replay")
             } catch {
-                XCTAssertEqual(error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")))
+                XCTAssertEqual(error as? UploadError, .internalFailure(.localStateUnavailable))
             }
             XCTAssertTrue(fault.fired, route)
             XCTAssertEqual(queue.catalogReplayState(), .inProgress, route)

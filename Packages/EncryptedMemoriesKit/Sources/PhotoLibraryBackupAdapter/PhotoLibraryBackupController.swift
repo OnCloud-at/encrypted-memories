@@ -1519,14 +1519,14 @@ public final class PhotoLibraryBackupController {
         retryRows: PhotoLibraryCatalogRetryRows
     ) async throws {
         guard let queueCount = queueStore.count(), queueStore.isOperational(), catalogStore.isOperational() else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw UploadError.internalFailure(.localStateUnavailable)
         }
         guard let catalogSnapshot = catalogStore.snapshot(), catalogStore.isOperational() else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw UploadError.internalFailure(.localStateUnavailable)
         }
         let catalogCount = catalogSnapshot.present
         guard let replayState = queueStore.catalogReplayState(), queueStore.isOperational() else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw UploadError.internalFailure(.localStateUnavailable)
         }
         switch BackupCatalogReplayPolicy.action(
             state: replayState,
@@ -1539,14 +1539,14 @@ public final class PhotoLibraryBackupController {
             // Upgrade path for queues created before the replay marker existed. A non-empty queue
             // cannot be behind its catalog: catalog sync durably writes every queue chunk first.
             guard queueStore.setCatalogReplayState(.completed) else {
-                throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+                throw UploadError.internalFailure(.localStateUnavailable)
             }
             return
         case .replay:
             break
         }
         guard replayState == .inProgress || queueStore.setCatalogReplayState(.inProgress) else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw UploadError.internalFailure(.localStateUnavailable)
         }
 
         var progress = PhotoLibraryCatalogPassProgress(retrying: retryRows.identifiers(for: .replay))
@@ -1555,7 +1555,7 @@ public final class PhotoLibraryBackupController {
             guard let page = progress.readPage(from: catalogStore, limit: 500),
                 catalogStore.isOperational()
             else {
-                throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+                throw UploadError.internalFailure(.localStateUnavailable)
             }
             guard case .advanced = progress.advance(past: page) else {
                 retryRows.remember(progress, for: .replay)
@@ -1564,7 +1564,7 @@ public final class PhotoLibraryBackupController {
                     return
                 }
                 guard queueStore.setCatalogReplayState(.completed) else {
-                    throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+                    throw UploadError.internalFailure(.localStateUnavailable)
                 }
                 return
             }

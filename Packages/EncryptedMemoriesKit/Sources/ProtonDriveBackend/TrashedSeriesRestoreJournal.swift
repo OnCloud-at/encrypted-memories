@@ -50,7 +50,7 @@ final class TrashedSeriesRestoreJournal: @unchecked Sendable {
 
     func close() { connection.close() }
 
-    static var unavailable: UploadError { .backend(L10n.string("backup.error_local_state_unavailable")) }
+    static var unavailable: UploadError { .internalFailure(.localStateUnavailable) }
 
     func records() throws -> [TrashedSeriesRestoreRecord] {
         try connection.withLock { try read() }
