@@ -155,6 +155,39 @@ final class CatalogReadFailClosedTests: XCTestCase {
             scan: fullScan([photo("a")]))
     }
 
+    func testASnapshotWithoutRowsAtItsCursorIsTheScanSnapshotIncomplete() async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.beginFullScanSnapshot(epochStart: Date(timeIntervalSince1970: 100)))
+        XCTAssertTrue(store.appendFullScanSnapshotIdentifiers(["a", "b", "c"]))
+        XCTAssertTrue(store.finishFullScanSnapshot())
+        // Three rows count, but none lies at or after the cursor: the saved snapshot lost its positions.
+        try changeCatalog(store, "UPDATE photo_full_scan_snapshot SET position = position - 10;")
+
+        do {
+            _ = try await sync(store, infos: [photo("a")]).run(engine: Enqueuer())
+            XCTFail("a snapshot without rows at its cursor is incomplete")
+        } catch {
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .scanSnapshotIncomplete)
+        }
+        XCTAssertNil(try store.fullScanProgress(), "the incomplete snapshot is dropped, so the next pass starts again")
+    }
+
+    func testASnapshotThatLosesItsReadyMarkIsTheScanSnapshotUnavailable() async throws {
+        let store = try makeCatalog()
+        try changeCatalog(
+            store,
+            "CREATE TRIGGER lose_ready AFTER UPDATE ON photo_catalog_info "
+                + "WHEN NEW.key='full_scan_snapshot_ready' AND NEW.value=1 "
+                + "BEGIN UPDATE photo_catalog_info SET value=0 WHERE key='full_scan_snapshot_ready'; END;")
+
+        do {
+            _ = try await sync(store, infos: [photo("a")]).run(engine: Enqueuer())
+            XCTFail("a published snapshot that reads as unfinished must stop the scan")
+        } catch {
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .scanSnapshotUnavailable)
+        }
+    }
+
     func testAFailedCompletionMarkerIsTheScanNotCompleted() async throws {
         try await assertScan(
             failing: { $0.contains("'completed_full_scan', 1") }, expecting: .scanNotCompleted,
@@ -211,7 +244,9 @@ final class CatalogReadFailClosedTests: XCTestCase {
         do {
             _ = try await sync(store, infos: ["a", "b", "c"].map { photo($0) }, at: 200).run(engine: Enqueuer())
             XCTFail("an unknown resume point must stop the scan")
-        } catch {}
+        } catch {
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .localStateUnavailable)
+        }
         fault.stop()
 
         XCTAssertTrue(fault.fired)
@@ -322,7 +357,9 @@ final class CatalogReadFailClosedTests: XCTestCase {
             _ = try await sync(store, infos: [edit("a", modified: 1_700_000_200)], at: 200)
                 .run(engine: engine, identifiers: ["a"])
             XCTFail("an unknown stored row must stop the chunk")
-        } catch {}
+        } catch {
+            XCTAssertEqual(error as? PhotoLibraryCatalogSyncError, .localStateUnavailable)
+        }
         fault.stop()
 
         XCTAssertTrue(fault.fired)
