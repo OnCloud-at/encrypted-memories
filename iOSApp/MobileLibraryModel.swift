@@ -221,8 +221,9 @@ struct MobileScopeRecoveryDriver {
     }
 }
 
-/// Owns signed-in iOS/iPadOS library state and composes the shared backend and thumbnail feed.
-/// Core owns loading; this model sequences cached data, authoritative data, and crawling.
+/// Owns the signed-in iOS/iPadOS account and composes the shared backend and thumbnail feed. The shared
+/// `TimelineViewModel` of each account runtime loads, refreshes, trashes and restores the library; this model wires it
+/// to the account (backup, pending grid, locations, Smart Search) and keeps the iOS presentation.
 /// `@Observable` invalidates views per property, so non-grid tabs do not observe timeline snapshots.
 @MainActor
 @Observable
@@ -231,12 +232,28 @@ final class MobileLibraryModel {
         case purgeFailed
     }
 
-    private struct SourceAnalysisStartupError: LocalizedError {
-        var errorDescription: String? { L10n.string("error.load_library_title") }
-    }
+    /// The shared timeline model of the current account runtime. It loads, refreshes, trashes and restores the whole
+    /// library; this model wires it to the account and keeps the iOS presentation.
+    private(set) var timeline: TimelineViewModel?
+    /// The timeline model of the runtime that a retry replaces. It keeps the photos of the earlier runtime visible
+    /// until the next runtime has its own model.
+    private var retainedTimeline: TimelineViewModel?
+    private var shownTimeline: TimelineViewModel? { timeline ?? retainedTimeline }
+    /// Every replaced timeline model moves this past every revision it showed, so `timelineRevision` and `gridRevision`
+    /// keep growing and one value never names two contents.
+    private var revisionBase: UInt64 = 0
+    /// The highest `gridRevision` that was read, the bound for the next timeline model's revisions.
+    @ObservationIgnored private var highestGridRevision: UInt64 = 0
+    /// The load state while no timeline model runs: before the backend exists, while a retry builds the next one,
+    /// and when opening the account failed.
+    private var hostLoadState: LibraryLoadState = .initial
 
-    /// Shared onboarding and loading policy. See `LibraryLoadState`.
-    private(set) var loadState: LibraryLoadState = .initial
+    /// Shared onboarding and loading policy. See `LibraryLoadState`. A lost Drive scope recovers without showing the
+    /// failure of the load that found it.
+    var loadState: LibraryLoadState {
+        guard let timeline, timeline.initialLoadFailureReason != .scopeAccessLost else { return hostLoadState }
+        return timeline.initialLibraryLoadState
+    }
 
     var isCompletelyEmpty: Bool {
         loadState.isCompletelyEmpty
@@ -244,22 +261,23 @@ final class MobileLibraryModel {
                 knownItemCount: snapshot.count, authority: primaryInventoryAuthority
             )
     }
-    /// Immutable timeline snapshot prepared off the main actor. Its index provides O(1) and O(k) lookups
-    /// for viewer, share, and trash actions without scanning the library.
-    private(set) var snapshot = TimelineSnapshot() {
-        didSet { pendingGrid?.setRemote(snapshot) }
+    /// Immutable whole-library snapshot of the timeline model. Its index provides O(1) and O(k) lookups for viewer,
+    /// share, and trash actions without scanning the library. Reading the content revision registers the
+    /// observation that the snapshot itself does not carry.
+    var snapshot: TimelineSnapshot {
+        guard let shownTimeline else { return TimelineSnapshot() }
+        _ = shownTimeline.wholeLibraryContentRevision
+        return shownTimeline.wholeLibraryTimeline
     }
     /// Changes only when a new canonical snapshot is published. Secondary grids use it to refresh their one
     /// indexed projection without recomputing it for unrelated SwiftUI state changes.
-    private(set) var timelineRevision: UInt64 = 0
-    private var provisionalProjection: TimelineContentProjection?
-    private var provisionalRevision: UInt64 = 0
-    var isProvisionalPresentation: Bool { provisionalProjection != nil }
+    var timelineRevision: UInt64 { revisionBase &+ (shownTimeline?.wholeLibraryContentRevision ?? 0) }
+    var isProvisionalPresentation: Bool { shownTimeline?.isProvisionalPresentation ?? false }
     /// The ordered items, for the grid and callers that pass the whole list (e.g. the viewer pager). Reads
-    /// register a dependency on `snapshot`, so a timeline change invalidates only views that read items.
+    /// register a dependency on the snapshot, so a timeline change invalidates only views that read items.
     var items: [PhotoItem] { snapshot.items }
-    /// Timeline sections retained for the shared section-based `TimelineSearch` filter.
-    private(set) var sections: [TimelineSection] = []
+    /// Timeline sections for the shared section-based `TimelineSearch` filter.
+    var sections: [TimelineSection] { shownTimeline?.currentSections ?? [] }
     /// Server favorites, writes in flight, and read state. Loading is independent of the timeline so a slow
     /// favorite endpoint never delays first thumbnails.
     private(set) var favoriteState = FavoriteState()
@@ -321,8 +339,10 @@ final class MobileLibraryModel {
     /// The pending grid of this account and its lists, shared with macOS. `PendingGridConnection` describes each one.
     @ObservationIgnored private let pendingGridConnection = PendingGridConnection()
     var pendingGrid: PendingGridSession? { pendingGridConnection.session }
-    /// The grid's view of the library: Proton photos plus pending local photos.
-    private(set) var pendingPresentation = PendingTimelinePresentation.empty
+    /// The grid's view of the library: Proton photos plus pending local photos. The timeline model merges it.
+    private(set) var pendingPresentation = PendingTimelinePresentation.empty {
+        didSet { timeline?.setPendingPresentation(pendingPresentation) }
+    }
     var pendingTrash: PendingTrashPresentation { pendingGridConnection.trash }
     var excludedPendingTiles: [PendingTile] { pendingGridConnection.excludedTiles }
     var pendingFavoriteRevision: UInt64 { pendingGridConnection.favoriteRevision }
@@ -337,22 +357,25 @@ final class MobileLibraryModel {
     var viewerMedia: LocalPendingMediaRouter {
         LocalPendingMediaRouter(remote: backend, remoteVideo: backend, imageRequest: PhotoKitPlatformImages.request)
     }
-    /// True while the grid shows pending photos. It waits for the Proton timeline, so a slow first load never
-    /// shows only local photos.
-    var showsPendingPhotos: Bool {
-        !pendingPresentation.isCanonical && !pendingPresentation.items.isEmpty
-            && (!items.isEmpty || loadState.isEmpty)
-    }
+    /// True while the grid shows pending photos. The timeline model waits for the Proton timeline, so a slow first
+    /// load never shows only local photos.
+    var showsPendingPhotos: Bool { shownTimeline?.showsPendingPhotos ?? false }
     /// Items of the whole-library grid and viewer. Every remote-only consumer keeps using `items`.
-    var gridItems: [PhotoItem] {
-        if let provisionalProjection { return provisionalProjection.snapshot.items }
-        return showsPendingPhotos ? pendingPresentation.items : items
-    }
+    var gridItems: [PhotoItem] { shownTimeline?.gridItems ?? [] }
     /// Content identity of `gridItems`: 4n for Proton, 4n + 2 for pending photos, and 4n + 3 for provisional rows.
-    /// Search projections use 4n + 1, so the four sources never share a value.
+    /// Search projections use 4n + 1, so the four sources never share a value. A Proton timeline counts every content
+    /// change, metadata too, so the grid shows a corrected photo.
     var gridRevision: UInt64 {
-        if isProvisionalPresentation { return provisionalRevision &* 4 &+ 3 }
-        return showsPendingPhotos ? pendingPresentation.membershipRevision &* 4 &+ 2 : timelineRevision &* 4
+        let revision: UInt64
+        if let shownTimeline {
+            revision =
+                shownTimeline.isProvisionalPresentation || shownTimeline.showsPendingPhotos
+                ? revisionBase &* 4 &+ shownTimeline.gridSourceRevision : timelineRevision &* 4
+        } else {
+            revision = revisionBase &* 4
+        }
+        highestGridRevision = max(highestGridRevision, revision)
+        return revision
     }
 
     /// Position of `uid` in `gridItems`. O(1).
@@ -425,6 +448,7 @@ final class MobileLibraryModel {
     /// account owners. Process termination drops this value, but the durable marker recreates it at launch.
     @ObservationIgnored private var pendingSignOutPurgeClaim: BackupLocalDataPurge.Claim?
     private var transitionTask: Task<Void, Never>?
+    /// Keeps the launch activity pill while the whole-library crawl that the timeline model started runs.
     private var prefetchStartTask: Task<Void, Never>?
     /// Lifecycle callbacks may arrive while the backend is still validating its cache. They record foreground
     /// state immediately, but monitoring is gated until this launch has one stable result or a handled failure.
@@ -448,10 +472,11 @@ final class MobileLibraryModel {
     /// Wakes analysis-only presentation after a source inventory becomes readable.
     private(set) var sourceAnalysisRevision: UInt64 = 0
     private var smartSearchAssets: MLAssetUniverse { smartSearchSession.assets }
-    private var primaryInventoryAuthority: SourceInventoryAuthority = .hydrating
-    /// Successful trash and restore mutations of this session, laid over every later listing.
-    @ObservationIgnored private var timelineRemovals = TimelineRemovalOverlay()
-    @ObservationIgnored private var timelineMutationGeneration = 0
+    private var primaryInventoryAuthority: SourceInventoryAuthority {
+        timeline?.wholeLibraryInventoryAuthority ?? .hydrating
+    }
+    /// The identities of the whole library that the location crawl last received.
+    @ObservationIgnored private var locationInventoryUIDs: [PhotoUID] = []
     @ObservationIgnored private let sourceAnalysis = LibrarySourceAnalysisSession()
     private var sourceAnalysisRuntime: LibrarySourceAnalysisRuntime? { sourceAnalysis.runtime }
     /// Coalesces repeated retry taps into one ordered transient retirement and one replacement load.
@@ -557,7 +582,7 @@ final class MobileLibraryModel {
         self.session = session
         if let teardownTask {
             configuredUID = session.uid
-            loadState = .preparingInventory
+            hostLoadState = .preparingInventory
             transitionTask?.cancel()
             transitionTask = Task { @MainActor [weak self] in
                 await teardownTask.value
@@ -672,8 +697,8 @@ final class MobileLibraryModel {
 
     /// A crash or an error can interrupt "Keep Only Favorites" in its trash step, after the user's consent and
     /// every copy are final. Activation finishes only such operations. The series is already in the trash then,
-    /// so the authoritative refresh removes it and adds the copies. The optimistic removal of the interactive
-    /// path is not used: it advances the timeline mutation generation and would reject the initial load.
+    /// so the authoritative refresh removes it and adds the copies. This recovery path does not remove photos
+    /// optimistically; the refresh publishes the completed changes.
     private func resumePendingSeriesDissolutions(_ dissolution: SeriesDissolutionOrchestrator) async {
         do {
             let outcomes = try await dissolution.resumePending()
@@ -705,21 +730,12 @@ final class MobileLibraryModel {
         let locationStoreLease = locationStore.captureSessionLease()
         try await remoteMutation()
         try requireCurrentMutation(mutationLease)
-        timelineRemovals.trashed(uids)
-        timelineMutationGeneration &+= 1
-        let generation = timelineMutationGeneration
-        let currentSections = sections
-        let allRemovals = timelineRemovals.hiddenFromLibrary
-        let result = await Task.detached(priority: .userInitiated) {
-            let projection = TimelineContentProjection(sections: currentSections).removing(allRemovals)
-            return (projection, Set(projection.snapshot.items.map(\.uid)))
-        }.value
+        guard let timeline else { return }
+        await timeline.commitTrash(uids: uids)
         try requireCurrentMutation(mutationLease)
-        guard generation == timelineMutationGeneration else { return }
-        publish(result.0, locationInventoryChanged: true)
-        apply(.inventoryResolved(count: result.0.snapshot.count, cached: false))
+        publishSmartSearchInventory(timeline.wholeLibraryTimeline.items)
         await locationIndex.retainOnly(
-            result.1,
+            Set(timeline.wholeLibraryUIDs),
             persistTo: locationStoreLease == nil ? nil : locationStore,
             sessionLease: locationStoreLease
         )
@@ -734,12 +750,10 @@ final class MobileLibraryModel {
     }
 
     /// The finder already moved the photos to Recently Deleted; the library only stops showing them, and the kept
-    /// photos show the favorite tag that the merge carried over. The optimistic removal advances the timeline
-    /// mutation generation, which rejects an initial load in flight, so it waits for that load. The overlay hides
-    /// the photos from every listing that starts meanwhile.
+    /// photos show the favorite tag that the merge carried over. A removal during the initial load would overtake
+    /// that load, so it waits for the load; the removal then hides the photos from every later listing.
     private func removeMergedDuplicates(_ uids: Set<PhotoUID>, account: ExactDuplicatesAccountLifetime.Token) async {
         guard duplicatesLifetime.isCurrent(account) else { return }
-        timelineRemovals.trashed(uids)
         var awaitedLoad: Task<Void, Never>?
         while !initialLibraryLoadSettled, let load = loadTask, load != awaitedLoad {
             awaitedLoad = load
@@ -779,24 +793,13 @@ final class MobileLibraryModel {
         try requireCurrentMutation(mutationLease)
         let pendingRestore = await restoredPendingGrid?.restoreSources(ofRemote: Array(uids))
         try requireCurrentMutation(mutationLease)
-        timelineRemovals.restored(uids)
-        timelineMutationGeneration &+= 1
-        let generation = timelineMutationGeneration
-        let currentSections = sections
-        let remainingRemovals = timelineRemovals.hiddenFromLibrary
-        let result = await Task.detached(priority: .userInitiated) {
-            let projection = TimelineContentProjection(sections: currentSections)
-                .inserting(items)
-                .removing(remainingRemovals)
-            return (projection, Set(projection.snapshot.items.map(\.uid)))
-        }.value
-        try requireCurrentMutation(mutationLease)
-        guard generation == timelineMutationGeneration else { return }
+        guard let timeline else { return }
         let shouldRestartLocationCrawl = locationCrawl.isStarted
-        publish(result.0, locationInventoryChanged: true)
-        apply(.inventoryResolved(count: result.0.snapshot.count, cached: false))
+        await timeline.commitRestore(items)
+        try requireCurrentMutation(mutationLease)
+        publishSmartSearchInventory(timeline.wholeLibraryTimeline.items)
         await locationIndex.retainOnly(
-            result.1,
+            Set(timeline.wholeLibraryUIDs),
             persistTo: locationStoreLease == nil ? nil : locationStore,
             sessionLease: locationStoreLease
         )
@@ -904,19 +907,9 @@ final class MobileLibraryModel {
     func clearCache() async {
         guard let cache = thumbnailCache else { return }
         if let feed = thumbnailFeed {
-            let token = loadToken
-            if let runtime = sourceAnalysisRuntime {
-                // Visible publication precedes async source admission. Join that boundary before clearing;
-                // the bound feed owns the authorized crawl order, including photos from additional sources.
-                let admission = await synchronizePrimarySourceInventory(items, authority: primaryInventoryAuthority)
-                guard sourceAnalysisRuntime === runtime else { return }
-                // A newer host generation may win while the existing runtime drains its pending inventory.
-                guard admission == .accepted || admission == .superseded else {
-                    DebugLog.log("thumbnail cache clear skipped: source inventory was not admitted")
-                    return
-                }
-            }
-            guard !Task.isCancelled, token == loadToken, thumbnailFeed === feed else { return }
+            // The timeline admits each listing before publication. The bound feed already owns that inventory
+            // and the photos from additional sources; clearing it needs no second source admission.
+            guard !Task.isCancelled else { return }
             await feed.clearCacheAndRestartPrefetch()
         } else {
             await cache.clear()
@@ -1010,14 +1003,10 @@ final class MobileLibraryModel {
                 self.favoriteLoadTask?.cancel()
                 self.seriesDissolutionTask?.cancel()
                 self.editedRevertResume.cancel()
-                self.snapshot = TimelineSnapshot()
-                self.sections = []
+                self.retireTimeline(keepingItVisible: false)
                 self.favoriteState.reset(keepingFavorites: false)
-                self.timelineRemovals = TimelineRemovalOverlay()
-                self.timelineMutationGeneration &+= 1
-                self.timelineRevision &+= 1
                 self.initialLibraryLoadSettled = false
-                self.loadState = .preparingInventory
+                self.hostLoadState = .preparingInventory
                 locationIndex.replaceAll([])
                 locationIndex.updateScanProgress(PhotoLocationScanProgress())
             },
@@ -1176,26 +1165,26 @@ final class MobileLibraryModel {
 
     /// Called when the grid first draws a fully populated frame to lift the loading UI.
     func markFirstContentReady() {
-        apply(.firstContentReady)
+        if let timeline {
+            timeline.markInitialContentReady()
+        } else {
+            hostLoadState = LibraryLoadPolicy.reduce(hostLoadState, .firstContentReady)
+        }
     }
 
-    private func scheduleThumbnailPrefetch(using feed: UIKitThumbnailFeed) {
-        // Metadata corrections must not restart the whole-library crawl. Later new identities use the
-        // existing update coordinator. An empty first inventory does not consume this generation's start.
-        // Teardown and a replacement load clear this owner; completion deliberately retains it.
-        guard !items.isEmpty, prefetchStartTask == nil else { return }
-        let crawlItems = items
+    /// Keeps the launch activity pill from the first non-empty publication until the whole-library crawl that the
+    /// timeline model started has finished. Completion keeps the task, so a later publication does not show it again;
+    /// later new photos use the update coordinator. Teardown and a replacement load clear the task.
+    private func startCrawlProgressIfNeeded(_ timeline: TimelineViewModel, feed: UIKitThumbnailFeed) {
+        guard prefetchStartTask == nil, !timeline.wholeLibraryUIDs.isEmpty else { return }
+        let itemCount = timeline.wholeLibraryUIDs.count
         let token = loadToken
-        isThumbnailPrefetchLoading = !crawlItems.isEmpty
+        isThumbnailPrefetchLoading = true
         let crawlStarted = ContinuousClock.now
-        PhotoDiagnostics.shared.emit(
-            "MediaFeed", ["event": "thumbnailCrawlStarted", "items": "\(crawlItems.count)"])
+        PhotoDiagnostics.shared.emit("MediaFeed", ["event": "thumbnailCrawlStarted", "items": "\(itemCount)"])
         prefetchStartTask = Task { [weak self] in
-            let uids = await Task.detached(priority: .utility) {
-                ThumbnailCrawlOrder.newestToOldestFromChronological(crawlItems)
-            }.value
-            guard !Task.isCancelled, token == self?.loadToken else { return }
-            await feed.startPrefetch(uids)
+            // The crawl starts after a detached sort; its end can only be awaited once it started.
+            await timeline.waitForWholeLibraryCrawlStart()
             do {
                 try await feed.waitForPrefetchToFinish()
             } catch {
@@ -1206,27 +1195,20 @@ final class MobileLibraryModel {
             PhotoDiagnostics.shared.emit(
                 "MediaFeed",
                 [
-                    "event": "thumbnailCrawlFinished", "items": "\(crawlItems.count)",
+                    "event": "thumbnailCrawlFinished", "items": "\(itemCount)",
                     "durationMs": "\(elapsed.seconds * 1_000 + elapsed.attoseconds / 1_000_000_000_000_000)",
                 ])
             self?.isThumbnailPrefetchLoading = false
         }
     }
 
-    /// Reports photos that appeared since `shownBefore`. `change` comes from `applyItems`; without it, another
-    /// publication replaced the timeline, and the comparison runs here against the timeline shown now.
-    private func reconcileNewAssetThumbnails(
-        since shownBefore: TimelineSnapshot,
-        change: TimelineProjectionChange?,
-        using feed: UIKitThumbnailFeed
-    ) {
-        let change = change ?? TimelineProjectionChange(from: shownBefore, to: snapshot, nextUIDs: items.map(\.uid))
-        // The same identities leave an empty pending set empty. A pending set can still hold a photo that trash
-        // removed without a reconcile, so it is reconciled against the current identities.
-        guard change.identitiesChanged || thumbnailUpdateCoordinator.state.isActive else { return }
+    /// Loads the thumbnails of photos that a listing added. A pending set also follows a listing without new photos:
+    /// a trash removes photos without a reconcile, so a later listing must still prune them.
+    private func reconcileNewAssetThumbnails(addedUIDs: [PhotoUID], feed: UIKitThumbnailFeed) {
+        guard let timeline, !addedUIDs.isEmpty || thumbnailUpdateCoordinator.state.isActive else { return }
         thumbnailUpdateCoordinator.reconcile(
-            currentUIDs: change.uids,
-            addedUIDs: change.addedUIDs,
+            currentUIDs: timeline.wholeLibraryUIDs,
+            addedUIDs: addedUIDs,
             onStateChange: { [weak self] state in
                 self?.isNewAssetThumbnailLoading = state.isActive
             },
@@ -1313,16 +1295,6 @@ final class MobileLibraryModel {
         sourceAnalysis.install(runtime)
     }
 
-    /// Installs the source-aware byte route before the same primary inventory is exposed to the grid. Otherwise
-    /// the first visible warm pass can run against the runtime's initial empty scope and leave the loading cover
-    /// without a rendered thumbnail with which to settle.
-    private func synchronizePrimarySourceInventory(
-        _ items: [PhotoItem],
-        authority: SourceInventoryAuthority
-    ) async -> PrimaryInventoryAdmission {
-        await sourceAnalysis.synchronizePrimaryInventory(items, authority: authority)
-    }
-
     @discardableResult
     private func stopSourceAnalysis() -> Task<Void, Never>? {
         smartSearchAssets.invalidateSourceSession()
@@ -1361,7 +1333,6 @@ final class MobileLibraryModel {
                 if signingOut { isRecoveringScope = false }
                 active.load?.cancel()
                 loadTask = nil
-                provisionalProjection = nil
                 active.transition?.cancel()
                 transitionTask = nil
                 active.prefetch?.cancel()
@@ -1387,7 +1358,9 @@ final class MobileLibraryModel {
         active.locationSession.retire()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
-        primaryInventoryAuthority = .hydrating
+        // A retry keeps the photos visible until the next runtime installs its timeline model.
+        retireTimeline(keepingItVisible: true)
+        hostLoadState = .preparingInventory
         backend = nil
         replaceDuplicates(using: nil)
         facade = nil
@@ -1422,7 +1395,6 @@ final class MobileLibraryModel {
         var active = captureAndCancelTransientOwners(signingOut: true, advanceLoadToken: true)
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
-        primaryInventoryAuthority = .hydrating
         configuredUID = nil
         session = nil
         cacheContext = nil
@@ -1434,18 +1406,14 @@ final class MobileLibraryModel {
         photoBackup = nil
         albumSync = nil
         albumCatalogRevision = 0
-        timelineRemovals = TimelineRemovalOverlay()
-        timelineMutationGeneration &+= 1
-        snapshot = TimelineSnapshot()
-        sections = []
+        retireTimeline(keepingItVisible: false)
         favoriteState.reset(keepingFavorites: false)
-        timelineRevision &+= 1
         thumbnailFeed = nil
         searchSuggestions.reset()
         active.stopSearch(stopSourceAnalysis: stopSourceAnalysis)
         thumbnailCache = nil
         originalsCache = nil
-        loadState = .initial
+        hostLoadState = .initial
         active.locationSession.resetForTeardown()
         active.locationIndex.replaceAll([])
         active.locationIndex.updateScanProgress(PhotoLocationScanProgress())
@@ -1511,7 +1479,6 @@ final class MobileLibraryModel {
         loadToken &+= 1  // this load supersedes any older in-flight snapshot sort
         let loadGeneration = loadToken
         loadTask?.cancel()
-        provisionalProjection = nil
         prefetchStartTask?.cancel()
         prefetchStartTask = nil
         isThumbnailPrefetchLoading = false
@@ -1521,7 +1488,6 @@ final class MobileLibraryModel {
         thumbnailUpdateCoordinator.cancel()
         isRefreshingLibrary = false
         initialLibraryLoadSettled = false
-        primaryInventoryAuthority = .hydrating
         configuredUID = session.uid
         backend = nil
         facade = nil
@@ -1532,18 +1498,12 @@ final class MobileLibraryModel {
         // the teardown order.
         let retiredPendingGrid = retirePendingGrid()
         albumSync = nil
-        timelineRemovals = TimelineRemovalOverlay()
-        timelineMutationGeneration &+= 1
-        if !preserveVisibleSnapshot {
-            snapshot = TimelineSnapshot()
-            sections = []
-            timelineRevision &+= 1
-        }
+        retireTimeline(keepingItVisible: preserveVisibleSnapshot)
         thumbnailFeed = nil
         searchSuggestions.reset()
         smartSearchSession.stop()
         stopSourceAnalysis()
-        loadState = .preparingInventory
+        hostLoadState = .preparingInventory
 
         let cacheContext = LocalMediaCacheContext(accountUID: session.uid, keyPassword: session.keyPassword)
         self.cacheContext = cacheContext
@@ -1683,8 +1643,9 @@ final class MobileLibraryModel {
                 // the earlier await does.
                 await self.closeRetired(replacedPendingGrid, photoBackup: replacedPhotoBackup).value
                 guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
-                try await loadInitialTimeline(
-                    backend: backend, feed: feed, session: session, loadGeneration: loadGeneration)
+                let timeline = self.makeTimeline(backend: backend, feed: feed, loadGeneration: loadGeneration)
+                await self.loadInitialTimeline(
+                    timeline, feed: feed, session: session, store: store, loadGeneration: loadGeneration)
             } catch let error as any LibraryChangeTerminalError {
                 guard !Task.isCancelled, loadGeneration == self.loadToken, self.session == session else { return }
                 DebugLog.log("timeline: terminal scope failure during initial load - \(error)")
@@ -1697,279 +1658,146 @@ final class MobileLibraryModel {
                     failedLoadGeneration: loadGeneration
                 )
             } catch {
-                handleInitialTimelineFailure(error, session: session, loadGeneration: loadGeneration)
+                handleAccountOpenFailure(error, session: session, loadGeneration: loadGeneration)
             }
         }
     }
 
-    private func handleInitialTimelineFailure(_ error: Error, session: ProtonSession, loadGeneration: Int) {
+    /// Opening the account failed before a timeline model existed, so this model shows the failure itself.
+    private func handleAccountOpenFailure(_ error: Error, session: ProtonSession, loadGeneration: Int) {
         guard !Task.isCancelled, loadGeneration == loadToken, self.session == session else { return }
         if isRecoveringScope { isRecoveringScope = false }
-        if error is SourceAnalysisStartupError {
-            apply(.contentLoadFailed(message: Self.message(for: error)))
-        } else {
-            apply(.failed(message: Self.message(for: error), retryable: true))
-        }
+        hostLoadState = LibraryLoadPolicy.reduce(
+            hostLoadState, .failed(message: LibraryLoadFailureMessage.message(for: error), retryable: true))
         initialLibraryLoadSettled = true
-        // A cold or cached load must recover when the server returns, even if its revision did not change.
-        startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
     }
 
-    private func loadInitialTimeline(
-        backend: any PhotosRepository,
-        feed: UIKitThumbnailFeed,
-        session: ProtonSession,
-        loadGeneration: Int
-    ) async throws {
-        var hadCachedInventory = false
-        // Show the persisted snapshot while Core validates its event token. A match avoids row
-        // enumeration; a mismatch falls back to the authoritative load.
-        var cacheValidation = TimelineCacheValidation.refreshRequired(monitorBaseline: nil)
-        if let cached = await backend.cachedTimelineSnapshot() {
-            hadCachedInventory = true
-            guard !Task.isCancelled,
-                loadGeneration == self.loadToken,
-                self.session == session
-            else { return }
-            _ = try await applyItems(cached.sections, cached: true)
-            guard !Task.isCancelled,
-                loadGeneration == self.loadToken,
-                self.session == session
-            else { return }
-            scheduleThumbnailPrefetch(using: feed)
-            let mutationGeneration = timelineMutationGeneration
-            let validation = await TimelineCacheValidationPolicy.validateForPublication(
-                snapshot: cached,
-                repository: backend
-            )
-            cacheValidation = validation.validation
-            guard !Task.isCancelled,
-                loadGeneration == self.loadToken,
-                self.session == session
-            else { return }
-            if case .terminalFailure = cacheValidation {
-                throw TimelineCacheValidationTerminalError()
-            }
-            let change = try await applyValidatedCacheForCurrentMutation(
-                validation, generation: mutationGeneration)
-            guard !Task.isCancelled,
-                loadGeneration == self.loadToken,
-                self.session == session
-            else { return }
-            guard mutationGeneration == timelineMutationGeneration else {
-                initialLibraryLoadSettled = true
-                startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: "")
-                return
-            }
-            if settleValidatedCachedTimeline(change: change, validation: cacheValidation) {
-                return
+    /// Creates the timeline model of this runtime. It asks the source inventory to admit every whole-library listing
+    /// before it shows it: otherwise the first visible pass can run against the runtime's empty scope and leave the
+    /// loading cover without a rendered thumbnail with which to settle.
+    private func makeTimeline(
+        backend: any PhotosBackend, feed: UIKitThumbnailFeed, loadGeneration: Int
+    ) -> TimelineViewModel {
+        let timeline = TimelineViewModel(
+            repository: backend, feed: feed.feedCore, library: backend,
+            admitWholeLibrary: makeWholeLibraryAdmitter())
+        installTimeline(timeline, feed: feed, loadGeneration: loadGeneration)
+        return timeline
+    }
+
+    /// Admits a whole-library listing through the source analysis session. A newer inventory supersedes it; every
+    /// other answer, such as a stopped runtime, refuses it.
+    private func makeWholeLibraryAdmitter() -> TimelineViewModel.WholeLibraryAdmitter {
+        { [weak self] items, authority in
+            guard let self else { return .superseded }
+            return switch await self.sourceAnalysis.synchronizePrimaryInventory(items, authority: authority) {
+            case .accepted: .accepted
+            case .superseded: .superseded
+            default: .rejected
             }
         }
-
-        let acceptsProvisional = !hadCachedInventory && snapshot.items.isEmpty
-        let access = acceptsProvisional ? await feed.feedCore.beginProvisionalThumbnailAccess() : nil
-        do {
-            try await loadFreshInitialTimeline(
-                backend: backend, feed: feed, session: session, loadGeneration: loadGeneration,
-                hadCachedInventory: hadCachedInventory, acceptsProvisional: acceptsProvisional,
-                thumbnailAccess: access)
-        } catch {
-            clearProvisionalTimeline(loadGeneration: loadGeneration)
-            if let access { await feed.feedCore.endProvisionalThumbnailAccess(access) }
-            throw error
-        }
-        clearProvisionalTimeline(loadGeneration: loadGeneration)
-        if let access { await feed.feedCore.endProvisionalThumbnailAccess(access) }
     }
 
-    private func loadFreshInitialTimeline(
-        backend: any PhotosRepository, feed: UIKitThumbnailFeed, session: ProtonSession, loadGeneration: Int,
-        hadCachedInventory: Bool, acceptsProvisional: Bool, thumbnailAccess: UUID?
-    ) async throws {
-        let mutationGeneration = timelineMutationGeneration
-        let refreshed: TimelineLoadSnapshot
-        if acceptsProvisional {
-            refreshed = try await backend.loadTimelineSnapshot { [weak self] page in
-                await self?.applyProvisionalTimeline(
-                    page, feed: feed, session: session, loadGeneration: loadGeneration,
-                    mutationGeneration: mutationGeneration, thumbnailAccess: thumbnailAccess)
+    /// Shows `timeline` as the whole library of this runtime and hands its publications to the account.
+    private func installTimeline(_ timeline: TimelineViewModel, feed: UIKitThumbnailFeed?, loadGeneration: Int) {
+        endShowing(self.timeline)
+        endShowing(retainedTimeline)
+        retainedTimeline = nil
+        timeline.setPendingPresentation(pendingPresentation)
+        self.timeline = timeline
+        locationInventoryUIDs = []
+        observePublications(of: timeline, loadGeneration: loadGeneration)
+        timelineDidPublish(timeline, feed: feed)
+    }
+
+    /// Ends the timeline model of the runtime and stops its first load. A retry keeps it visible until the next
+    /// runtime installs its own.
+    private func retireTimeline(keepingItVisible: Bool) {
+        timeline?.cancelLoadAndCrawlStart()
+        if keepingItVisible, let timeline {
+            endShowing(retainedTimeline)
+            retainedTimeline = timeline
+        } else if !keepingItVisible {
+            endShowing(timeline)
+            endShowing(retainedTimeline)
+            retainedTimeline = nil
+        }
+        timeline = nil
+        locationInventoryUIDs = []
+    }
+
+    /// Moves the revisions past everything that a timeline model showed once it is no longer shown: past its timeline
+    /// revisions and past the highest grid revision that was read, whichever source it named.
+    private func endShowing(_ timeline: TimelineViewModel?) {
+        guard let timeline else { return }
+        revisionBase = max(
+            revisionBase &+ timeline.wholeLibraryContentRevision &+ 1, highestGridRevision / 4 &+ 1)
+    }
+
+    private func observePublications(of timeline: TimelineViewModel, loadGeneration: Int) {
+        withObservationTracking {
+            _ = timeline.wholeLibraryContentRevision
+        } onChange: { [weak self, weak timeline] in
+            Task { @MainActor [weak self, weak timeline] in
+                guard let self, let timeline, self.timeline === timeline, loadGeneration == self.loadToken else {
+                    return
+                }
+                self.timelineDidPublish(timeline, feed: self.thumbnailFeed)
+                self.observePublications(of: timeline, loadGeneration: loadGeneration)
             }
-        } else {
-            refreshed = try await backend.loadTimelineSnapshot()
         }
-        guard !Task.isCancelled,
-            loadGeneration == self.loadToken,
-            self.session == session
-        else { return }
-        let shownBefore = snapshot
-        let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
-        guard !Task.isCancelled,
-            loadGeneration == self.loadToken,
-            self.session == session
-        else { return }
-        scheduleThumbnailPrefetch(using: feed)
-        if hadCachedInventory {
-            reconcileNewAssetThumbnails(since: shownBefore, change: change, using: feed)
-        }
-        settleInitialTimelineLoad(refreshed, change: change)
     }
 
-    private func applyProvisionalTimeline(
-        _ page: ProvisionalTimelineSnapshot, feed: UIKitThumbnailFeed, session: ProtonSession,
-        loadGeneration: Int, mutationGeneration: Int, thumbnailAccess: UUID?
-    ) async {
-        guard !Task.isCancelled, loadGeneration == loadToken, self.session == session,
-            mutationGeneration == timelineMutationGeneration, snapshot.items.isEmpty,
-            primaryInventoryAuthority != .authoritative
-        else { return }
-        let projection = await Task.detached(priority: .userInitiated) {
-            TimelineContentProjection(sections: page.sections)
-        }.value
-        guard !Task.isCancelled, loadGeneration == loadToken, self.session == session,
-            mutationGeneration == timelineMutationGeneration, snapshot.items.isEmpty,
-            primaryInventoryAuthority != .authoritative, !projection.snapshot.items.isEmpty
-        else { return }
-        if let thumbnailAccess {
-            await feed.feedCore.updateProvisionalThumbnailAccess(projection.uids, using: thumbnailAccess)
-            guard !Task.isCancelled, loadGeneration == loadToken, self.session == session,
-                mutationGeneration == timelineMutationGeneration, snapshot.items.isEmpty,
-                primaryInventoryAuthority != .authoritative
-            else { return }
-        }
-        provisionalProjection = projection
-        provisionalRevision &+= 1
-        apply(.provisionalInventoryResolved(count: projection.snapshot.count))
-    }
-
-    private func clearProvisionalTimeline(loadGeneration: Int) {
-        guard loadGeneration == loadToken else { return }
-        provisionalProjection = nil
-        if Task.isCancelled, case .provisionalContent = loadState { apply(.reset) }
-    }
-
-    /// Builds an immutable `TimelineSnapshot` off the main actor and publishes it only for the current load.
-    /// It compares the new timeline with the shown one off the main actor too, and returns that comparison.
-    /// Nil means that a cancelled or superseded load published nothing.
-    @discardableResult
-    private func applyItems(
-        _ sections: [TimelineSection],
-        cached: Bool,
-        authoritative: Bool = false
-    ) async throws -> TimelineProjectionChange? {
-        let token = loadToken
-        let mutationGeneration = timelineMutationGeneration
-        let removals = timelineRemovals.hiddenFromLibrary
-        let shown = snapshot
-        let shownRevision = timelineRevision
-        let (prepared, preparedChange) = await Task.detached(priority: .userInitiated) {
-            let projection = TimelineContentProjection(sections: sections).removing(removals)
-            return (projection, TimelineProjectionChange(from: shown, to: projection))
-        }.value
-        // The generation token rejects results from cancelled or superseded loads.
-        guard !Task.isCancelled,
-            token == loadToken,
-            mutationGeneration == timelineMutationGeneration
-        else { return nil }
-        let sourceReady = await synchronizePrimarySourceInventory(
-            prepared.snapshot.items,
-            authority: authoritative ? .authoritative : .cached
-        )
-        try Task.checkCancellation()
-        guard token == loadToken,
-            mutationGeneration == timelineMutationGeneration
-        else { return nil }
-        if sourceReady == .superseded { return nil }
-        guard sourceReady == .accepted else { throw SourceAnalysisStartupError() }
-        // A concurrent load can publish while this one waits; then compare with the timeline shown now.
-        let change =
-            timelineRevision == shownRevision ? preparedChange : TimelineProjectionChange(from: snapshot, to: prepared)
-        let requiresNewFrame = change.identitiesChanged
-        let changed = change.contentChanged
-        if authoritative {
-            primaryInventoryAuthority = .authoritative
-        } else if cached, primaryInventoryAuthority != .authoritative {
-            primaryInventoryAuthority = .cached
-        }
-        if changed {
-            publish(
-                prepared,
-                locationInventoryChanged: requiresNewFrame,
-                publishPrimaryInventory: false
-            )
-        }
-        if authoritative {
-            apply(
-                .authoritativeInventoryResolved(
-                    count: prepared.snapshot.count,
-                    requiresNewFrame: requiresNewFrame
-                ))
-        } else {
-            apply(.inventoryResolved(count: prepared.snapshot.count, cached: cached))
-        }
-        return change
-    }
-
-    private func publish(
-        _ projection: TimelineContentProjection,
-        locationInventoryChanged: Bool,
-        publishPrimaryInventory: Bool = true
-    ) {
-        if locationInventoryChanged {
-            locationCrawl.updateInventory(projection.snapshot.items)
-        }
-        snapshot = projection.snapshot
-        sections = projection.sections
-        timelineRevision &+= 1
-        if publishPrimaryInventory {
-            publishSmartSearchInventory(projection.snapshot.items)
+    /// Hands a whole-library publication to the pending grid, the location crawl and the crawl progress.
+    private func timelineDidPublish(_ timeline: TimelineViewModel, feed: UIKitThumbnailFeed?) {
+        let snapshot = timeline.wholeLibraryTimeline
+        pendingGrid?.setRemote(snapshot)
+        if timeline.wholeLibraryUIDs != locationInventoryUIDs {
+            locationInventoryUIDs = timeline.wholeLibraryUIDs
+            locationCrawl.updateInventory(snapshot.items)
         }
         if locationCrawl.finishedWithOutdatedInventory {
             locationCrawl.prepareRestart()
             startLocationCrawlIfNeeded()
         }
+        if let feed { startCrawlProgressIfNeeded(timeline, feed: feed) }
     }
 
-    private func publishSmartSearchInventory(
-        _ items: [PhotoItem],
-        authority: SourceInventoryAuthority? = nil
-    ) {
-        if let authority,
-            primaryInventoryAuthority != .authoritative || authority == .authoritative
-        {
-            primaryInventoryAuthority = authority
+    /// Runs the shared first load and settles this runtime after it: a lost Drive scope recovers, new photos load
+    /// their thumbnails, and the change monitor starts from the revision that the load published.
+    private func loadInitialTimeline(
+        _ timeline: TimelineViewModel, feed: UIKitThumbnailFeed, session: ProtonSession, store: SessionKeychainStore,
+        loadGeneration: Int
+    ) async {
+        // Retirement cancels the load task; the shared first load then stops too and publishes nothing.
+        await withTaskCancellationHandler {
+            await timeline.load()
+        } onCancel: {
+            Task { @MainActor in timeline.cancelLoadAndCrawlStart() }
         }
+        guard !Task.isCancelled, loadGeneration == loadToken, self.session == session else { return }
+        if timeline.initialLoadFailureReason == .scopeAccessLost {
+            DebugLog.log("timeline: terminal scope failure during initial load")
+            // The recovery task must not join the load task that schedules it. Remove this completed owner
+            // first, then synchronously register recovery before this main-actor turn ends.
+            loadTask = nil
+            scheduleScopeRecovery(failedSession: session, failedStore: store, failedLoadGeneration: loadGeneration)
+            return
+        }
+        if loadState.failure != nil, isRecoveringScope { isRecoveringScope = false }
+        reconcileNewAssetThumbnails(addedUIDs: timeline.takeInitialAuthoritativeAddedUIDs(), feed: feed)
+        initialLibraryLoadSettled = true
+        startLibraryChangeMonitorIfPossible(
+            resetBaseline: true, initialToken: timeline.initialLibraryChangeToken ?? "")
+    }
+
+    /// Replaces the source inventory after a trash or restore of this device.
+    private func publishSmartSearchInventory(_ items: [PhotoItem]) {
         sourceAnalysis.replacePrimaryInventory(
             items,
             authority: primaryInventoryAuthority,
-            onFailure: { [weak self] in
-                self?.apply(.contentLoadFailed(message: L10n.string("error.load_library_title")))
-            }
+            onFailure: { [weak self] in self?.timeline?.reportInitialContentFailure() }
         )
-    }
-
-    private func applyValidatedCacheForCurrentMutation(
-        _ validation: TimelineCacheValidationResult, generation: Int
-    ) async throws -> TimelineProjectionChange? {
-        guard generation == timelineMutationGeneration, let current = validation.snapshot else { return nil }
-        return try await applyItems(current.sections, cached: false, authoritative: true)
-    }
-
-    private func settleValidatedCachedTimeline(
-        change: TimelineProjectionChange?, validation: TimelineCacheValidation
-    ) -> Bool {
-        guard change != nil, case .validated(let token) = validation else { return false }
-        publishSmartSearchInventory(snapshot.items, authority: .authoritative)
-        initialLibraryLoadSettled = true
-        startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: token)
-        return true
-    }
-
-    private func settleInitialTimelineLoad(
-        _ refreshed: TimelineLoadSnapshot, change: TimelineProjectionChange?
-    ) {
-        initialLibraryLoadSettled = true
-        startLibraryChangeMonitorIfPossible(
-            resetBaseline: true, initialToken: refreshed.monitorBaseline(afterPublishing: change != nil))
     }
 
     private func startLibraryChangeMonitorIfPossible(
@@ -2016,52 +1844,31 @@ final class MobileLibraryModel {
     ) async -> MobileLibraryRefreshResult {
         guard !isRecoveringScope,
             refreshLease.isCurrent(loadToken: loadToken, sessionUID: session?.uid),
-            let backend
+            let timeline
         else { return .init(outcome: .retry, failureReason: .cancelled) }
         isRefreshingLibrary = true
         defer { isRefreshingLibrary = false }
-        do {
-            let refreshed = try await backend.loadTimelineSnapshot()
-            try Task.checkCancellation()
-            try requireCurrentMutation(refreshLease)
-            let shownBefore = snapshot
-            guard let change = try await applyItems(refreshed.sections, cached: false, authoritative: true) else {
-                return .init(outcome: .retry, failureReason: .superseded)
-            }
-            try requireCurrentMutation(refreshLease)
-            if let thumbnailFeed {
-                scheduleThumbnailPrefetch(using: thumbnailFeed)
-                reconcileNewAssetThumbnails(since: shownBefore, change: change, using: thumbnailFeed)
-            }
-            // The same opaque server event token covers album mutations. Reuse this central foreground
-            // refresh instead of adding a second poller; Collections reloads through its existing revision key.
-            albumCatalogRevision &+= 1
-            // Another device's favorite change moves the same token, so refreshLibrarySources reads them again.
-            favoriteState.observeLibraryToken(refreshed.validationToken)
-            refreshLibrarySources()
-            return .init(
-                outcome: .refreshed(token: refreshed.validationToken),
-                failureReason: nil,
-                contentUnchanged: !change.contentChanged
-            )
-        } catch is CancellationError {
+        let result = await timeline.refreshLibrary()
+        // A refresh that ends after sign-out, a retry or a scope recovery belongs to a retired runtime.
+        guard refreshLease.isCurrent(loadToken: loadToken, sessionUID: session?.uid), self.timeline === timeline else {
             return .init(outcome: .retry, failureReason: .cancelled)
-        } catch is any LibraryChangeTerminalError {
-            return .init(outcome: .terminal, failureReason: .scopeAccessLost)
-        } catch is any TimelineInventoryConvergenceError {
-            return .init(outcome: .retry, failureReason: .pendingInventoryVisibility)
-        } catch {
-            DebugLog.log("timeline: foreground refresh failed - \(error)")
-            return .init(outcome: .retry, failureReason: .other)
         }
-    }
-
-    private func apply(_ event: LibraryLoadEvent) {
-        loadState = LibraryLoadPolicy.reduce(loadState, event)
-    }
-
-    private static func message(for error: Error) -> String {
-        LibraryLoadFailureMessage.message(for: error)
+        if result.failureReason == .scopeAccessLost {
+            return .init(outcome: .terminal, failureReason: .scopeAccessLost)
+        }
+        guard result.errorMessage == nil else { return .init(outcome: .retry, failureReason: result.failureReason) }
+        if let thumbnailFeed { reconcileNewAssetThumbnails(addedUIDs: result.addedUIDs, feed: thumbnailFeed) }
+        // The same opaque server event token covers album mutations. Reuse this central foreground
+        // refresh instead of adding a second poller; Collections reloads through its existing revision key.
+        albumCatalogRevision &+= 1
+        // Another device's favorite change moves the same token, so refreshLibrarySources reads them again.
+        favoriteState.observeLibraryToken(result.publishedLibraryChangeToken)
+        refreshLibrarySources()
+        return .init(
+            outcome: result.refreshedOutcome,
+            failureReason: nil,
+            contentUnchanged: result.contentUnchanged
+        )
     }
 }
 
@@ -2095,7 +1902,6 @@ final class MobileLibraryModel {
             thumbnailCache: ThumbnailCache? = nil,
             albums: AlbumsRepository? = nil
         ) {
-            let projection = TimelineContentProjection(sections: sections)
             albumActions = albums.map(AlbumActionCoordinator.init(repository:))
             self.store = store
             self.session = session
@@ -2103,16 +1909,13 @@ final class MobileLibraryModel {
             self.backend = backend
             self.thumbnailFeed = thumbnailFeed
             self.thumbnailCache = thumbnailCache
-            snapshot = projection.snapshot
-            self.sections = projection.sections
             // Unread favorites, so the first library refresh reads them like a signed-in account.
             favoriteState.reset(keepingFavorites: false)
-            timelineRevision &+= 1
-            primaryInventoryAuthority = .authoritative
-            loadState = LibraryLoadPolicy.reduce(
-                .initial, .authoritativeInventoryResolved(count: projection.snapshot.count, requiresNewFrame: true)
-            )
-            loadState = LibraryLoadPolicy.reduce(loadState, .firstContentReady)
+            let timeline = TimelineViewModel(
+                repository: backend, feed: thumbnailFeed.feedCore, library: backend,
+                admitWholeLibrary: makeWholeLibraryAdmitter())
+            installTimeline(timeline, feed: thumbnailFeed, loadGeneration: loadToken)
+            timeline.installIsolatedWholeLibraryForTesting(sections)
         }
 
         /// Settles the installed library like a completed initial load and reads its favorites, so search
@@ -2123,25 +1926,6 @@ final class MobileLibraryModel {
             if let initialToken {
                 startLibraryChangeMonitorIfPossible(resetBaseline: true, initialToken: initialToken)
             }
-        }
-
-        func publishIsolatedValidatedCacheForTesting(_ cached: CachedTimelineSnapshot) async throws -> Bool {
-            let change = try await applyItems(cached.sections, cached: false, authoritative: true)
-            return settleValidatedCachedTimeline(change: change, validation: .validated(token: "b"))
-        }
-
-        func validateIsolatedCacheForTesting(_ cached: CachedTimelineSnapshot) async throws -> Bool {
-            guard let backend else { return false }
-            let generation = timelineMutationGeneration
-            let validation = await TimelineCacheValidationPolicy.validateForPublication(
-                snapshot: cached, repository: backend)
-            let change = try await applyValidatedCacheForCurrentMutation(validation, generation: generation)
-            return settleValidatedCachedTimeline(change: change, validation: validation.validation)
-        }
-
-        func publishIsolatedInitialSnapshotForTesting(_ refreshed: TimelineLoadSnapshot) async throws {
-            let change = try await applyItems(refreshed.sections, cached: false, authoritative: true)
-            settleInitialTimelineLoad(refreshed, change: change)
         }
 
         func refreshIsolatedLibraryForTesting() async -> LibraryChangeRefreshOutcome {
@@ -2155,27 +1939,28 @@ final class MobileLibraryModel {
 
         var isolatedInventoryAuthorityForTesting: SourceInventoryAuthority { primaryInventoryAuthority }
 
-        /// Drives the shipping startup read sequence with an already installed isolated account.
-        func loadIsolatedInitialTimelineForTesting(repository: any PhotosRepository) async throws {
-            guard let thumbnailFeed, let session else { throw CancellationError() }
-            primaryInventoryAuthority = .hydrating
-            loadState = .preparingInventory
+        /// Runs the shipping first load of a new timeline model on `repository` for the installed isolated account.
+        func loadIsolatedInitialTimelineForTesting(repository: any PhotosRepository) async {
+            guard let thumbnailFeed, let session, let store else { return }
             initialLibraryLoadSettled = false
-            let generation = loadToken
-            do {
-                try await loadInitialTimeline(
-                    backend: repository, feed: thumbnailFeed, session: session, loadGeneration: generation)
-            } catch let error as any LibraryChangeTerminalError {
-                throw error
-            } catch {
-                handleInitialTimelineFailure(error, session: session, loadGeneration: generation)
-                throw error
-            }
+            let timeline = TimelineViewModel(
+                repository: repository, feed: thumbnailFeed.feedCore, library: backend,
+                admitWholeLibrary: makeWholeLibraryAdmitter())
+            installTimeline(timeline, feed: thumbnailFeed, loadGeneration: loadToken)
+            await loadInitialTimeline(
+                timeline, feed: thumbnailFeed, session: session, store: store, loadGeneration: loadToken)
         }
 
         /// Replays first-load outcomes through the shipping reducer without a real account request.
         func applyIsolatedLibraryLoadEventsForTesting(_ events: [LibraryLoadEvent]) {
-            loadState = events.reduce(.initial) { LibraryLoadPolicy.reduce($0, $1) }
+            if let timeline {
+                timeline.applyIsolatedInitialLoadEventsForTesting(events, from: .initial)
+            } else {
+                // Before an account opens, no repository or feed exists from which to create a timeline model.
+                // This fixture drives the host-owned account-open state through the same shipping reducer.
+                // Once a timeline exists, only its core fixture replays the library events above.
+                hostLoadState = events.reduce(.initial) { LibraryLoadPolicy.reduce($0, $1) }
+            }
         }
 
         /// Stands for an initial library load that runs until `load` returns and settles then.
@@ -2208,26 +1993,24 @@ final class MobileLibraryModel {
         /// Installs the real source runtime for bound-feed lifecycle regression tests.
         func installIsolatedSourceAnalysisForTests(_ runtime: LibrarySourceAnalysisRuntime) {
             sourceAnalysis.install(runtime)
-            primaryInventoryAuthority = .authoritative
         }
 
-        /// Drives the production startup and new-identity paths without opening a real account backend.
+        /// Drives the production crawl and new-identity paths: the timeline model shows `sections` as its next listing.
         func replaceIsolatedThumbnailInventoryForTests(_ sections: [TimelineSection]) {
-            let shownBefore = snapshot
-            let projection = TimelineContentProjection(sections: sections)
-            snapshot = projection.snapshot
-            self.sections = projection.sections
-            timelineRevision &+= 1
-            guard let thumbnailFeed else { return }
-            scheduleThumbnailPrefetch(using: thumbnailFeed)
+            guard let timeline, let thumbnailFeed else { return }
+            let shownBefore = timeline.wholeLibraryUIDs
+            timeline.installIsolatedWholeLibraryForTesting(sections)
+            startIsolatedThumbnailPrefetchForTests()
             reconcileNewAssetThumbnails(
-                since: shownBefore, change: TimelineProjectionChange(from: shownBefore, to: projection),
-                using: thumbnailFeed)
+                addedUIDs: LibraryInventoryDelta.addedUIDs(previous: shownBefore, current: timeline.wholeLibraryUIDs),
+                feed: thumbnailFeed)
         }
 
+        /// Starts the whole-library crawl of the installed library and its activity pill, as a first load does.
         func startIsolatedThumbnailPrefetchForTests() {
-            guard let thumbnailFeed else { return }
-            scheduleThumbnailPrefetch(using: thumbnailFeed)
+            guard let timeline, let thumbnailFeed else { return }
+            timeline.startIsolatedWholeLibraryCrawlForTesting()
+            startCrawlProgressIfNeeded(timeline, feed: thumbnailFeed)
         }
     }
 #endif

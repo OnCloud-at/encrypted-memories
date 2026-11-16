@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 @testable import TimelineCore
 
@@ -95,4 +96,13 @@ final class TimelineTestCounter: @unchecked Sendable {
         }
     }
     var value: Int { lock.withLock { count } }
+}
+
+/// A thumbnail loader that delivers nothing, for tests that check publication only.
+struct NoThumbnails: ThumbnailBatchLoader {
+    func loadThumbnails(
+        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
+    ) async -> ThumbnailBatchLoadResult {
+        ThumbnailBatchLoadResult()
+    }
 }

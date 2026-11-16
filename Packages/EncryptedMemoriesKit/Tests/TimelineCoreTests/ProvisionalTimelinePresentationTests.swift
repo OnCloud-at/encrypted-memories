@@ -41,7 +41,7 @@ import Testing
             try await withHeldPresentation(loader: loader) { model, repository in
                 #expect(await loader.events == ["begin", "update"])
                 model.markInitialContentReady()
-                if cancel { model.cancelInitialLoadForTesting() }
+                if cancel { model.cancelLoadAndCrawlStart() }
                 await repository.release(failing: !cancel)
             } after: { model in
                 #expect(model.gridItems.isEmpty)
@@ -81,7 +81,7 @@ import Testing
             try await withHeldPresentation { model, repository in
                 model.markInitialContentReady()
                 #expect(model.gridItems.count == 10)
-                model.cancelInitialLoadForTesting()
+                model.cancelLoadAndCrawlStart()
                 await repository.release()
             } after: { model in
                 #expect(model.gridItems.isEmpty)
@@ -118,7 +118,7 @@ import Testing
     #if DEBUG
         @MainActor private func withHeldPresentation(
             count: Int = 10,
-            loader: any ThumbnailBatchLoader = NoProvisionalThumbnails(),
+            loader: any ThumbnailBatchLoader = NoThumbnails(),
             during: @MainActor (TimelineViewModel, HeldProvisionalRepository) async throws -> Void,
             after: @MainActor (TimelineViewModel) -> Void
         ) async throws {
@@ -134,7 +134,7 @@ import Testing
                 await loading.value
                 after(model)
             } catch {
-                model.cancelInitialLoadForTesting()
+                model.cancelLoadAndCrawlStart()
                 await repository.release()
                 await loading.value
                 await feed.stopPrefetch()
@@ -150,7 +150,7 @@ import Testing
             defer { try? FileManager.default.removeItem(at: directory) }
             let repository = HeldProvisionalRepository()
             let feed = ThumbnailFeedCore(
-                cache: ThumbnailCache(rootDirectory: directory), loader: NoProvisionalThumbnails())
+                cache: ThumbnailCache(rootDirectory: directory), loader: NoThumbnails())
             let model = TimelineViewModel(repository: repository, feed: feed)
             let loading = Task { await model.load() }
             do {
@@ -181,7 +181,7 @@ import Testing
                 model.markInitialContentReady()
                 #expect(model.initialLibraryLoadState.hasSettled)
             } catch {
-                model.cancelInitialLoadForTesting()
+                model.cancelLoadAndCrawlStart()
                 await repository.release()
                 await loading.value
                 await feed.stopPrefetch()
@@ -237,14 +237,6 @@ private actor HeldProvisionalRepository: PhotosRepository {
         released = true
         continuation?.resume()
         continuation = nil
-    }
-}
-
-private struct NoProvisionalThumbnails: ThumbnailBatchLoader {
-    func loadThumbnails(
-        for uids: [PhotoUID], onLoaded: @Sendable @escaping (PhotoUID, Data) -> Void
-    ) async -> ThumbnailBatchLoadResult {
-        ThumbnailBatchLoadResult()
     }
 }
 

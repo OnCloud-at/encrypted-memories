@@ -100,7 +100,7 @@ import Testing
                 grid.onCellClick?(qualifiedPoint, 1, .command)
                 #expect(selections.count == previousSelectionCount + 1)
             } catch {
-                model.cancelInitialLoadForTesting()
+                model.cancelLoadAndCrawlStart()
                 await repository.releaseRemote()
                 await loading.value
                 await feed.stopPrefetch()
@@ -177,7 +177,7 @@ import Testing
                 #expect(Set(model.allItems.map(\.uid)) == Set(items.map(\.uid)))
                 #expect(model.wholeLibraryInventoryAuthority == .authoritative)
             } catch {
-                model.cancelInitialLoadForTesting()
+                model.cancelLoadAndCrawlStart()
                 await repository.releaseRemote()
                 await loading.value
                 await feed.stopPrefetch()
@@ -263,7 +263,7 @@ import Testing
                 #expect(model.wholeLibraryInventoryAuthority == .authoritative)
                 #expect(model.initialLibraryChangeToken == "retry-complete")
             } catch {
-                model.cancelInitialLoadForTesting()
+                model.cancelLoadAndCrawlStart()
                 retry?.cancel()
                 await repository.release(read: 1)
                 await repository.release(read: 2)

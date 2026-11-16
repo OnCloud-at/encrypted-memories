@@ -69,13 +69,14 @@ import TimelineCore
         let runtime = await installSourceRuntime(
             into: model, fixture: fixture, startingWith: .authoritative, generation: 100)
         model.setApplicationActive(true)
-        try await model.publishIsolatedInitialSnapshotForTesting(
-            TimelineLoadSnapshot(sections: attemptedSections, validationToken: "b"))
+        // A newer source inventory supersedes the first listing, so the timeline model shows nothing of it.
+        await model.loadIsolatedInitialTimelineForTesting(repository: model.backend!)
         #expect(!model.items.contains { $0.uid == arriving.uid })
+        #expect(model.timeline?.initialLibraryChangeToken == "", "An unpublished listing cannot seed its revision")
         try await waitUntil { await probe.probes >= 1 }
-        try await waitUntil { await probe.loads >= 1 }
+        try await waitUntil { await probe.loads >= 2 }
         model.setApplicationActive(false)
-        #expect(await probe.loads >= 1, "A discarded initial projection must leave b pending")
+        #expect(await probe.loads >= 2, "A discarded initial projection must leave b pending")
         await runtime.shutdown()
     }
 
@@ -84,13 +85,24 @@ import TimelineCore
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
-        fixture.install(into: model)
+        let probe = MobileCatchUpProbe(sections: fixture.sections)
+        await probe.advance()
+        let saved = CachedTimelineSnapshot(sections: fixture.sections, validationToken: "b")
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: fixture.sections, thumbnails: fixture.backend.thumbnails,
+                timelineLoader: { await probe.snapshot() }, changeTokenLoader: { await probe.token() },
+                cachedTimelineLoader: { saved }),
+            sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         let runtime = await installSourceRuntime(
             into: model, fixture: fixture, startingWith: .authoritative, generation: 100)
         model.setApplicationActive(false)
-        let accepted = try await model.publishIsolatedValidatedCacheForTesting(
-            CachedTimelineSnapshot(sections: fixture.sections, validationToken: "b"))
-        #expect(!accepted, "A rejected cached projection must continue through authoritative startup recovery")
+        await model.loadIsolatedInitialTimelineForTesting(repository: model.backend!)
+        #expect(
+            model.timeline?.initialLibraryChangeToken != "b",
+            "A superseded cached projection must not become a validated launch")
+        #expect(await probe.loads == 1, "It continues through the authoritative startup listing")
         await runtime.shutdown()
     }
 
@@ -153,13 +165,12 @@ import TimelineCore
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .cached)
         model.setApplicationActive(false)
-        let accepted = try await model.validateIsolatedCacheForTesting(
-            CachedTimelineSnapshot(sections: fixture.sections, validationToken: "a"))
-        #expect(accepted)
+        await model.loadIsolatedInitialTimelineForTesting(repository: model.backend!)
+        #expect(model.timeline?.initialLibraryChangeToken == "a", "The check validated the saved library")
         #expect(
             model.items.first { $0.uid == first.uid } == corrected,
             "The accepted cache must contain the post-check correction")
-        #expect(await cache.reads == 1, "Validation adds one local read before publication")
+        #expect(await cache.reads == 2, "Validation adds one local read after the saved library")
         await runtime.shutdown()
     }
 
@@ -169,7 +180,7 @@ import TimelineCore
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         let cache = MobileRereadProbe(
-            snapshot: CachedTimelineSnapshot(sections: fixture.sections, validationToken: "a"), holdsRead: true)
+            snapshot: CachedTimelineSnapshot(sections: fixture.sections, validationToken: "a"), holdsRead: 2)
         fixture.install(
             into: model,
             backend: MobileFixtureBackend(
@@ -178,10 +189,8 @@ import TimelineCore
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .cached)
         model.setApplicationActive(false)
-        let validation = Task {
-            try await model.validateIsolatedCacheForTesting(
-                CachedTimelineSnapshot(sections: fixture.sections, validationToken: "a"))
-        }
+        let validation = Task { await model.loadIsolatedInitialTimelineForTesting(repository: model.backend!) }
+        // The saved library shows; the check's reread of it is held.
         #expect(await cache.waitUntilHeld())
         let restored = PhotoItem(
             uid: .init(volumeID: "fixture", nodeID: "restored-during-mobile-warm-start"),
@@ -189,8 +198,10 @@ import TimelineCore
         try await model.restoreItems([restored])
         #expect(model.items.contains { $0.uid == restored.uid })
         await cache.release()
-        let accepted = try await validation.value
-        #expect(!accepted, "A newer local mutation supersedes the cached publication")
+        await validation.value
+        #expect(
+            model.timeline?.initialLibraryChangeToken != "a",
+            "A newer local mutation supersedes the cached publication")
         #expect(model.items.contains { $0.uid == restored.uid }, "Warm validation must retain the restored photo")
         await runtime.shutdown()
     }
@@ -217,12 +228,12 @@ import TimelineCore
             sections: fixture.sections, thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
         let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .cached)
         model.setApplicationActive(false)
-        let startup = Task { try await model.loadIsolatedInitialTimelineForTesting(repository: backend) }
+        let startup = Task { await model.loadIsolatedInitialTimelineForTesting(repository: backend) }
         #expect(await probe.waitUntilRereadIsHeld())
         try await model.restoreItems([restored])
         #expect(model.items.contains { $0.uid == restored.uid })
         await probe.releaseReread()
-        try await startup.value
+        await startup.value
         #expect(
             model.items.contains { $0.uid == restored.uid },
             "The complete startup route must not let an older fallback remove the local restore")
@@ -374,16 +385,17 @@ private actor MobileRemoteFavoriteProbe {
 private actor MobileRereadProbe {
     let snapshot: CachedTimelineSnapshot
     private(set) var reads = 0
-    private let holdsRead: Bool
+    /// The number of the read that waits until `release()`, or nil.
+    private let holdsRead: Int?
     private var held = false
     private var continuation: CheckedContinuation<Void, Never>?
-    init(snapshot: CachedTimelineSnapshot, holdsRead: Bool = false) {
+    init(snapshot: CachedTimelineSnapshot, holdsRead: Int? = nil) {
         self.snapshot = snapshot
         self.holdsRead = holdsRead
     }
     func read() async -> CachedTimelineSnapshot {
         reads += 1
-        if holdsRead {
+        if reads == holdsRead {
             held = true
             await withCheckedContinuation { continuation = $0 }
         }
