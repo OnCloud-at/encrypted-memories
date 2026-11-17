@@ -63,7 +63,7 @@ import Testing
         @MainActor @Test func theCardKeepsAMarginOnANarrowTallPage() async throws {
             let page = try await HostedPage(PlaybackFailedView(.networkUnavailable, retry: {}), width: 375, height: 800)
             defer { page.close() }
-            let card = try #require(page.materialFrame(), "the card draws no material")
+            let card = try #require(page.cardFrame(), "the card has no layout")
             #expect(card.minX > 0, "the card touches the leading edge: \(card)")
             #expect(card.maxX < 375, "the card touches the trailing edge: \(card)")
             #expect(card.height < 400, "the card grows beyond its content: \(card)")
@@ -75,7 +75,7 @@ import Testing
         @MainActor @Test func theCardStartsAtItsMarginOnAShortPage() async throws {
             let page = try await HostedPage(PlaybackFailedView(.networkUnavailable, retry: {}), width: 375, height: 150)
             defer { page.close() }
-            let card = try #require(page.materialFrame(), "the card draws no material")
+            let card = try #require(page.cardFrame(), "the card has no layout")
             #expect(abs(card.minY - 16) < 1, "the card does not start at its margin: \(card)")
             #expect(card.height > 150, "the card is not taller than the short page: \(card)")
         }
@@ -90,7 +90,7 @@ import Testing
             }
             let page = try await HostedPage(view, width: 375, height: 800)
             defer { page.close() }
-            let card = try #require(page.materialFrame(), "the card draws no material")
+            let card = try #require(page.cardFrame(), "the card has no layout")
             let outside = CGPoint(x: card.midX, y: card.minY - 60)
             #expect(page.hitView(at: outside) === poster, "a view covers the page outside the card")
             page.scroll(at: outside)
@@ -102,7 +102,7 @@ import Testing
         /// is a few points taller, so the hidden copy that measures it has the card's own height.
         @MainActor @Test func theCardScrollsExactlyWhenItIsTallerThanItsPage() async throws {
             let tall = try await HostedPage(PlaybackFailedView(.networkUnavailable, retry: {}), width: 375, height: 800)
-            let card = try #require(tall.materialFrame(), "the card draws no material")
+            let card = try #require(tall.cardFrame(), "the card has no layout")
             tall.close()
             let cardWithMargin = card.height + 32
             for (height, scrolls) in [(cardWithMargin + 4, false), (cardWithMargin - 4, true)] {
@@ -154,24 +154,28 @@ import Testing
     }
 
     /// A view in a live window of a fixed size, so its native layers and views exist. Hosted SwiftUI builds no
-    /// accessibility tree without an accessibility client, so the page reads layers and native subviews only.
+    /// accessibility tree without an accessibility client, so the page reads the card's layout, its layers and its
+    /// native subviews. The window stays invisible and lets clicks through, so a test run never shows it.
     @MainActor
     private final class HostedPage {
         private let host: NSView
         private let window: NSWindow
+        private let card = PlaybackFailedCardFrame()
 
         init(_ view: some View, width: CGFloat, height: CGFloat) async throws {
             _ = NSApplication.shared
             let frame = NSRect(x: 0, y: 0, width: width, height: height)
-            host = NSHostingView(rootView: view.frame(width: width, height: height))
+            host = NSHostingView(rootView: card.recording(view).frame(width: width, height: height))
             host.frame = frame
             window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false)
             window.contentView = host
+            window.alphaValue = 0
+            window.ignoresMouseEvents = true
             window.orderFrontRegardless()
-            for _ in 0..<10 {
+            let host = host
+            try await card.settle {
                 host.layoutSubtreeIfNeeded()
                 host.displayIfNeeded()
-                try await Task.sleep(for: .milliseconds(30))
             }
         }
 
@@ -179,16 +183,16 @@ import Testing
             window.orderOut(nil)
         }
 
+        /// The frame of the card in the page's coordinates.
+        func cardFrame() -> CGRect? {
+            card.value
+        }
+
         /// The pixels the page draws.
         func drawnPixels() -> Data? {
             guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return nil }
             host.cacheDisplay(in: host.bounds, to: bitmap)
             return bitmap.bitmapData.map { Data(bytes: $0, count: bitmap.bytesPerRow * bitmap.pixelsHigh) }
-        }
-
-        /// The frame of the card's material in the page's coordinates.
-        func materialFrame() -> CGRect? {
-            host.layer.flatMap { MaterialLayerFrames.largest(below: $0, in: $0) }
         }
 
         /// The view that a click at `point` (page coordinates) reaches.

@@ -13,7 +13,7 @@ final class MobilePlaybackFailedLayoutTests: XCTestCase {
         for error: VideoPlaybackError in [.networkUnavailable, .decryptionFailed] {
             let page = try await HostedCardPage(error, size: CGSize(width: 375, height: 800))
             defer { page.close() }
-            let card = try XCTUnwrap(page.materialFrame(), "the card draws no material: \(error)")
+            let card = try XCTUnwrap(page.cardFrame(), "the card has no layout: \(error)")
             XCTAssertLessThan(card.height, 400, "the card grows beyond its content: \(error) \(card)")
             XCTAssertGreaterThan(card.minX, 0, "the card touches the leading edge: \(error) \(card)")
             XCTAssertLessThan(card.maxX, 375, "the card touches the trailing edge: \(error) \(card)")
@@ -27,7 +27,7 @@ final class MobilePlaybackFailedLayoutTests: XCTestCase {
             let page = try await HostedCardPage(
                 .networkUnavailable, size: CGSize(width: 375, height: height), dynamicTypeSize: .accessibility5)
             defer { page.close() }
-            let card = try XCTUnwrap(page.materialFrame(), "the card draws no material")
+            let card = try XCTUnwrap(page.cardFrame(), "the card has no layout")
             XCTAssertEqual(card.minY, 16, accuracy: 1, "the card does not start at its margin: \(card)")
             XCTAssertGreaterThan(card.height, height, "the card is not taller than the page: \(card)")
             XCTAssertTrue(page.reportsScrolling, "a card taller than the page does not report scrolling: \(height)")
@@ -35,7 +35,7 @@ final class MobilePlaybackFailedLayoutTests: XCTestCase {
     }
 }
 
-/// The card in a live window of a fixed size, so its layers exist, and the scrolling it reports to its page.
+/// The card in a live window of a fixed size, where it lays out, and the scrolling it reports to its page.
 @MainActor
 private final class HostedCardPage {
     private final class Report {
@@ -44,6 +44,7 @@ private final class HostedCardPage {
 
     private let window: UIWindow
     private let report = Report()
+    private let card = PlaybackFailedCardFrame()
 
     init(
         _ error: VideoPlaybackError, size: CGSize, dynamicTypeSize: DynamicTypeSize = .large
@@ -54,13 +55,15 @@ private final class HostedCardPage {
         window.frame = CGRect(origin: .zero, size: size)
         let report = report
         let host = UIHostingController(
-            rootView: PlaybackFailedView(error, retry: {})
-                .environment(\.dynamicTypeSize, dynamicTypeSize)
-                .onPreferenceChange(PlaybackFailedView.ScrollsKey.self) { report.scrolls = $0 })
+            rootView: card.recording(
+                PlaybackFailedView(error, retry: {})
+                    .environment(\.dynamicTypeSize, dynamicTypeSize)
+                    .onPreferenceChange(PlaybackFailedView.ScrollsKey.self) { report.scrolls = $0 }))
         host.safeAreaRegions = []
         window.rootViewController = host
         window.makeKeyAndVisible()
-        try await Task.sleep(for: .milliseconds(400))
+        let window = window
+        try await card.settle { window.layoutIfNeeded() }
     }
 
     var reportsScrolling: Bool { report.scrolls }
@@ -69,8 +72,8 @@ private final class HostedCardPage {
         window.isHidden = true
     }
 
-    /// The frame of the card's material in window coordinates.
-    func materialFrame() -> CGRect? {
-        MaterialLayerFrames.largest(below: window.layer, in: window.layer)
+    /// The frame of the card in window coordinates: the page fills the window.
+    func cardFrame() -> CGRect? {
+        card.value
     }
 }

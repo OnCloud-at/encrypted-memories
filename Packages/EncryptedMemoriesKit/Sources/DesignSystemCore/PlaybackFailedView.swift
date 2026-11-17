@@ -70,6 +70,17 @@ public struct PlaybackFailedView: View {
         }
     }
 
+    /// The bounds of the card, which a containing view resolves in its own coordinates. The layout tests read the card
+    /// through it: how the material draws depends on the renderer, and a hosted test runner can draw it without a
+    /// backdrop layer.
+    struct CardBoundsKey: PreferenceKey {
+        static var defaultValue: Anchor<CGRect>? { nil }
+
+        static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+            value = value ?? nextValue()
+        }
+    }
+
     private func decideScrolling() {
         scrolls = Self.scrolls(cardHeight: cardHeight, pageHeight: pageHeight, current: scrolls)
     }
@@ -89,6 +100,7 @@ public struct PlaybackFailedView: View {
     private var card: some View {
         framed(unavailableView)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .anchorPreference(key: CardBoundsKey.self, value: .bounds) { $0 }
             .padding()
     }
 
