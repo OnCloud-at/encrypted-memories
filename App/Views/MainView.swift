@@ -1644,9 +1644,8 @@ struct MainView: View {
                 try await facade.albums.setAlbumCover(albumID: albumID, photoUID: uid)
                 await loadAlbums()
             } catch {
-                albumCoverFailureMessage = LibraryActionFailureMessage.message(
-                    for: error, action: .albumCover, specificAlbumReason: albumCoverSpecificReason(error),
-                    underlyingError: (error as? AlbumError)?.underlyingCause, text: libraryActionFailureText)
+                albumCoverFailureMessage = AlbumFailurePresentation.coverMessage(
+                    for: error, text: libraryActionFailureText)
             }
         }
     }
@@ -2889,16 +2888,6 @@ struct MainView: View {
                 exportFailureTitle = libraryActionFailureText(title)
                 exportFailureMessage = message
             }
-        }
-    }
-
-    private func albumCoverSpecificReason(_ error: any Error) -> String? {
-        guard let albumError = error as? AlbumError else { return nil }
-        switch albumError {
-        case .unsupported, .sharedAlbumReadOnly, .albumCreatedButPhotosNotAdded, .partialAdd, .partialAddWithCauses:
-            return albumError.errorDescription
-        case .backend, .requestFailed:
-            return nil
         }
     }
 

@@ -104,10 +104,9 @@ public struct LibraryRefreshBannerState: Sendable, Equatable {
         case .notYetVisible:
             isBusy = false
             return show(.notYetIndexed)
-        case .failed:
-            isBusy = false
-            return show(.refreshFailed)
-        case .cancelled:
+        case .failed, .cancelled:
+            // A backup upload starts this refresh in the background. A failure stays silent and the next refresh
+            // tries again; only a refresh that the person asked for shows `refreshFailed`.
             isBusy = false
             clear()
             return nil

@@ -48,6 +48,41 @@ import TimelineCore
         await runtime.shutdown()
     }
 
+    /// The monitor refresh is a background refresh: with nothing loaded, its failure leaves the grid alone and the
+    /// next refresh tries again. Only lost scope access ends the monitor.
+    @Test(.timeLimit(.minutes(1)))
+    func failedBackgroundRefreshLeavesTheGridAloneAndAsksForARetry() async throws {
+        let failed = try await refreshWithNothingLoaded { MobileCatchUpRefreshFailure() }
+        #expect(failed.outcome == .retry)
+        #expect(!failed.showsFailedLibrary, "A background refresh never replaces the grid with the failed library")
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func lostScopeAccessDuringABackgroundRefreshEndsTheMonitorWithoutAFailedLibrary() async throws {
+        let lost = try await refreshWithNothingLoaded { MobileCatchUpScopeLoss() }
+        #expect(lost.outcome == .terminal)
+        #expect(!lost.showsFailedLibrary)
+    }
+
+    private func refreshWithNothingLoaded(
+        failingWith makeError: @escaping @Sendable () -> any Error
+    ) async throws -> (outcome: LibraryChangeRefreshOutcome, showsFailedLibrary: Bool) {
+        let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
+        defer { fixture.removeCache() }
+        let model = MobileLibraryModel()
+        fixture.install(
+            into: model,
+            backend: MobileFixtureBackend(
+                sections: [], thumbnails: fixture.backend.thumbnails, timelineLoader: { throw makeError() }),
+            sections: [], thumbnailFeed: fixture.feed, thumbnailCache: fixture.cache)
+        let runtime = await installSourceRuntime(into: model, fixture: fixture, startingWith: .authoritative)
+        let outcome = await model.refreshIsolatedLibraryForTesting()
+        var showsFailedLibrary = false
+        if case .failed = model.timeline?.state { showsFailedLibrary = true }
+        await runtime.shutdown()
+        return (outcome, showsFailedLibrary)
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func unpublishedInitialProjectionCannotSeedItsRevision() async throws {
         let fixture = try await MobileSignedInFixture(itemsPerSection: 1)
@@ -322,6 +357,10 @@ import TimelineCore
         #expect(held)
     }
 }
+
+private struct MobileCatchUpRefreshFailure: Error {}
+
+private struct MobileCatchUpScopeLoss: LibraryChangeTerminalError {}
 
 private actor MobileCatchUpProbe {
     let sections: [TimelineSection]

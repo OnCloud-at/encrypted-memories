@@ -55,6 +55,13 @@ public struct TimelineRefreshResult: Sendable, Equatable {
     public var refreshedOutcome: LibraryChangeRefreshOutcome {
         coversWholeLibrary ? .refreshed(token: publishedLibraryChangeToken) : .refreshedWithoutRevision
     }
+
+    /// What the change monitor does next, for a success and for every failure.
+    public var monitorOutcome: LibraryChangeRefreshOutcome {
+        // A load that found nothing new is a success and keeps the token that it published.
+        guard let failureReason, failureReason != .unchanged else { return refreshedOutcome }
+        return TimelineRefreshFailurePolicy.monitorOutcome(for: failureReason)
+    }
 }
 
 @MainActor
@@ -605,16 +612,23 @@ public final class TimelineViewModel {
         wholeLibraryLocationRevision == nil ? nil : wholeLibrarySnapshot.items
     }
 
-    /// Manual user-triggered reload of the currently visible library/filter.
+    /// Manual user-triggered reload of the currently visible library/filter. A person waits for it.
     @discardableResult
     public func refreshLibrary() async -> TimelineRefreshResult {
-        await refreshCurrent(uploadedUID: nil)
+        await refreshCurrent(uploadedUID: nil, situation: .awaitedByPerson)
     }
 
-    /// Reloads the current timeline after an upload and warms the new UID's thumbnail cache if known.
+    /// Reload for a remote library change or a backup upload. No person waits for it, so a failure stays silent.
+    @discardableResult
+    public func refreshLibraryInBackground() async -> TimelineRefreshResult {
+        await refreshCurrent(uploadedUID: nil, situation: .background)
+    }
+
+    /// Reloads the current timeline after a manual upload and warms the new UID's thumbnail cache if known.
+    /// A person waits for it.
     @discardableResult
     public func refreshAfterUpload(uploadedUID: PhotoUID?) async -> TimelineRefreshResult {
-        let result = await refreshCurrent(uploadedUID: uploadedUID)
+        let result = await refreshCurrent(uploadedUID: uploadedUID, situation: .awaitedByPerson)
         guard result.failureReason != .scopeAccessLost else { return result }
         if let uploadedUID {
             await feed.requestPriority(uploadedUID, priority: .visibleNow)
@@ -931,7 +945,7 @@ public final class TimelineViewModel {
         } catch {
             // A cancelled owner cannot publish. A backend cancellation of an active read is a load failure.
             guard !Task.isCancelled, filter == .all else { return }
-            initialLoadFailureReason = error is any LibraryChangeTerminalError ? .scopeAccessLost : .other
+            initialLoadFailureReason = TimelineRefreshFailurePolicy.reason(for: error)
             applyInitialLoad(.failed(message: LibraryLoadFailureMessage.message(for: error), retryable: true))
             // Keep showing the cached timeline on a refresh error; surface failure only if we have
             // nothing to show. The reducer's verdict - not this site - decides the Retry affordance.
@@ -1052,7 +1066,7 @@ public final class TimelineViewModel {
         await feed.startPrefetch(ThumbnailCrawlOrder.newestToOldest(items))
     }
 
-    private func refreshCurrent(uploadedUID: PhotoUID?) async -> TimelineRefreshResult {
+    private func refreshCurrent(uploadedUID: PhotoUID?, situation: FailureSituation) async -> TimelineRefreshResult {
         let start = ContinuousClock.now
         let before = allItems.count
         let previousWholeLibraryUIDs = wholeLibraryUIDs
@@ -1175,14 +1189,11 @@ public final class TimelineViewModel {
                 failureReason: .cancelled
             )
         } catch {
-            if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
-            let failureReason: TimelineRefreshFailureReason
-            if error is any LibraryChangeTerminalError {
-                failureReason = .scopeAccessLost
-            } else if error is any TimelineInventoryConvergenceError {
-                failureReason = .pendingInventoryVisibility
-            } else {
-                failureReason = .other
+            // The caller names who waits: a background refresh leaves the grid as it is and the next refresh tries
+            // again; a refresh that a person started shows its failure while nothing is loaded.
+            let verdict = TimelineRefreshFailurePolicy.verdict(for: error, situation: situation)
+            if verdict.presentation == .alert {
+                if case .loaded = state {} else { surfaceLoadFailure(LibraryLoadFailureMessage.message(for: error)) }
             }
             return TimelineRefreshResult(
                 uploadedUID: uploadedUID,
@@ -1192,7 +1203,7 @@ public final class TimelineViewModel {
                 filterDescription: Self.describe(filter),
                 elapsedMs: elapsedMilliseconds(since: start),
                 errorMessage: error.localizedDescription,
-                failureReason: failureReason
+                failureReason: verdict.reason
             )
         }
     }

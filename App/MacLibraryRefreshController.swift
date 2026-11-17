@@ -76,17 +76,16 @@ final class MacLibraryRefreshController {
         // gate for refresh serialization, but show the shared bottom banner only if the refreshed projection
         // actually schedules thumbnail or GPS work (observed by `backgroundLibraryActivityActive`).
         guard uploadTask == nil, banner.beginRemoteRefresh() else { return .retry }
-        let result = await host.timelineModel.refreshLibrary()
+        let result = await host.timelineModel.refreshLibraryInBackground()
         if result.failureReason == .scopeAccessLost {
             banner.finishRemoteRefresh(succeeded: false)
-            return .terminal
+            return result.monitorOutcome
         }
         await host.loadAlbums()
         host.model.refreshLibrarySources()
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
-        let succeeded = result.errorMessage == nil
-        banner.finishRemoteRefresh(succeeded: succeeded)
-        return succeeded ? result.refreshedOutcome : .retry
+        banner.finishRemoteRefresh(succeeded: result.errorMessage == nil)
+        return result.monitorOutcome
     }
 
     /// Stops a coalesced backup refresh when the library view disappears.
@@ -108,7 +107,7 @@ final class MacLibraryRefreshController {
     private func performBackupUploadRefreshAttempt(attempt: Int, host: Host) async -> TimelineRefreshFailureReason? {
         // The banner shows a refresh that runs, not a signal that waits for the interval.
         if attempt == 0 { banner.beginBackupUploadRefresh() }
-        let result = await host.timelineModel.refreshLibrary()
+        let result = await host.timelineModel.refreshLibraryInBackground()
         if await recoverBackendAfterScopeAccessLoss(ifNeeded: result, host: host) { return .cancelled }
         reconcileNewAssetThumbnails(result.addedUIDs, host: host)
         logUploadRefresh(uploadedNode: "backup", attempt: attempt, result: result)
