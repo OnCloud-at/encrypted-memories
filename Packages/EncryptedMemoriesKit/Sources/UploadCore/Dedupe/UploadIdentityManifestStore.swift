@@ -405,39 +405,36 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
         guard !valid.isEmpty else { return true }
         let now = Date().timeIntervalSince1970
         return connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            var stmt: OpaquePointer?
-            var didWrite =
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    UPDATE upload_identity SET remote_link=?, outcome='duplicateActive', updated_at=?
-                    WHERE remote_link=? AND content_hash=? AND key_epoch=?
-                      AND outcome IN ('uploaded', 'duplicateActive');
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            for move in valid where didWrite {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                do {
-                    try connection.bindText(stmt, 1, move.to)
-                    sqlite3_bind_double(stmt, 2, now)
-                    try connection.bindText(stmt, 3, move.from)
-                    try connection.bindText(stmt, 4, move.contentHash)
-                    try connection.bindText(stmt, 5, hashKeyEpoch)
-                } catch {
-                    didWrite = false
-                    break
+            SQLiteTransaction.immediate(db) {
+                var stmt: OpaquePointer?
+                var didWrite =
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        UPDATE upload_identity SET remote_link=?, outcome='duplicateActive', updated_at=?
+                        WHERE remote_link=? AND content_hash=? AND key_epoch=?
+                          AND outcome IN ('uploaded', 'duplicateActive');
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK
+                for move in valid where didWrite {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    do {
+                        try connection.bindText(stmt, 1, move.to)
+                        sqlite3_bind_double(stmt, 2, now)
+                        try connection.bindText(stmt, 3, move.from)
+                        try connection.bindText(stmt, 4, move.contentHash)
+                        try connection.bindText(stmt, 5, hashKeyEpoch)
+                    } catch {
+                        didWrite = false
+                        break
+                    }
+                    didWrite = sqlite3_step(stmt) == SQLITE_DONE
                 }
-                didWrite = sqlite3_step(stmt) == SQLITE_DONE
+                sqlite3_finalize(stmt)
+                return didWrite
             }
-            sqlite3_finalize(stmt)
-            guard didWrite, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
         }
     }
 
@@ -630,61 +627,51 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             return nil
         }
         return connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return nil }
-            if let existing = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
-                existing.eventID == eventID,
-                existing.sourceFingerprint == sourceFingerprint,
-                existing.total == total,
-                existing.cursor <= total
-            {
-                guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    return nil
+            var checkpoint: UploadRemoteContentIndexBuildCheckpoint?
+            let committed = SQLiteTransaction.immediate(db) {
+                if let existing = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
+                    existing.eventID == eventID,
+                    existing.sourceFingerprint == sourceFingerprint,
+                    existing.total == total,
+                    existing.cursor <= total
+                {
+                    checkpoint = existing
+                    return true
                 }
-                return existing
-            }
-            guard clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch) else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return nil
-            }
-            let buildID = UUID().uuidString
-            var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    "INSERT INTO remote_content_build_checkpoint(key_epoch,build_id,event_id,source_fingerprint,cursor,total,updated_at) VALUES(?,?,?,?,0,?,?);",
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return nil
-            }
-            do {
-                try connection.bindText(stmt, 1, hashKeyEpoch)
-                try connection.bindText(stmt, 2, buildID)
-                try connection.bindText(stmt, 3, eventID)
-                try connection.bindText(stmt, 4, sourceFingerprint)
-            } catch {
+                guard clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch) else { return false }
+                let buildID = UUID().uuidString
+                var stmt: OpaquePointer?
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        "INSERT INTO remote_content_build_checkpoint(key_epoch,build_id,event_id,source_fingerprint,cursor,total,updated_at) VALUES(?,?,?,?,0,?,?);",
+                        -1, &stmt, nil
+                    ) == SQLITE_OK
+                else { return false }
+                do {
+                    try connection.bindText(stmt, 1, hashKeyEpoch)
+                    try connection.bindText(stmt, 2, buildID)
+                    try connection.bindText(stmt, 3, eventID)
+                    try connection.bindText(stmt, 4, sourceFingerprint)
+                } catch {
+                    sqlite3_finalize(stmt)
+                    return false
+                }
+                sqlite3_bind_int64(stmt, 5, Int64(total))
+                sqlite3_bind_double(stmt, 6, updatedAt.timeIntervalSince1970)
+                let wrote = sqlite3_step(stmt) == SQLITE_DONE
                 sqlite3_finalize(stmt)
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return nil
+                checkpoint = UploadRemoteContentIndexBuildCheckpoint(
+                    buildID: buildID,
+                    eventID: eventID,
+                    sourceFingerprint: sourceFingerprint,
+                    cursor: 0,
+                    total: total,
+                    updatedAt: updatedAt
+                )
+                return wrote
             }
-            sqlite3_bind_int64(stmt, 5, Int64(total))
-            sqlite3_bind_double(stmt, 6, updatedAt.timeIntervalSince1970)
-            let wrote = sqlite3_step(stmt) == SQLITE_DONE
-            sqlite3_finalize(stmt)
-            guard wrote, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return nil
-            }
-            return UploadRemoteContentIndexBuildCheckpoint(
-                buildID: buildID,
-                eventID: eventID,
-                sourceFingerprint: sourceFingerprint,
-                cursor: 0,
-                total: total,
-                updatedAt: updatedAt
-            )
+            return committed ? checkpoint : nil
         }
     }
 
@@ -702,29 +689,22 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             records.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch })
         else { return false }
         return connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            guard let checkpoint = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
-                checkpoint.buildID == buildID,
-                nextCursor >= checkpoint.cursor, nextCursor <= checkpoint.total
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
+            SQLiteTransaction.immediate(db) {
+                guard let checkpoint = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
+                    checkpoint.buildID == buildID,
+                    nextCursor >= checkpoint.cursor, nextCursor <= checkpoint.total
+                else { return false }
+                return
+                    writeBuildContentRecordsLocked(records)
+                    && writeBuildUnresolvedLocked(unresolvedIssues, hashKeyEpoch: hashKeyEpoch)
+                    && writeBuildExternalLocked(externalIdentities, hashKeyEpoch: hashKeyEpoch)
+                    && updateBuildCursorLocked(
+                        hashKeyEpoch: hashKeyEpoch,
+                        buildID: buildID,
+                        nextCursor: nextCursor,
+                        updatedAt: updatedAt
+                    )
             }
-            let ok =
-                writeBuildContentRecordsLocked(records)
-                && writeBuildUnresolvedLocked(unresolvedIssues, hashKeyEpoch: hashKeyEpoch)
-                && writeBuildExternalLocked(externalIdentities, hashKeyEpoch: hashKeyEpoch)
-                && updateBuildCursorLocked(
-                    hashKeyEpoch: hashKeyEpoch,
-                    buildID: buildID,
-                    nextCursor: nextCursor,
-                    updatedAt: updatedAt
-                )
-            guard ok, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
         }
     }
 
@@ -783,42 +763,36 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             remoteAssetRecords.allSatisfy({ $0.hashKeyEpoch == hashKeyEpoch })
         else { return false }
         return connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            guard let build = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
-                build.buildID == buildID,
-                build.eventID == checkpoint.eventID,
-                build.cursor == build.total
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            var ok = executeBoundLocked("DELETE FROM remote_content_index WHERE key_epoch=?;", value: hashKeyEpoch)
-            if ok {
-                let stagedIssues = readBuildRemoteIssuesLocked(hashKeyEpoch: hashKeyEpoch)
+            SQLiteTransaction.immediate(db) {
+                guard let build = readBuildCheckpointLocked(hashKeyEpoch: hashKeyEpoch),
+                    build.buildID == buildID,
+                    build.eventID == checkpoint.eventID,
+                    build.cursor == build.total
+                else { return false }
+                var ok = executeBoundLocked("DELETE FROM remote_content_index WHERE key_epoch=?;", value: hashKeyEpoch)
+                if ok {
+                    let stagedIssues = readBuildRemoteIssuesLocked(hashKeyEpoch: hashKeyEpoch)
+                    ok =
+                        stagedIssues != nil
+                        && executeBoundLocked(
+                            "INSERT INTO remote_content_index SELECT key_epoch,content_hash,remote_link FROM remote_content_build_record WHERE key_epoch=?;",
+                            value: hashKeyEpoch
+                        )
+                        && deleteResolvedRemoteIssuesAfterBuildLocked(hashKeyEpoch: hashKeyEpoch)
+                        && writeUnresolvedRemoteIssuesLocked(
+                            stagedIssues ?? [],
+                            hashKeyEpoch: hashKeyEpoch
+                        )
+                }
                 ok =
-                    stagedIssues != nil
-                    && executeBoundLocked(
-                        "INSERT INTO remote_content_index SELECT key_epoch,content_hash,remote_link FROM remote_content_build_record WHERE key_epoch=?;",
-                        value: hashKeyEpoch
-                    )
-                    && deleteResolvedRemoteIssuesAfterBuildLocked(hashKeyEpoch: hashKeyEpoch)
-                    && writeUnresolvedRemoteIssuesLocked(
-                        stagedIssues ?? [],
-                        hashKeyEpoch: hashKeyEpoch
-                    )
+                    ok
+                    && deleteRemoteAssetEpochLocked(hashKeyEpoch: hashKeyEpoch)
+                    && writeRemoteAssetRecordsLocked(remoteAssetRecords)
+                    && writeRemoteContentCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
+                    && writeRemoteAssetCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
+                    && clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch)
+                return ok
             }
-            ok =
-                ok
-                && deleteRemoteAssetEpochLocked(hashKeyEpoch: hashKeyEpoch)
-                && writeRemoteAssetRecordsLocked(remoteAssetRecords)
-                && writeRemoteContentCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
-                && writeRemoteAssetCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
-                && clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch)
-            guard ok, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
         }
     }
 
@@ -826,14 +800,7 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
     public func invalidateRemoteContentIndexBuild(hashKeyEpoch: String) -> Bool {
         guard !hashKeyEpoch.isEmpty else { return false }
         return connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            guard clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch),
-                sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
+            SQLiteTransaction.immediate(db) { clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch) }
         }
     }
 
@@ -862,54 +829,46 @@ public final class UploadIdentityManifestStore: UploadIdentityStore, UploadRemot
             !expectedEventID.isEmpty
         else { return false }
         return connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            guard readRemoteContentCheckpointLocked(hashKeyEpoch: hashKeyEpoch)?.eventID == expectedEventID else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
+            SQLiteTransaction.immediate(db) {
+                guard readRemoteContentCheckpointLocked(hashKeyEpoch: hashKeyEpoch)?.eventID == expectedEventID else {
+                    return false
+                }
+                let didDelete =
+                    clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch)
+                    && deleteRemoteContentLinksLocked(
+                        removingRemoteLinkIDs,
+                        hashKeyEpoch: hashKeyEpoch
+                    )
+                    && invalidateRemoteAssetRecordsLocked(
+                        touching: removingRemoteLinkIDs,
+                        hashKeyEpoch: hashKeyEpoch
+                    )
+                let didWrite =
+                    didDelete
+                    && writeRemoteContentRecordsLocked(records)
+                    && writeUnresolvedRemoteIssuesLocked(
+                        unresolvedIssues,
+                        hashKeyEpoch: hashKeyEpoch
+                    )
+                    && writeRemoteContentCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
+                    && writeRemoteAssetCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
+                return didWrite
             }
-            let didDelete =
-                clearRemoteContentBuildLocked(hashKeyEpoch: hashKeyEpoch)
-                && deleteRemoteContentLinksLocked(
-                    removingRemoteLinkIDs,
-                    hashKeyEpoch: hashKeyEpoch
-                )
-                && invalidateRemoteAssetRecordsLocked(
-                    touching: removingRemoteLinkIDs,
-                    hashKeyEpoch: hashKeyEpoch
-                )
-            let didWrite =
-                didDelete
-                && writeRemoteContentRecordsLocked(records)
-                && writeUnresolvedRemoteIssuesLocked(
-                    unresolvedIssues,
-                    hashKeyEpoch: hashKeyEpoch
-                )
-                && writeRemoteContentCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
-                && writeRemoteAssetCheckpointLocked(checkpoint, hashKeyEpoch: hashKeyEpoch)
-            guard didWrite, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            return true
         }
     }
 
     @discardableResult
     public func upsertRemoteContentRecord(_ record: UploadRemoteContentIndexRecord) -> Bool {
         connection.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            let didDelete =
-                clearRemoteContentBuildLocked(hashKeyEpoch: record.hashKeyEpoch)
-                && deleteUnresolvedRemoteLinksLocked(
-                    [record.remoteLinkID],
-                    hashKeyEpoch: record.hashKeyEpoch
-                )
-            let didWrite = didDelete && writeRemoteContentRecordsLocked([record])
-            guard didWrite, sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
+            SQLiteTransaction.immediate(db) {
+                let didDelete =
+                    clearRemoteContentBuildLocked(hashKeyEpoch: record.hashKeyEpoch)
+                    && deleteUnresolvedRemoteLinksLocked(
+                        [record.remoteLinkID],
+                        hashKeyEpoch: record.hashKeyEpoch
+                    )
+                return didDelete && writeRemoteContentRecordsLocked([record])
             }
-            return true
         }
     }
 

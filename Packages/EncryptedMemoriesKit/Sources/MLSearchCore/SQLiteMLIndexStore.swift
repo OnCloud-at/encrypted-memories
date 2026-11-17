@@ -52,113 +52,106 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
         var rejected = 0
         var failed = 0
         var changedDescriptors: Set<MLModelDescriptor> = []
-        var transactionFailed = false
 
         lock.withLock {
-            guard db != nil, sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
+            guard db != nil else {
                 failed = records.count
                 return
             }
             var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    INSERT OR IGNORE INTO ml_embeddings(
-                      volume_id, node_id, model_identifier, model_version,
-                      embedding_dimension, embedding_precision, vector, capture_time, indexed_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?);
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                failed = records.count
-                return
-            }
-            defer { sqlite3_finalize(stmt) }
             var clearFailureStmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?;",
-                    -1, &clearFailureStmt, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                failed = records.count
-                return
+            defer {
+                sqlite3_finalize(stmt)
+                sqlite3_finalize(clearFailureStmt)
             }
-            defer { sqlite3_finalize(clearFailureStmt) }
+            // A failed begin, prepare, failure cleanup, generation bump or commit stores nothing. Every record not
+            // rejected before the failure then counts as transient. A failed insert bind or insert step counts only that
+            // record.
+            let committed = SQLiteTransaction.immediate(db) {
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        INSERT OR IGNORE INTO ml_embeddings(
+                          volume_id, node_id, model_identifier, model_version,
+                          embedding_dimension, embedding_precision, vector, capture_time, indexed_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?);
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK
+                else { return false }
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?;",
+                        -1, &clearFailureStmt, nil
+                    ) == SQLITE_OK
+                else { return false }
 
-            for record in records {
-                guard record.isDimensionConsistent else {
-                    rejected += 1
-                    continue
-                }
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                // A failed bind leaves its parameter NULL, and OR IGNORE would skip that row as already indexed (#1194).
-                guard bindUID(stmt, 1, record.uid), bindText(stmt, 3, record.descriptor.identifier),
-                    bindText(stmt, 6, Self.precision.rawValue)
-                else {
-                    failed += 1
-                    continue
-                }
-                sqlite3_bind_int64(stmt, 4, Int64(record.descriptor.version))
-                sqlite3_bind_int64(stmt, 5, Int64(record.descriptor.embeddingDimension))
-                let plaintext = MLFloat16Codec.encodeLittleEndian(record.vector)
-                let ciphertext: Data
-                do {
-                    ciphertext = try cipher.seal(
-                        plaintext,
-                        context: MLVectorCipherContext(uid: record.uid, descriptor: record.descriptor)
-                    )
-                } catch {
-                    failed += 1
-                    continue
-                }
-                guard SQLiteBinding.blob(stmt, 7, ciphertext) == SQLITE_OK else {
-                    failed += 1
-                    continue
-                }
-                if let captureTime = record.captureTime {
-                    sqlite3_bind_double(stmt, 8, captureTime.timeIntervalSince1970)
-                } else {
-                    sqlite3_bind_null(stmt, 8)
-                }
-                sqlite3_bind_double(stmt, 9, record.timestamp.timeIntervalSince1970)
-
-                if sqlite3_step(stmt) == SQLITE_DONE {
-                    // OR IGNORE: 0 changes means the unique key already existed (first write wins).
-                    if sqlite3_changes(db) > 0 {
-                        indexed += 1
-                        changedDescriptors.insert(record.descriptor)
-                    } else {
-                        skipped += 1
+                for record in records {
+                    guard record.isDimensionConsistent else {
+                        rejected += 1
+                        continue
                     }
-                    sqlite3_reset(clearFailureStmt)
-                    sqlite3_clear_bindings(clearFailureStmt)
-                    sqlite3_bind_int64(clearFailureStmt, 2, Int64(record.descriptor.version))
-                    guard bindText(clearFailureStmt, 1, record.descriptor.identifier),
-                        bindUID(clearFailureStmt, 3, record.uid),
-                        sqlite3_step(clearFailureStmt) == SQLITE_DONE
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    // A failed bind leaves its parameter NULL, and OR IGNORE would skip that row as already indexed
+                    // (#1194).
+                    guard bindUID(stmt, 1, record.uid), bindText(stmt, 3, record.descriptor.identifier),
+                        bindText(stmt, 6, Self.precision.rawValue)
                     else {
-                        transactionFailed = true
-                        break
+                        failed += 1
+                        continue
                     }
-                } else {
-                    failed += 1
+                    sqlite3_bind_int64(stmt, 4, Int64(record.descriptor.version))
+                    sqlite3_bind_int64(stmt, 5, Int64(record.descriptor.embeddingDimension))
+                    let plaintext = MLFloat16Codec.encodeLittleEndian(record.vector)
+                    let ciphertext: Data
+                    do {
+                        ciphertext = try cipher.seal(
+                            plaintext,
+                            context: MLVectorCipherContext(uid: record.uid, descriptor: record.descriptor)
+                        )
+                    } catch {
+                        failed += 1
+                        continue
+                    }
+                    guard SQLiteBinding.blob(stmt, 7, ciphertext) == SQLITE_OK else {
+                        failed += 1
+                        continue
+                    }
+                    if let captureTime = record.captureTime {
+                        sqlite3_bind_double(stmt, 8, captureTime.timeIntervalSince1970)
+                    } else {
+                        sqlite3_bind_null(stmt, 8)
+                    }
+                    sqlite3_bind_double(stmt, 9, record.timestamp.timeIntervalSince1970)
+
+                    if sqlite3_step(stmt) == SQLITE_DONE {
+                        // OR IGNORE: 0 changes means the unique key already existed (first write wins).
+                        if sqlite3_changes(db) > 0 {
+                            indexed += 1
+                            changedDescriptors.insert(record.descriptor)
+                        } else {
+                            skipped += 1
+                        }
+                        sqlite3_reset(clearFailureStmt)
+                        sqlite3_clear_bindings(clearFailureStmt)
+                        sqlite3_bind_int64(clearFailureStmt, 2, Int64(record.descriptor.version))
+                        guard bindText(clearFailureStmt, 1, record.descriptor.identifier),
+                            bindUID(clearFailureStmt, 3, record.uid),
+                            sqlite3_step(clearFailureStmt) == SQLITE_DONE
+                        else { return false }
+                    } else {
+                        failed += 1
+                    }
                 }
-            }
-            if !transactionFailed {
                 for descriptor in changedDescriptors where !bumpGenerationLocked(for: descriptor) {
-                    transactionFailed = true
-                    break
+                    return false
                 }
+                return true
             }
-            if transactionFailed || sqlite3_exec(db, "COMMIT;", nil, nil, nil) != SQLITE_OK {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            if !committed {
                 indexed = 0
                 skipped = 0
                 failed = records.count - rejected
@@ -182,48 +175,37 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     @discardableResult
     public func removeAll(for descriptor: MLModelDescriptor) -> Bool {
         lock.withLock {
-            guard db != nil,
-                sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
-            else { return false }
-
+            guard db != nil else { return false }
             var embeddings: OpaquePointer?
             var failures: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM ml_embeddings WHERE model_identifier=? AND model_version=?;",
-                    -1, &embeddings, nil
-                ) == SQLITE_OK,
-                sqlite3_prepare_v2(
-                    db,
-                    "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=?;",
-                    -1, &failures, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_finalize(embeddings)
-                sqlite3_finalize(failures)
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
+            // The statements end after the transaction. After a failed prepare they end after the rollback; they
+            // had not run. One that did not prepare finalizes as a no-op.
             defer {
                 sqlite3_finalize(embeddings)
                 sqlite3_finalize(failures)
             }
+            return SQLiteTransaction.immediate(db) {
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        "DELETE FROM ml_embeddings WHERE model_identifier=? AND model_version=?;",
+                        -1, &embeddings, nil
+                    ) == SQLITE_OK,
+                    sqlite3_prepare_v2(
+                        db,
+                        "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=?;",
+                        -1, &failures, nil
+                    ) == SQLITE_OK
+                else { return false }
 
-            guard bindDescriptor(embeddings, descriptor), sqlite3_step(embeddings) == SQLITE_DONE else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
-            let removedEmbeddings = sqlite3_changes(db)
+                guard bindDescriptor(embeddings, descriptor), sqlite3_step(embeddings) == SQLITE_DONE else {
+                    return false
+                }
+                let removedEmbeddings = sqlite3_changes(db)
 
-            guard bindDescriptor(failures, descriptor), sqlite3_step(failures) == SQLITE_DONE,
-                removedEmbeddings == 0 || bumpGenerationLocked(for: descriptor),
-                sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
+                return bindDescriptor(failures, descriptor) && sqlite3_step(failures) == SQLITE_DONE
+                    && (removedEmbeddings == 0 || bumpGenerationLocked(for: descriptor))
             }
-            return true
         }
     }
 
@@ -652,28 +634,22 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     ) -> Bool {
         let uniqueUIDs = Array(Set(uids))
         guard !uniqueUIDs.isEmpty else { return true }
-        guard db != nil, sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else {
-            return false
+        guard db != nil else { return false }
+        return SQLiteTransaction.immediate(db) {
+            guard
+                let removedEmbeddings = deleteUIDRowsLocked(
+                    uniqueUIDs,
+                    table: "ml_embeddings",
+                    descriptor: descriptor
+                ),
+                deleteUIDRowsLocked(
+                    uniqueUIDs,
+                    table: "ml_failures",
+                    descriptor: descriptor
+                ) != nil
+            else { return false }
+            return removedEmbeddings == 0 || bumpGenerationLocked(for: descriptor)
         }
-
-        guard
-            let removedEmbeddings = deleteUIDRowsLocked(
-                uniqueUIDs,
-                table: "ml_embeddings",
-                descriptor: descriptor
-            ),
-            deleteUIDRowsLocked(
-                uniqueUIDs,
-                table: "ml_failures",
-                descriptor: descriptor
-            ) != nil,
-            removedEmbeddings == 0 || bumpGenerationLocked(for: descriptor),
-            sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
-        else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return false
-        }
-        return true
     }
 
     /// Deletes UID rows in bounded chunks. Only fixed internal table names are accepted.
@@ -736,37 +712,28 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     }
 
     private func deleteInvalidRowsLocked(_ uids: Set<PhotoUID>, descriptor: MLModelDescriptor) {
-        guard !uids.isEmpty,
-            sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK
-        else { return }
+        guard !uids.isEmpty else { return }
         var stmt: OpaquePointer?
-        guard
-            sqlite3_prepare_v2(
-                db,
-                "DELETE FROM ml_embeddings WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?;",
-                -1, &stmt, nil
-            ) == SQLITE_OK
-        else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return
-        }
+        // The statement ends after the transaction; one that did not prepare finalizes as a no-op.
         defer { sqlite3_finalize(stmt) }
-
-        var deleted = false
-        for uid in uids {
-            sqlite3_reset(stmt)
-            sqlite3_clear_bindings(stmt)
-            guard bindDescriptor(stmt, descriptor), bindUID(stmt, 3, uid), sqlite3_step(stmt) == SQLITE_DONE else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return
+        _ = SQLiteTransaction.immediate(db) {
+            guard
+                sqlite3_prepare_v2(
+                    db,
+                    "DELETE FROM ml_embeddings WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?;",
+                    -1, &stmt, nil
+                ) == SQLITE_OK
+            else { return false }
+            var deleted = false
+            for uid in uids {
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                guard bindDescriptor(stmt, descriptor), bindUID(stmt, 3, uid), sqlite3_step(stmt) == SQLITE_DONE else {
+                    return false
+                }
+                deleted = deleted || sqlite3_changes(db) > 0
             }
-            deleted = deleted || sqlite3_changes(db) > 0
-        }
-        guard !deleted || bumpGenerationLocked(for: descriptor),
-            sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
-        else {
-            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-            return
+            return !deleted || bumpGenerationLocked(for: descriptor)
         }
     }
 

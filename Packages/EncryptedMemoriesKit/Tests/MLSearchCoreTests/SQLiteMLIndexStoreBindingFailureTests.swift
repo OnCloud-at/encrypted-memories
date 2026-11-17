@@ -92,6 +92,32 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         assertFailedBeforeStep(fault)
     }
 
+    /// A record whose key does not bind fails alone: the batch goes on and stores the next record. The fault ends when
+    /// the first insert steps, so only the first record of the batch fails to bind.
+    func testUpsertWithAKeyThatDoesNotBindFailsOnlyThatRecord() throws {
+        let fault = try failBinds(of: "INSERT OR IGNORE INTO ml_embeddings")
+        defer { fault.remove() }
+        let report = store.upsert([record(longUID, descriptor), record(shortUID, descriptor)])
+        XCTAssertEqual(report.indexed, 1)
+        XCTAssertEqual(report.transientFailure, 1)
+        fault.remove()
+        XCTAssertEqual(try store.indexedUIDs(for: descriptor, from: [shortUID, longUID]), [shortUID])
+    }
+
+    /// A record whose vector does not bind fails alone, like a record whose key does not bind.
+    func testUpsertWithAVectorThatDoesNotBindFailsOnlyThatRecord() throws {
+        let wide = MLModelDescriptor(identifier: "fixture-model", version: 1, embeddingDimension: 256)
+        let wideUID = PhotoUID(volumeID: "volume", nodeID: "wide")
+        let fault = try failBinds(of: "INSERT OR IGNORE INTO ml_embeddings")
+        defer { fault.remove() }
+        let report = store.upsert([record(wideUID, wide), record(shortUID, descriptor)])
+        XCTAssertEqual(report.indexed, 1)
+        XCTAssertEqual(report.transientFailure, 1)
+        fault.remove()
+        XCTAssertEqual(try store.indexedUIDs(for: descriptor, from: [shortUID]), [shortUID])
+        XCTAssertEqual(try store.indexedUIDs(for: wide, from: [wideUID]), [])
+    }
+
     func testUpsertWithAKeyThatDoesNotBindInTheFailureClearFailsTheBatch() throws {
         XCTAssertTrue(store.recordFailures([failure(longUID)]))
         let fault = try failBinds(

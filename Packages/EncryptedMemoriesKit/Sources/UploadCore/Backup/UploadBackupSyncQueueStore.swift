@@ -142,8 +142,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                        state IN (\(Self.upsertReplaceableStateList)), state, last_error
                                 FROM backup_sync_queue
                                 WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
-                                """, -1, &prior, nil) == SQLITE_OK),
-                        requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                                """, -1, &prior, nil) == SQLITE_OK)
                     else {
                         sqlite3_finalize(write)
                         sqlite3_finalize(prior)
@@ -155,58 +154,50 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     }
 
                     var enqueued = false
-                    var didPersist = true
-                    for entry in entries {
-                        sqlite3_reset(prior)
-                        sqlite3_clear_bindings(prior)
-                        // A failed bind is recorded on the connection; the batch rolls back (#1194).
-                        guard connection.bindUploadSource(entry.source, to: prior, from: 1) else {
-                            didPersist = false
-                            break
-                        }
-                        sqlite3_bind_int64(prior, 4, entry.revision.rawValue)
-                        let result = sqlite3_step(prior)
-                        if result == SQLITE_ROW {
-                            let priorState = columnText(prior, 3).flatMap(UploadBackupSyncQueueState.init(rawValue:))
-                            if let priorState,
-                                UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
-                                    sourceKind: entry.source.kind, state: priorState, lastError: columnText(prior, 4))
-                            {
-                                sqlite3_reset(prior)
-                                continue
+                    let committed = connection.immediateTransaction {
+                        for entry in entries {
+                            sqlite3_reset(prior)
+                            sqlite3_clear_bindings(prior)
+                            // A failed bind is recorded on the connection; the batch rolls back (#1194).
+                            guard connection.bindUploadSource(entry.source, to: prior, from: 1) else { return false }
+                            sqlite3_bind_int64(prior, 4, entry.revision.rawValue)
+                            let result = sqlite3_step(prior)
+                            if result == SQLITE_ROW {
+                                let priorState = columnText(prior, 3).flatMap(
+                                    UploadBackupSyncQueueState.init(rawValue:))
+                                if let priorState,
+                                    UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
+                                        sourceKind: entry.source.kind, state: priorState,
+                                        lastError: columnText(prior, 4))
+                                {
+                                    sqlite3_reset(prior)
+                                    continue
+                                }
+                                if Self.runnableStates.contains(entry.state.rawValue) {
+                                    let wasRunnable = sqlite3_column_int(prior, 0) != 0
+                                    let wasReplaceable = sqlite3_column_int(prior, 2) != 0
+                                    let becomesEarlier =
+                                        entry.updatedAt.timeIntervalSince1970 < sqlite3_column_double(prior, 1)
+                                    enqueued = enqueued || (wasReplaceable && (!wasRunnable || becomesEarlier))
+                                }
+                            } else if result == SQLITE_DONE {
+                                enqueued = enqueued || Self.runnableStates.contains(entry.state.rawValue)
+                            } else {
+                                // The step just failed, so its extended code is fresh. Record it even when an earlier
+                                // transient failure is already recorded: a lasting code must not be dropped by it (#1004).
+                                markFailedWithFreshStepCode()
+                                return false
                             }
-                            if Self.runnableStates.contains(entry.state.rawValue) {
-                                let wasRunnable = sqlite3_column_int(prior, 0) != 0
-                                let wasReplaceable = sqlite3_column_int(prior, 2) != 0
-                                let becomesEarlier =
-                                    entry.updatedAt.timeIntervalSince1970 < sqlite3_column_double(prior, 1)
-                                enqueued = enqueued || (wasReplaceable && (!wasRunnable || becomesEarlier))
-                            }
-                        } else if result == SQLITE_DONE {
-                            enqueued = enqueued || Self.runnableStates.contains(entry.state.rawValue)
-                        } else {
-                            // The step just failed, so its extended code is fresh. Record it even when an earlier
-                            // transient failure is already recorded: a lasting code must not be dropped by it (#1004).
-                            markFailedWithFreshStepCode()
-                            didPersist = false
-                            break
+                            sqlite3_reset(prior)
+                            sqlite3_reset(write)
+                            sqlite3_clear_bindings(write)
+                            guard (try? bind(entry, to: write)) != nil,
+                                requireOperational(sqlite3_step(write) == SQLITE_DONE)
+                            else { return false }
                         }
-                        sqlite3_reset(prior)
-                        sqlite3_reset(write)
-                        sqlite3_clear_bindings(write)
-                        guard (try? bind(entry, to: write)) != nil,
-                            requireOperational(sqlite3_step(write) == SQLITE_DONE)
-                        else {
-                            didPersist = false
-                            break
-                        }
+                        return true
                     }
-                    guard didPersist,
-                        requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
-                    else {
-                        connection.rollBack()
-                        return nil
-                    }
+                    guard committed else { return nil }
                     return UploadBackupSyncQueueChange(sources: entries.map(\.source), enqueued: enqueued)
                 } ?? nil
             if change == nil { markFailedOnceUnrecorded() }
@@ -406,111 +397,94 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         let clampedLimit = max(1, limit)
         let exclusion = SourceExclusion(excludedSources)
         return connection.withLock {
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
-                return nil
-            }
-            var selected: [UploadBackupSyncQueueEntry] = []
-            var selectStmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        SELECT \(Self.entryColumns)
-                        FROM backup_sync_queue
-                        WHERE state IN (\(Self.runnableStateList))
-                          AND updated_at <= ?\(exclusion.clause)
-                        ORDER BY revision_us DESC, updated_at ASC
-                        LIMIT ?;
-                        """,
-                        -1, &selectStmt, nil
-                    ) == SQLITE_OK)
-            else {
-                connection.rollBack()
-                return nil
-            }
-            sqlite3_bind_double(selectStmt, 1, claimedAt.timeIntervalSince1970)
-            // An exclusion that does not bind must not hide every row of its kind (#1194).
-            guard let limitParameter = try? bind(exclusion, to: selectStmt, from: 2) else {
-                sqlite3_finalize(selectStmt)
-                connection.rollBack()
-                return nil
-            }
-            sqlite3_bind_int(selectStmt, limitParameter, Int32(clamping: clampedLimit))
-            var selectResult = sqlite3_step(selectStmt)
-            while selectResult == SQLITE_ROW {
-                guard let source = sourceFromColumns(selectStmt, kindColumn: 0, idColumn: 1, resourceColumn: 2) else {
-                    connection.markFailed()
-                    sqlite3_finalize(selectStmt)
-                    connection.rollBack()
-                    return nil
-                }
-                let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(selectStmt, 3))
-                guard let entry = row(selectStmt, source: source, revision: revision, offset: 4) else {
-                    sqlite3_finalize(selectStmt)
-                    connection.rollBack()
-                    return nil
-                }
-                selected.append(entry)
-                selectResult = sqlite3_step(selectStmt)
-            }
-            sqlite3_finalize(selectStmt)
-            guard requireOperational(selectResult == SQLITE_DONE) else {
-                connection.rollBack()
-                return nil
-            }
-
-            guard !selected.isEmpty else {
-                guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-                    connection.rollBack()
-                    return nil
-                }
-                return []
-            }
-
-            var updateStmt: OpaquePointer?
-            guard
-                requireOperational(
-                    sqlite3_prepare_v2(
-                        db,
-                        """
-                        UPDATE backup_sync_queue
-                        SET state='checking', updated_at=?
-                        WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
-                          AND state IN (\(Self.runnableStateList));
-                        """,
-                        -1, &updateStmt, nil
-                    ) == SQLITE_OK)
-            else {
-                connection.rollBack()
-                return nil
-            }
-            defer { sqlite3_finalize(updateStmt) }
-
             var claimed: [UploadBackupSyncQueueEntry] = []
-            for entry in selected {
-                sqlite3_reset(updateStmt)
-                sqlite3_clear_bindings(updateStmt)
-                sqlite3_bind_double(updateStmt, 1, claimedAt.timeIntervalSince1970)
-                guard connection.bindUploadSource(entry.source, to: updateStmt, from: 2) else {
-                    connection.rollBack()
-                    return nil
-                }
-                sqlite3_bind_int64(updateStmt, 5, entry.revision.rawValue)
-                guard requireOperational(sqlite3_step(updateStmt) == SQLITE_DONE),
-                    requireOperational(sqlite3_changes(db) > 0)
+            var updateStmt: OpaquePointer?
+            // The update statement ends after the transaction, as before.
+            defer { sqlite3_finalize(updateStmt) }
+            let committed = connection.immediateTransaction {
+                var selected: [UploadBackupSyncQueueEntry] = []
+                var selectStmt: OpaquePointer?
+                guard
+                    requireOperational(
+                        sqlite3_prepare_v2(
+                            db,
+                            """
+                            SELECT \(Self.entryColumns)
+                            FROM backup_sync_queue
+                            WHERE state IN (\(Self.runnableStateList))
+                              AND updated_at <= ?\(exclusion.clause)
+                            ORDER BY revision_us DESC, updated_at ASC
+                            LIMIT ?;
+                            """,
+                            -1, &selectStmt, nil
+                        ) == SQLITE_OK)
                 else {
-                    connection.rollBack()
-                    return nil
+                    return false
                 }
-                claimed.append(entry)
-            }
+                sqlite3_bind_double(selectStmt, 1, claimedAt.timeIntervalSince1970)
+                // An exclusion that does not bind must not hide every row of its kind (#1194).
+                guard let limitParameter = try? bind(exclusion, to: selectStmt, from: 2) else {
+                    sqlite3_finalize(selectStmt)
+                    return false
+                }
+                sqlite3_bind_int(selectStmt, limitParameter, Int32(clamping: clampedLimit))
+                var selectResult = sqlite3_step(selectStmt)
+                while selectResult == SQLITE_ROW {
+                    guard let source = sourceFromColumns(selectStmt, kindColumn: 0, idColumn: 1, resourceColumn: 2)
+                    else {
+                        connection.markFailed()
+                        sqlite3_finalize(selectStmt)
+                        return false
+                    }
+                    let revision = UploadBackupRevision(rawValue: sqlite3_column_int64(selectStmt, 3))
+                    guard let entry = row(selectStmt, source: source, revision: revision, offset: 4) else {
+                        sqlite3_finalize(selectStmt)
+                        return false
+                    }
+                    selected.append(entry)
+                    selectResult = sqlite3_step(selectStmt)
+                }
+                sqlite3_finalize(selectStmt)
+                guard requireOperational(selectResult == SQLITE_DONE) else {
+                    return false
+                }
 
-            guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-                connection.rollBack()
-                return nil
+                guard !selected.isEmpty else { return true }
+
+                guard
+                    requireOperational(
+                        sqlite3_prepare_v2(
+                            db,
+                            """
+                            UPDATE backup_sync_queue
+                            SET state='checking', updated_at=?
+                            WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
+                              AND state IN (\(Self.runnableStateList));
+                            """,
+                            -1, &updateStmt, nil
+                        ) == SQLITE_OK)
+                else {
+                    return false
+                }
+                for entry in selected {
+                    sqlite3_reset(updateStmt)
+                    sqlite3_clear_bindings(updateStmt)
+                    sqlite3_bind_double(updateStmt, 1, claimedAt.timeIntervalSince1970)
+                    guard connection.bindUploadSource(entry.source, to: updateStmt, from: 2) else {
+                        return false
+                    }
+                    sqlite3_bind_int64(updateStmt, 5, entry.revision.rawValue)
+                    guard requireOperational(sqlite3_step(updateStmt) == SQLITE_DONE),
+                        requireOperational(sqlite3_changes(db) > 0)
+                    else {
+                        return false
+                    }
+                    claimed.append(entry)
+                }
+
+                return true
             }
-            return claimed
+            return committed ? claimed : nil
         }
     }
 
@@ -839,44 +813,38 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         connection.withLock {
             let changed =
                 withDurableCommitsRecordingSetup { () -> Int? in
-                    guard
-                        requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
-                    else {
-                        return nil
+                    var count = 0
+                    let committed = connection.immediateTransaction {
+                        guard let markers = dismissedSourceRecheckRowIDsLocked() else { return false }
+                        let exclusion =
+                            markers.isEmpty
+                            ? "" : "AND rowid NOT IN (\(markers.map(String.init).joined(separator: ",")))"
+                        var stmt: OpaquePointer?
+                        guard
+                            requireOperational(
+                                sqlite3_prepare_v2(
+                                    db,
+                                    """
+                                    UPDATE backup_sync_queue SET
+                                      state = CASE
+                                        WHEN state IN ('failed', 'blockedByDraft') THEN 'discovered'
+                                        ELSE state
+                                      END,
+                                      attempts = CASE WHEN state = 'failed' THEN 0 ELSE attempts END,
+                                      updated_at = ?
+                                    WHERE state IN (
+                                      'failed', 'blockedByDraft', 'discovered', 'queuedForUpload',
+                                      'needsRemoteReconciliation'
+                                    ) \(exclusion);
+                                    """, -1, &stmt, nil) == SQLITE_OK)
+                        else { return false }
+                        defer { sqlite3_finalize(stmt) }
+                        sqlite3_bind_double(stmt, 1, updatedAt.timeIntervalSince1970)
+                        guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return false }
+                        count = Int(sqlite3_changes(db))
+                        return true
                     }
-                    var committed = false
-                    defer { if !committed { connection.rollBack() } }
-                    guard let markers = dismissedSourceRecheckRowIDsLocked() else { return nil }
-                    let exclusion =
-                        markers.isEmpty ? "" : "AND rowid NOT IN (\(markers.map(String.init).joined(separator: ",")))"
-                    var stmt: OpaquePointer?
-                    guard
-                        requireOperational(
-                            sqlite3_prepare_v2(
-                                db,
-                                """
-                                UPDATE backup_sync_queue SET
-                                  state = CASE
-                                    WHEN state IN ('failed', 'blockedByDraft') THEN 'discovered'
-                                    ELSE state
-                                  END,
-                                  attempts = CASE WHEN state = 'failed' THEN 0 ELSE attempts END,
-                                  updated_at = ?
-                                WHERE state IN (
-                                  'failed', 'blockedByDraft', 'discovered', 'queuedForUpload',
-                                  'needsRemoteReconciliation'
-                                ) \(exclusion);
-                                """, -1, &stmt, nil) == SQLITE_OK)
-                    else { return nil }
-                    defer { sqlite3_finalize(stmt) }
-                    sqlite3_bind_double(stmt, 1, updatedAt.timeIntervalSince1970)
-                    guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
-                    let count = Int(sqlite3_changes(db))
-                    guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-                        return nil
-                    }
-                    committed = true
-                    return count
+                    return committed ? count : nil
                 } ?? nil
             if changed == nil { markFailedOnceUnrecorded() }
             return changed ?? 0
@@ -954,29 +922,23 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             guard requireOperational(sqlite3_prepare_v2(db, Self.updateStateSQL, -1, &stmt, nil) == SQLITE_OK)
             else { return false }
             defer { sqlite3_finalize(stmt) }
-            guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK) else {
-                return false
-            }
-            for update in updates {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                guard
-                    (try? bindStateUpdate(
-                        stmt, source: source, revision: update.revision, state: update.state, attempts: nil,
-                        lastError: update.lastError, updatedAt: updatedAt)) != nil,
-                    requireOperational(sqlite3_step(stmt) == SQLITE_DONE), sqlite3_changes(db) == 1
-                else {
+            return connection.immediateTransaction {
+                for update in updates {
                     sqlite3_reset(stmt)
-                    connection.rollBack()
-                    return false
+                    sqlite3_clear_bindings(stmt)
+                    guard
+                        (try? bindStateUpdate(
+                            stmt, source: source, revision: update.revision, state: update.state, attempts: nil,
+                            lastError: update.lastError, updatedAt: updatedAt)) != nil,
+                        requireOperational(sqlite3_step(stmt) == SQLITE_DONE), sqlite3_changes(db) == 1
+                    else {
+                        sqlite3_reset(stmt)
+                        return false
+                    }
                 }
+                sqlite3_reset(stmt)
+                return true
             }
-            sqlite3_reset(stmt)
-            guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-                connection.rollBack()
-                return false
-            }
-            return true
         }
     }
 
@@ -1119,54 +1081,47 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return connection.withLock {
             let changed =
                 withDurableCommitsRecordingSetup { () -> Set<UploadSourceIdentity>? in
-                    guard
-                        requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
-                    else {
-                        return nil
-                    }
-                    var committed = false
-                    defer { if !committed { connection.rollBack() } }
                     var changed: Set<UploadSourceIdentity> = []
-                    for cleanup in scopes {
-                        let scope = """
-                            source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
-                            AND remote_commit_reconciliation IS NULL
-                            """
-                        let bindScope: (OpaquePointer?) throws -> Void = { stmt in
-                            guard self.connection.bindUploadSource(cleanup.source, to: stmt, from: 1) else {
-                                throw SQLiteStoreUnknownReadError()
+                    let committed = connection.immediateTransaction {
+                        for cleanup in scopes {
+                            let scope = """
+                                source_kind=? AND source_id=? AND resource=? AND revision_us<=? AND revision_us<>?
+                                AND remote_commit_reconciliation IS NULL
+                                """
+                            let bindScope: (OpaquePointer?) throws -> Void = { stmt in
+                                guard self.connection.bindUploadSource(cleanup.source, to: stmt, from: 1) else {
+                                    throw SQLiteStoreUnknownReadError()
+                                }
+                                sqlite3_bind_int64(stmt, 4, cleanup.through.rawValue)
+                                sqlite3_bind_int64(stmt, 5, cleanup.kept.rawValue)
                             }
-                            sqlite3_bind_int64(stmt, 4, cleanup.through.rawValue)
-                            sqlite3_bind_int64(stmt, 5, cleanup.kept.rawValue)
+                            guard
+                                let markers = dismissedSourceRecheckRowIDsLocked(matching: scope, bindScope: bindScope)
+                            else {
+                                return false
+                            }
+                            let markerMatch =
+                                markers.isEmpty ? "0" : "rowid IN (\(markers.map(String.init).joined(separator: ",")))"
+                            var stmt: OpaquePointer?
+                            guard
+                                requireOperational(
+                                    sqlite3_prepare_v2(
+                                        db,
+                                        """
+                                        DELETE FROM backup_sync_queue WHERE \(scope)
+                                          AND (state IN ('skippedRemoteDeletion','sourceMissing','failedPermanent','dismissedFailure')
+                                               OR \(markerMatch));
+                                        """, -1, &stmt, nil) == SQLITE_OK)
+                            else { return false }
+                            defer { sqlite3_finalize(stmt) }
+                            guard (try? bindScope(stmt)) != nil,
+                                requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+                            else { return false }
+                            if sqlite3_changes(db) > 0 { changed.insert(cleanup.source) }
                         }
-                        guard let markers = dismissedSourceRecheckRowIDsLocked(matching: scope, bindScope: bindScope)
-                        else {
-                            return nil
-                        }
-                        let markerMatch =
-                            markers.isEmpty ? "0" : "rowid IN (\(markers.map(String.init).joined(separator: ",")))"
-                        var stmt: OpaquePointer?
-                        guard
-                            requireOperational(
-                                sqlite3_prepare_v2(
-                                    db,
-                                    """
-                                    DELETE FROM backup_sync_queue WHERE \(scope)
-                                      AND (state IN ('skippedRemoteDeletion','sourceMissing','failedPermanent','dismissedFailure')
-                                           OR \(markerMatch));
-                                    """, -1, &stmt, nil) == SQLITE_OK)
-                        else { return nil }
-                        defer { sqlite3_finalize(stmt) }
-                        guard (try? bindScope(stmt)) != nil,
-                            requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
-                        else { return nil }
-                        if sqlite3_changes(db) > 0 { changed.insert(cleanup.source) }
+                        return true
                     }
-                    guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-                        return nil
-                    }
-                    committed = true
-                    return changed
+                    return committed ? changed : nil
                 } ?? nil
             if changed == nil { markFailedOnceUnrecorded() }
             return changed
@@ -1185,8 +1140,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         db,
                         "DELETE FROM backup_sync_queue WHERE source_kind=? AND source_id=?;",
                         -1, &stmt, nil
-                    ) == SQLITE_OK),
-                requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                    ) == SQLITE_OK)
             else {
                 sqlite3_finalize(stmt)
                 return 0
@@ -1194,23 +1148,19 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             defer { sqlite3_finalize(stmt) }
 
             var removed = 0
-            for identifier in identifiers {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                guard (try? connection.bindText(stmt, 1, kind.rawValue)) != nil,
-                    (try? connection.bindText(stmt, 2, identifier)) != nil,
-                    requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
-                else {
-                    connection.rollBack()
-                    return 0
+            let committed = connection.immediateTransaction {
+                for identifier in identifiers {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    guard (try? connection.bindText(stmt, 1, kind.rawValue)) != nil,
+                        (try? connection.bindText(stmt, 2, identifier)) != nil,
+                        requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+                    else { return false }
+                    removed += Int(sqlite3_changes(db))
                 }
-                removed += Int(sqlite3_changes(db))
+                return true
             }
-            guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-                connection.rollBack()
-                return 0
-            }
-            return removed
+            return committed ? removed : 0
         }
     }
 
@@ -1475,33 +1425,27 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                 ) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (
                                     SELECT 1 FROM backup_sync_queue WHERE source_kind=? AND source_id=?
                                 );
-                                """, -1, &stmt, nil) == SQLITE_OK),
-                        requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
+                                """, -1, &stmt, nil) == SQLITE_OK)
                     else {
                         sqlite3_finalize(stmt)
                         return false
                     }
                     defer { sqlite3_finalize(stmt) }
-                    for entry in entries {
-                        sqlite3_reset(stmt)
-                        sqlite3_clear_bindings(stmt)
-                        guard (try? bind(entry, to: stmt)) != nil,
-                            (try? connection.bindText(stmt, 12, entry.source.kind.rawValue)) != nil,
-                            (try? connection.bindText(stmt, 13, entry.source.identifier)) != nil,
-                            requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
-                        else {
-                            connection.rollBack()
-                            return false
+                    return connection.immediateTransaction {
+                        for entry in entries {
+                            sqlite3_reset(stmt)
+                            sqlite3_clear_bindings(stmt)
+                            guard (try? bind(entry, to: stmt)) != nil,
+                                (try? connection.bindText(stmt, 12, entry.source.kind.rawValue)) != nil,
+                                (try? connection.bindText(stmt, 13, entry.source.identifier)) != nil,
+                                requireOperational(sqlite3_step(stmt) == SQLITE_DONE)
+                            else { return false }
+                            if sqlite3_changes(db) > 0, Self.runnableStates.contains(entry.state.rawValue) {
+                                enqueued = true
+                            }
                         }
-                        if sqlite3_changes(db) > 0, Self.runnableStates.contains(entry.state.rawValue) {
-                            enqueued = true
-                        }
+                        return true
                     }
-                    guard requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK) else {
-                        connection.rollBack()
-                        return false
-                    }
-                    return true
                 }
             if committed == nil { markFailedOnceUnrecorded() }
             let result = committed ?? false
@@ -1516,24 +1460,16 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         let result = connection.withLock { () -> Bool in
             let committed =
                 withDurableCommitsRecordingSetup { () -> Bool in
-                    guard requireOperational(sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK)
-                    else {
-                        return false
+                    connection.immediateTransaction {
+                        removeLocked(source: source, revision: revision)
+                            && requireOperational(
+                                sqlite3_exec(
+                                    db,
+                                    """
+                                    INSERT INTO backup_sync_queue_info(key, value) VALUES('missing_source_discard_generation', 1)
+                                    ON CONFLICT(key) DO UPDATE SET value=value+1;
+                                    """, nil, nil, nil) == SQLITE_OK)
                     }
-                    guard removeLocked(source: source, revision: revision),
-                        requireOperational(
-                            sqlite3_exec(
-                                db,
-                                """
-                                INSERT INTO backup_sync_queue_info(key, value) VALUES('missing_source_discard_generation', 1)
-                                ON CONFLICT(key) DO UPDATE SET value=value+1;
-                                """, nil, nil, nil) == SQLITE_OK),
-                        requireOperational(sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK)
-                    else {
-                        connection.rollBack()
-                        return false
-                    }
-                    return true
                 }
             // A body result of false can mean an absent discard, which is not a failure; only a wrapper that could not
             // run records a failure (#1004).
