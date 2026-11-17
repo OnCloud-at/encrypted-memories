@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 public enum UploadBackupSyncQueueState: String, Sendable, Codable, CaseIterable {
     case discovered
@@ -276,7 +277,9 @@ public protocol UploadBackupSyncQueueStore: Sendable {
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
     ) -> Bool?
     /// Reads one row. Throws `SQLiteStoreUnknownReadError` when the read could not run, so callers never mistake a
-    /// failed read for a real absence (#1004).
+    /// failed read for a real absence (#1004). A conformer throws no other error from it.
+    /// A throwing optional is easy to collapse with `try?`, so a decision reads `decisionEntry(for:revision:)` instead.
+    /// This method stays only for the callers that have not moved yet (#1153) and is removed once the last one does.
     func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry?
     /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
@@ -386,6 +389,22 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 }
 
 public extension UploadBackupSyncQueueStore {
+    /// The keyed read for a decision: found, absent, or unknown. A read that failed (`SQLiteStoreUnknownReadError`) is
+    /// unknown and never proves the row absent. Any other error propagates unchanged, also a cancellation.
+    /// It adds no collapse of its own: it answers from the strict `entry(for:revision:)` of the store, and a failed
+    /// strict read is unknown. It is an extension method, so it dispatches statically: a concrete store must not
+    /// declare its own `decisionEntry`.
+    func decisionEntry(
+        for source: UploadSourceIdentity, revision: UploadBackupRevision
+    ) throws -> StoreLookup<UploadBackupSyncQueueEntry> {
+        do {
+            guard let row = try entry(for: source, revision: revision) else { return .absent }
+            return .found(row)
+        } catch is SQLiteStoreUnknownReadError {
+            return .unknown
+        }
+    }
+
     @discardableResult
     func dismissPermanentFailure(
         source: UploadSourceIdentity,
@@ -394,7 +413,9 @@ public extension UploadBackupSyncQueueStore {
     ) -> Bool {
         // The dismissed row keeps its record: a missing photo needs it to be checked again when its bytes return. A
         // row that could not be read is not dismissed, so a failed read never writes an empty record (#1004 B2).
-        guard let current = (try? entry(for: source, revision: revision)) ?? nil else { return false }
+        let lookup: StoreLookup<UploadBackupSyncQueueEntry>
+        do { lookup = try decisionEntry(for: source, revision: revision) } catch { return false }
+        guard case .found(let current) = lookup else { return false }
         return updateState(
             source: source,
             revision: revision,

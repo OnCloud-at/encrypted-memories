@@ -21,10 +21,16 @@ public enum AlbumSyncRemoteProofLookup {
             else { continue }
             // An unread row is no admission, and no reason to skip the photo silently (#1004 B2).
             let row: UploadBackupSyncQueueEntry?
+            let lookup: StoreLookup<UploadBackupSyncQueueEntry>
             do {
-                row = try queue.entry(for: snapshot.source, revision: snapshot.revision)
+                lookup = try queue.decisionEntry(for: snapshot.source, revision: snapshot.revision)
             } catch {
                 throw AlbumSyncError.mappingStoreUnavailable
+            }
+            switch lookup {
+            case .found(let entry): row = entry
+            case .absent: row = nil
+            case .unknown: throw AlbumSyncError.mappingStoreUnavailable
             }
             guard queue.isOperational() else { throw AlbumSyncError.mappingStoreUnavailable }
             guard row?.state == .alreadyBackedUp else { continue }
