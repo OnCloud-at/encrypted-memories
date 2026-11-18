@@ -1,0 +1,43 @@
+// Host decision canary (#1157): what a host may do with an error or a store. The host rules must report nothing here.
+func allowed() {
+    do {
+        try work()
+    } catch is CancellationError {
+        return
+    } catch let error as URLError {
+        log(error)
+    } catch let error as Foundation.CocoaError {
+        log(error)
+    } catch {
+        // A comment may name a type: catch is AlbumError, catch UploadError.quota, error as? UploadError.
+        // It may also name a switch or a check: switch error, switch err, store.isOperational(), store.isReadable.
+        // A web address in a comment changes nothing: https://example.invalid, error as? AlbumError.
+        let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let code = (error as NSError).code
+        let cocoa = error as? CocoaError
+        let decoding = error as? DecodingError
+        let encoding = error as? EncodingError
+        let qualified = error as? Foundation.URLError
+        let anyQualified = error as? any Foundation.LocalizedError
+        show(text, code, cocoa, decoding, encoding, qualified, anyQualified)
+    }
+    // Display and routing code switches over values that are not errors, and over platform types.
+    switch route {
+    default: break
+    }
+    switch phase.state {
+    default: break
+    }
+    switch value {
+    case let decoding as DecodingError: show(decoding)
+    case is CancellationError: show(nil)
+    default: break
+    }
+    switch errorBadge.count {
+    default: break
+    }
+    let readable = FileManager.default.isReadableFile(atPath: path)
+    let flag = isOperationalToday
+    let loaded = isReadableCount
+    _ = (readable, flag, loaded)
+}

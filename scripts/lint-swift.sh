@@ -10,7 +10,9 @@ source "$ROOT/scripts/build-paths.sh"
 # Decision reads (#1148): `.swiftlint-decision-reads.yml` finds reads that turn a failure into absence. Each line of
 # the baseline allows `count` sites of `rule` in `file`, independent of line numbers.
 decision_baseline=".swiftlint-decision-reads-baseline"
-decision_rules="no_try_optional_in_store_lookup|no_try_optional_store_read_in_decision_code|no_default_for_store_read_in_decision_code"
+# The rule names are the two-space keys below `custom_rules:` of the configuration.
+rule_names() { sed -nE 's/^  ([a-z_]+):[[:space:]]*$/\1/p'; }
+decision_rules="$(rule_names < "$ROOT/.swiftlint-decision-reads.yml" | paste -sd '|' -)"
 decision_work="$(mktemp -d)"
 trap 'rm -rf "$decision_work"' EXIT
 # Prints the `count rule file` lines of a baseline read from stdin. Fails for a line that is not `count rule file`
@@ -52,7 +54,21 @@ if [[ "${1:-}" == "--diff" && $# -eq 3 ]]; then
     git show "$merge_base:$decision_baseline" | baseline_entries "$merge_base:$decision_baseline" \
       > "$decision_work/merge-base" || exit 1
     rule_totals "$decision_work/merge-base" > "$decision_work/merge-base-totals"
-    rule_totals "$decision_work/head" > "$decision_work/head-totals"
+    # A rule that the change itself adds has no allowance at the merge base: its first baseline lines are part of the
+    # change. A rule that exists there keeps its total as the limit, also when the total is zero.
+    git show "$merge_base:.swiftlint-decision-reads.yml" 2>/dev/null | rule_names > "$decision_work/merge-base-rules"
+    # A rule of the merge base must still exist at the head. Without this, a renamed rule would count as a new one and
+    # start with a baseline of any size.
+    git show "$3:.swiftlint-decision-reads.yml" 2>/dev/null | rule_names > "$decision_work/head-rules"
+    missing="$(awk 'FILENAME == ARGV[1] { head[$0] = 1; next } !($0 in head)' \
+      "$decision_work/head-rules" "$decision_work/merge-base-rules" | paste -sd ' ' -)"
+    if [[ -n "$missing" ]]; then
+      echo "A decision-read rule of the merge base is missing from the configuration: $missing" >&2
+      exit 1
+    fi
+    rule_totals "$decision_work/head" |
+      awk 'FILENAME == ARGV[1] { known[$0] = 1; next } $2 in known' "$decision_work/merge-base-rules" - \
+        > "$decision_work/head-totals"
     grown="$(counts_above "$decision_work/merge-base-totals" "$decision_work/head-totals")"
     if [[ -n "$grown" ]]; then
       echo "The decision-read baseline grew; the total of a rule can only shrink:" >&2
@@ -106,9 +122,20 @@ if [[ -n "$disabled" ]]; then
   printf '%s\n' "$disabled" >&2
   exit 1
 fi
+# SwiftLint matches the host rules against the absolute path of a file. The configuration names the root of the
+# checkout as HOST_ROOT, so that a directory called App above the checkout never turns core files into host files.
+# `DECISION_HOST_ROOT` names another root; the style check sets it for its canary files. `/private` covers the
+# symbolic link of the temporary directory on macOS.
+host_root="$(cd "${DECISION_HOST_ROOT:-$ROOT}" && pwd -P)"
+host_root_pattern="$(sed 's/[][\.*^$#+?(){}|]/\\&/g' <<< "${host_root#/private}")"
+# awk reads the root from the environment, because bash and `awk -v` would process the backslashes of the pattern.
+HOST_ROOT_PATTERN="(?:/private)?$host_root_pattern" awk '{
+  while ((at = index($0, "HOST_ROOT")) > 0) $0 = substr($0, 1, at - 1) ENVIRON["HOST_ROOT_PATTERN"] substr($0, at + 9)
+  print
+}' "$ROOT/.swiftlint-decision-reads.yml" > "$decision_work/.swiftlint-decision-reads.yml"
 decision_status=0
-decision_output="$("$swiftlint" lint --strict --config "$ROOT/.swiftlint-decision-reads.yml" "${source_files[@]}" 2>&1)" ||
-  decision_status=$?
+decision_output="$("$swiftlint" lint --strict --config "$decision_work/.swiftlint-decision-reads.yml" \
+  "${source_files[@]}" 2>&1)" || decision_status=$?
 # Without SourceKit, or when SourceKit fails, SwiftLint skips the comment rules and still succeeds. That would be a
 # check that does not run.
 if grep -qE "Skipping enabled rule|SourceKit-based rules will be skipped" <<< "$output"$'\n'"$decision_output"; then

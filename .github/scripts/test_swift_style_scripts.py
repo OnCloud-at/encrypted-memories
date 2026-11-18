@@ -1,4 +1,5 @@
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -102,6 +103,7 @@ exit {status}
         # `missed` drops that many expected sites; `extra` adds a site without an `expect` comment.
         body = f'''if [[ "$1" == "version" ]]; then echo 0.65.1; exit 0; fi
 for argument in "$@"; do
+  echo "$argument" >> "{self.dir}/linted-files"
   if [[ "$argument" == *StyleCanary.swift ]]; then {'echo "canary: no_em_dash_in_comments"; exit 2' if fires else 'exit 0'}; fi
   if [[ "$argument" == *DecisionReadCanary.swift ]]; then
     grep -n '// expect: ' "$argument" | tail -n +{missed + 1} | while IFS=: read -r line rest; do
@@ -125,6 +127,23 @@ echo "Done linting!"
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn('did not report exactly the decision reads', result.stderr)
                 self.assertIn('Canary Violation', result.stderr, 'the lint output explains the mismatch')
+
+    def test_the_style_check_lints_the_core_and_the_host_canary_files_below_their_own_trees(self):
+        swiftlint = self.canary_swiftlint()
+        format_tool = tool(self.dir, 'swift-format', 'exit 0\n')
+        result = self.run_script('verify-swift-style.sh', SWIFTLINT_EXECUTABLE=str(swiftlint),
+                                 SWIFT_FORMAT_EXECUTABLE=str(format_tool), BASE_SHA='HEAD', HEAD_SHA='HEAD')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        linted = (self.dir / 'linted-files').read_text().split()
+        for tree, names in [
+            ('/Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/',
+             ['DecisionReadCanary.swift', 'DisplayReadCanary.swift', 'DisabledReadCanary.swift']),
+            ('/App/', ['HostDecisionReadCanary.swift', 'HostDisplayReadCanary.swift', 'HostDisabledReadCanary.swift']),
+            ('/App/leak-root/Packages/EncryptedMemoriesKit/Sources/PhotosCore/', ['LeakCanary.swift']),
+        ]:
+            for name in names:
+                with self.subTest(file=name):
+                    self.assertTrue(any(path.endswith(tree + name) for path in linted), f'{tree}{name} not linted')
 
     def test_a_swiftlint_that_reports_a_display_read_fails_the_check(self):
         swiftlint = self.canary_swiftlint(display_fires=True)
@@ -200,6 +219,7 @@ class DecisionReadBaseline(unittest.TestCase):
         status = decision_status if decision_status is not None else (2 if sites else 0)
         return tool(self.dir, 'swiftlint', f'''if [[ "$1" == "version" ]]; then echo 0.65.1; exit 0; fi
 if [[ "$*" == *.swiftlint-decision-reads.yml* ]]; then
+for argument in "$@"; do [[ "$argument" == *.swiftlint-decision-reads.yml ]] && cp "$argument" "{self.dir}/decision-config"; done
 cat <<'TEXT'
 {lines}
 TEXT
@@ -219,6 +239,16 @@ echo "Done linting!"
             with self.subTest(sites=sites):
                 result = self.lint(self.swiftlint(sites), self.FILE)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_host_rules_are_anchored_to_the_root_of_the_checkout(self):
+        # SwiftLint matches the host rules against absolute paths, so a directory called App above the checkout would
+        # make every file a host file. The configuration that SwiftLint reads names the root of the checkout.
+        self.assertEqual(self.lint(self.swiftlint(), self.FILE).returncode, 0)
+        config = (self.dir / 'decision-config').read_text()
+        root = os.path.realpath(self.repo).removeprefix('/private')
+        escaped = re.sub(r'([][\\.*^$#+?(){}|])', r'\\\1', root)
+        self.assertIn("included: &host_sources '^(?:/private)?" + escaped + "/(?:App|iOSApp)/'", config)
+        self.assertNotIn('HOST_ROOT', config)
 
     def test_a_decision_read_beyond_the_baseline_fails_and_names_its_site(self):
         result = self.lint(self.swiftlint(3), self.FILE)
@@ -269,6 +299,52 @@ echo "Done linting!"
         result = self.lint(swiftlint, '--diff', lowered, raised)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn('baseline grew', result.stderr)
+
+    def commit_rules(self, *rules, baseline):
+        """Commits a rule configuration that names `rules` and the given baseline."""
+        config = 'only_rules:\n  - custom_rules\n\ncustom_rules:\n' + ''.join(
+            f"  {rule}:\n    regex: 'x'\n    message: m\n" for rule in rules)
+        (self.repo / '.swiftlint-decision-reads.yml').write_text(config)
+        return self.commit_baseline(baseline)
+
+    def test_a_rule_that_the_change_adds_starts_with_its_own_baseline_lines(self):
+        added = 'no_store_health_check_in_host'
+        base = self.commit_rules(self.RULE, baseline=f'2 {self.RULE} {self.FILE}\n')
+        head = self.commit_rules(
+            self.RULE, added, baseline=f'2 {self.RULE} {self.FILE}\n3 {added} App/Reader.swift\n')
+        result = self.lint(self.swiftlint(), '--diff', base, head)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_rule_of_the_merge_base_cannot_be_renamed_or_removed_with_an_inflated_baseline(self):
+        base = self.commit_rules(self.RULE, baseline=f'2 {self.RULE} {self.FILE}\n')
+        cases = [
+            ('renamed', ['renamed_rule'], f'49 renamed_rule {self.FILE}\n'),
+            ('removed', [], ''),
+            ('renamed and another rule added', ['renamed_rule', 'another_rule'],
+             f'2 renamed_rule {self.FILE}\n1 another_rule {self.FILE}\n'),
+        ]
+        for name, rules, baseline in cases:
+            with self.subTest(case=name):
+                head = self.commit_rules(*rules, baseline=baseline)
+                result = self.lint(self.swiftlint(), '--diff', base, head)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f'missing from the configuration: {self.RULE}', result.stderr)
+
+    def test_a_rule_that_exists_at_the_merge_base_cannot_regrow_from_an_empty_baseline(self):
+        base = self.commit_rules(self.RULE, baseline='')
+        head = self.commit_rules(self.RULE, baseline=f'1 {self.RULE} {self.FILE}\n')
+        result = self.lint(self.swiftlint(), '--diff', base, head)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'{self.RULE}: 1 sites, 0 at the merge base', result.stderr)
+
+    def test_a_rule_that_the_change_adds_cannot_hide_a_baseline_line_of_an_existing_rule(self):
+        added = 'no_store_health_check_in_host'
+        base = self.commit_rules(self.RULE, baseline=f'2 {self.RULE} {self.FILE}\n')
+        head = self.commit_rules(
+            self.RULE, added, baseline=f'3 {self.RULE} {self.FILE}\n1 {added} App/Reader.swift\n')
+        result = self.lint(self.swiftlint(), '--diff', base, head)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'{self.RULE}: 3 sites, 2 at the merge base', result.stderr)
 
     def test_a_base_without_a_baseline_lets_a_change_add_it(self):
         without = self.commit_baseline(None)

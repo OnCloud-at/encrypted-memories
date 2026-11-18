@@ -1,0 +1,5 @@
+// Host decision canary (#1157): a comment that turns off a host decision rule must fail the style check.
+func disabled() {
+    // swiftlint:disable:next no_domain_error_decision_in_host
+    _ = error as? AlbumError
+}
