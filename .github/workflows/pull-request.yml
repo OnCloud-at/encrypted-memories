@@ -188,6 +188,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run_macos: ${{ steps.policy.outputs.run_macos }}
+      run_ui: ${{ steps.policy.outputs.run_ui }}
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -209,6 +210,7 @@ jobs:
             git show "$BASE_SHA:.github/scripts/queue_path_policy.py" | python3 -I -
           else
             echo "run_macos=true" >> "$GITHUB_OUTPUT"
+            echo "run_ui=false" >> "$GITHUB_OUTPUT"
             echo "Base policy or ALLGREEN unavailable; macOS jobs required."
           fi
 
@@ -399,7 +401,10 @@ jobs:
   ios-ui-verification:
     name: iOS UI verification
     needs: [queue-path-policy]
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}
+    # The merge queue never runs the UI tests (issues #1134, #1197): the policy reports run_ui=false for
+    # every entry, so this job finishes as skipped. The UI tests run locally before a pull request and
+    # nightly on main (issue #1134); a manual run of this workflow still runs them.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_ui == 'false') }}
     runs-on: xcode-27
     # The slowest finished queue run took 88 minutes, and another was cancelled at the 90-minute
     # job limit although no test failed; the merge queue then removed the pull request. 120 minutes
@@ -773,7 +778,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
-      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false' }}
+      SKIP: ${{ github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_ui == 'false' }}
     steps:
       - name: Require UI tests
         if: ${{ always() }}

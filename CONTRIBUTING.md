@@ -63,7 +63,7 @@ Every change that alters behavior comes with tests:
 - Keep unrelated formatting and refactors out of the pull request.
 - Do not weaken a test to hide an application defect.
 
-GitHub runs repository hygiene, Swift style, package tests, iOS app tests, iOS UI tests, and both platform builds. A maintainer reviews the result before merge.
+GitHub runs repository hygiene, Swift style, package tests, iOS app tests, and both platform builds. The iOS UI tests run locally before you submit the pull request and nightly on `main` (see Local verification). A maintainer reviews the result before merge.
 
 ## Own your pull request
 
@@ -81,6 +81,7 @@ Run focused tests while you work. Before you request review, run these local che
 - the focused tests of the code that you changed;
 - the style check of the changed files: `BASE_SHA=<base> HEAD_SHA=<head> ./scripts/verify-swift-style.sh`;
 - the shell build of each app that your change touches (see below);
+- the iOS UI tests, when the change touches a path of the local UI gate (see below);
 - the device runs that CI does not do: the iPhone Duo simulator, iPad, repeated runs of a flaky test,
   macOS runtime behavior, and mutation runs.
 
@@ -94,10 +95,25 @@ Run the full local gates only when your change touches storage, a migration, bac
 ```
 
 A pull request runs repository hygiene and the Swift style check on Linux. The merge queue runs the package
-tests, the iOS app and UI tests, and both platform builds before the merge. Changes only to `Wiki/**`, `site/**`,
+tests, the iOS app tests and both platform builds before the merge. Changes only to `Wiki/**`, `site/**`,
 the root `README.md` or `SECURITY.md` skip these macOS jobs when the queue uses ALLGREEN and no Swift file changed;
 all other changes run them.
-For every gate that you did not run locally, write "covered by the merge queue" in the pull request.
+For every gate that you did not run locally, write "covered by the merge queue" in the pull request. The iOS UI
+tests are the exception: the merge queue never runs them (issues #1134 and #1197). The jobs `iOS UI verification`
+and `iOS UI tests` stay in the workflow and finish as skipped, which GitHub reports as success, so the required
+checks stay satisfied.
+
+The local UI gate: run `./scripts/verify-ios-app-tests.sh ui` before you submit the pull request, on the iPhone 17
+simulator and on the iPhone Duo (see below), when the change touches `iOSApp`, `iOSUITests`, `VendorPatches`, a
+workflow file, `project.yml`, a package manifest, the UI test tooling, a `Resources` bundle of a package, or a package
+module that the iOS app or a UI module reaches. `is_ui_relevant` and `UI_RELEVANT_MODULES` in
+`.github/scripts/queue_path_policy.py` define these paths once. To check a branch, run
+`BASE_SHA=origin/main HEAD_SHA=HEAD GITHUB_OUTPUT=/dev/null python3 .github/scripts/queue_path_policy.py`;
+the line `local UI gate applies` means that the gate applies. State the UI test run and its result in the pull request.
+
+The hosted safety net is the nightly UI run on `main`, on the default simulator and on the iPhone
+Duo (issue #1134). A release needs a green nightly run for its commit (issue #1166). The nightly run
+is not a required check and never blocks a merge.
 
 A pull request that changes `iOSApp`, `iOSUITests`, `project.yml`, or the UI test scripts also runs the iOS UI tests
 on the iPhone Duo simulator of a hosted runner. The job takes about 40 to 60 minutes and stops after 75 minutes. It is advice, not a gate:
