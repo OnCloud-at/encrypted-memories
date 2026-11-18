@@ -134,9 +134,23 @@ final class MobileViewerShareWiringTests: XCTestCase {
         let failure = String(localized: "viewer.share_burst_load_failed")
         let start = ContinuousClock.now
         while start.duration(to: .now) < .seconds(15) {
-            _ = fixture.tryActivatingShare()
+            // The raw-control fallback reports an accepted press also while Share is still
+            // committed dimmed, and such a press reads nothing. Press only an enabled control.
+            guard fixture.shareIsEnabled() == true, fixture.tryActivatingShare() else {
+                try await Task.sleep(for: .milliseconds(100))
+                continue
+            }
+            // The accepted press reads the burst again. A next press can arrive before
+            // Share renders dimmed, reach the running read, and record burstUnsettled.
+            // The failing fixture records the read's outcome at once, so a short wait
+            // settles it before another press.
+            let settled = ContinuousClock.now
+            while settled.duration(to: .now) < .seconds(2),
+                !fixture.probe.events.contains(where: \.isBurstReadFailed)
+            {
+                try await Task.sleep(for: .milliseconds(50))
+            }
             if fixture.probe.events.contains(where: \.isBurstReadFailed) { break }
-            try await Task.sleep(for: .milliseconds(100))
         }
 
         XCTAssertEqual(
