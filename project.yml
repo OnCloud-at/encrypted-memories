@@ -272,6 +272,7 @@ targets:
     sources:
       - iOSTests
       - Packages/EncryptedMemoriesKit/Tests/PhotosCoreTests/AppSettingsDefaultTests.swift
+      - Packages/EncryptedMemoriesKit/Tests/DesignSystemCoreTests/PlaybackFailedCardFrame.swift
     dependencies:
       - target: EncryptedMemoriesMobile
     settings:

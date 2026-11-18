@@ -499,7 +499,7 @@ public struct PhotoViewerView: View {
     /// second round spinner over it.
     @ViewBuilder private var loadingOverlay: some View {
         if let error = model.videoState.error {
-            failureCard(error)
+            PlaybackFailedView(error) { model.retry() }
         } else if model.videoState.isBusy && !model.videoState.hasPlayer {
             // Resolving has no player yet, so it is a centered blocking spinner.
             // Buffering/seeking use the live AVKit surface and its native spinner instead.
@@ -514,23 +514,6 @@ public struct PhotoViewerView: View {
         } else if model.player == nil && !model.isSharp && model.isLoadingOriginal {
             imageLoadingOverlay  // still images: percent while the original downloads
         }
-    }
-
-    /// The native unavailable state on glass. The card sits above the photo, whose colors are unknown, so it
-    /// keeps a backing surface instead of drawing bare text onto the image.
-    private func failureCard(_ error: VideoPlaybackError) -> some View {
-        ContentUnavailableView {
-            Label(L10n.string("viewer.playback_failed"), systemImage: "exclamationmark.triangle")
-        } description: {
-            Text(error.userMessage)
-        } actions: {
-            if error.isRetryable {
-                RetryButton(.prominent) { model.retry() }
-            }
-        }
-        .fixedSize()
-        .padding(24)
-        .glassEffect(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     /// A native determinate indicator with a percentage while bytes arrive, otherwise the indeterminate spinner.
