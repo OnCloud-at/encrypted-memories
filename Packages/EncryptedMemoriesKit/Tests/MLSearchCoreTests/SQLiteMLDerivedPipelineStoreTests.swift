@@ -888,45 +888,6 @@ import Testing
         #expect(try store.unavailableAssetUIDs(for: key).isEmpty)
     }
 
-    private func makeArtifact(stage: String, revision: String) throws -> MLDerivedArtifactIdentity {
-        let kind: MLNativeAnalysisKind =
-            switch stage {
-            case "document": .documentRecognition
-            case "barcode": .barcodeDetection
-            default: .textRecognition
-            }
-        let output: MLAnalysisOutputDescriptor =
-            switch kind {
-            case .documentRecognition: .structuredDocument
-            case .barcodeDetection: .barcodePayload
-            default: .recognizedText
-            }
-        return try MLDerivedArtifactIdentity(
-            pipelineID: .nativeSearch,
-            stageID: .init(rawValue: stage),
-            producer: .native(
-                providerIdentifier: "apple.vision",
-                kind: kind,
-                requestRevision: revision
-            ),
-            preprocessingRevision: "bounded-image-v1",
-            output: output,
-            schemaEpoch: 1
-        )
-    }
-
-    private func makeKey(
-        account: String,
-        artifacts: Set<MLDerivedArtifactIdentity>
-    ) throws -> MLPipelineExecutionKey {
-        try MLPipelineExecutionKey(
-            accountIdentifier: account,
-            pipelineID: .nativeSearch,
-            schemaVersion: 1,
-            artifacts: artifacts
-        )
-    }
-
     private func openStore(
         url: URL,
         policy: LibraryDatabasePolicy = .conservative,
@@ -937,6 +898,49 @@ import Testing
         }
         return store
     }
+}
+
+/// A native search artifact of `stage` with `revision`, shared by the derived pipeline store tests.
+func makeArtifact(
+    stage: String, revision: String, pipelineID: MLPipelineID = .nativeSearch,
+    preprocessingRevision: String = "bounded-image-v1"
+) throws -> MLDerivedArtifactIdentity {
+    let kind: MLNativeAnalysisKind =
+        switch stage {
+        case "document": .documentRecognition
+        case "barcode": .barcodeDetection
+        default: .textRecognition
+        }
+    let output: MLAnalysisOutputDescriptor =
+        switch kind {
+        case .documentRecognition: .structuredDocument
+        case .barcodeDetection: .barcodePayload
+        default: .recognizedText
+        }
+    return try MLDerivedArtifactIdentity(
+        pipelineID: pipelineID,
+        stageID: .init(rawValue: stage),
+        producer: .native(
+            providerIdentifier: "apple.vision",
+            kind: kind,
+            requestRevision: revision
+        ),
+        preprocessingRevision: preprocessingRevision,
+        output: output,
+        schemaEpoch: 1
+    )
+}
+
+/// An execution key of the native search pipeline, shared by the derived pipeline store tests.
+func makeKey(
+    account: String, artifacts: Set<MLDerivedArtifactIdentity>, pipelineID: MLPipelineID = .nativeSearch
+) throws -> MLPipelineExecutionKey {
+    try MLPipelineExecutionKey(
+        accountIdentifier: account,
+        pipelineID: pipelineID,
+        schemaVersion: 1,
+        artifacts: artifacts
+    )
 }
 
 private enum SQLiteDerivedStoreTestError: Error {
@@ -955,7 +959,7 @@ private actor SQLiteRecordingExecutor: MLDerivedPipelineExecutor {
     }
 }
 
-private struct TestDerivedCipher: MLDerivedDataCipher {
+struct TestDerivedCipher: MLDerivedDataCipher {
     let key: UInt8
 
     func seal(_ plaintext: Data, context: MLDerivedDataCipherContext) throws -> Data {

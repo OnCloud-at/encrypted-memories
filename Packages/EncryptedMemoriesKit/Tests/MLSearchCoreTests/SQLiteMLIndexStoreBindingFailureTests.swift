@@ -58,13 +58,6 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         return fault
     }
 
-    private func assertFailedBeforeStep(
-        _ fault: BindFailureUntilStep, file: StaticString = #filePath, line: UInt = #line
-    ) {
-        XCTAssertTrue(fault.lowered, "The fault must reach the target statement", file: file, line: line)
-        XCTAssertFalse(fault.stepped, "A value that does not bind must not reach the statement", file: file, line: line)
-    }
-
     private func readAllBlocks(_ descriptor: MLModelDescriptor, maximumRows: Int) throws -> [PhotoUID] {
         var uids: [PhotoUID] = []
         try store.forEachVectorBlock(for: descriptor, maximumRows: maximumRows) { uids += $0.uids }
@@ -79,7 +72,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         let report = store.upsert([record(longUID, descriptor)])
         XCTAssertEqual(report.skippedAlreadyIndexed, 0, "A row that was never written is not already indexed")
         XCTAssertEqual(report.transientFailure, 1)
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testUpsertWithAVectorThatDoesNotBindIsATransientFailureNotAnIndexedRow() throws {
@@ -89,7 +82,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         let report = store.upsert([record(shortUID, wide)])
         XCTAssertEqual(report.skippedAlreadyIndexed, 0, "A row that was never written is not already indexed")
         XCTAssertEqual(report.transientFailure, 1)
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     /// A record whose key does not bind fails alone: the batch goes on and stores the next record. The fault ends when
@@ -127,7 +120,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         let report = store.upsert([record(longUID, descriptor)])
         XCTAssertEqual(report.indexed, 0, "An indexed row must not keep its failure record")
         XCTAssertEqual(report.transientFailure, 1)
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testUpsertWithADescriptorThatDoesNotBindFailsTheGenerationBump() throws {
@@ -136,7 +129,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
             after: "DELETE FROM ml_failures WHERE model_identifier=? AND model_version=? AND volume_id")
         defer { fault.remove() }
         XCTAssertEqual(store.upsert([record(shortUID, longDescriptor)]).indexed, 0)
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testRemoveAllWithADescriptorThatDoesNotBindFailsAndKeepsTheVectors() throws {
@@ -144,7 +137,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         let fault = try failBinds(of: "DELETE FROM ml_embeddings")
         defer { fault.remove() }
         XCTAssertFalse(store.removeAll(for: longDescriptor), "A removal that matched no row removed nothing")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
         fault.remove()
         XCTAssertEqual(store.count(for: longDescriptor), 1)
     }
@@ -154,7 +147,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         let fault = try failBinds(of: "DELETE FROM ml_failures", after: "DELETE FROM ml_embeddings")
         defer { fault.remove() }
         XCTAssertFalse(store.removeAll(for: longDescriptor), "A removal that matched no failure row is not complete")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
         fault.remove()
         XCTAssertEqual(store.count(for: longDescriptor), 1, "The failed removal rolls back")
     }
@@ -165,7 +158,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         XCTAssertFalse(
             store.recordFailures([failure(shortUID, reason: Self.long)]),
             "A reason that does not bind must not be stored as NULL")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     // MARK: Reads
@@ -176,7 +169,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         defer { fault.remove() }
         XCTAssertThrowsError(
             try store.indexedUIDs(for: descriptor, from: [longUID]), "A key that does not bind is no proof of absence")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testGenerationWithADescriptorThatDoesNotBindDoesNotRunTheRead() throws {
@@ -184,7 +177,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         let fault = try failBinds(of: "SELECT generation FROM ml_epoch_state")
         defer { fault.remove() }
         XCTAssertEqual(store.generation(for: longDescriptor), 0)
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testFailureRecordsWithAKeyThatDoesNotBindIsAReadFailure() throws {
@@ -194,7 +187,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         XCTAssertThrowsError(
             try store.failureRecords(for: descriptor, from: [longUID]),
             "A key that does not bind is no proof of absence")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testVectorBlocksWithADescriptorThatDoesNotBindAreAReadFailure() throws {
@@ -203,7 +196,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         defer { fault.remove() }
         XCTAssertThrowsError(
             try readAllBlocks(longDescriptor, maximumRows: 10), "A descriptor that does not bind is no empty index")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testVectorBlocksWithACursorThatDoesNotBindAreAReadFailure() throws {
@@ -215,7 +208,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         defer { fault.remove() }
         XCTAssertThrowsError(
             try readAllBlocks(descriptor, maximumRows: 1), "A cursor that does not bind is no end of the index")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testReconcileWithADescriptorThatDoesNotBindInTheTrackedReadFails() throws {
@@ -226,7 +219,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
             store.reconcileTrackedUIDs(
                 currentAuthoritativeUIDs: [], previousAuthoritativeUIDs: nil, descriptor: longDescriptor),
             "A tracked read that does not bind is no proof that nothing is tracked")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testReconcileWithAKeyThatDoesNotBindInTheRowDeleteFailsAndKeepsTheVector() throws {
@@ -237,7 +230,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
             store.reconcileTrackedUIDs(
                 currentAuthoritativeUIDs: [], previousAuthoritativeUIDs: [longUID], descriptor: descriptor),
             "A removal that matched no row removed nothing")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
         fault.remove()
         XCTAssertEqual(store.count(for: descriptor), 1)
     }
@@ -247,7 +240,7 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         let fault = try failBinds(of: "SELECT count FROM ml_embedding_count")
         defer { fault.remove() }
         XCTAssertEqual(store.count(for: longDescriptor), 0)
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     func testInvalidRowCleanupWithAKeyThatDoesNotBindDoesNotRunTheDelete() throws {
@@ -261,6 +254,6 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
             after: "SELECT volume_id, node_id, vector FROM ml_embeddings")
         defer { fault.remove() }
         XCTAssertEqual(try readAllBlocks(descriptor, maximumRows: 10), [], "An unreadable vector is never served")
-        assertFailedBeforeStep(fault)
+        XCTAssertNil(fault.failedBeforeStepProblem)
     }
 }
