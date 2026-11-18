@@ -46,14 +46,17 @@ class PullRequestWorkflowTests < Minitest::Test
   def test_policy_skip_requires_a_successful_decision_and_skipped_workers
     jobs = @workflow.fetch("jobs")
     decision = {"github.event_name" => "merge_group", "needs.queue-path-policy.result" => "success",
-                "needs.queue-path-policy.outputs.run_macos" => "false"}
+                "needs.queue-path-policy.outputs.run_macos" => "false",
+                "needs.queue-path-policy.outputs.run_ui" => "false"}
     policy = jobs.fetch("queue-path-policy")
     assert_equal "${{ github.event_name == 'merge_group' }}", policy.fetch("if")
     step = policy.fetch("steps").find { |item| item["id"] == "policy" }
     assert_equal "${{ github.event.merge_group.base_sha }}", step.fetch("env").fetch("BASE_SHA")
     assert_equal "${{ github.event.merge_group.head_sha }}", step.fetch("env").fetch("HEAD_SHA")
     assert_equal "${{ github.token }}", step.fetch("env").fetch("GH_TOKEN")
-    workers = %w[package-verification ios-verification ios-ui-verification macos-verification]
+    # An undeclared output is empty at run time, so the UI job would run again in the queue.
+    assert_equal "${{ steps.policy.outputs.run_ui }}", policy.fetch("outputs").fetch("run_ui")
+    workers = %w[package-verification ios-verification macos-verification]
     workers.each do |id|
       condition = jobs.fetch(id).fetch("if")
       refute evaluate(condition, decision), id
@@ -61,6 +64,16 @@ class PullRequestWorkflowTests < Minitest::Test
       assert evaluate(condition, decision.merge("needs.queue-path-policy.outputs.run_macos" => "true")), id
       assert evaluate(condition, decision.merge("github.event_name" => "workflow_dispatch")), id
     end
+    # The UI worker reads only the UI verdict: a package-only entry (run_macos=true, run_ui=false)
+    # skips it while every other macOS worker runs (issue #1134).
+    ui_condition = jobs.fetch("ios-ui-verification").fetch("if")
+    refute evaluate(ui_condition, decision), "ios-ui-verification"
+    assert evaluate(ui_condition, decision.merge("needs.queue-path-policy.result" => "failure")), "ios-ui-verification"
+    assert evaluate(ui_condition, decision.merge("needs.queue-path-policy.outputs.run_ui" => "true")), "ios-ui-verification"
+    assert evaluate(ui_condition, decision.merge("github.event_name" => "workflow_dispatch")), "ios-ui-verification"
+    package_only = decision.merge("needs.queue-path-policy.outputs.run_macos" => "true")
+    workers.each { |id| assert evaluate(jobs.fetch(id).fetch("if"), package_only), id }
+    refute evaluate(ui_condition, package_only), "ios-ui-verification"
     %w[code-quality package-tests architecture ios-app-tests ios-ui-tests macos-app-shell ios-app-shell].each do |id|
       job = jobs.fetch(id)
       skip = job.fetch("env").fetch("SKIP")
@@ -89,13 +102,23 @@ class PullRequestWorkflowTests < Minitest::Test
         refute status.success?, "#{id}: #{key}"
       end
     end
+    # A package-only queue entry skips only the iOS UI result job; every other required result
+    # job keeps its run branch, and the UI verdict alone flips the UI result job back.
+    %w[code-quality package-tests architecture ios-app-tests macos-app-shell ios-app-shell].each do |id|
+      refute evaluate(jobs.fetch(id).fetch("env").fetch("SKIP"), package_only), id
+    end
+    assert evaluate(jobs.fetch("ios-ui-tests").fetch("env").fetch("SKIP"), package_only), "ios-ui-tests"
+    refute evaluate(jobs.fetch("ios-ui-tests").fetch("env").fetch("SKIP"),
+                    package_only.merge("needs.queue-path-policy.outputs.run_ui" => "true")), "ios-ui-tests"
   end
 
   def test_macos_worker_conditions_preserve_cancelled_status_check
     expected = "${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_macos == 'false') }}"
-    %w[package-verification ios-verification ios-ui-verification macos-verification].each do |id|
+    %w[package-verification ios-verification macos-verification].each do |id|
       assert_equal expected, @workflow.fetch("jobs").fetch(id).fetch("if"), id
     end
+    ui_expected = "${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_ui == 'false') }}"
+    assert_equal ui_expected, @workflow.fetch("jobs").fetch("ios-ui-verification").fetch("if"), "ios-ui-verification"
   end
 
   def test_policy_step_reads_the_base_script_and_runs_all_when_missing
@@ -125,22 +148,31 @@ class PullRequestWorkflowTests < Minitest::Test
       git.call("add", ".")
       git.call("commit", "-qm", "changed head policy")
       head = git.call("rev-parse", "HEAD")
-      ["", missing_base, base].each do |ref|
+      # A missing base ref and a base without the policy script fall back and write both verdicts
+      # as required; the trusted base stub is older-style and writes only its run_macos verdict.
+      [["", "run_macos=true\nrun_ui=false\n"],
+       [missing_base, "run_macos=true\nrun_ui=false\n"],
+       [base, "run_macos=true\n"]].each do |ref, expected|
         output = File.join(directory, "output")
         File.write(output, "")
         env = {"BASE_SHA" => ref, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output, "RUNNER_TEMP" => directory, "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN"}
         text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
         assert status.success?, text
-        assert_equal "run_macos=true\n", File.read(output), ref
+        assert_equal expected, File.read(output), ref
       end
-      ["ALLGREEN", "HEADGREEN", "", "UNAVAILABLE"].each do |strategy|
+      # Only ALLGREEN reaches the base stub, which writes just its run_macos verdict; every other
+      # strategy falls back and requires both the macOS jobs and the UI job.
+      [["ALLGREEN", "run_macos=false\n"],
+       ["HEADGREEN", "run_macos=true\nrun_ui=false\n"],
+       ["", "run_macos=true\nrun_ui=false\n"],
+       ["UNAVAILABLE", "run_macos=true\nrun_ui=false\n"]].each do |strategy, expected|
         output = File.join(directory, "output")
         File.write(output, "")
         env = {"BASE_SHA" => base, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
                "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => strategy, "POLICY_TEST_RESULT" => "false"}
         text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
         assert status.success?, text
-        assert_equal "run_macos=#{strategy == 'ALLGREEN' ? 'false' : 'true'}\n", File.read(output), strategy
+        assert_equal expected, File.read(output), strategy
       end
       output = File.join(directory, "output")
       File.write(output, "")
@@ -149,7 +181,7 @@ class PullRequestWorkflowTests < Minitest::Test
              "GITHUB_REPOSITORY" => "test/repo", "POLICY_STRATEGY" => "ALLGREEN", "POLICY_TEST_RESULT" => "false"}
       text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
       assert status.success?, text
-      assert_equal "run_macos=true\n", File.read(output), "tree base"
+      assert_equal "run_macos=true\nrun_ui=false\n", File.read(output), "tree base"
       output = File.join(directory, "output")
       File.write(output, "")
       env = {"BASE_SHA" => base, "HEAD_SHA" => head, "GITHUB_OUTPUT" => output,
@@ -157,7 +189,7 @@ class PullRequestWorkflowTests < Minitest::Test
              "OLD_READER" => "1", "GH_TOKEN" => "synthetic-test-token"}
       text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
       assert status.success?, text
-      assert_equal "run_macos=true\n", File.read(output)
+      assert_equal "run_macos=true\nrun_ui=false\n", File.read(output)
       assert_includes text, "unrecognized arguments: --require-allgreen"
       refute_includes text, "synthetic-test-token"
       # A head checkout can contain names that shadow Python's standard library.
@@ -172,7 +204,11 @@ class PullRequestWorkflowTests < Minitest::Test
       git.call("add", ".")
       git.call("commit", "-qm", "shadow standard library")
       hostile_head = git.call("rev-parse", "HEAD")
-      [[base, "HEADGREEN"], [real_base, "ALLGREEN"]].each do |ref, strategy|
+      # The HEADGREEN row falls back to running everything; the ALLGREEN row runs the real base
+      # script through python3 -I (the shadowing defenses hold), and its diff touches only the
+      # macOS app, so the real script still skips the UI tests for it (issue #1134).
+      [[base, "HEADGREEN", "run_macos=true\nrun_ui=false\n"],
+       [real_base, "ALLGREEN", "run_macos=true\nrun_ui=false\n"]].each do |ref, strategy, expected|
         output = File.join(directory, "output")
         File.write(output, "")
         env = {"BASE_SHA" => ref, "HEAD_SHA" => hostile_head, "GITHUB_OUTPUT" => output,
@@ -180,7 +216,7 @@ class PullRequestWorkflowTests < Minitest::Test
                "POLICY_TEST_RESULT" => "false", "GH_TOKEN" => "synthetic-test-token"}
         text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
         assert status.success?, text
-        assert_equal "run_macos=true\n", File.read(output), strategy
+        assert_equal expected, File.read(output), strategy
         refute_includes text, "synthetic-test-token"
       end
     end
@@ -647,6 +683,7 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal({"contents" => "read"}, workflow.fetch("permissions"))
     assert_equal @workflow.fetch("env").fetch("DEVELOPER_DIR"), workflow.fetch("env").fetch("DEVELOPER_DIR")
   end
+
   def test_full_verification_uses_four_mac_runners_without_hygiene_waits
     mac_jobs = @workflow.fetch("jobs").select { |_, job| job["runs-on"] == "xcode-27" }
     assert_equal ["ios-ui-verification", "ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort
