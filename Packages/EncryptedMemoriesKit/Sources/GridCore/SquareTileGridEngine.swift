@@ -56,11 +56,6 @@ public struct GridLevelMetrics: Equatable, Sendable {
     public let defaultContentMode: TileContentDisplayMode
     public let transitionKindToNext: GridTransitionKind?
 
-    /// Reference slot side used to calibrate this level before the settled resolver applies its fixed column count.
-    public var referenceSlotSide: CGFloat {
-        GridSizePolicy.slotSide(nominalColumns: nominalColumns, gap: gap, sizeClass: .regular)
-    }
-
     public var semanticRole: GridLevelSemanticRole {
         supportedContentModes.contains(.aspectFitInsideSquare) ? .aspectThumbnail : .squareOverview
     }
@@ -291,13 +286,12 @@ public struct SquareTileGridEngine: Equatable, Sendable {
     }
 
     /// Picks the column count whose width-filled slot is closest to `side`. The live over-zoom path uses this
-    /// calculation between integer detents; an optional cap limits the result.
-    public static func columnsForFixedSide(side: CGFloat, gap: CGFloat, width: CGFloat, maxColumns: Int? = nil) -> Int {
+    /// calculation between integer detents.
+    public static func columnsForFixedSide(side: CGFloat, gap: CGFloat, width: CGFloat) -> Int {
         let s = max(1, side)
         let g = max(0, gap)
         let w = max(1, width)
-        let fit = max(1, Int(((w + g) / (s + g)).rounded()))
-        return min(maxColumns ?? Int.max, fit)
+        return max(1, Int(((w + g) / (s + g)).rounded()))
     }
 
     // MARK: global index and section/item coordinates
@@ -424,23 +418,26 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         }
     }
 
-    /// Builds a resolved grid for the supplied metrics and width. A phase may be supplied for a single-section
-    /// zoom commit; nil uses the configured fill order.
+    /// Builds a resolved grid whose column count comes from the target slot side. The live over-zoom path uses
+    /// it between integer detents.
     func resolved(
-        targetSide: CGFloat, gap: CGFloat, headerHeight: CGFloat, interSectionSpacing: CGFloat,
-        width: CGFloat, columnPhase: Int? = nil, fixedColumns: Int? = nil, maxColumns: Int? = nil
+        targetSide: CGFloat, gap: CGFloat, headerHeight: CGFloat, interSectionSpacing: CGFloat, width: CGFloat
+    ) -> ResolvedGrid {
+        resolved(
+            columns: Self.columnsForFixedSide(side: targetSide, gap: gap, width: width), gap: gap,
+            headerHeight: headerHeight, interSectionSpacing: interSectionSpacing, width: width)
+    }
+
+    /// Builds a resolved grid with a fixed column count, as settled levels and integer pinch detents use. The
+    /// slots fill the available width. A phase may be supplied for a single-section zoom commit; nil uses the
+    /// configured fill order.
+    func resolved(
+        columns requestedColumns: Int, gap: CGFloat, headerHeight: CGFloat, interSectionSpacing: CGFloat,
+        width: CGFloat, columnPhase: Int? = nil
     ) -> ResolvedGrid {
         let w = max(width, 1)
         let g = max(gap, 0)
-        let target = max(targetSide, 1)
-        // A fixed column count is used for settled levels and integer pinch detents. The live over-zoom path
-        // derives a count from the target side. Both paths fill the available width.
-        let columns: Int
-        if let fc = fixedColumns {
-            columns = max(1, fc)
-        } else {
-            columns = Self.columnsForFixedSide(side: target, gap: g, width: w, maxColumns: maxColumns)
-        }
+        let columns = max(1, requestedColumns)
         let geometry = GridColumnGeometry(columns: columns, gap: g, width: w)
         let side = geometry.side
         let pitch = side + g
@@ -489,9 +486,8 @@ public struct SquareTileGridEngine: Equatable, Sendable {
         // Keep the level's column count stable across width changes so settled and integer-detent pinch frames
         // share the same geometry.
         return resolved(
-            targetSide: m.referenceSlotSide, gap: m.gap, headerHeight: m.headerHeight,
-            interSectionSpacing: m.interSectionSpacing, width: width, columnPhase: columnPhase,
-            fixedColumns: m.nominalColumns)
+            columns: m.nominalColumns, gap: m.gap, headerHeight: m.headerHeight,
+            interSectionSpacing: m.interSectionSpacing, width: width, columnPhase: columnPhase)
     }
 
     // MARK: Frame plans

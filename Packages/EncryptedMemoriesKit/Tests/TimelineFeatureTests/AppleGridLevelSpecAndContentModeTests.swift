@@ -32,14 +32,16 @@ import TimelineCore
 
     // Fixed-column levels fill the width at every width without reflow; the column
     // count is constant (held at nominalColumns) and the tile scales with width (resize = scale, never reflow).
-    // At the calibration width it reproduces nominalColumns.
+    // At the reference width it reproduces nominalColumns.
     @Test func levelSpecsFillWidthFixedColumns() {
         for profile in [GridLevelProfile.testRegularTimeline, GridLevelProfile.testCompactTimeline] {
             let e = SquareTileGridEngine(sectionCounts: [4000], profile: profile)
             for level in 0..<e.levelCount {
                 let nominal = e.metrics(level: level).nominalColumns
                 var sides: [CGFloat] = []
-                for w: CGFloat in [120, 400, 700, 1000, 1080, 1440, 1600, 2560, 3840] {
+                for w: CGFloat in [
+                    120, 400, 700, 1000, 1080, SquareTileGridEngine.testReferenceWidth, 1440, 1600, 2560, 3840,
+                ] {
                     let m = e.resolvedMetrics(level: level, width: w)
                     if w >= 700 {
                         sides.append(m.slotSide)
@@ -57,9 +59,6 @@ import TimelineCore
                 for i in 1..<sides.count {
                     #expect(sides[i] >= sides[i - 1] - 0.001, "level \(level) tile monotone non-decreasing in width")
                 }
-                #expect(
-                    e.resolvedMetrics(level: level, width: GridSizePolicy.referenceWidth).columns == nominal,
-                    "level \(level) must reproduce nominalColumns at the reference width")
             }
         }
     }
@@ -102,7 +101,6 @@ import TimelineCore
         }
     }
 
-    // Level metrics remain stable at the calibration width.
     @Test func transitionKindsAreClassified() {
         #expect(specs[0].transitionKindToNext == .focusRowRelayout)
         #expect(specs[1].transitionKindToNext == .focusRowRelayout)
