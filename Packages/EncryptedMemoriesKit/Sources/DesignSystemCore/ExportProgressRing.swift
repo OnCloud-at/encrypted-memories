@@ -2,10 +2,14 @@ import SwiftUI
 
 /// The toolbar's export progress: a thin ring that fills like a pie, in the same primary style as the toolbar
 /// symbols. The native circular `ProgressView` draws in the accent color and at another size than those symbols.
-struct ExportProgressRing: View {
-    let fraction: Double
+public struct ExportProgressRing: View {
+    private let fraction: Double
 
-    var body: some View {
+    public init(fraction: Double) {
+        self.fraction = fraction
+    }
+
+    public var body: some View {
         ZStack {
             Circle().strokeBorder(.primary, lineWidth: 1.5)
             ExportProgressPie(fraction: min(max(fraction, 0), 1))
@@ -14,6 +18,9 @@ struct ExportProgressRing: View {
         }
         .frame(width: 18, height: 18)
         .padding(.horizontal, 6)
+        // The whole item answers the pointer, not only the thin ring and the filled part of the pie, so a tooltip on
+        // the ring also shows while the pie is still nearly empty.
+        .contentShape(Rectangle())
         .animation(.linear(duration: 0.15), value: fraction)
     }
 }
