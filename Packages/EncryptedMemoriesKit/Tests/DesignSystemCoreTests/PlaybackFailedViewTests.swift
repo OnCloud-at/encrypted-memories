@@ -200,18 +200,18 @@ import Testing
             host.hitTest(host.convert(point, to: host.superview))
         }
 
-        /// Sends one two-finger scroll at `point` (page coordinates) through the window, as the system does.
+        /// Sends one two-finger scroll to the view that a click at `point` (page coordinates) reaches, through
+        /// its responder chain. An event through the window reaches that view only while the window is ordered
+        /// on a screen and the test's flip of the screen coordinates matches that screen's height; a hosted
+        /// runner need not give the test either. This route needs no visible and no key window.
         func scroll(at point: CGPoint) {
-            let screenPoint = window.convertPoint(toScreen: host.convert(point, to: nil))
-            let screenHeight = NSScreen.screens.first?.frame.maxY ?? 0
+            let target = hitView(at: point)
             guard
                 let event = CGEvent(
-                    scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: -40, wheel3: 0)
+                    scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: -40, wheel3: 0),
+                let scroll = NSEvent(cgEvent: event)
             else { return }
-            event.location = CGPoint(x: screenPoint.x, y: screenHeight - screenPoint.y)
-            event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window.windowNumber))
-            guard let scroll = NSEvent(cgEvent: event) else { return }
-            window.sendEvent(scroll)
+            target?.scrollWheel(with: scroll)
         }
 
         /// How many native controls the page holds. SwiftUI draws text, symbols and the material into layers; each
