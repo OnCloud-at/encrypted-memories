@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// A merge of exact duplicates that moved photos to the trash and has not confirmed an active copy of its group yet.
 /// The merge records it before its trash. When the merge fails or the process ends before its check, the next scan or
@@ -71,9 +72,16 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
     /// Serializes the writes of every store in the process.
     private static let lock = NSLock()
     private let url: URL
+    /// Writes and removes the file. Reads and the move aside of a damaged file use the file manager.
+    private let fileSystem: any DurableFileSystem
 
-    public init(accountDataDirectory: URL) {
+    public convenience init(accountDataDirectory: URL) {
+        self.init(accountDataDirectory: accountDataDirectory, fileSystem: LocalDurableFileSystem())
+    }
+
+    init(accountDataDirectory: URL, fileSystem: any DurableFileSystem) {
         url = accountDataDirectory.appendingPathComponent(Self.fileName)
+        self.fileSystem = fileSystem
     }
 
     public func pendingMerges() -> [ExactDuplicateMergeIntent]? {
@@ -169,14 +177,14 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
             guard intents != before else { return true }
             guard !intents.isEmpty else {
                 do {
-                    try FileManager.default.removeItem(at: url)
+                    try fileSystem.remove(url)
                     return true
                 } catch {
                     return Self.isMissingFile(error)
                 }
             }
             guard let data = try? JSONEncoder().encode(intents) else { return false }
-            return (try? data.write(to: url, options: .atomic)) != nil
+            return (try? fileSystem.replace(url, with: data)) != nil
         }
     }
 }

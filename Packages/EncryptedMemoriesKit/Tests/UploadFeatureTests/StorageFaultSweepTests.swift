@@ -12,6 +12,7 @@ final class StorageFaultSweepTests: XCTestCase {
         "catalog.lateRenders": 20, "catalog.expiredHistory": 79, "journal.editReplacement.update": 1,
         "journal.editReplacement.compact": 2, "journal.editReplacement.create": 2, "journal.revert.save": 1,
         "journal.revert.remove": 1, "journal.series.save": 1, "journal.series.remove": 1,
+        "journal.exactDuplicateMerge.record": 1, "journal.exactDuplicateMerge.clear": 1,
         "backup.resolveRemoteDeletion.keep": 7, "backup.resolveRemoteDeletion.backUpAgain": 7,
         "backup.replayRemoteDeletion.keep": 9, "backup.replayRemoteDeletion.backUpAgain": 9, "fingerprints.store": 9,
         "fingerprints.advance": 9, "fingerprints.discontinuity": 5, "trashedSeries.record": 12,
