@@ -105,6 +105,99 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
 
     private var nodeReads: Int { server.readCounts.sharingMembers }
 
+    // MARK: Possibly identical photos
+
+    /// Two different files of the same second, a JPEG and a HEIC of the same camera and size, in the stored timeline.
+    @discardableResult
+    private func seedPossiblePair(_ name: String, second offset: TimeInterval = 0) -> [PhotoUID] {
+        let time = Date(timeIntervalSince1970: 1_700_000_000 + offset)
+        let pair = [server.seedLink(digest: digest("\(name)-jpeg")), server.seedLink(digest: digest("\(name)-heic"))]
+        for (uid, type) in zip(pair, ["image/jpeg", "image/heic"]) {
+            server.setFingerprint(
+                ExactDuplicateFingerprint(
+                    captureTime: time, device: "camera", pixelWidth: 100, pixelHeight: 100, mimeType: type), of: uid)
+            server.setNodeSize(type == "image/jpeg" ? 300 : 200, of: uid)
+        }
+        return pair
+    }
+
+    private func setLibrary(_ pairs: [[PhotoUID]]) {
+        server.setLibraryItems(
+            pairs.enumerated().flatMap { index, pair in
+                pair.map {
+                    PhotoItem(
+                        uid: $0, captureTime: Date(timeIntervalSince1970: 1_700_000_000 + Double(index * 60)),
+                        mediaType: "image/jpeg")
+                }
+            })
+    }
+
+    private var shape: PossibleDuplicatePolicy { PossibleDuplicatePolicy(rule: .sameShape, includesVideos: true) }
+
+    func testASecondPossibleCheckReadsOnlyPhotosWithoutSavedFactsAlsoAfterALaunch() async throws {
+        let pair = seedPossiblePair("one")
+        setLibrary([pair])
+        publishIndex(eventID: "event-1")
+        let first = await finder(cache: try openCache()).possibleDuplicates(excluding: [], policy: shape)
+        XCTAssertEqual(first?.groups.map(\.members), [pair])
+        XCTAssertEqual(nodeReads, 2)
+
+        let again = await finder(cache: try openCache()).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(again, first, "the saved details and sizes give the same result")
+        XCTAssertEqual(nodeReads, 2, "no photo is read again")
+    }
+
+    func testAnEventDropsTheSavedFactsOfTheChangedPhotoOnly() async throws {
+        let pair = seedPossiblePair("one")
+        setLibrary([pair])
+        publishIndex(eventID: "event-1")
+        let cache = try openCache()
+        _ = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        cache.advance(
+            volumeID: "vol", hashKeyEpoch: epoch, from: "event-1", to: "event-2", invalidating: [pair[1].nodeID])
+        publishIndex(eventID: "event-2")
+        _ = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(nodeReads, 3, "only the changed photo is read again")
+    }
+
+    func testAPhotoOfAnotherVolumeDoesNotStopItsGroupFromSaving() async throws {
+        let own = server.seedLink(digest: digest("own"))
+        let shared = PhotoUID(volumeID: "shared-volume", nodeID: server.seedLink(digest: digest("shared")).nodeID)
+        let time = Date(timeIntervalSince1970: 1_700_000_000)
+        for (uid, type) in [(own, "image/jpeg"), (shared, "image/heic")] {
+            server.setFingerprint(
+                ExactDuplicateFingerprint(
+                    captureTime: time, device: "camera", pixelWidth: 100, pixelHeight: 100, mimeType: type), of: uid)
+        }
+        server.setLibraryItems([own, shared].map { PhotoItem(uid: $0, captureTime: time, mediaType: "image/jpeg") })
+        publishIndex(eventID: "event-1")
+        let cache = try openCache()
+        _ = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        _ = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(nodeReads, 3, "the photo of the own volume was saved; only the other one is read again")
+    }
+
+    func testAPassThatStopsKeepsTheFactsOfItsFinishedGroups() async throws {
+        let done = seedPossiblePair("done")
+        let failing = seedPossiblePair("failing", second: 60)
+        setLibrary([done, failing])
+        publishIndex(eventID: "event-1")
+        server.loseNode(failing[0])
+        let cache = try openCache()
+        let partial = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+        XCTAssertEqual(partial?.groups.map(\.members), [done])
+        let readsOfThePass = nodeReads
+
+        _ = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(nodeReads - readsOfThePass, failing.count, "the next pass reads only the group that failed")
+    }
+
     // MARK: Relaunch
 
     @MainActor

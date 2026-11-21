@@ -25,6 +25,17 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         let generation: String
     }
 
+    /// The saved details of one photo and the file size that its node stated, if a read saved one.
+    public struct Facts: Equatable, Sendable {
+        public let fingerprint: ExactDuplicateFingerprint
+        public let byteSize: Int64?
+
+        public init(fingerprint: ExactDuplicateFingerprint, byteSize: Int64? = nil) {
+            self.fingerprint = fingerprint
+            self.byteSize = byteSize
+        }
+    }
+
     private let connection: SQLiteStoreConnection
 
     /// The caller supplies its existing, canonical cache directory. Admission failures leave the cache unavailable.
@@ -117,11 +128,15 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
     }
 
     @discardableResult
-    public func store(_ fingerprints: [PhotoUID: ExactDuplicateFingerprint], for snapshot: Snapshot) -> Bool {
+    public func store(
+        _ fingerprints: [PhotoUID: ExactDuplicateFingerprint], byteSizes: [PhotoUID: Int64] = [:],
+        for snapshot: Snapshot
+    ) -> Bool {
         var rows: [(String, Data)] = []
         for (uid, fingerprint) in fingerprints {
             guard uid.volumeID == snapshot.scope.volumeID,
-                let saved = SavedFingerprint(fingerprint, uid: uid), let data = try? JSONEncoder().encode(saved)
+                let saved = SavedFingerprint(fingerprint, uid: uid, byteSize: byteSizes[uid]),
+                let data = try? JSONEncoder().encode(saved)
             else { return false }
             rows.append((uid.nodeID, data))
         }
@@ -135,6 +150,27 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
             }
             return true
         } ?? false
+    }
+
+    /// The saved facts of each photo in `uids` of the snapshot's volume, in one read. A missing, corrupt or foreign
+    /// photo is left out, and a stale snapshot returns nothing.
+    public func facts(ofLinks uids: [PhotoUID], in snapshot: Snapshot) -> [PhotoUID: Facts] {
+        transaction(writing: false) { db in
+            guard case .found(snapshot) = self.context(db) else { return nil }
+            var result: [PhotoUID: Facts] = [:]
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            for uid in uids where uid.volumeID == snapshot.scope.volumeID {
+                guard self.prepare(db, "SELECT payload FROM fingerprint WHERE link_id=?;", reusing: &statement)
+                else { return nil }
+                // A missing or corrupt row is left out, so the caller reads that node again.
+                guard let data = self.read(statement, text: uid.nodeID),
+                    let row = try? JSONDecoder().decode(SavedFingerprint.self, from: data)
+                else { continue }
+                result[uid] = Facts(fingerprint: row.fingerprint(for: uid), byteSize: row.byteSize)
+            }
+            return result
+        } ?? [:]
     }
 
     /// The details of every member of each group in `groups` whose members all have current details, in one read.
@@ -257,14 +293,20 @@ private enum SavedFingerprint: Codable {
     case photo(Details)
     case nodeOnly
 
-    init?(_ fingerprint: ExactDuplicateFingerprint, uid: PhotoUID) {
+    init?(_ fingerprint: ExactDuplicateFingerprint, uid: PhotoUID, byteSize: Int64? = nil) {
         if fingerprint == .matchingOnly(uid) {
             self = .nodeOnly
         } else {
-            let details = Details(fingerprint)
+            let details = Details(fingerprint, byteSize: byteSize)
             guard details.fingerprint == fingerprint else { return nil }
             self = .photo(details)
         }
+    }
+
+    /// The file size that the node stated, if the read saved one.
+    var byteSize: Int64? {
+        if case .photo(let details) = self { return details.byteSize }
+        return nil
     }
 
     func fingerprint(for uid: PhotoUID) -> ExactDuplicateFingerprint {
@@ -283,8 +325,10 @@ private enum SavedFingerprint: Codable {
         let pixelHeight: Int?
         let durationSeconds: Double?
         let mimeType: String?
+        /// The file size that the node stated. Rows saved without it decode with nil and keep their bytes.
+        let byteSize: Int64?
 
-        init(_ value: ExactDuplicateFingerprint) {
+        init(_ value: ExactDuplicateFingerprint, byteSize: Int64? = nil) {
             captureTime = value.captureTime
             latitude = value.latitude
             longitude = value.longitude
@@ -293,6 +337,7 @@ private enum SavedFingerprint: Codable {
             pixelHeight = value.pixelHeight
             durationSeconds = value.durationSeconds
             mimeType = value.mimeType
+            self.byteSize = byteSize
         }
 
         var fingerprint: ExactDuplicateFingerprint {

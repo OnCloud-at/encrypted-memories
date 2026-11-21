@@ -55,14 +55,32 @@ public final class ExactDuplicateFingerprintCache: @unchecked Sendable {
     /// that began later replaced it, and the details of the earlier reads must not carry the newer cursor.
     func currentSnapshot() -> ExactDuplicateFingerprintStore.Snapshot? { lock.withLock { snapshot } }
 
+    /// The snapshot of the latest scan, or one at `eventID` when no scan of this launch began one, for example because
+    /// the library has no copies with the same bytes.
+    func currentSnapshot(
+        orBeginAt volumeID: String, hashKeyEpoch: String, eventID: String?
+    ) -> ExactDuplicateFingerprintStore.Snapshot? {
+        if let current = currentSnapshot() { return current }
+        begin(volumeID: volumeID, hashKeyEpoch: hashKeyEpoch, eventID: eventID)
+        return currentSnapshot()
+    }
+
+    /// The saved facts of `uids` under `snapshot`.
+    func facts(
+        of uids: [PhotoUID], in snapshot: ExactDuplicateFingerprintStore.Snapshot?
+    ) -> [PhotoUID: ExactDuplicateFingerprintStore.Facts] {
+        guard let snapshot, !uids.isEmpty else { return [:] }
+        return store.facts(ofLinks: uids, in: snapshot)
+    }
+
     /// Saves details that a node read returned, for the snapshot that was current before the read began.
     /// `currentEventID` is the cursor that the content index has now.
     func record(
-        _ fingerprints: [PhotoUID: ExactDuplicateFingerprint], for snapshot: ExactDuplicateFingerprintStore.Snapshot?,
-        currentEventID: String?
+        _ fingerprints: [PhotoUID: ExactDuplicateFingerprint], byteSizes: [PhotoUID: Int64] = [:],
+        for snapshot: ExactDuplicateFingerprintStore.Snapshot?, currentEventID: String?
     ) {
         guard let snapshot, currentEventID == snapshot.eventID, !fingerprints.isEmpty else { return }
-        store.store(fingerprints, for: snapshot)
+        store.store(fingerprints, byteSizes: byteSizes, for: snapshot)
     }
 
     /// Advances the saved details to a new cursor of the content index, dropping the details of the given links.

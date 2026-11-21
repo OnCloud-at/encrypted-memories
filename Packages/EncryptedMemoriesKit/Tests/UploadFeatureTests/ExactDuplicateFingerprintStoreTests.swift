@@ -610,4 +610,46 @@ final class ExactDuplicateFingerprintStoreTests: XCTestCase {
         defer { sqlite3_close(db) }
         XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
     }
+
+    func testTheFactsOfSinglePhotosKeepTheirSizesAndServeOnlyTheCurrentSnapshot() throws {
+        let store = try open()
+        defer { store.close() }
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        let third = PhotoUID(volumeID: "volume", nodeID: "third")
+        let foreign = PhotoUID(volumeID: "foreign-volume", nodeID: "first")
+        XCTAssertTrue(
+            store.store([first: details(), second: details("different")], byteSizes: [first: 4_000_000], for: snapshot))
+
+        XCTAssertEqual(
+            store.facts(ofLinks: [first, second, third, foreign], in: snapshot),
+            [
+                first: .init(fingerprint: details(), byteSize: 4_000_000),
+                second: .init(fingerprint: details("different")),
+            ],
+            "an unsaved photo and a photo of another volume are left out")
+
+        let later = try XCTUnwrap(store.advance(from: snapshot, to: "event-2", invalidating: ["second"]))
+
+        XCTAssertEqual(store.facts(ofLinks: [first, second], in: snapshot), [:], "the earlier snapshot is stale")
+        XCTAssertEqual(
+            store.facts(ofLinks: [first, second], in: later),
+            [first: .init(fingerprint: details(), byteSize: 4_000_000)])
+    }
+
+    func testARowWithoutASizeServesItsDetailsAndACorruptRowIsLeftOut() throws {
+        let store = try open()
+        let snapshot = try XCTUnwrap(store.prepare(scope: scope, eventID: "event"))
+        XCTAssertTrue(store.store([first: details(), second: details("different")], for: snapshot))
+        XCTAssertTrue(store.store([first: details()], byteSizes: [first: 9], for: snapshot))
+        XCTAssertEqual(
+            store.fingerprints(for: group.members, in: snapshot)?[first], details(), "a size changes no group")
+        store.close()
+        try changeDatabase("UPDATE fingerprint SET payload=x'00' WHERE link_id='second';")
+        let reopened = try open()
+        defer { reopened.close() }
+        let current = try XCTUnwrap(reopened.prepare(scope: scope, eventID: "event"))
+
+        XCTAssertEqual(
+            reopened.facts(ofLinks: [first, second], in: current), [first: .init(fingerprint: details(), byteSize: 9)])
+    }
 }

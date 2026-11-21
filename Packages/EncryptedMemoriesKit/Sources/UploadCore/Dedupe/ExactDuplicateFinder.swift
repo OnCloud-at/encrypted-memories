@@ -525,21 +525,56 @@ public struct ExactDuplicateFinder: Sendable {
         let candidates = PossibleDuplicateCandidates.groups(
             of: items, sameBytes: sameBytes.map(\.members),
             includesVideos: policy.includesVideos)
+        // The cursor before the first read: the details saved during this check belong to it.
+        let snapshot = await possibleDuplicateSnapshot()
+        let cache = fingerprintCache
+        let saved = cache?.facts(of: candidates.flatMap { $0 }, in: snapshot) ?? [:]
         let remote = remote
-        let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) { members in
-            try? await remote.nodeFacts(of: members)
+        let index = index
+        let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) {
+            (members: [PhotoUID]) -> [PhotoUID: ExactDuplicateNodeFacts]? in
+            let unsaved = members.filter { saved[$0] == nil }
+            guard !unsaved.isEmpty else { return [PhotoUID: ExactDuplicateNodeFacts]() }
+            guard let read = try? await remote.nodeFacts(of: unsaved) else { return nil }
+            // Each group saves at once, so a pass that stops keeps what it read. Only while the index still stands at
+            // the cursor of the snapshot, and only the photos of its volume.
+            if let cache, let snapshot {
+                let own = read.filter { $0.key.volumeID == snapshot.scope.volumeID }
+                cache.record(
+                    own.mapValues(\.fingerprint), byteSizes: own.compactMapValues(\.byteSize), for: snapshot,
+                    currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: snapshot.scope.hashKeyEpoch)?
+                        .eventID)
+            }
+            return read
         }
-        var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
-        for case let read?? in reads { facts.merge(read) { first, _ in first } }
-        let groups = policy.groups(of: candidates, fingerprints: facts.mapValues(\.fingerprint))
+        var fingerprints = saved.mapValues(\.fingerprint)
+        var sizes = saved.compactMapValues(\.byteSize)
+        var readCount = 0
+        for case let read?? in reads {
+            readCount += read.count
+            fingerprints.merge(read.mapValues(\.fingerprint)) { _, read in read }
+            sizes.merge(read.compactMapValues(\.byteSize)) { _, read in read }
+        }
+        let groups = policy.groups(of: candidates, fingerprints: fingerprints)
         let members = Set(groups.flatMap(\.members))
         log(
-            "possible duplicates candidates=\(candidates.count) reads=\(reads.count) groups=\(groups.count) "
-                + "duration=\(start.duration(to: .now))")
-        let memberFacts = facts.filter { members.contains($0.key) }
+            "possible duplicates candidates=\(candidates.count) saved=\(saved.count) nodeReads=\(readCount) "
+                + "groups=\(groups.count) duration=\(start.duration(to: .now))")
         return PossibleDuplicateScan(
-            groups: groups, byteSizes: memberFacts.compactMapValues(\.byteSize),
-            fingerprints: memberFacts.mapValues(\.fingerprint))
+            groups: groups, byteSizes: sizes.filter { members.contains($0.key) },
+            fingerprints: fingerprints.filter { members.contains($0.key) })
+    }
+
+    /// The snapshot of the latest scan, or a new one at the current cursor of the content index. Nil without a cache
+    /// or a cursor: the check then reads every candidate and saves nothing.
+    private func possibleDuplicateSnapshot() async -> ExactDuplicateFingerprintStore.Snapshot? {
+        guard let fingerprintCache else { return nil }
+        if let current = fingerprintCache.currentSnapshot() { return current }
+        guard let epoch = try? await checker.hashKeyEpoch(), let volumeID = try? await remote.ownPhotosVolumeID()
+        else { return nil }
+        return fingerprintCache.currentSnapshot(
+            orBeginAt: volumeID, hashKeyEpoch: epoch,
+            eventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
     }
 
     private typealias GroupFacts = [PhotoUID: ExactDuplicateNodeFacts]
