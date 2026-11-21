@@ -89,6 +89,30 @@ final class PhotoBackupBulkActionTests: XCTestCase {
         await fixture.controller.shutdown()
     }
 
+    /// A Keep Deleted whose queue write and take-back both failed stays recorded. Back Up Again for all is the
+    /// person's newer choice: it reopens the photo, counts it as changed, and the stuck choice never applies.
+    #if DEBUG
+        func testBackUpAgainForAllReplacesAStuckEarlierChoice() async throws {
+            let fixture = try makeFixture(ScriptedBackupResolver(defaultModified: date))
+            defer { fixture.cleanup() }
+            try fixture.park("photo", at: date)
+            await fixture.controller.waitForLaunchDeletionReplayForTesting()
+            try fixture.journal.recordDeletionDecision(
+                .keptDeleted, revisions: [.init(date: date)], for: fixture.source("photo"))
+            let captured = await fixture.controller.prepareBackUpAgain()
+            let confirmation = try XCTUnwrap(captured)
+            XCTAssertTrue(fixture.controller.startBackUpAgain(confirmation))
+            await fixture.controller.bulkPhotoActions.waitUntilFinished()
+            XCTAssertEqual(fixture.controller.bulkPhotoActions.summary?.completed, 1)
+            XCTAssertEqual(fixture.entry("photo", at: date)?.state, .discovered)
+            let entry = fixture.journal.entry(for: fixture.source("photo"))
+            XCTAssertEqual(entry.backUpAgainRevision, .init(date: date))
+            XCTAssertNil(entry.keptDeleted)
+            XCTAssertNil(entry.deletionDecision)
+            await fixture.controller.shutdown()
+        }
+    #endif
+
     func testSourcePreflightKeepsTheDecisionWhenBackupWaitsForWiFi() async throws {
         let runtime = LibraryRuntimeState(
             initial: LibraryRuntimeSnapshot(

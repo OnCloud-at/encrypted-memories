@@ -68,13 +68,17 @@ public protocol DeletionDecisionLog: Sendable {
     ) throws -> DeletionDecisionIntent
     /// One lookup per pending key; an unreadable intent must not hide another key.
     func pendingDeletionDecisionSources() -> [StoreLookup<UploadSourceIdentity>]
+    /// The rows of exactly one intent, or none. `apply` writes all rows under the source and the intent of the first
+    /// row, so a backend must never mix rows of two intents or two sources in one result.
     func pendingDeletionDecision(for source: UploadSourceIdentity) throws -> [DeletionDecisionRow]
     func settleDeletionDecision(id: UUID, for source: UploadSourceIdentity) throws
 }
 
 public enum DeletionDecisionReplay {
     /// Records the intent before the queue transaction. A failed read of the recorded rows or a failed transaction
-    /// takes both intent and choice back and throws the local-state error.
+    /// takes both intent and choice back and throws the local-state error. When this choice replaced an earlier intent
+    /// that was not applied (`prepareLatestChoice`), it stays instead: a take-back would bring the earlier choice back,
+    /// and the latest choice is the one that a replay applies.
     @MainActor
     public static func record(
         _ choice: EditReplacementDeletionChoice, revisions: [UploadBackupRevision], for source: UploadSourceIdentity,
@@ -94,9 +98,16 @@ public enum DeletionDecisionReplay {
                     "BackupDecisionQueueWrite", { queue.updateStates(of: source, rows.map(\.update), updatedAt: date) })
             else { throw UploadError.backend(L10n.string("backup.error_local_state_unavailable")) }
         } catch {
-            do { try journal.restoreDeletionChoice(previous, ifStill: written, for: source) } catch {
+            if previous.deletionDecision == nil {
+                do { try journal.restoreDeletionChoice(previous, ifStill: written, for: source) } catch {
+                    log.notice(
+                        .photoBackup, "decision.choiceNotRestored",
+                        [(.init("choice"), .word(choice.keptDeleted == true ? "keepDeleted" : "backUpAgain"))])
+                }
+            } else {
+                // The new choice replaced an earlier intent and stays recorded, so the next start applies it.
                 log.notice(
-                    .photoBackup, "decision.choiceNotRestored",
+                    .photoBackup, "decision.choiceKept",
                     [(.init("choice"), .word(choice.keptDeleted == true ? "keepDeleted" : "backUpAgain"))])
             }
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
@@ -105,19 +116,60 @@ public enum DeletionDecisionReplay {
         try? journal.settleDeletionDecision(id: intent.id, for: source)
     }
 
-    /// One intent has no suspension point. Unknown reads or failed writes retain the whole intent for retry. A store
-    /// with a recorded failure still accepts writes, but its reads may miss a parked row; the intent would then settle
-    /// without its queue write, so such a store keeps the intent.
+    /// One intent has no suspension point. Unknown reads or failed writes retain the whole intent for retry.
     @MainActor
     public static func apply(
         _ rows: [DeletionDecisionRow], queue: UploadBackupSyncQueueManifestStore,
         journal: any DeletionDecisionLog, at date: Date
     ) throws {
         guard let first = rows.first else { return }
-        guard queue.isOperational() else {
+        let updates = try parkedUpdates(rows, queue: queue)
+        guard queue.updateStates(of: first.source, updates, updatedAt: date) else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
-        guard rows.allSatisfy({ $0.source == first.source && $0.decisionID == first.decisionID }) else {
+        try journal.settleDeletionDecision(id: first.decisionID, for: first.source)
+    }
+
+    /// Why a new choice replaced the earlier intent of its photo without applying it.
+    public enum ReplacedIntent: Sendable {
+        case notApplied, unreadable
+
+        /// The background-log word; it names no photo.
+        public var logWord: StaticString {
+            switch self {
+            case .notApplied: "notApplied"
+            case .unreadable: "unreadable"
+            }
+        }
+    }
+
+    /// The person's latest choice wins. Call this before a new choice for `source` reads its rows. In order:
+    /// 1. An earlier intent with no row left that waits for the question committed its queue write before its clear
+    ///    failed. It is settled here, without a queue write, so the new choice meets the rows as they are now.
+    /// 2. An earlier intent with a row that still waits, or one that cannot be read, is never applied. The caller's
+    ///    `record` replaces it in the one journal line that records the new choice, so one intent remains at every
+    ///    stop: the earlier one before that line, the new one after it, none after the new choice's clear.
+    /// Returns the reason when step 2 applies, nil otherwise. A queue that cannot answer throws and changes nothing.
+    @MainActor
+    public static func prepareLatestChoice(
+        for source: UploadSourceIdentity, queue: UploadBackupSyncQueueManifestStore, journal: any DeletionDecisionLog
+    ) throws -> ReplacedIntent? {
+        let rows: [DeletionDecisionRow]
+        do { rows = try journal.pendingDeletionDecision(for: source) } catch { return .unreadable }
+        guard let first = rows.first else { return nil }
+        guard try parkedUpdates(rows, queue: queue).isEmpty else { return .notApplied }
+        try journal.settleDeletionDecision(id: first.decisionID, for: source)
+        return nil
+    }
+
+    /// The updates for the rows that still wait for the question. A store with a recorded failure still accepts
+    /// writes, but its reads may miss a parked row; an intent would then settle without its queue write, so such a
+    /// store throws. Every row comes from one journal entry, so all share one photo and one intent.
+    @MainActor
+    private static func parkedUpdates(
+        _ rows: [DeletionDecisionRow], queue: UploadBackupSyncQueueManifestStore
+    ) throws -> [UploadBackupSyncQueueManifestStore.StateUpdate] {
+        guard queue.isOperational() else {
             throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
         }
         var updates: [UploadBackupSyncQueueManifestStore.StateUpdate] = []
@@ -130,10 +182,7 @@ public enum DeletionDecisionReplay {
             else { continue }
             updates.append(row.update)
         }
-        guard queue.updateStates(of: first.source, updates, updatedAt: date) else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
-        }
-        try journal.settleDeletionDecision(id: first.decisionID, for: first.source)
+        return updates
     }
 
     /// Replays each pending key independently, retaining unreadable intents and intents whose apply failed, for example

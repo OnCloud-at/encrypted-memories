@@ -1023,17 +1023,13 @@ public final class PhotoLibraryBackupController {
         guard item.issue == .deletedElsewhere, let source = item.source, let revision = item.revision,
             !isShuttingDown, let queueStore, let journal = pendingReplacementJournal
         else { return false }
-        // The choice is about the photo, so it settles every revision of it that waits for the same question.
+        // The choice is about the photo, so it settles every revision of it that waits for the same question. The
+        // person's latest choice wins: an earlier intent is settled when its rows already moved, and otherwise
+        // replaced unapplied by this choice's journal line. When a guard below refuses the tap first, the earlier
+        // intent stays recorded and the next replay applies it. Nothing below suspends, so no replay runs in between.
         do {
-            let pending = try journal.pendingDeletionDecision(for: source)
-            defer {
-                if !pending.isEmpty {
-                    noteProblemListChange()
-                    refreshFromQueue()
-                }
-            }
-            try DeletionDecisionReplay.apply(
-                pending, queue: queueStore, journal: journal, at: Date())
+            let replaced = try DeletionDecisionReplay.prepareLatestChoice(
+                for: source, queue: queueStore, journal: journal)
             guard
                 let row = try PhotoPerformanceSignposts.database.interval(
                     "BackupDecisionEntry", { try queueStore.entry(for: source, revision: revision) }),
@@ -1057,6 +1053,9 @@ public final class PhotoLibraryBackupController {
             try DeletionDecisionReplay.record(
                 keepDeleted ? .keptDeleted : .backUpAgain(newest), revisions: Set(parked + [revision]).sorted(),
                 for: source, queue: queueStore, journal: journal, at: Date(), log: backgroundLog)
+            if let replaced {
+                backgroundLog.notice(.photoBackup, "decision.replaced", [(.init("reason"), .word(replaced.logWord))])
+            }
             SupportEventTrail.shared.record(
                 keepDeleted ? .backupDeletionKept : .backupDeletionReopened, subject: source.identifier)
             noteProblemListChange()
@@ -2020,6 +2019,11 @@ public final class PhotoLibraryBackupController {
         /// Returns when every ended pass has finished its completion, including the decision about its next wake.
         internal func waitForSyncRunCompletionForTesting() async {
             while let runID = settlingRunIDs.first { await waitUntilRunSettled(runID) }
+        }
+
+        /// Returns when the deletion replay of this launch has run.
+        internal func waitForLaunchDeletionReplayForTesting() async {
+            await deletionReplayTask?.value
         }
 
         /// Background windows that wait for their deferred pass.

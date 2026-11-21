@@ -472,6 +472,38 @@ final class DeletedPhotoTests: XCTestCase {
             await controller.shutdown()
         }
 
+        /// A Back Up Again whose queue write and take-back both failed stays recorded. The person taps Back Up Again
+        /// again: that choice is the one that reopens the photo, so it reports success and starts a pass.
+        @MainActor
+        func testBackUpAgainAfterAStuckBackUpAgainStartsAPass() async throws {
+            let suite = "deletion-controller-stuck-pass-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
+                    runtimeSignals: .wiFiWithMobileDataOff),
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+            await controller.waitForLaunchDeletionReplayForTesting()
+            XCTAssertTrue(controller.installDeletedElsewhereFixtureForTesting())
+            controller.setAccessStateForTesting(.full)
+            controller.replacePassBodyForTesting {}
+            let capturedItems = try await photoBackupProblemItems(controller)
+            let item = try XCTUnwrap(capturedItems.first)
+            let photo = try XCTUnwrap(item.source)
+            let revision = try XCTUnwrap(item.revision)
+            try journal.recordDeletionDecision(.backUpAgain(revision), revisions: [revision], for: photo)
+            XCTAssertFalse(controller.isSyncing)
+
+            XCTAssertTrue(controller.backUpAgain(item))
+
+            XCTAssertTrue(controller.isSyncing)
+            XCTAssertEqual(
+                try controller.queueStoreForTesting?.entry(for: photo, revision: revision)?.state, .discovered)
+            XCTAssertNil(journal.entry(for: photo).deletionDecision)
+            await controller.shutdown()
+        }
+
         @MainActor
         func testBackUpAgainRefusesARejectedDecisionWithoutStartingAPass() async throws {
             let suite = "deletion-controller-refused-\(UUID().uuidString)"
@@ -1440,6 +1472,58 @@ final class DeletedPhotoTests: XCTestCase {
         XCTAssertTrue(journal.entry(for: plain).isEmpty, "an unedited photo needs no answer")
         await controller.shutdown()
     }
+
+    /// The restore of a photo is the person's newer answer. A deletion choice that is still recorded for the photo,
+    /// because its queue write and its take-back both failed, is dropped with it and never applied afterwards.
+    #if DEBUG
+        @MainActor
+        func testRestoringAPhotoDropsAStuckDeletionChoice() async throws {
+            let suite = "deletion-restore-stuck-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let info = PhotoBackupAssetInfo(
+                localIdentifier: source.identifier, creationDate: date, modificationDate: date.addingTimeInterval(60),
+                pixelWidth: 4032, pixelHeight: 3024, durationSeconds: 0, isLivePhoto: false, isVideo: false,
+                resources: [.init(role: .originalPhoto, originalFilename: "photo.heic", mimeType: "image/heic")])
+            let catalog = try XCTUnwrap(
+                PhotoLibraryCatalogManifestStore(
+                    url: directory.appendingPathComponent(PhotoLibraryCatalogManifestStore.databaseFileName)))
+            let catalogEntry = PhotoLibraryCatalogMapper.entry(for: info, observedAt: date)
+            XCTAssertTrue(catalog.upsertBatch([catalogEntry]))
+            catalog.close()
+            let edit = try XCTUnwrap(
+                PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: catalogEntry)))
+            let parked = UploadBackupSyncQueueEntry(
+                source: source, revision: UploadBackupRevision(date: date), originalFilename: "photo.heic",
+                state: .failedPermanent,
+                lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue, updatedAt: date
+            )
+            let queue = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(
+                    url: directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
+            defer { queue.close() }
+            XCTAssertTrue(queue.upsert(parked))
+            try addEarlierUpload()
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(), replacementJournal: journal)
+            await controller.waitForLaunchDeletionReplayForTesting()
+            try journal.recordDeletionDecision(.keptDeleted, revisions: [parked.revision], for: source)
+
+            let returned = await controller.returnToBackup(identifiers: [source.identifier])
+
+            XCTAssertTrue(returned)
+            XCTAssertEqual(journal.entry(for: source).backUpAgainRevision, edit.snapshot.revision)
+            XCTAssertNil(journal.entry(for: source).keptDeleted)
+            XCTAssertNil(journal.entry(for: source).deletionDecision)
+            await controller.shutdown()
+            let done = await DeletionDecisionReplay.run(queue: queue, journal: journal, at: date)
+            XCTAssertTrue(done)
+            XCTAssertEqual(
+                try queue.entry(for: source, revision: parked.revision), parked, "Keep Deleted never applies")
+        }
+    #endif
 
     /// "Back Up Again" on an excluded photo that was deleted in Apple Photos meanwhile succeeds and queues nothing,
     /// so the restore ends and the entry leaves the excluded list.
