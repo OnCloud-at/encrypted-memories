@@ -61,9 +61,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
     public var remainingCount = 0
     /// Smoothed upload speed; only set while the phase checks or uploads.
     public var uploadSpeedBytesPerSecond: Double?
-    /// Queue-wide dedupe-index failure. Kept separate from item failures so hosts do not open an empty
-    /// per-photo failure list for an account/service problem.
-    public var remoteIndexPreparationFailed: Bool
     public var degradedDedupeUnresolvedCount: Int
     public var executionOpportunityIssue: BackupExecutionOpportunityIssue?
     /// True while a large first backup runs: the host shows how to make it faster (#275).
@@ -91,7 +88,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         waitingCount: Int = 0,
         skippedRemoteDeletions: Int = 0,
         nextAttemptAt: Date? = nil,
-        remoteIndexPreparationFailed: Bool = false,
         degradedDedupeUnresolvedCount: Int = 0,
         executionOpportunityIssue: BackupExecutionOpportunityIssue? = nil
     ) {
@@ -106,7 +102,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         self.waitingCount = waitingCount
         self.skippedRemoteDeletions = skippedRemoteDeletions
         self.nextAttemptAt = nextAttemptAt
-        self.remoteIndexPreparationFailed = remoteIndexPreparationFailed
         self.degradedDedupeUnresolvedCount = max(0, degradedDedupeUnresolvedCount)
         self.executionOpportunityIssue = executionOpportunityIssue
     }
@@ -203,8 +198,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 // those rows are still scheduled work, not failed photos.
                 attentionCount: status.needsAttentionCount,
                 skippedRemoteDeletions: status.skippedRemoteDeletions,
-                nextAttemptAt: status.nextAttemptAt,
-                remoteIndexPreparationFailed: status.remoteIndexPreparationFailed)
+                nextAttemptAt: status.nextAttemptAt)
 
         case .idle:
             self.init(
@@ -220,7 +214,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         if status.remoteContentIndexHealth.shouldWarn {
             degradedDedupeUnresolvedCount = status.remoteContentIndexHealth.unresolvedCount
         }
-        remoteIndexPreparationFailed = status.remoteIndexPreparationFailed
         if let photo = status.photoDisplayProgress {
             photoTotalIsKnown = photo.isTotalKnown
             if photo.isTotalKnown {
@@ -318,24 +311,17 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         return L10n.string("backup.progress_waiting \(waitingCount)")
     }
 
+    /// The one line under the backup status that the person can act on. A failed index preparation and the scheduling
+    /// problems that iOS and the app retry on their own show no line. The index failure carries its own cause headline
+    /// and retry date. A scheduler issue sets neither: the app submits the work again on the next background entry, at
+    /// the end of a task and in the next refresh window.
     public var localizedSystemIssue: String? {
-        if remoteIndexPreparationFailed {
-            return L10n.string("backup.detail_preparing_index_failed")
-        }
         switch executionOpportunityIssue {
-        case .backgroundRefreshUnavailable:
-            return L10n.string("backup.error_background_refresh_unavailable")
-        case .backgroundLaunchNotPermitted:
-            return L10n.string("backup.error_background_not_permitted")
-        case .schedulerCapacity:
-            return L10n.string("backup.error_background_scheduler_capacity")
-        case .immediateRunIneligible:
-            return L10n.string("backup.error_background_immediate_ineligible")
+        case .backgroundRefreshUnavailable, .backgroundLaunchNotPermitted:
+            return L10n.string("backup.background_unavailable_action")
         case .registrationFailed:
             return L10n.string("backup.error_background_registration")
-        case .unknown:
-            return L10n.string("backup.error_background_unknown")
-        case nil:
+        case .schedulerCapacity, .immediateRunIneligible, .unknown, nil:
             return nil
         }
     }

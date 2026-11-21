@@ -422,7 +422,7 @@
       }
     },
     "backup.background_unavailable_action": {
-      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "comment": "The line under the backup status when iOS did not permit background backup or Background App Refresh is off: check Background App Refresh in Settings or keep the app open.",
       "localizations": {
         "en": {
           "stringUnit": {
@@ -1345,13 +1345,6 @@
         "de": { "stringUnit": { "state": "translated", "value": "Sicherungsindex wird vorbereitet…" } }
       }
     },
-    "backup.detail_preparing_index_failed": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The backup index could not be prepared. Try again later." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Der Sicherungsindex konnte nicht vorbereitet werden. Versuche es später erneut." } }
-      }
-    },
     "backup.warning_dedupe_degraded %lld": {
       "extractionState": "manual",
       "comment": "Non-blocking warning when legacy remote photos lack encrypted exact-content hashes.",
@@ -1368,46 +1361,11 @@
         "de": { "stringUnit": { "state": "translated", "value": "%lld Dateien werden beim nächsten Durchlauf fortgesetzt" } }
       }
     },
-    "backup.error_background_immediate_ineligible": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "iOS could not continue this backup immediately. A later background attempt remains scheduled." } },
-        "de": { "stringUnit": { "state": "translated", "value": "iOS konnte diese Sicherung nicht sofort fortsetzen. Ein späterer Hintergrundversuch bleibt geplant." } }
-      }
-    },
-    "backup.error_background_not_permitted": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "iOS has not permitted background backup. Check Background App Refresh in Settings or keep Encrypted Memories open." } },
-        "de": { "stringUnit": { "state": "translated", "value": "iOS hat die Hintergrundsicherung nicht erlaubt. Prüfe die Hintergrundaktualisierung in den Einstellungen oder lasse Encrypted Memories geöffnet." } }
-      }
-    },
-    "backup.error_background_refresh_unavailable": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Background backup is unavailable. Enable Background App Refresh in Settings or keep Encrypted Memories open." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Hintergrundsicherung ist nicht verfügbar. Aktiviere die Hintergrundaktualisierung in den Einstellungen oder lasse Encrypted Memories geöffnet." } }
-      }
-    },
     "backup.error_background_registration": {
       "extractionState": "manual",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Background backup could not start; restart the app or keep it open." } },
         "de": { "stringUnit": { "state": "translated", "value": "Das Hintergrund-Backup konnte nicht starten; starte die App neu oder lasse sie geöffnet." } }
-      }
-    },
-    "backup.error_background_scheduler_capacity": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "The iOS background queue is currently full. Encrypted Memories will retry; keep the app open to continue now." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die iOS-Hintergrundwarteschlange ist derzeit voll. Encrypted Memories versucht es erneut; lasse die App geöffnet, um jetzt fortzufahren." } }
-      }
-    },
-    "backup.error_background_unknown": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Background backup could not be scheduled. Encrypted Memories will retry; keep the app open to continue now." } },
-        "de": { "stringUnit": { "state": "translated", "value": "Die Hintergrundsicherung konnte nicht geplant werden. Encrypted Memories versucht es erneut; lasse die App geöffnet, um jetzt fortzufahren." } }
       }
     },
     "settings.backup_uploads_section": {
