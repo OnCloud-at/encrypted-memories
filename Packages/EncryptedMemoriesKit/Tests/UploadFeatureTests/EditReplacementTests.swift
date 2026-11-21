@@ -1200,7 +1200,12 @@ final class EditReplacementTests: XCTestCase {
         do {
             try await makeReplacement(remote).replaceSuperseded(of: asset, with: new, edited: true, holdsOriginal: true)
             XCTFail("the manifest write fails")
-        } catch {}
+        } catch UploadError.internalFailure(let failure) {
+            XCTAssertEqual(failure, .identityManifestNotUpdated)
+            XCTAssertEqual(failure.message, "Upload identity manifest could not be updated")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
         XCTAssertEqual(remote.trashCalls, [[old]])
 
         XCTAssertTrue(journal.entry(for: asset).retired.isEmpty)

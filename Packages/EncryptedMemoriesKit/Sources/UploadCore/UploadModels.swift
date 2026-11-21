@@ -657,6 +657,18 @@ public enum UploadError: LocalizedError, Equatable {
     public enum InternalFailure: Equatable, Sendable, CaseIterable {
         /// A store of the app cannot answer. The person sees the localized local-state message.
         case localStateUnavailable
+        /// The cases below keep the fixed text of the backend error that each one replaces (#1159), so the stored
+        /// detail of a row and the text that a person sees do not change.
+        case sourceRecoveryUnavailable
+        case preflightClassificationIncomplete
+        case exclusionsUnavailable
+        case stateNotRead
+        case stateBatchNotRead
+        case stateNotSaved
+        case stateNotUpdated
+        case completionStateNotSaved
+        case identityManifestNotUpdated
+        case editJournalNotWritten
 
         /// The localized local-state message of the app. The one place that names its key.
         public static var localStateMessage: String { L10n.string("backup.error_local_state_unavailable") }
@@ -665,14 +677,21 @@ public enum UploadError: LocalizedError, Equatable {
         public var message: String {
             switch self {
             case .localStateUnavailable: Self.localStateMessage
+            case .sourceRecoveryUnavailable: "Backup source recovery is unavailable"
+            case .preflightClassificationIncomplete: "Backup preflight classification was incomplete"
+            case .exclusionsUnavailable: "Backup exclusions are unavailable"
+            case .stateNotRead: "Backup state could not be read"
+            case .stateBatchNotRead: "Backup state batch could not be read"
+            case .stateNotSaved: "Backup state could not be saved"
+            case .stateNotUpdated: "Backup state could not be updated"
+            case .completionStateNotSaved: "Backup completion state could not be saved"
+            case .identityManifestNotUpdated: "Upload identity manifest could not be updated"
+            case .editJournalNotWritten: "Edit replacement journal could not be written"
             }
         }
 
-        public var failureCause: FailureCause {
-            switch self {
-            case .localStateUnavailable: .localState
-            }
-        }
+        /// Every case is a failure of a store or a file of the app.
+        public var failureCause: FailureCause { .localState }
     }
 
     public var errorDescription: String? {

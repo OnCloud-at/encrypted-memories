@@ -227,6 +227,62 @@ final class UploadBackupStateTests: XCTestCase {
         }
     }
 
+    /// Runs `body` and expects the fixed internal failure `expected` with its old text.
+    private func assertInternalFailure(
+        _ expected: UploadError.InternalFailure, text: String,
+        file: StaticString = #filePath, line: UInt = #line, _ body: () async throws -> Void
+    ) async {
+        do {
+            try await body()
+            XCTFail("the call must fail", file: file, line: line)
+        } catch UploadError.internalFailure(let failure) {
+            XCTAssertEqual(failure, expected, file: file, line: line)
+            XCTAssertEqual(failure.message, text, file: file, line: line)
+        } catch {
+            XCTFail("unexpected error: \(error)", file: file, line: line)
+        }
+    }
+
+    func testAStateStoreThatCannotBeReadFailsWithTheFixedInternalFailures() async throws {
+        let url = tempDir.appendingPathComponent(UploadBackupStateManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupStateManifestStore(url: url))
+        store.close()
+        let index = UploadBackupPreflightIndex(store: store)
+        let snapshot = snapshot(revision: 10)
+
+        await assertInternalFailure(.stateNotRead, text: "Backup state could not be read") {
+            _ = try await index.classify(snapshot)
+        }
+        await assertInternalFailure(.stateNotRead, text: "Backup state could not be read") {
+            _ = try await index.reopen(snapshot)
+        }
+        await assertInternalFailure(.stateBatchNotRead, text: "Backup state batch could not be read") {
+            _ = try await index.classifyBatch([snapshot])
+        }
+        await assertInternalFailure(.stateBatchNotRead, text: "Backup state batch could not be read") {
+            _ = try await index.completeStates([snapshot])
+        }
+    }
+
+    func testAStateStoreThatCannotWriteFailsWithTheFixedInternalFailures() async throws {
+        let store = MemoryBackupStateStore(removesRecords: false)
+        store.failWrites()
+        let index = UploadBackupPreflightIndex(store: store)
+        let snapshot = snapshot(revision: 10)
+
+        await assertInternalFailure(.stateNotSaved, text: "Backup state could not be saved") {
+            try await index.markPending(snapshot)
+        }
+        await assertInternalFailure(
+            .completionStateNotSaved, text: "Backup completion state could not be saved"
+        ) {
+            try await index.markBackedUp(snapshot)
+        }
+        await assertInternalFailure(.stateNotUpdated, text: "Backup state could not be updated") {
+            try await index.forgetEarlierStates(of: snapshot)
+        }
+    }
+
     func testMetadataDriftClassificationFailsWhenSeedCannotPersist() async throws {
         let store = MemoryBackupStateStore(removesRecords: false)
         let index = UploadBackupPreflightIndex(store: store)

@@ -529,7 +529,7 @@ public final class EditReplacementJournalFileStore: EditReplacementJournaling, @
 
     /// Appends `line` and returns its bytes as written.
     private func append(_ line: Line) throws -> Data {
-        guard !log.writeFailed else { throw UploadError.backend("Edit replacement journal could not be written") }
+        guard !log.writeFailed else { throw UploadError.internalFailure(.editJournalNotWritten) }
         var data = try JSONEncoder().encode(line)
         data.append(UInt8(ascii: "\n"))
         // A new log is created with its first line in one atomic write; a later line is appended, and a line that
