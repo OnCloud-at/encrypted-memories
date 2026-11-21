@@ -490,15 +490,7 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
     private func withAdmission<T: Sendable>(
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        guard let requestCause else { return try await admitted(operation) }
-        return try await requestCause.run { try await admitted(operation) }
-    }
-
-    private func admitted<T: Sendable>(
-        _ operation: @escaping @Sendable () async throws -> T
-    ) async throws -> T {
-        guard let admission else { return try await operation() }
-        return try await admission.withAdmission(operation)
+        try await RequestAdmission(gate: admission, requestCause: requestCause).run(operation)
     }
 
     private func enumerateAlbumUIDs() async throws -> [SDKNodeUid] {

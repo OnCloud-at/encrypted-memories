@@ -370,18 +370,6 @@ extension DriveSessionStubSuite {
             #expect(try linkIDs(inBodyOf: request) == ["l1"])
         }
 
-        @Test func deleteAlbumUsesSafeAlbumEndpointWithoutDeletingAlbumOnlyPhotos() async throws {
-            StubURLProtocol.reset()
-            StubURLProtocol.route("DELETE /drive/photos/volumes/vol1/albums/album1", json: #"{"Code":1000}"#)
-
-            try await makeSession().deleteAlbum(volumeID: "vol1", albumLinkID: "album1")
-
-            let request = try #require(StubURLProtocol.requests().first)
-            #expect(request.method == "DELETE")
-            #expect(request.path == "/drive/photos/volumes/vol1/albums/album1?DeleteAlbumPhotos=0")
-            #expect(request.body == nil)
-        }
-
         @Test func listTrashResolvesIdGroupsViaFetchMetadata() async throws {
             // The volume trash listing returns only {ShareID, LinkIDs} groups. Decoding `Links` from it
             // yields nil, so the bridge must fetch link bodies with

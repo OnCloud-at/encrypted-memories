@@ -1905,35 +1905,14 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
     }
 
-    /// Sets an album's cover to an already-uploaded photo (direct REST; the app does not use the SDK album-write bindings yet).
-    /// The photo's `nodeID` is its Drive link id.
-    func setAlbumCover(albumID: String, photoUID: PhotoUID) async throws {
-        try await withOpenSession(cause: .albums) { bridge in
-            let root = try await bridge.resolvePhotosRoot()
-            try await bridge.driveSession.setAlbumCover(
-                volumeID: root.volumeID,
-                albumLinkID: albumID,
-                coverLinkID: photoUID.nodeID
-            )
-        }
-    }
-
-    func deleteAlbum(albumID: String) async throws {
-        try await withOpenSession(cause: .albums) { bridge in
-            let root = try await bridge.resolvePhotosRoot()
-            try await bridge.driveSession.deleteAlbum(volumeID: root.volumeID, albumLinkID: albumID)
-        }
-    }
-
-    func removePhotos(_ photoUIDs: [PhotoUID], fromAlbum albumID: String) async throws {
-        try await withOpenSession(cause: .albums) { bridge in
-            let root = try await bridge.resolvePhotosRoot()
-            try await bridge.driveSession.removeFromAlbum(
-                volumeID: root.volumeID,
-                albumLinkID: albumID,
-                linkIDs: photoUIDs.map(\.nodeID)
-            )
-        }
+    /// The five album writes (create, cover, delete, add, remove) over the SDK album calls. Every call
+    /// addresses the account's own Photos volume.
+    nonisolated func makeAlbumWriteBackend() -> SDKAlbumWriteBackend {
+        SDKAlbumWriteBackend(
+            client: photosClient,
+            ownVolumeID: { [self] in try await photosShareContext().volumeID },
+            admission: RequestAdmission(gate: shutdownGate, requestCause: requestCause(.albums))
+        )
     }
 
     /// Refreshes the lightweight account snapshot used by Settings (email and Drive quota). The existing
@@ -2908,8 +2887,8 @@ extension DriveSDKBridge: PhotoUploading {
         )
     }
 
-    /// The album WRITE service (create + add-photos crypto/REST). Built once at facade
-    /// composition; shares the bridge's session, crypto, and photos-share discovery.
+    /// The album write service of Album Sync (create + add-photos crypto/REST over the Drive web API). Built once at
+    /// facade composition; shares the bridge's session, crypto, and photos-share discovery.
     nonisolated func makeAlbumWriteService() -> ProtonAlbumWriteService {
         ProtonAlbumWriteService(
             session: driveSession,

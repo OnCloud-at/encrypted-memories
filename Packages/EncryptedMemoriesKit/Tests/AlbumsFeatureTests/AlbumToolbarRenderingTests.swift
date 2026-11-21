@@ -12,7 +12,7 @@
         @MainActor func testAlbumSheetKeepsItsTextActionsOnMac() async throws {
             _ = NSApplication.shared
             try requireVisionOCR()
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
             let host = NSHostingController(
                 rootView: Color.clear.frame(width: 480, height: 320)
@@ -56,7 +56,7 @@
         @MainActor func testEmptyDestinationUsesTheSurroundingTextSize() async throws {
             _ = NSApplication.shared
             try requireVisionOCR()
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
             await coordinator.refresh()
             let title = L10n.string("albums.none_available")

@@ -8,7 +8,7 @@ import XCTest
 final class AlbumFailurePresentationTests: XCTestCase {
     @MainActor
     func testOwnedReadUsesTheReadSpecificReason() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.listError = NSError(domain: "PrivateAlbumNode", code: 17)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
@@ -21,7 +21,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
 
     @MainActor
     func testSharedReadUsesTheReadSpecificReason() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.sharedListError = URLError(.timedOut)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
@@ -36,7 +36,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
     func testCancelledReadsKeepCachedListsWithoutAnError() async {
         for error: any Error in [CancellationError(), URLError(.cancelled)] {
             let backend = FakeAlbumBackend(
-                capabilities: .sdkCatalogWithHTTPWrites,
+                capabilities: .sdkCatalogAndWrites,
                 albums: [AlbumSummary(id: "existing", title: "Trip", photoCount: 2, coverPhotoID: nil)]
             )
             backend.sharedAlbums = [sharedAlbum()]
@@ -64,7 +64,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
 
     @MainActor
     func testManualReadAfterTransientFailureCanRecoverWithoutReplayingWrites() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.listError = URLError(.notConnectedToInternet)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         await coordinator.refresh()
@@ -91,7 +91,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
             .sharedAlbumReadOnly(.transportUnsupported),
         ]
         for error in errors {
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             backend.listError = error
             backend.sharedListError = error
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
@@ -111,7 +111,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
     @MainActor
     func testSuccessfulCreateWithFailedReloadKeepsTheSuccessAndCachedAlbums() async {
         let backend = FakeAlbumBackend(
-            capabilities: .sdkCatalogWithHTTPWrites,
+            capabilities: .sdkCatalogAndWrites,
             albums: [AlbumSummary(id: "existing", title: "Trip", photoCount: 2, coverPhotoID: nil)]
         )
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
@@ -131,7 +131,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
 
     @MainActor
     func testCancelledTaskDoesNotPublishALateSuccessfulRead() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         await coordinator.refresh()
         backend.albums = [AlbumSummary(id: "late", title: "Trip", photoCount: 2, coverPhotoID: nil)]
@@ -152,7 +152,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
     @MainActor
     func testFirstCancelledOwnedReadRemainsUnloadedRatherThanEmpty() async {
         for error: any Error in [CancellationError(), URLError(.cancelled)] {
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             backend.listError = error
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
@@ -168,7 +168,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
     @MainActor
     func testFirstCancelledSharedReadRemainsUnloadedRatherThanEmpty() async {
         for error: any Error in [CancellationError(), URLError(.cancelled)] {
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             backend.sharedListError = error
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
@@ -183,7 +183,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
 
     @MainActor
     func testCancelledRetriesRestoreTheEarlierFailureAndRetry() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.listError = URLError(.timedOut)
         backend.sharedListError = URLError(.timedOut)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
@@ -211,7 +211,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
     func testAReplacementReadIsNotDroppedWhenTheFirstReadIsCancelled() async {
         for shared in [false, true] {
             let backend = FakeAlbumBackend(
-                capabilities: .sdkCatalogWithHTTPWrites,
+                capabilities: .sdkCatalogAndWrites,
                 albums: [AlbumSummary(id: "replacement", title: "Trip", photoCount: 2, coverPhotoID: nil)]
             )
             backend.sharedAlbums = [sharedAlbum()]
@@ -256,7 +256,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
     @MainActor
     func testACancelledReplacementDoesNotStartAnotherRead() async {
         for shared in [false, true] {
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             let gate = CancelledAlbumReadGate()
             backend.listHold = { await gate.hold() }
             let coordinator = AlbumActionCoordinator(repository: repository(backend))
@@ -292,7 +292,7 @@ final class AlbumFailurePresentationTests: XCTestCase {
     @MainActor
     func testACancelledReplacementReadCannotStartAThirdRead() async {
         for shared in [false, true] {
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             let firstGate = CancelledAlbumReadGate()
             let replacementGate = CancelledAlbumReadGate()
             let secondRead = expectation(description: "the replacement read started")

@@ -25,19 +25,19 @@ private func sharedAlbum(
 }
 
 private var sharedWriteTransport: AlbumCapabilities {
-    var capabilities = AlbumCapabilities.sdkCatalogWithHTTPWrites
+    var capabilities = AlbumCapabilities.sdkCatalogAndWrites
     capabilities.canWriteSharedAlbums = true
     return capabilities
 }
 
 final class SharedAlbumPermissionTests: XCTestCase {
     func testWiredHTTPTransportDoesNotAddressSharedAlbums() {
-        XCTAssertFalse(AlbumCapabilities.sdkCatalogWithHTTPWrites.canWriteSharedAlbums)
+        XCTAssertFalse(AlbumCapabilities.sdkCatalogAndWrites.canWriteSharedAlbums)
     }
 
     func testViewerAndInheritedAccessStayReadOnlyEvenWithATransport() {
         for role in [SharedAlbumRole.viewer, .inherited] {
-            for capabilities in [AlbumCapabilities.sdkCatalogWithHTTPWrites, sharedWriteTransport] {
+            for capabilities in [AlbumCapabilities.sdkCatalogAndWrites, sharedWriteTransport] {
                 let permissions = SharedAlbumPermissions.resolve(role: role, capabilities: capabilities)
                 XCTAssertTrue(permissions.canView)
                 XCTAssertFalse(permissions.canAddPhotos, "\(role)")
@@ -53,7 +53,7 @@ final class SharedAlbumPermissionTests: XCTestCase {
     func testEditorAndAdminAreReadOnlyWithoutASharedAlbumTransport() {
         for role in [SharedAlbumRole.editor, .admin] {
             let permissions = SharedAlbumPermissions.resolve(
-                role: role, capabilities: .sdkCatalogWithHTTPWrites)
+                role: role, capabilities: .sdkCatalogAndWrites)
             XCTAssertTrue(permissions.isReadOnly, "\(role)")
             XCTAssertEqual(permissions.writeRestriction, .transportUnsupported)
         }
@@ -110,7 +110,7 @@ final class SharedAlbumPermissionTests: XCTestCase {
 
 final class SharedAlbumRepositoryGuardTests: XCTestCase {
     func testOwnedWritesRejectAKnownSharedAlbumBeforeAnyRequest() async throws {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.sharedAlbums = [sharedAlbum("viewer-album", role: .viewer), sharedAlbum("editor-album", role: .editor)]
         let repo = repository(backend)
         _ = try await repo.listAlbums()
@@ -133,7 +133,7 @@ final class SharedAlbumRepositoryGuardTests: XCTestCase {
 
     func testOwnedAlbumWritesAreUnchangedWhenSharedAlbumsAreLoaded() async throws {
         let backend = FakeAlbumBackend(
-            capabilities: .sdkCatalogWithHTTPWrites,
+            capabilities: .sdkCatalogAndWrites,
             albums: [AlbumSummary(id: "owned", title: "Mine", photoCount: 0, coverPhotoID: nil)])
         backend.sharedAlbums = [sharedAlbum("shared", role: .viewer)]
         let repo = repository(backend)
@@ -189,7 +189,7 @@ final class SharedAlbumCoordinatorTests: XCTestCase {
 
     @MainActor
     func testWiredCapabilitiesKeepEditorAndAdminReadOnly() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.sharedAlbums = [sharedAlbum("editor", role: .editor), sharedAlbum("admin", role: .admin)]
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         await coordinator.refreshSharedAlbums()
@@ -202,7 +202,7 @@ final class SharedAlbumCoordinatorTests: XCTestCase {
     @MainActor
     func testFailedMembershipReadKeepsTheOwnedWritePathEnabled() async {
         let backend = FailingMembershipBackend(
-            capabilities: .sdkCatalogWithHTTPWrites,
+            capabilities: .sdkCatalogAndWrites,
             albums: [AlbumSummary(id: "owned", title: "Mine", photoCount: 0, coverPhotoID: nil)])
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         let photo = PhotoUID(volumeID: "vol", nodeID: "p")
@@ -219,7 +219,7 @@ final class SharedAlbumCoordinatorTests: XCTestCase {
     @MainActor
     func testPartialAddStaysVisibleAndDoesNotCreateAnotherAlbum() async {
         let backend = FakeAlbumBackend(
-            capabilities: .sdkCatalogWithHTTPWrites,
+            capabilities: .sdkCatalogAndWrites,
             albums: [AlbumSummary(id: "owned", title: "Mine", photoCount: 0, coverPhotoID: nil)])
         backend.addError = AlbumError.partialAdd(succeeded: 1, total: 2, message: "code 2011")
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
@@ -236,7 +236,7 @@ final class SharedAlbumCoordinatorTests: XCTestCase {
 
     @MainActor
     func testSharedAlbumWriteRejectionIsReportedAsAFailure() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.sharedAlbums = [sharedAlbum("viewer", role: .viewer)]
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         await coordinator.refresh()
@@ -257,7 +257,7 @@ final class SharedAlbumPresentationTests: XCTestCase {
             let album = sharedAlbum("one", role: role)
             let presentation = SharedAlbumPresentation(
                 album: album,
-                permissions: .resolve(role: role, capabilities: .sdkCatalogWithHTTPWrites))
+                permissions: .resolve(role: role, capabilities: .sdkCatalogAndWrites))
             let title = SharedAlbumPresentation.roleTitle(role)
             XCTAssertTrue(presentation.detailLine.contains(title), "\(role)")
             XCTAssertTrue(presentation.accessibilityLabel.contains(title), "\(role)")
@@ -279,7 +279,7 @@ final class SharedAlbumPresentationTests: XCTestCase {
         try XCTSkipUnless(catalogCompiledIntoBundle, "String Catalog not compiled (plain SwiftPM build).")
         let presentation = SharedAlbumPresentation(
             album: sharedAlbum("one", role: .viewer, photoCount: 12),
-            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogWithHTTPWrites))
+            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogAndWrites))
         XCTAssertFalse(presentation.detailLine.contains("albums.photo_count"), presentation.detailLine)
         XCTAssertTrue(presentation.detailLine.contains("12"), presentation.detailLine)
         XCTAssertFalse(presentation.accessibilityLabel.contains("albums.photo_count"), presentation.accessibilityLabel)
@@ -305,14 +305,14 @@ final class SharedAlbumPresentationTests: XCTestCase {
             role: .viewer, sharedBy: "a@example.test", isSharedByVerified: true, inviteTime: Date())
         let presentation = SharedAlbumPresentation(
             album: sharedAlbum("one", role: .inherited, invitation: invitation),
-            permissions: .resolve(role: .inherited, capabilities: .sdkCatalogWithHTTPWrites))
+            permissions: .resolve(role: .inherited, capabilities: .sdkCatalogAndWrites))
         XCTAssertNil(presentation.invitationDetail)
     }
 
     func testEditorWithoutTransportIsMarkedReadOnlyInText() {
         let album = sharedAlbum("one", role: .editor)
         let presentation = SharedAlbumPresentation(
-            album: album, permissions: .resolve(role: .editor, capabilities: .sdkCatalogWithHTTPWrites))
+            album: album, permissions: .resolve(role: .editor, capabilities: .sdkCatalogAndWrites))
         let editor = SharedAlbumPresentation.roleTitle(.editor)
         XCTAssertTrue(presentation.detailLine.contains(L10n.string("albums.shared_role_read_only \(editor)")))
         XCTAssertEqual(
@@ -326,7 +326,7 @@ final class SharedAlbumPresentationTests: XCTestCase {
                 "one", role: .viewer,
                 invitation: .init(
                     role: .viewer, sharedBy: "a@example.test", isSharedByVerified: true, inviteTime: date)),
-            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogWithHTTPWrites))
+            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogAndWrites))
         XCTAssertEqual(
             verified.invitationDetail,
             L10n.string("albums.shared_invited_by \("a@example.test")") + " • "
@@ -337,7 +337,7 @@ final class SharedAlbumPresentationTests: XCTestCase {
                 "one", role: .viewer,
                 invitation: .init(
                     role: .viewer, sharedBy: "a@example.test", isSharedByVerified: false, inviteTime: nil)),
-            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogWithHTTPWrites))
+            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogAndWrites))
         XCTAssertEqual(
             unverified.invitationDetail, L10n.string("albums.shared_invited_by_unverified \("a@example.test")"))
         XCTAssertNotEqual(unverified.invitationDetail, L10n.string("albums.shared_invited_by \("a@example.test")"))
@@ -346,14 +346,14 @@ final class SharedAlbumPresentationTests: XCTestCase {
             album: sharedAlbum(
                 "one", role: .viewer,
                 invitation: .init(role: .viewer, sharedBy: nil, isSharedByVerified: false, inviteTime: nil)),
-            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogWithHTTPWrites))
+            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogAndWrites))
         XCTAssertEqual(anonymous.invitationDetail, L10n.string("albums.shared_inviter_unverified"))
 
         let missing = SharedAlbumPresentation(
             album: sharedAlbum(
                 "one", role: .viewer,
                 invitation: .init(role: .viewer, sharedBy: nil, isSharedByVerified: true, inviteTime: nil)),
-            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogWithHTTPWrites))
+            permissions: .resolve(role: .viewer, capabilities: .sdkCatalogAndWrites))
         XCTAssertNil(missing.invitationDetail)
     }
 }

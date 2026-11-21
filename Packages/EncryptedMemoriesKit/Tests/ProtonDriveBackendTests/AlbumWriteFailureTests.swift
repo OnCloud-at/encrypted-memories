@@ -20,38 +20,6 @@ private struct FailingAlbumBackend: AlbumCatalogBackend, AlbumWriteBackend {
 }
 
 final class AlbumWriteFailureTests: XCTestCase {
-    private func backend(throwing error: any Error) -> HTTPAlbumWriteBackend {
-        HTTPAlbumWriteBackend(
-            setCoverProvider: { _, _ in throw error }, createProvider: { _ in throw error },
-            deleteProvider: { _ in throw error }, addProvider: { _, _ in throw error },
-            removeProvider: { _, _ in throw error })
-    }
-
-    func testHTTPStatusAndTransientClassificationSurviveAlbumWrites() async {
-        for status in [408, 429, 500, 503, 403, 404] {
-            let original = ProtonAuthError.apiError(code: status, message: "failed")
-            do {
-                try await backend(throwing: original).addPhotos([PhotoUID(volumeID: "v", nodeID: "p")], to: "a")
-                XCTFail("the write must fail")
-            } catch let AlbumError.requestFailed(cause) {
-                XCTAssertEqual(cause.kind, .http(status: status))
-                XCTAssertEqual(cause.isTransient, status == 408 || status == 429 || status >= 500)
-                XCTAssertNotNil(cause.underlyingError as? ProtonAuthError)
-            } catch {
-                XCTFail("the HTTP cause must remain typed: \(error)")
-            }
-        }
-    }
-
-    func testCancellationPassesTheHTTPAdapter() async {
-        do {
-            try await backend(throwing: CancellationError()).addPhotos([], to: "a")
-            XCTFail("the write must fail")
-        } catch {
-            XCTAssertTrue(error is CancellationError)
-        }
-    }
-
     func testMixedAndMissingItemOutcomesNeverBecomeSuccess() {
         let photos = [
             PhotoUID(volumeID: "v", nodeID: "a"), PhotoUID(volumeID: "v", nodeID: "b"),

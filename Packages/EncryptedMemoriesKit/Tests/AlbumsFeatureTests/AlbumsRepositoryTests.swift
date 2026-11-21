@@ -89,7 +89,7 @@ func repository(_ backend: FakeAlbumBackend) -> AlbumsRepository {
 
 final class AlbumsRepositoryTests: XCTestCase {
     func testAlbumWriteCancellationRemainsCancellation() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.addError = CancellationError()
         do {
             try await repository(backend).addPhotos([uid("1")], to: "album")
@@ -102,7 +102,7 @@ final class AlbumsRepositoryTests: XCTestCase {
 
     func testOfflineAndTimeoutKeepTheirCauseInsteadOfBecomingBackendStrings() async {
         for code in [URLError.notConnectedToInternet, URLError.timedOut] {
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             backend.addError = URLError(code)
             do {
                 try await repository(backend).addPhotos([uid("1")], to: "album")
@@ -125,7 +125,7 @@ final class AlbumsRepositoryTests: XCTestCase {
     }
 
     func testCancelledAddAfterCreatingAlbumKeepsIDAndCancellationForRetry() async throws {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.addError = CancellationError()
         let repo = repository(backend)
         var createdID: AlbumID?
@@ -149,7 +149,7 @@ final class AlbumsRepositoryTests: XCTestCase {
     }
 
     func testUnrecognizedNetworkErrorIsNotCalledTransientOrRefusal() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.addError = URLError(.unsupportedURL)
         do {
             try await repository(backend).addPhotos([uid("1")], to: "album")
@@ -165,7 +165,7 @@ final class AlbumsRepositoryTests: XCTestCase {
     }
 
     func testUnknownWriteFailureKeepsItsCauseAndStops() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.addError = NSError(domain: "AlbumTestFailure", code: 73)
         do {
             try await repository(backend).addPhotos([uid("1")], to: "album")
@@ -189,7 +189,7 @@ final class AlbumsRepositoryTests: XCTestCase {
                 failures: [AlbumWriteItemFailure(linkID: "2", code: 429, message: "later")]),
         ]
         for underlying in errors {
-            let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+            let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
             backend.addError = underlying
             let repo = repository(backend)
             var createdID: AlbumID?
@@ -214,7 +214,7 @@ final class AlbumsRepositoryTests: XCTestCase {
     }
 
     func testHTTPBackendCapabilityPresetIncludesEveryWiredAlbumOperation() {
-        let capabilities = AlbumCapabilities.sdkCatalogWithHTTPWrites
+        let capabilities = AlbumCapabilities.sdkCatalogAndWrites
         XCTAssertTrue(capabilities.canList)
         XCTAssertTrue(capabilities.canCreate)
         XCTAssertTrue(capabilities.canDelete)
@@ -233,7 +233,7 @@ final class AlbumsRepositoryTests: XCTestCase {
     }
 
     func testSuccessfulSharedLeavePublishesConfirmedAccessLoss() async throws {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let recorder = SharedLeaveRecorder()
         let repo = AlbumsRepository(
             catalogBackend: backend,
@@ -253,7 +253,7 @@ final class AlbumsRepositoryTests: XCTestCase {
     func testAlbumMembershipTitlesMatchLosslessVolumeAndSortForViewer() async throws {
         let photo = uid("photo")
         let backend = FakeAlbumBackend(
-            capabilities: .sdkCatalogWithHTTPWrites,
+            capabilities: .sdkCatalogAndWrites,
             albums: [
                 AlbumSummary(id: "summer", volumeID: "vol", title: "Summer", photoCount: 1, coverPhotoID: nil),
                 AlbumSummary(id: "family", volumeID: "vol", title: "Family", photoCount: 1, coverPhotoID: nil),
@@ -281,7 +281,7 @@ final class AlbumsRepositoryTests: XCTestCase {
         let photo = PhotoUID(volumeID: "foreign", nodeID: "photo")
         let sharedNode = AlbumNodeIdentifier(volumeID: "foreign", nodeID: "album")
         let backend = FakeAlbumBackend(
-            capabilities: .sdkCatalogWithHTTPWrites,
+            capabilities: .sdkCatalogAndWrites,
             albums: [AlbumSummary(id: "album", volumeID: "vol", title: "Wrong album", photoCount: 1, coverPhotoID: nil)]
         )
         backend.sharedAlbums = [
