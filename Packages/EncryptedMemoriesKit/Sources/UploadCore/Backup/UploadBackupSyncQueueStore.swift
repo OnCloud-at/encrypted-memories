@@ -205,14 +205,14 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    /// Reads one row. Closed stores, failed binds, failed statements and a row that does not decode throw
-    /// `SQLiteStoreUnknownReadError` (#1004). A lasting failure with successful SQL still answers the row, as
+    /// Reads one row. A closed store, a failed bind, a failed statement and a row that does not decode answer unknown
+    /// (#1004). A lasting failure with successful SQL still answers the row, as
     /// `testQueueDecodeFailureStaysStickyAfterSuccessfulSQLAndRefusesDurability` pins.
-    public func entry(
+    public func decisionEntry(
         for source: UploadSourceIdentity, revision: UploadBackupRevision
-    ) throws -> UploadBackupSyncQueueEntry? {
-        try connection.withLock {
-            guard let db else { throw SQLiteStoreUnknownReadError() }
+    ) throws -> StoreLookup<UploadBackupSyncQueueEntry> {
+        connection.withLock {
+            guard let db else { return .unknown }
             var stmt: OpaquePointer?
             guard
                 requireOperational(
@@ -226,25 +226,26 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         """,
                         -1, &stmt, nil
                     ) == SQLITE_OK)
-            else { throw SQLiteStoreUnknownReadError() }
+            else { return .unknown }
             defer { sqlite3_finalize(stmt) }
-            guard connection.bindUploadSource(source, to: stmt, from: 1) else {
-                throw SQLiteStoreUnknownReadError()
+            // A bind that fails leaves its parameter unset: the query would match no row and answer absent.
+            guard connection.bindUploadSource(source, to: stmt, from: 1) else { return .unknown }
+            do {
+                try connection.requireReadableBinding(resultCode: sqlite3_bind_int64(stmt, 4, revision.rawValue))
+            } catch {
+                return .unknown
             }
-            sqlite3_bind_int64(stmt, 4, revision.rawValue)
             let result = sqlite3_step(stmt)
             if result == SQLITE_ROW {
                 // A row whose stored receipt does not decode is unknown, never an absent row (#1004 B2).
-                guard let entry = row(stmt, source: source, revision: revision) else {
-                    throw SQLiteStoreUnknownReadError()
-                }
-                return entry
+                guard let entry = row(stmt, source: source, revision: revision) else { return .unknown }
+                return .found(entry)
             }
             if result != SQLITE_DONE {
                 connection.markFailed(resultCode: sqlite3_extended_errcode(db))
-                throw SQLiteStoreUnknownReadError()
+                return .unknown
             }
-            return nil
+            return .absent
         }
     }
 

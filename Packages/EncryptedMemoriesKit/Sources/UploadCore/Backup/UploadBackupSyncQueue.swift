@@ -276,11 +276,13 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func updateDismissedSourceRecheck(
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
     ) -> Bool?
-    /// Reads one row. Throws `SQLiteStoreUnknownReadError` when the read could not run, so callers never mistake a
-    /// failed read for a real absence (#1004). A conformer throws no other error from it.
-    /// A throwing optional is easy to collapse with `try?`, so a decision reads `decisionEntry(for:revision:)` instead.
-    /// This method stays only for the callers that have not moved yet (#1153) and is removed once the last one does.
-    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry?
+    /// The keyed read for a decision: found, absent, or unknown. A read that could not run (a closed store, a failed
+    /// bind or statement, a row that does not decode) answers unknown and never proves the row absent (#1004). The
+    /// store itself does not throw. A test double may throw a foreign error, a cancellation for example, and the
+    /// callers let it propagate; only the callers that already ended such a read in their failure path catch it.
+    func decisionEntry(
+        for source: UploadSourceIdentity, revision: UploadBackupRevision
+    ) throws -> StoreLookup<UploadBackupSyncQueueEntry>
     /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry]
@@ -389,22 +391,6 @@ public protocol UploadBackupSyncQueueStore: Sendable {
 }
 
 public extension UploadBackupSyncQueueStore {
-    /// The keyed read for a decision: found, absent, or unknown. A read that failed (`SQLiteStoreUnknownReadError`) is
-    /// unknown and never proves the row absent. Any other error propagates unchanged, also a cancellation.
-    /// It adds no collapse of its own: it answers from the strict `entry(for:revision:)` of the store, and a failed
-    /// strict read is unknown. It is an extension method, so it dispatches statically: a concrete store must not
-    /// declare its own `decisionEntry`.
-    func decisionEntry(
-        for source: UploadSourceIdentity, revision: UploadBackupRevision
-    ) throws -> StoreLookup<UploadBackupSyncQueueEntry> {
-        do {
-            guard let row = try entry(for: source, revision: revision) else { return .absent }
-            return .found(row)
-        } catch is SQLiteStoreUnknownReadError {
-            return .unknown
-        }
-    }
-
     @discardableResult
     func dismissPermanentFailure(
         source: UploadSourceIdentity,

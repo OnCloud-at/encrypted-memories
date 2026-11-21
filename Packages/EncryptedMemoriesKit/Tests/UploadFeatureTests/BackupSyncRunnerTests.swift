@@ -591,7 +591,9 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         return inner.upsert(entry)
     }
 
-    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
+    func decisionEntry(
+        for source: UploadSourceIdentity, revision: UploadBackupRevision
+    ) throws -> StoreLookup<UploadBackupSyncQueueEntry> {
         if let foreign = entryReadFailure { throw foreign }
         let unknown = lock.withLock {
             guard unknownEntryReads > 0 else { return false }
@@ -599,8 +601,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
             unknownEntryReadCount += 1
             return true
         }
-        if unknown { throw SQLiteStoreUnknownReadError() }
-        return try inner.entry(for: source, revision: revision)
+        if unknown { return .unknown }
+        return try inner.decisionEntry(for: source, revision: revision)
     }
 
     func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool {
@@ -719,8 +721,10 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     func recordedFailureCount() -> UInt64 { inner.recordedFailureCount() }
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool { inner.upsert(entry) }
-    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
-        try inner.entry(for: source, revision: revision)
+    func decisionEntry(
+        for source: UploadSourceIdentity, revision: UploadBackupRevision
+    ) throws -> StoreLookup<UploadBackupSyncQueueEntry> {
+        try inner.decisionEntry(for: source, revision: revision)
     }
     func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool {
         try inner.containsAny(in: states)

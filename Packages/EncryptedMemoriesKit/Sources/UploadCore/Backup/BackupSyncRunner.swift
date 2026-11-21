@@ -1174,8 +1174,10 @@ public actor BackupSyncRunner {
                         // the photo and, for an exclusion, schedules its trash. Settlement ends as cancelled; the
                         // runner ends the pass unless it removed this source itself.
                         // A failed read is no removal: it ends settlement as a store failure, which stops the pass.
-                        if try queue.entry(for: entry.source, revision: entry.revision) == nil {
-                            throw CancellationError()
+                        switch try queue.decisionEntry(for: entry.source, revision: entry.revision) {
+                        case .absent: throw CancellationError()
+                        case .unknown: throw SQLiteStoreUnknownReadError()
+                        case .found: break
                         }
                         throw UploadError.backend("Remote commit reconciliation could not be persisted")
                     }
@@ -1585,8 +1587,10 @@ public actor BackupSyncRunner {
         _ entry: UploadBackupSyncQueueEntry, from state: UploadBackupSyncQueueState, message: String
     ) {
         if sourceWasRemoved(entry) { return }
-        guard let persisted = (try? queue.entry(for: entry.source, revision: entry.revision)),
-            let reconciliation = persisted.remoteCommitReconciliation
+        // A row that cannot be read or that is gone has no receipt to park: the pass stops either way.
+        let lookup: StoreLookup<UploadBackupSyncQueueEntry>
+        do { lookup = try queue.decisionEntry(for: entry.source, revision: entry.revision) } catch { lookup = .unknown }
+        guard case .found(let persisted) = lookup, let reconciliation = persisted.remoteCommitReconciliation
         else {
             PhotoDiagnostics.shared.increment("backup.remoteCommitReconciliationUnavailable")
             PhotoDiagnostics.shared.emitDebug(
@@ -1605,8 +1609,13 @@ public actor BackupSyncRunner {
         private let lock = NSLock()
         private var failed = false
         var occurred: Bool { lock.withLock { failed } }
-        func read<Value>(_ operation: () throws -> Value) rethrows -> Value {
-            do { return try operation() } catch {
+        /// A read that throws or answers unknown has failed; the settlement then reports a store failure.
+        func read<Row>(_ operation: () throws -> StoreLookup<Row>) rethrows -> StoreLookup<Row> {
+            do {
+                let lookup = try operation()
+                if case .unknown = lookup { lock.withLock { failed = true } }
+                return lookup
+            } catch {
                 lock.withLock { failed = true }
                 throw error
             }
@@ -1919,10 +1928,12 @@ public actor BackupSyncRunner {
                             )
                         else {
                             // The row is gone, for example after a deletion or an exclusion.
-                            if try queueReadFailure.read({
-                                try queue.entry(for: entry.source, revision: entry.revision)
-                            }) == nil {
-                                throw CancellationError()
+                            switch try queueReadFailure.read({
+                                try queue.decisionEntry(for: entry.source, revision: entry.revision)
+                            }) {
+                            case .absent: throw CancellationError()
+                            case .unknown: throw SQLiteStoreUnknownReadError()
+                            case .found: break
                             }
                             throw UploadError.backend("Secondary reconciliation could not be persisted")
                         }
@@ -1965,9 +1976,11 @@ public actor BackupSyncRunner {
                 )
                 switch outcome {
                 case .settled:
-                    if try queue.entry(for: entry.source, revision: entry.revision)?.state
-                        == .needsRemoteReconciliation
-                    {
+                    switch try queue.decisionEntry(for: entry.source, revision: entry.revision) {
+                    case .unknown:
+                        stopRequested = true
+                        return .storeUnavailable
+                    case .found(let row) where row.state == .needsRemoteReconciliation:
                         guard
                             queue.updateState(
                                 source: entry.source,
@@ -1981,6 +1994,8 @@ public actor BackupSyncRunner {
                             stopRequested = true
                             return .cancelled
                         }
+                    case .found, .absent:
+                        break
                     }
                     remaining -= 1
                     completedSecondaries += 1
@@ -2598,8 +2613,12 @@ public actor BackupSyncRunner {
         // write keeps the earlier behavior too.
         if sourceIsUnavailable { _ = markSourceUnavailable?(entry.source) }
         guard queue.removeMissingSource(source: entry.source, revision: entry.revision) else {
+            // Only a row that is certainly gone lets the pass go on; a row that is still there or cannot be read stops it.
             do {
-                if try queue.entry(for: entry.source, revision: entry.revision) != nil { stopRequested = true }
+                switch try queue.decisionEntry(for: entry.source, revision: entry.revision) {
+                case .absent: break
+                case .found, .unknown: stopRequested = true
+                }
             } catch {
                 stopRequested = true
             }
@@ -2622,7 +2641,13 @@ public actor BackupSyncRunner {
         of entry: UploadBackupSyncQueueEntry, fallback: UploadBackupSyncQueueState
     ) -> UploadBackupSyncQueueState? {
         do {
-            return try queue.entry(for: entry.source, revision: entry.revision)?.state ?? fallback
+            switch try queue.decisionEntry(for: entry.source, revision: entry.revision) {
+            case .found(let row): return row.state
+            case .absent: return fallback
+            case .unknown:
+                stopRequested = true
+                return nil
+            }
         } catch {
             stopRequested = true
             return nil
