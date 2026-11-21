@@ -1,6 +1,7 @@
 import AlbumSyncCore
 import Foundation
 import PhotosCore
+import SQLiteTestSupport
 import UploadCore
 import XCTest
 

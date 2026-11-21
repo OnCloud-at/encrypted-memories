@@ -393,7 +393,12 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                     bindText(selectAsset, 3, item.asset.uid.nodeID),
                     bindText(selectAsset, 4, item.asset.sourceRevision)
                 else { return rollback() }
-                guard sqlite3_step(selectAsset) == SQLITE_ROW else { continue }
+                // A step that fails is no proof that the asset is gone, so it fails the commit as well.
+                switch sqlite3_step(selectAsset) {
+                case SQLITE_ROW: break
+                case SQLITE_DONE: continue
+                default: return rollback()
+                }
                 let assetID = sqlite3_column_int64(selectAsset, 0)
 
                 let state: Int32
@@ -767,13 +772,19 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
     public func reconcile(liveUIDs: Set<PhotoUID>, for key: MLPipelineExecutionKey) -> Bool {
         lock.withLock {
             defer { checkpointWALLocked() }
-            guard
-                let accountKey = accountKeyLocked(identifier: key.accountIdentifier, create: false),
-                let artifactIDs = artifactIDsLocked(for: key, create: false),
-                !artifactIDs.isEmpty
-            else {
-                return true
+            let accountKey: Int64
+            let artifactIDs: [String: Int64]
+            do {
+                // A lookup that fails is no proof that the account or its artifacts are gone.
+                guard let existingAccountKey = try existingAccountKeyLocked(identifier: key.accountIdentifier) else {
+                    return true
+                }
+                accountKey = existingAccountKey
+                artifactIDs = try existingArtifactIDsLocked(for: key)
+            } catch {
+                return false
             }
+            guard !artifactIDs.isEmpty else { return true }
             let ids = artifactIDs.values.sorted()
             var select: OpaquePointer?
             guard
@@ -1031,51 +1042,33 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         for key: MLPipelineExecutionKey,
         create: Bool
     ) -> [String: Int64]? {
-        var insert: OpaquePointer?
-        if create,
-            !prepare(
-                "INSERT OR IGNORE INTO ml_derived_artifacts(pipeline_id, schema_version, artifact_namespace) VALUES(?,?,?);",
-                &insert
-            )
-        {
-            return nil
-        }
-        defer { sqlite3_finalize(insert) }
-        var select: OpaquePointer?
-        guard
-            prepare(
-                "SELECT artifact_id, pipeline_id, schema_version FROM ml_derived_artifacts WHERE artifact_namespace=?;",
-                &select
-            )
-        else { return nil }
-        defer { sqlite3_finalize(select) }
-
-        var result: [String: Int64] = [:]
-        result.reserveCapacity(key.artifacts.count)
-        for artifact in key.artifacts {
-            if create {
+        if create {
+            var insert: OpaquePointer?
+            guard
+                prepare(
+                    "INSERT OR IGNORE INTO ml_derived_artifacts(pipeline_id, schema_version, artifact_namespace) VALUES(?,?,?);",
+                    &insert
+                )
+            else { return nil }
+            defer { sqlite3_finalize(insert) }
+            for artifact in key.artifacts {
                 reset(insert)
                 sqlite3_bind_int64(insert, 2, Int64(key.schemaVersion))
                 guard bindText(insert, 1, key.pipelineID.rawValue), bindText(insert, 3, artifact.stableNamespace),
                     sqlite3_step(insert) == SQLITE_DONE
                 else { return nil }
             }
-            reset(select)
-            // A namespace that does not bind is no proof that the artifact is missing.
-            guard bindText(select, 1, artifact.stableNamespace) else { return nil }
-            guard sqlite3_step(select) == SQLITE_ROW,
-                columnText(select, 1) == key.pipelineID.rawValue,
-                sqlite3_column_int64(select, 2) == Int64(key.schemaVersion)
-            else { continue }
-            result[artifact.stableNamespace] = sqlite3_column_int64(select, 0)
         }
-        return result
+        // An artifact row of another pipeline or schema version is left out here instead of failing the call.
+        return try? existingArtifactIDsLocked(for: key, skippingMismatches: true)
     }
 
     /// Read-only lookup which distinguishes a genuinely absent row from an unavailable SQLite
     /// connection. Work schedulers must never translate the latter into an empty, drained queue.
+    /// A row of another pipeline or schema version is corrupt data, or with `skippingMismatches` an absent artifact.
     private func existingArtifactIDsLocked(
-        for key: MLPipelineExecutionKey
+        for key: MLPipelineExecutionKey,
+        skippingMismatches: Bool = false
     ) throws -> [String: Int64] {
         var select: OpaquePointer?
         guard
@@ -1090,14 +1083,19 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         result.reserveCapacity(key.artifacts.count)
         for artifact in key.artifacts {
             reset(select)
+            // A namespace that does not bind is no proof that the artifact is missing.
             guard bindText(select, 1, artifact.stableNamespace) else {
                 throw MLDerivedPipelineStoreError.storageUnavailable
             }
+            // A step that fails is no proof that the artifact is missing.
             switch sqlite3_step(select) {
             case SQLITE_ROW:
                 guard columnText(select, 1) == key.pipelineID.rawValue,
                     sqlite3_column_int64(select, 2) == Int64(key.schemaVersion)
-                else { throw MLDerivedPipelineStoreError.corruptData }
+                else {
+                    if skippingMismatches { continue }
+                    throw MLDerivedPipelineStoreError.corruptData
+                }
                 result[artifact.stableNamespace] = sqlite3_column_int64(select, 0)
             case SQLITE_DONE:
                 continue

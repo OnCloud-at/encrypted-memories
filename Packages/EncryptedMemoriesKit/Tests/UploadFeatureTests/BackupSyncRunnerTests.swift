@@ -2,6 +2,7 @@ import Foundation
 import Photos
 import PhotosCore
 import SQLite3
+import SQLiteTestSupport
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter

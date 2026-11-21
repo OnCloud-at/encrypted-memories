@@ -888,6 +888,38 @@ import Testing
         #expect(try store.unavailableAssetUIDs(for: key).isEmpty)
     }
 
+    /// An artifact row of another schema version: the lookups that schedule, save and search leave it out and keep
+    /// working, while the lookups that drain or clean up the work read it as corrupt data instead of as no work.
+    @Test func anArtifactRowOfAnotherSchemaVersionIsLeftOutOrCorruptData() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SQLiteMLDerivedPipelineStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try openStore(
+            url: root.appendingPathComponent(SQLiteMLDerivedPipelineStore.databaseFileName),
+            cipher: TestDerivedCipher(key: 0x79)
+        )
+        defer { store.close() }
+        let artifact = try makeArtifact(stage: "ocr", revision: "revision3")
+        let stored = try makeKey(account: "account", artifacts: [artifact])
+        let newer = try MLPipelineExecutionKey(
+            accountIdentifier: "account", pipelineID: .nativeSearch, schemaVersion: 2, artifacts: [artifact])
+        let asset = try MLPipelineAssetRevision(
+            uid: PhotoUID(volumeID: "volume", nodeID: "1"), sourceRevision: "source-v1")
+        #expect(store.enqueue([asset], for: stored))
+
+        #expect(store.enqueue([asset], for: newer))
+        #expect(store.search(normalizedTokens: ["text"], in: newer, limit: 8).isEmpty)
+        #expect(!store.hasIndexedEntries(for: newer))
+        #expect(throws: MLDerivedPipelineStoreError.corruptData) {
+            _ = try store.nextWorkBatch(for: newer, limit: 8, now: .now)
+        }
+        #expect(throws: MLDerivedPipelineStoreError.corruptData) {
+            _ = try store.progress(for: newer)
+        }
+        #expect(!store.reconcile(liveUIDs: [], for: newer), "A corrupt artifact row is no proof that nothing is left")
+        #expect(try store.nextWorkBatch(for: stored, limit: 8, now: .now).map(\.asset) == [asset])
+    }
+
     private func openStore(
         url: URL,
         policy: LibraryDatabasePolicy = .conservative,

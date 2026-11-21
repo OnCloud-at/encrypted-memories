@@ -346,6 +346,81 @@ final class SQLiteMLDerivedPipelineStoreBindingFailureTests: XCTestCase {
                 cipher: WideDigestCipher()))
     }
 
+    /// A step that fails is no proof that the asset is gone: the commit fails and the work stays pending.
+    func testCommitWithAnAssetReadThatFailsInItsStepFailsAndKeepsTheWork() throws {
+        let artifact = try artifact()
+        let key = try key(artifact)
+        let asset = try asset(shortUID)
+        XCTAssertTrue(store.enqueue([asset], for: key))
+        let fault = SQLiteStatementFaults(onDatabase: try XCTUnwrap(storeDatabase(store!)), failures: 1) {
+            $0.contains("SELECT asset_id FROM ml_derived_assets WHERE account_key=")
+        }
+        defer { fault.stop() }
+        XCTAssertFalse(store.commit([completed(asset, artifact)], for: key, now: .now))
+        XCTAssertEqual(fault.firedCount, 1, "The fault must reach the target statement")
+        fault.stop()
+        XCTAssertEqual(try store.nextWorkBatch(for: key, limit: 8, now: .now).map(\.asset), [asset])
+    }
+
+    /// A step that fails is no proof that the artifact is missing: the commit fails and the work stays pending.
+    func testCommitWithAnArtifactReadThatFailsInItsStepFailsAndKeepsTheWork() throws {
+        let artifact = try artifact()
+        let key = try key(artifact)
+        let asset = try asset(shortUID)
+        XCTAssertTrue(store.enqueue([asset], for: key))
+        let fault = SQLiteStatementFaults(onDatabase: try XCTUnwrap(storeDatabase(store!)), failures: 1) {
+            $0.contains("SELECT artifact_id, pipeline_id, schema_version")
+        }
+        defer { fault.stop() }
+        XCTAssertFalse(store.commit([completed(asset, artifact)], for: key, now: .now))
+        XCTAssertEqual(fault.firedCount, 1, "The fault must reach the target statement")
+        fault.stop()
+        XCTAssertEqual(try store.nextWorkBatch(for: key, limit: 8, now: .now).map(\.asset), [asset])
+    }
+
+    // MARK: Reconcile
+
+    func testReconcileWithAnAccountThatDoesNotBindFailsAndKeepsTheRows() throws {
+        let key = try key(account: Self.long, artifact())
+        let asset = try asset(shortUID)
+        XCTAssertTrue(store.enqueue([asset], for: key))
+        let fault = try failBinds(of: "SELECT account_key FROM ml_derived_accounts")
+        XCTAssertFalse(
+            store.reconcile(liveUIDs: [], for: key), "An account that does not bind is no proof that it has no rows")
+        XCTAssertNil(fault.failedBeforeStepProblem)
+        fault.remove()
+        XCTAssertEqual(try store.nextWorkBatch(for: key, limit: 8, now: .now).map(\.asset), [asset])
+    }
+
+    func testReconcileWithANamespaceThatDoesNotBindFailsAndKeepsTheRows() throws {
+        let key = try key(longNamespaceArtifact())
+        let asset = try asset(shortUID)
+        XCTAssertTrue(store.enqueue([asset], for: key))
+        let fault = try failBinds(
+            of: "SELECT artifact_id, pipeline_id, schema_version", after: "SELECT account_key FROM ml_derived_accounts")
+        XCTAssertFalse(
+            store.reconcile(liveUIDs: [], for: key), "A namespace that does not bind is no proof that it has no rows")
+        XCTAssertNil(fault.failedBeforeStepProblem)
+        fault.remove()
+        XCTAssertEqual(try store.nextWorkBatch(for: key, limit: 8, now: .now).map(\.asset), [asset])
+    }
+
+    // MARK: Obsolete work removal
+
+    /// The pipeline, its stage prefix and the artifact namespace nest: a namespace contains its stage prefix, and the
+    /// prefix contains the pipeline. A length limit therefore cannot fail the pipeline bind or the prefix binds alone,
+    /// and the binds stop at the first one that fails. With a pipeline that does not bind, only the pipeline bind runs.
+    /// Without its check the namespace bind still fails the removal, so this test cannot tell the pipeline check or the
+    /// prefix checks apart from the namespace check; those two checks stay without a test of their own.
+    func testEnqueueWithAPipelineThatDoesNotBindFailsTheObsoleteWorkRemovalAtThePipelineBind() throws {
+        let key = try key(longPipelineArtifact(), pipelineID: longPipeline)
+        let fault = try failBinds(
+            of: "AND artifact_namespace NOT IN", after: "SELECT artifact_id, pipeline_id, schema_version")
+        defer { fault.remove() }
+        XCTAssertFalse(store.enqueue([], for: key), "A removal that matched no row is no complete removal")
+        XCTAssertNil(fault.failedBeforeStepProblem)
+    }
+
     // MARK: Purge
 
     func testPurgeWithAPipelineThatDoesNotBindRollsBackAndKeepsTheWork() throws {
