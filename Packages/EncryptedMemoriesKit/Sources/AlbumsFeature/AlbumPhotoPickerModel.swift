@@ -5,27 +5,17 @@ import PhotosCore
 
 /// What the picker knows about the library it offers photos from.
 public enum AlbumPhotoPickerLibrary: Sendable, Equatable {
-    /// The last failed load of the library. `retryable` is false when trying again cannot help, so no Retry shows.
-    public struct Failure: Sendable, Equatable {
-        public let message: String
-        public let retryable: Bool
-
-        public init(message: String, retryable: Bool) {
-            self.message = message
-            self.retryable = retryable
-        }
-    }
-
     case loading
-    /// The items shown so far, how far they are known, and the failure of the last load, if it failed. A saved
+    /// The items shown so far, how far they are known, and the message of the last load, if it failed. A saved
     /// library can stay shown after a failed load; the failure then explains why the picker cannot wait for more.
-    case loaded([PhotoItem], authority: SourceInventoryAuthority, failure: Failure? = nil)
+    case loaded([PhotoItem], authority: SourceInventoryAuthority, failure: String? = nil)
 }
 
 /// What the picker shows.
 public enum AlbumPhotoPickerContent: Sendable, Equatable {
     case loading
-    case failed(message: String, retryable: Bool)
+    /// The library could not load; Retry loads it again.
+    case failed(message: String)
     case emptyLibrary
     case nothingToAdd
     case choose
@@ -101,7 +91,7 @@ public final class AlbumPhotoPickerModel {
             content = .loading
             return
         }
-        let failed = failure.map { AlbumPhotoPickerContent.failed(message: $0.message, retryable: $0.retryable) }
+        let failed = failure.map { AlbumPhotoPickerContent.failed(message: $0) }
         if items.isEmpty, authority != .authoritative, let failed {
             content = failed
             return

@@ -106,12 +106,8 @@ final class MobileAlbumAddPhotosUITests: XCTestCase {
         let tab = app.buttons[collections].firstMatch
         XCTAssertTrue(tab.waitForExistence(timeout: 60))
         tab.tap()
-        // The albums follow the library rows; the list loads them once they scroll in.
-        let album = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch
-        for _ in 0..<4 where !album.waitForExistence(timeout: 3) { app.swipeUp() }
-        XCTAssertTrue(album.waitForExistence(timeout: 10), "Collections lists the fixture album")
-        album.tap()
+        // The albums follow the library rows below the fold on a phone.
+        app.openCollectionsRow(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Fixture Album'")).firstMatch)
     }
 
     private func openAddPhotos(menuItem: String, moreActions: String = "More album actions") {

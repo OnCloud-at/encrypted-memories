@@ -19,6 +19,25 @@ struct TimelineSnapshotReconcilerTests {
         #expect(owner.presentationItems.isEmpty)
     }
 
+    @Test func everyPublicationMovesTheSnapshotRevision() async {
+        let owner = TimelineSnapshotReconciler(snapshot: snapshot(["a", "b"]))
+        var revision = owner.snapshotRevision
+
+        let load = owner.beginLoad()
+        #expect(owner.publishLoaded(snapshot(["a", "b", "c"]), token: load))
+        #expect(owner.snapshotRevision != revision, "a load moves it")
+        revision = owner.snapshotRevision
+
+        #expect(await owner.remove([uid("a")], within: owner.epoch))
+        #expect(owner.snapshotRevision != revision, "a removal moves it")
+        revision = owner.snapshotRevision
+
+        _ = owner.beginLoad()
+        #expect(owner.snapshotRevision == revision, "starting a load publishes nothing")
+        owner.reset()
+        #expect(owner.snapshotRevision != revision, "a reset moves it")
+    }
+
     @Test(arguments: [false, true])
     func concurrentRemovalsRebaseInEitherCompletionOrder(reverse: Bool) async {
         let gate = SnapshotTransformGate(blockedCalls: 2)

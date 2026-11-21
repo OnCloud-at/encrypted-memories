@@ -4,10 +4,12 @@ import PhotosCore
 import SwiftUI
 
 /// The sheet that adds library photos to an owned album, shared by macOS, iOS and iPadOS. Each platform supplies
-/// only its native photo grid; states, toolbar, failures and the add live here once.
+/// only its native photo grid; loading, states, toolbar, failures and the add live here once.
 public struct AlbumPhotoPickerSheet<Grid: View>: View {
     @Bindable private var model: AlbumPhotoPickerModel
-    private let onRetry: () -> Void
+    private let library: (any AlbumPhotoPickerLibrarySource)?
+    private let albumItems: [PhotoItem]?
+    private let albumRevision: UInt64
     private let onAlbumChanged: () -> Void
     private let grid: (AlbumPhotoPickerModel) -> Grid
     @Environment(\.dismiss) private var dismiss
@@ -16,18 +18,24 @@ public struct AlbumPhotoPickerSheet<Grid: View>: View {
     #endif
 
     /// - Parameters:
-    ///   - onRetry: Loads the library again after a failure.
+    ///   - library: The host's whole library, or nil while the host has none yet.
+    ///   - albumItems: The album's own photos, or nil while the album still loads.
+    ///   - albumRevision: Changes whenever the album's own photos change.
     ///   - onAlbumChanged: Runs after an add that changed the album: a full add, before the sheet closes, or a
     ///     partial one, while the sheet stays open with its selection.
     ///   - grid: The platform grid of `model.candidates` in selection mode.
     public init(
         model: AlbumPhotoPickerModel,
-        onRetry: @escaping () -> Void,
+        library: (any AlbumPhotoPickerLibrarySource)?,
+        albumItems: [PhotoItem]?,
+        albumRevision: UInt64,
         onAlbumChanged: @escaping () -> Void,
         @ViewBuilder grid: @escaping (AlbumPhotoPickerModel) -> Grid
     ) {
         self.model = model
-        self.onRetry = onRetry
+        self.library = library
+        self.albumItems = albumItems
+        self.albumRevision = albumRevision
         self.onAlbumChanged = onAlbumChanged
         self.grid = grid
     }
@@ -76,6 +84,17 @@ public struct AlbumPhotoPickerSheet<Grid: View>: View {
             .presentationDetents([.large])
         #endif
         .albumActionFailureAlert(model.coordinator)
+        .task(id: library.map { ObjectIdentifier($0) }) { await loadLibrary() }
+        .task(id: library.map { model.inputs(from: $0, albumRevision: albumRevision, albumLoaded: albumItems != nil) })
+        {
+            guard let library else { return }
+            await model.update(from: library, albumItems: albumItems)
+        }
+    }
+
+    private func loadLibrary() async {
+        guard let library else { return }
+        await model.loadLibrary(from: library)
     }
 
     /// A compact iPhone shows only the close symbol, the iOS 26 look of a sheet's Cancel, so the title and the count
@@ -101,8 +120,8 @@ public struct AlbumPhotoPickerSheet<Grid: View>: View {
         switch model.content {
         case .loading:
             GridLoadingMark()
-        case .failed(let message, let retryable):
-            LibraryLoadErrorView(message: message, retryable: retryable, onRetry: onRetry)
+        case .failed(let message):
+            LibraryLoadErrorView(message: message, retryable: true) { Task { await loadLibrary() } }
         case .emptyLibrary:
             ContentUnavailableView(L10n.string("empty.no_photos_title"), systemImage: "photo.on.rectangle")
         case .nothingToAdd:
@@ -126,6 +145,31 @@ public struct AlbumPhotoPickerSheet<Grid: View>: View {
             onAlbumChanged()
         case .notStarted:
             break
+        }
+    }
+}
+
+extension View {
+    /// Presents the Add Photos sheet while `picker` holds a model, and clears it when the sheet closes.
+    public func albumPhotoPickerSheet<Grid: View>(
+        _ picker: Binding<AlbumPhotoPickerModel?>,
+        library: (any AlbumPhotoPickerLibrarySource)?,
+        albumItems: [PhotoItem]?,
+        albumRevision: UInt64,
+        onAlbumChanged: @escaping () -> Void,
+        @ViewBuilder grid: @escaping (AlbumPhotoPickerModel) -> Grid
+    ) -> some View {
+        sheet(
+            isPresented: Binding(
+                get: { picker.wrappedValue != nil },
+                set: { if !$0 { picker.wrappedValue = nil } }
+            )
+        ) {
+            if let model = picker.wrappedValue {
+                AlbumPhotoPickerSheet(
+                    model: model, library: library, albumItems: albumItems, albumRevision: albumRevision,
+                    onAlbumChanged: onAlbumChanged, grid: grid)
+            }
         }
     }
 }

@@ -21,14 +21,14 @@ private func loaded(
 @MainActor
 final class AlbumPhotoPickerModelTests: XCTestCase {
     private let pending = PhotoUID(localPending: .photoLibrary, identifier: "asset-1")
-    private let offline = AlbumPhotoPickerLibrary.Failure(message: "offline", retryable: true)
+    private let offline = "offline"
 
     private func makeModel(_ backend: FakeAlbumBackend) -> AlbumPhotoPickerModel {
         AlbumPhotoPickerModel(albumID: "album", coordinator: AlbumActionCoordinator(repository: repository(backend)))
     }
 
     private func readyModel(
-        _ backend: FakeAlbumBackend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites),
+        _ backend: FakeAlbumBackend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites),
         library: [PhotoUID],
         members: Set<String> = []
     ) async -> AlbumPhotoPickerModel {
@@ -77,24 +77,25 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
             candidates.map(\.uid), [pickerUID("other")], "a burst grouped under another main is in the album")
     }
 
-    func testCandidatesForALargeLibraryTakeOnePass() {
+    /// A library of 100,000 photos with half of them in the album keeps the other half in library order. The time goes
+    /// to the log only: a time limit would fail on a loaded runner.
+    func testCandidatesOfALargeLibraryKeepLibraryOrder() {
         let library = (0..<100_000).map { pickerItem(pickerUID("p\($0)")) }
         let members = Set((0..<50_000).map { "p\($0 * 2)" })
         let start = ContinuousClock.now
 
         let candidates = AlbumPhotoPickerModel.candidates(from: library, excludingAlbumNodeIDs: members)
 
-        let elapsed = ContinuousClock.now - start
+        print("[AlbumPhotoPicker] 100k candidates in \(ContinuousClock.now - start)")
         XCTAssertEqual(candidates.count, 50_000)
         XCTAssertEqual(candidates.first?.uid, pickerUID("p1"))
-        print("[AlbumPhotoPicker] 100k candidates in \(elapsed)")
-        XCTAssertLessThan(elapsed, .seconds(2), "the filter must stay one linear pass")
+        XCTAssertEqual(candidates.last?.uid, pickerUID("p99999"))
     }
 
     // MARK: Content states
 
     func testContentStaysLoadingUntilTheLibraryAndTheAlbumAreLoaded() async {
-        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
         XCTAssertEqual(model.content, .loading)
 
         await model.update(library: .loading, albumNodeIDs: [])
@@ -106,7 +107,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testAnAlbumThatHoldsEveryPhotoSaysSoOnlyWithAnAuthoritativeLibrary() async {
-        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
 
         await model.update(library: loaded([pickerUID("a")], authority: .cached), albumNodeIDs: ["a"])
         XCTAssertEqual(model.content, .loading, "a saved library can be stale")
@@ -118,7 +119,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testAnEmptyLibraryIsReportedOnlyWithAuthority() async {
-        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
 
         await model.update(library: loaded([], authority: .cached), albumNodeIDs: [])
         XCTAssertEqual(model.content, .loading)
@@ -135,7 +136,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testASavedLibraryWithPhotosToAddShowsTheGrid() async {
-        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
 
         await model.update(library: loaded([pickerUID("a"), pickerUID("b")], authority: .cached), albumNodeIDs: ["a"])
 
@@ -144,7 +145,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testPhotosThatAreBackingUpAreHandedToTheBackupForTheAlbum() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let albums = repository(backend)
         let recorded = RecordedPendingAlbumAdds()
         await albums.setPendingAlbumAdds { uids, albumID in
@@ -166,10 +167,10 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testALoadFailureThenARetryShowsTheGrid() async {
-        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
 
         await model.update(library: .loaded([], authority: .hydrating, failure: offline), albumNodeIDs: nil)
-        XCTAssertEqual(model.content, .failed(message: "offline", retryable: true), "no album load can help")
+        XCTAssertEqual(model.content, .failed(message: "offline"), "no album load can help")
 
         await model.update(library: .loading, albumNodeIDs: [])
         XCTAssertEqual(model.content, .loading)
@@ -179,27 +180,18 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testASavedLibraryWithoutPhotosToAddShowsAFailedServerLoad() async {
-        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
 
         await model.update(library: loaded([pickerUID("a")], authority: .cached), albumNodeIDs: ["a"])
         XCTAssertEqual(model.content, .loading, "the server listing may still bring photos")
 
         await model.update(
             library: .loaded([pickerItem(pickerUID("a"))], authority: .cached, failure: offline), albumNodeIDs: ["a"])
-        XCTAssertEqual(model.content, .failed(message: "offline", retryable: true), "a failed listing never ends")
+        XCTAssertEqual(model.content, .failed(message: "offline"), "a failed listing never ends")
 
         await model.update(library: loaded([pickerUID("a"), pickerUID("b")]), albumNodeIDs: ["a"])
         XCTAssertEqual(model.content, .choose, "a retry that brings photos shows them")
         XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("b")])
-    }
-
-    func testAFailureThatCannotBeRetriedOffersNoRetry() async {
-        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites))
-        let final = AlbumPhotoPickerLibrary.Failure(message: "no access", retryable: false)
-
-        await model.update(library: .loaded([], authority: .hydrating, failure: final), albumNodeIDs: [])
-
-        XCTAssertEqual(model.content, .failed(message: "no access", retryable: false))
     }
 
     func testTheCandidatesStayFixedOnceTheGridShows() async {
@@ -212,6 +204,59 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
         XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("a"), pickerUID("b")])
         XCTAssertEqual(model.selection, [pickerUID("a")])
         XCTAssertEqual(model.content, .choose)
+    }
+
+    // MARK: Library source
+
+    func testALoadFailureShowsWithRetryAndTheNextLoadClearsIt() async {
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
+        let source = FakePickerLibrary(loadResults: ["offline", nil])
+
+        await model.loadLibrary(from: source)
+        await model.update(from: source, albumItems: [])
+        XCTAssertEqual(model.libraryLoadFailure, "offline")
+        XCTAssertEqual(model.content, .failed(message: "offline"))
+
+        await model.loadLibrary(from: source)
+        XCTAssertNil(model.libraryLoadFailure, "a new load ends the failure")
+        source.items = [pickerItem(pickerUID("a"))]
+        source.authority = .authoritative
+        await model.update(from: source, albumItems: [])
+        XCTAssertEqual(model.content, .choose)
+        XCTAssertEqual(source.loads, 2)
+    }
+
+    func testTheAlbumsOwnPhotosLeaveTheCandidates() async {
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
+        let source = FakePickerLibrary(
+            items: [pickerItem(pickerUID("a")), pickerItem(pickerUID("b"))], authority: .authoritative)
+
+        await model.update(from: source, albumItems: nil)
+        XCTAssertEqual(model.content, .loading, "the album still loads")
+
+        await model.update(from: source, albumItems: [pickerItem(pickerUID("a", volume: "route"))])
+        XCTAssertEqual(model.candidates.map(\.uid), [pickerUID("b")])
+    }
+
+    func testTheInputsChangeWithEverythingThePickerReads() {
+        let model = makeModel(FakeAlbumBackend(capabilities: .sdkCatalogAndWrites))
+        let source = FakePickerLibrary()
+        let base = model.inputs(from: source, albumRevision: 1, albumLoaded: true)
+        XCTAssertEqual(model.inputs(from: source, albumRevision: 1, albumLoaded: true), base)
+
+        XCTAssertNotEqual(model.inputs(from: source, albumRevision: 2, albumLoaded: true), base)
+        XCTAssertNotEqual(model.inputs(from: source, albumRevision: 1, albumLoaded: false), base)
+        source.contentRevision = 1
+        XCTAssertNotEqual(model.inputs(from: source, albumRevision: 1, albumLoaded: true), base)
+        source.contentRevision = 0
+        source.authorityRevision = 1
+        XCTAssertNotEqual(model.inputs(from: source, albumRevision: 1, albumLoaded: true), base)
+        source.authorityRevision = 0
+        source.pendingRevision = 1
+        XCTAssertNotEqual(model.inputs(from: source, albumRevision: 1, albumLoaded: true), base)
+        source.pendingRevision = 0
+        model.libraryLoadFailure = "offline"
+        XCTAssertNotEqual(model.inputs(from: source, albumRevision: 1, albumLoaded: true), base)
     }
 
     // MARK: Selection and submit
@@ -232,7 +277,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testAnEmptySelectionCannotBeSubmittedAndSendsNoRequest() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let model = await readyModel(backend, library: [pickerUID("a")])
 
         XCTAssertFalse(model.canSubmit)
@@ -243,7 +288,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testSubmitAddsTheSelectionOnceInLibraryOrder() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let model = await readyModel(backend, library: [pickerUID("c"), pickerUID("a"), pickerUID("b")])
         model.toggle(pickerUID("b"))
         model.toggle(pickerUID("c"))
@@ -259,7 +304,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testAnAddWhileAnotherAlbumChangeRunsDoesNotStart() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let gate = AsyncStream<Void>.makeStream()
         backend.listHold = { for await _ in gate.stream { break } }
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
@@ -281,7 +326,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testAFailedAddKeepsTheSelectionAndCanBeRetried() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.addError = AlbumError.partialAdd(succeeded: 1, total: 2, message: "one photo failed")
         let model = await readyModel(backend, library: [pickerUID("a"), pickerUID("b")])
         model.replaceSelection(with: [pickerUID("a"), pickerUID("b")])
@@ -305,13 +350,13 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
 
     func testTheActionIsOfferedOnlyForAnOwnedAlbumThatAcceptsPhotos() {
         let writable = AlbumsRepository(
-            catalogBackend: FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites),
-            writeBackend: FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites),
-            capabilities: .sdkCatalogWithHTTPWrites
+            catalogBackend: FakeAlbumBackend(capabilities: .sdkCatalogAndWrites),
+            writeBackend: FakeAlbumBackend(capabilities: .sdkCatalogAndWrites),
+            capabilities: .sdkCatalogAndWrites
         )
         let readOnly = AlbumsRepository(
-            catalogBackend: FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites),
-            writeBackend: FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites),
+            catalogBackend: FakeAlbumBackend(capabilities: .sdkCatalogAndWrites),
+            writeBackend: FakeAlbumBackend(capabilities: .sdkCatalogAndWrites),
             capabilities: AlbumCapabilities(
                 canList: true, canCreate: true, canAddPhotos: false, canSetCover: false, canReadMemberships: true)
         )
@@ -327,7 +372,7 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
     }
 
     func testAKnownSharedAlbumIsRejectedBeforeAnyRequest() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.sharedAlbums = [
             SharedAlbumSummary(
                 node: AlbumNodeIdentifier(volumeID: "shared-volume", nodeID: "album"),
@@ -351,5 +396,34 @@ final class AlbumPhotoPickerModelTests: XCTestCase {
         XCTAssertEqual(outcome, .failed)
         XCTAssertTrue(backend.added.isEmpty)
         XCTAssertNotNil(coordinator.actionFailure)
+    }
+}
+
+/// A whole library that a test sets directly; each load returns the next of `loadResults`.
+@MainActor
+private final class FakePickerLibrary: AlbumPhotoPickerLibrarySource {
+    var items: [PhotoItem]
+    var authority: SourceInventoryAuthority
+    var contentRevision: UInt64 = 0
+    var authorityRevision: UInt64 = 0
+    var pendingRevision: UInt64 = 0
+    private var loadResults: [String?]
+    private(set) var loads = 0
+
+    init(items: [PhotoItem] = [], authority: SourceInventoryAuthority = .hydrating, loadResults: [String?] = []) {
+        self.items = items
+        self.authority = authority
+        self.loadResults = loadResults
+    }
+
+    var wholeLibraryGridItems: [PhotoItem] { items }
+    var wholeLibraryInventoryAuthority: SourceInventoryAuthority { authority }
+    var wholeLibraryContentRevision: UInt64 { contentRevision }
+    var wholeLibraryInventoryAuthorityRevision: UInt64 { authorityRevision }
+    var pendingMembershipRevision: UInt64 { pendingRevision }
+
+    func loadWholeLibraryIfNeeded() async -> String? {
+        loads += 1
+        return loadResults.isEmpty ? nil : loadResults.removeFirst()
     }
 }

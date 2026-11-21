@@ -13,8 +13,13 @@ public final class TimelineSnapshotReconciler {
     }
 
     public private(set) var snapshot: TimelineSnapshot {
-        didSet { presentationItems = Array(snapshot.items.reversed()) }
+        didSet {
+            presentationItems = Array(snapshot.items.reversed())
+            snapshotRevision &+= 1
+        }
     }
+    /// Moves with every publication of `snapshot`: a load, a removal or a reset.
+    public private(set) var snapshotRevision: UInt64 = 0
     /// Collection grids and their viewers share one newest-first array per publication.
     /// The canonical snapshot and its mutation indices remain chronological.
     public private(set) var presentationItems: [PhotoItem]

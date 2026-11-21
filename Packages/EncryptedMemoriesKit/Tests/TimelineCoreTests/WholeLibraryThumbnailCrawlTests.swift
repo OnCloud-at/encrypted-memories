@@ -127,6 +127,27 @@ import Testing
             await fixture.close()
         }
 
+        /// The album photo picker shows its candidates on a timeline model of its own over the same feed. It starts no
+        /// crawl there, so the crawl that All Photos started is not replaced: no worker starts and no disk probe.
+        @Test(.timeLimit(.minutes(1)))
+        func aPickerGridOnTheSameFeedStartsNoCrawl() async throws {
+            let fixture = try await CrawlFixture.loaded(photoCount: 6)
+            try await fixture.waitUntilIdle(expecting: fixture.expectedOnDisk)
+            let before = await fixture.counts()
+            let picker = TimelineViewModel(repository: fixture.library, feed: fixture.feed, library: fixture.library)
+
+            await picker.showTransientItems(
+                Array(fixture.timeline.wholeLibraryItemsForViewer.prefix(3)), sectionID: "album-add-photos",
+                restartsPrefetch: false)
+            try await fixture.waitUntilIdle()
+
+            let after = await fixture.counts()
+            #expect(after.workerStarts == before.workerStarts, "the picker starts no crawl worker")
+            #expect(after.diskProbes == before.diskProbes, "the picker probes no thumbnail on disk")
+            #expect(after.requests == before.requests)
+            await fixture.close()
+        }
+
         /// Prints the work of one session: a cold load, an unchanged refresh, five refreshes that each add a photo,
         /// a local trash and restore, and one photo whose thumbnail Proton refuses. The package test log carries the
         /// numbers; the assertions above hold the rule. Without a source scope, these numbers leave out the feed's own

@@ -480,14 +480,15 @@ private struct MobileFilterGridScreen: View {
 
     private var alertContent: some View {
         selectionDialogContent
-            .sheet(
-                isPresented: Binding(
-                    get: { addPhotosPicker != nil },
-                    set: { if !$0 { addPhotosPicker = nil } }
-                )
-            ) {
-                if let addPhotosPicker { addPhotosSheet(addPhotosPicker) }
-            }
+            .albumPhotoPickerSheet(
+                $addPhotosPicker, library: model.timeline, albumItems: phase == .loaded ? snapshot.items : nil,
+                albumRevision: snapshotReconciler.snapshotRevision,
+                onAlbumChanged: {
+                    model.noteAlbumsChanged()
+                    Task { await load(showsLoading: false) }
+                },
+                grid: addPhotosGrid
+            )
             .alert(L10n.string("trash.empty_title"), isPresented: $confirmEmptyTrash) {
                 Button(L10n.string("trash.empty_confirm"), role: .destructive) {
                     Task { await emptyTrash() }
@@ -538,54 +539,22 @@ private struct MobileFilterGridScreen: View {
     }
 
     /// The library photos this album can still take, in the library's own grid with its backup badges.
-    private func addPhotosSheet(_ picker: AlbumPhotoPickerModel) -> some View {
-        AlbumPhotoPickerSheet(
-            model: picker,
-            onRetry: {
-                guard let timeline = model.timeline else { return }
-                Task { await picker.loadLibrary(from: timeline) }
-            },
-            onAlbumChanged: {
-                model.noteAlbumsChanged()
-                Task { await load(showsLoading: false) }
-            }
-        ) { picker in
-            if let feed = model.thumbnailFeed {
-                UIKitTimelineGrid(
-                    items: picker.candidates,
-                    // The candidates stay fixed while the sheet shows them.
-                    contentRevision: 1,
-                    thumbnailFeed: feed,
-                    selectionMode: true,
-                    selectedUIDs: picker.selection,
-                    uploadBadges: model.pendingPresentation.uploadBadges,
-                    onOpenPhoto: { picker.toggle($0.uid) },
-                    onToggleSelection: { picker.toggle($0.uid) },
-                    onSelectionChanged: { picker.replaceSelection(with: $0) }
-                )
-                .ignoresSafeArea(edges: .bottom)
-                .accessibilityIdentifier("albums.addPhotos.grid")
-            }
-        }
-        .task(id: model.timeline.map(ObjectIdentifier.init)) {
-            guard let timeline = model.timeline else { return }
-            await picker.loadLibrary(from: timeline)
-        }
-        .task(id: addPhotosInputs(of: picker)) {
-            guard let timeline = model.timeline else { return }
-            await picker.update(from: timeline, albumNodeIDs: addPhotosAlbumNodeIDs)
-        }
-    }
-
-    /// The album's own photos, once its grid loaded.
-    private var addPhotosAlbumNodeIDs: Set<String>? {
-        phase == .loaded ? AlbumPhotoPickerModel.albumNodeIDs(of: snapshot.items) : nil
-    }
-
-    /// Changes whenever an input of the picker changes, so the picker reads them again.
-    private func addPhotosInputs(of picker: AlbumPhotoPickerModel) -> AlbumPhotoPickerModel.TimelineInputs? {
-        model.timeline.map {
-            picker.inputs(from: $0, albumRevision: UInt64(snapshot.count), albumLoaded: phase == .loaded)
+    @ViewBuilder private func addPhotosGrid(_ picker: AlbumPhotoPickerModel) -> some View {
+        if let feed = model.thumbnailFeed {
+            UIKitTimelineGrid(
+                items: picker.candidates,
+                // The candidates stay fixed while the sheet shows them.
+                contentRevision: 1,
+                thumbnailFeed: feed,
+                selectionMode: true,
+                selectedUIDs: picker.selection,
+                uploadBadges: model.pendingPresentation.uploadBadges,
+                onOpenPhoto: { picker.toggle($0.uid) },
+                onToggleSelection: { picker.toggle($0.uid) },
+                onSelectionChanged: { picker.replaceSelection(with: $0) }
+            )
+            .ignoresSafeArea(edges: .bottom)
+            .accessibilityIdentifier("albums.addPhotos.grid")
         }
     }
 

@@ -2,11 +2,27 @@ import Foundation
 import PhotosCore
 import TimelineCore
 
-/// The picker reads the whole library from the host's shared timeline model, the same way on macOS, iOS and iPadOS.
+/// Where the picker reads the whole library from: what All Photos shows, how far it is known, and a load when it is not
+/// known yet. The shared timeline model of macOS, iOS and iPadOS is the production source.
+@MainActor
+public protocol AlbumPhotoPickerLibrarySource: AnyObject {
+    /// What All Photos shows, photos that are still backing up included.
+    var wholeLibraryGridItems: [PhotoItem] { get }
+    var wholeLibraryInventoryAuthority: SourceInventoryAuthority { get }
+    var wholeLibraryContentRevision: UInt64 { get }
+    var wholeLibraryInventoryAuthorityRevision: UInt64 { get }
+    /// Moves when photos that are still backing up join or leave the library, not with their upload progress.
+    var pendingMembershipRevision: UInt64 { get }
+    /// Returns nil once the whole library is known, or the failure message.
+    func loadWholeLibraryIfNeeded() async -> String?
+}
+
+extension TimelineViewModel: AlbumPhotoPickerLibrarySource {}
+
 extension AlbumPhotoPickerModel {
-    /// Everything that the picker reads from a timeline model and its album. The host updates the picker whenever
+    /// Everything that the picker reads from its library source and its album. The sheet updates the picker whenever
     /// this value changes.
-    public struct TimelineInputs: Hashable, Sendable {
+    struct LibraryInputs: Hashable, Sendable {
         let wholeLibraryRevision: UInt64
         let authorityRevision: UInt64
         let pendingRevision: UInt64
@@ -15,31 +31,30 @@ extension AlbumPhotoPickerModel {
         let albumLoaded: Bool
     }
 
-    /// - Parameters:
-    ///   - albumRevision: Changes whenever the album's own grid changes.
-    ///   - albumLoaded: Whether the album's own grid has loaded.
-    public func inputs(from timeline: TimelineViewModel, albumRevision: UInt64, albumLoaded: Bool) -> TimelineInputs {
-        TimelineInputs(
-            wholeLibraryRevision: timeline.wholeLibraryContentRevision,
-            authorityRevision: timeline.wholeLibraryInventoryAuthorityRevision,
-            pendingRevision: timeline.pendingPresentation.revision, failure: libraryLoadFailure,
+    func inputs(
+        from library: any AlbumPhotoPickerLibrarySource, albumRevision: UInt64, albumLoaded: Bool
+    ) -> LibraryInputs {
+        LibraryInputs(
+            wholeLibraryRevision: library.wholeLibraryContentRevision,
+            authorityRevision: library.wholeLibraryInventoryAuthorityRevision,
+            pendingRevision: library.pendingMembershipRevision, failure: libraryLoadFailure,
             albumRevision: albumRevision, albumLoaded: albumLoaded)
     }
 
-    /// Loads the whole library once when the timeline model does not know it yet. The album grid under the sheet
-    /// keeps its route. A failure stays until the next load, which Retry starts.
-    public func loadLibrary(from timeline: TimelineViewModel) async {
+    /// Loads the whole library once when the source does not know it yet. A failure stays until the next load, which
+    /// Retry starts.
+    func loadLibrary(from library: any AlbumPhotoPickerLibrarySource) async {
         libraryLoadFailure = nil
-        libraryLoadFailure = await timeline.loadWholeLibraryIfNeeded()
+        libraryLoadFailure = await library.loadWholeLibraryIfNeeded()
     }
 
-    /// Applies what All Photos shows, photos that are still backing up included, and the album's own photos.
-    /// `albumNodeIDs` is nil while the album itself still loads.
-    public func update(from timeline: TimelineViewModel, albumNodeIDs: Set<String>?) async {
+    /// Applies what the source shows and the album's own photos. `albumItems` is nil while the album itself still
+    /// loads.
+    func update(from library: any AlbumPhotoPickerLibrarySource, albumItems: [PhotoItem]?) async {
         await update(
             library: .loaded(
-                timeline.wholeLibraryGridItems, authority: timeline.wholeLibraryInventoryAuthority,
-                failure: libraryLoadFailure.map { .init(message: $0, retryable: true) }),
-            albumNodeIDs: albumNodeIDs)
+                library.wholeLibraryGridItems, authority: library.wholeLibraryInventoryAuthority,
+                failure: libraryLoadFailure),
+            albumNodeIDs: albumItems.map(Self.albumNodeIDs(of:)))
     }
 }

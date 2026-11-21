@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import GridCore
 import MediaByteCache
 import MediaFeedCore
 import Observation
@@ -287,16 +288,90 @@ import Testing
         let allPhotosRetry = Task { await fixture.timeline.retry() }
         while let event = await events.next(), event != .fullReadEntered {}
         let picker = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
-        // Let the picker reach its decision while All Photos' listing is still held. The fixture has no hook for
-        // "the picker waits", so a bounded number of yields lets the picker task run first; without the join, the
-        // picker starts its own listing here and the count below becomes 3.
-        for _ in 0..<100 { await Task.yield() }
         gate.open()
         await allPhotosRetry.value
 
+        // The count after both finished is the check: a picker that does not wait lists the library a third time.
         #expect(await picker.value == nil)
         #expect(await fixture.repository.fullReads == 2, "the picker used All Photos' listing")
         #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func onAllPhotosAFailedFirstLoadIsRepairedThroughAllPhotosOwnLoad() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: false)
+        await fixture.timeline.load()
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority != .authoritative)
+        #expect(fixture.timeline.initialLibraryLoadState.failure != nil, "the offline first load failed")
+        await fixture.repository.setOnline()
+
+        let failure = await fixture.timeline.loadWholeLibraryIfNeeded()
+
+        #expect(failure == nil)
+        #expect(fixture.timeline.filter == .all)
+        #expect(fixture.timeline.allItems == fixture.items, "All Photos shows the library that the picker loaded")
+        #expect(fixture.timeline.initialLibraryLoadState.failure == nil, "All Photos leaves its failure")
+        if case .loaded = fixture.timeline.gridState {
+        } else {
+            Issue.record("All Photos must show the loaded library, not \(fixture.timeline.gridState)")
+        }
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority == .authoritative)
+        #expect(await fixture.repository.fullReads == 2)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func onAllPhotosASavedLibraryIsReplacedThroughAllPhotosOwnLoad() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: false, cached: [inventoryItem("a")])
+        await fixture.timeline.load()
+        #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")], "the saved library shows")
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority != .authoritative)
+        await fixture.repository.setOnline()
+
+        #expect(await fixture.timeline.loadWholeLibraryIfNeeded() == nil)
+
+        #expect(fixture.timeline.allItems == fixture.items, "All Photos shows the current library, not the saved one")
+        #expect(fixture.timeline.wholeLibraryItemsForLocations == fixture.items)
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority == .authoritative)
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func onAllPhotosAnOvertakenListingIsListedOnceMore() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: false)
+        await fixture.timeline.load()
+        await fixture.repository.setOnline()
+        let gate = InventoryGate()
+        defer { gate.open() }
+        await fixture.repository.holdNextFullRead(gate) { fixture.events.send(.fullReadEntered) }
+        var events = fixture.events.stream.makeAsyncIterator()
+        let picker = Task { await fixture.timeline.loadWholeLibraryIfNeeded() }
+        while let event = await events.next(), event != .fullReadEntered {}
+
+        // A trash during the held listing overtakes it. Nothing failed, so the picker shows no failure.
+        await fixture.repository.setItems([inventoryItem("a"), inventoryItem("c")])
+        await fixture.timeline.commitTrash(uids: [inventoryUID("b")])
+        gate.open()
+
+        #expect(await picker.value == nil)
+        #expect(await fixture.repository.fullReads == 3, "the launch, the overtaken listing and one more")
+        #expect(fixture.timeline.wholeLibraryInventoryAuthority == .authoritative)
+        #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a"), inventoryUID("c")])
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func onAllPhotosAFailedListingOverASavedLibraryReportsItsReason() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: false, cached: [inventoryItem("a")])
+        await fixture.timeline.load()
+        #expect(fixture.timeline.initialLibraryLoadState.failure == nil, "the saved library hides the failure")
+
+        let failure = await fixture.timeline.loadWholeLibraryIfNeeded()
+
+        // The app has no sentence for this error, so the picker shows the failure screen's title alone.
+        #expect(failure == "", "a failure without a sentence of the app's own, not success and not a title")
+        #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")], "the saved library stays")
         await fixture.close()
     }
 
@@ -308,7 +383,7 @@ import Testing
 
         let failure = await fixture.timeline.loadWholeLibraryIfNeeded()
 
-        #expect(failure?.isEmpty == false)
+        #expect(failure != nil)
         #expect(fixture.timeline.wholeLibraryItemsForLocations == nil)
         #expect(fixture.timeline.wholeLibraryInventoryAuthority != .authoritative)
         #expect(fixture.timeline.allItems.map(\.uid) == [inventoryUID("a")], "a failure leaves the album grid")
@@ -346,6 +421,30 @@ import Testing
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func uploadProgressLeavesThePendingMembershipRevision() async throws {
+        let fixture = try await LocationInventoryFixture.make(online: true)
+        let local = PhotoItem(
+            uid: PhotoUID(localPending: .photoLibrary, identifier: "asset"), captureTime: .distantPast,
+            mediaType: "image/jpeg")
+        func presentation(revision: UInt64, membership: UInt64, badge: GridUploadBadge) -> PendingTimelinePresentation {
+            PendingTimelinePresentation(
+                revision: revision, membershipRevision: membership,
+                snapshot: TimelineSnapshot(sections: inventorySections(fixture.items + [local])),
+                localUIDs: [local.uid], favoriteIntents: [:],
+                uploadBadges: PendingUploadBadges(base: [local.uid: badge]), isCanonical: false)
+        }
+        fixture.timeline.setPendingPresentation(presentation(revision: 1, membership: 1, badge: .waiting))
+        let joined = fixture.timeline.pendingMembershipRevision
+
+        fixture.timeline.setPendingPresentation(presentation(revision: 2, membership: 1, badge: .uploading(step: 1)))
+        #expect(fixture.timeline.pendingMembershipRevision == joined, "upload progress changes no tile")
+
+        fixture.timeline.setPendingPresentation(presentation(revision: 3, membership: 2, badge: .waiting))
+        #expect(fixture.timeline.pendingMembershipRevision != joined, "a pending photo that joins or leaves does")
+        await fixture.close()
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func transientItemsShowTheUploadBadgesTheyCarry() async throws {
         let fixture = try await LocationInventoryFixture.make(online: true)
         let local = PhotoUID(localPending: .photoLibrary, identifier: "asset")
@@ -353,6 +452,8 @@ import Testing
 
         await fixture.timeline.showTransientItems(fixture.items, sectionID: "picker", uploadBadges: badges)
         #expect(fixture.timeline.pendingUploadBadges[local] == .waiting)
+        fixture.timeline.updateTransientUploadBadges(PendingUploadBadges(base: [local: .uploading(step: 1)]))
+        #expect(fixture.timeline.pendingUploadBadges[local] == .uploading(step: 1), "the badges follow the backup")
 
         await fixture.timeline.showTransientItems(fixture.items, sectionID: "cluster")
         #expect(fixture.timeline.pendingUploadBadges.isEmpty, "a map cluster shows no badges, as before")

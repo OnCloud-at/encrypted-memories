@@ -521,13 +521,20 @@ struct MainView: View {
                 onCompleted: { _ in showCreateAlbum = false }
             )
         }
-        .sheet(
-            isPresented: Binding(
-                get: { addPhotosPicker != nil },
-                set: { if !$0 { addPhotosPicker = nil } }
-            )
-        ) {
-            if let addPhotosPicker { addPhotosSheet(addPhotosPicker) }
+        .albumPhotoPickerSheet(
+            $addPhotosPicker, library: timelineModel, albumItems: isAlbumGridLoaded ? timelineModel.allItems : nil,
+            albumRevision: timelineModel.contentRevision,
+            onAlbumChanged: {
+                Task {
+                    await timelineModel.refreshLibrary()
+                    await loadAlbums()
+                }
+            }
+        ) { picker in
+            // The picker grid runs on a timeline model of its own, so the album grid underneath keeps its route.
+            MacAlbumPhotoPickerGrid(
+                picker: picker, feed: feed, uploadBadges: timelineModel.pendingPresentation.uploadBadges,
+                makeGridModel: { TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend) })
         }
         .alert(trashConfirmationTitle, isPresented: $confirmTrash) {
             Button("alert.move_to_trash", role: .destructive) {
@@ -642,7 +649,8 @@ struct MainView: View {
         .alert(
             albumActions.actionFailure?.title ?? "",
             isPresented: Binding(
-                get: { albumActions.actionFailure != nil },
+                // The Add Photos sheet shows its own album failure while it is open.
+                get: { albumActions.actionFailure != nil && addPhotosPicker == nil },
                 set: { if !$0 { albumActions.clearActionFailure() } }
             )
         ) {
@@ -847,36 +855,7 @@ struct MainView: View {
         selectedUIDs.removeAll()
     }
 
-    /// The library photos the shown album can still take, in the production grid on a model of its own.
-    private func addPhotosSheet(_ picker: AlbumPhotoPickerModel) -> some View {
-        AlbumPhotoPickerSheet(
-            model: picker,
-            onRetry: { Task { await picker.loadLibrary(from: timelineModel) } },
-            onAlbumChanged: {
-                Task {
-                    await timelineModel.refreshLibrary()
-                    await loadAlbums()
-                }
-            }
-        ) { picker in
-            MacAlbumPhotoPickerGrid(
-                picker: picker, feed: feed, uploadBadges: timelineModel.pendingPresentation.uploadBadges,
-                makeGridModel: { TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend) })
-        }
-        .task { await picker.loadLibrary(from: timelineModel) }
-        .task(
-            id: picker.inputs(
-                from: timelineModel, albumRevision: timelineModel.contentRevision, albumLoaded: isAlbumGridLoaded)
-        ) {
-            await picker.update(from: timelineModel, albumNodeIDs: addPhotosAlbumNodeIDs)
-        }
-    }
-
-    /// The shown album's own photos, once its grid loaded.
-    private var addPhotosAlbumNodeIDs: Set<String>? {
-        isAlbumGridLoaded ? AlbumPhotoPickerModel.albumNodeIDs(of: timelineModel.allItems) : nil
-    }
-
+    /// Whether the shown album's own grid has loaded.
     private var isAlbumGridLoaded: Bool {
         guard case .album = selection else { return false }
         switch timelineModel.gridState {

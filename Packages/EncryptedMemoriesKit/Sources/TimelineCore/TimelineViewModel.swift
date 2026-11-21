@@ -140,6 +140,9 @@ public final class TimelineViewModel {
     /// (search, Map, Smart Search, trash and export).
     public private(set) var pendingPresentation = PendingTimelinePresentation.empty
 
+    /// Moves only when pending photos join or leave the whole library, not with their upload progress.
+    public var pendingMembershipRevision: UInt64 { pendingPresentation.membershipRevision }
+
     public func setPendingPresentation(_ presentation: PendingTimelinePresentation) {
         pendingPresentation = presentation
     }
@@ -298,6 +301,9 @@ public final class TimelineViewModel {
     @ObservationIgnored private var initialLoadTask: Task<Void, Never>?
     /// The whole-library listing that a surface over another route started; concurrent callers share it.
     @ObservationIgnored private var wholeLibraryLoadTask: Task<String?, Never>?
+    /// Why All Photos' last own listing failed: the app's own sentence, or empty when it has none. A saved library on
+    /// screen keeps the first-load state free of the failure, so the picker reads the reason here.
+    @ObservationIgnored private var lastWholeLibraryListingFailure: String?
     /// All Photos' own loads (its first load, its retry or a switch to All Photos) while their listing runs, and the
     /// callers that wait for it to end.
     @ObservationIgnored private var runningWholeLibraryListings = 0
@@ -583,10 +589,9 @@ public final class TimelineViewModel {
     /// backend for a server-side filter. Used by map cluster/member pins: the map owns which UIDs are grouped,
     /// while the grid, selection, export, trash, viewer, and thumbnail prefetch remain the normal timeline path.
     /// The album photo picker shows its candidates the same way, with the upload badges of photos still backing up.
-    /// It passes `restartsPrefetch: false`. A route crawl replaces the crawl list of the feed that every grid of the
-    /// window shares and cancels a whole-library crawl start that is still being prepared (`startRouteCrawl`); nothing
-    /// restores the crawl of the route under the sheet when the sheet closes. The grid still loads the thumbnails that
-    /// it shows.
+    /// It passes `restartsPrefetch: false`, so the crawl that the window's routes started on the shared feed keeps
+    /// running under the sheet; a route crawl (`startRouteCrawl`) would replace that crawl list. The picker's grid still
+    /// loads the thumbnails that it shows.
     public func showTransientItems(
         _ items: [PhotoItem], sectionID: String, uploadBadges: PendingUploadBadges = .empty,
         restartsPrefetch: Bool = true
@@ -601,6 +606,12 @@ public final class TimelineViewModel {
         state = items.isEmpty ? .empty : .loaded(sections)
         guard restartsPrefetch else { return }
         await startRouteCrawl(items)
+    }
+
+    /// Updates the upload badges of the items that `showTransientItems` shows, as their backups move on.
+    public func updateTransientUploadBadges(_ uploadBadges: PendingUploadBadges) {
+        guard filter == .map else { return }
+        transientUploadBadges = uploadBadges
     }
 
     /// Resolves map UID lists against the last known whole-library snapshot. This keeps Map taps independent
@@ -645,10 +656,11 @@ public final class TimelineViewModel {
         wholeLibraryLocationRevision == nil ? nil : wholeLibrarySnapshot.items
     }
 
-    /// Loads the whole library for a surface over another route, such as the album picker, and leaves the route's
-    /// grid as it is. Returns nil once the whole library is known, or the failure message. It waits for All Photos'
-    /// own load (its first load, its retry or a switch to All Photos) while its listing runs, concurrent callers share
-    /// one listing, and a newer whole-library publication overtakes its result.
+    /// Loads the whole library for a surface such as the album picker. Returns nil once the whole library is known, or
+    /// the failure message. It waits for All Photos' own load (its first load, its retry or a switch to All Photos)
+    /// while its listing runs, and concurrent callers share one listing. While All Photos is shown, its own retry loads
+    /// the library, so its grid, first-load state and change baseline follow. Under another route, one listing settles
+    /// the whole library and leaves that route's grid as it is; a newer whole-library publication overtakes it.
     @discardableResult
     public func loadWholeLibraryIfNeeded() async -> String? {
         if let initialLoadTask { await initialLoadTask.value }
@@ -659,6 +671,17 @@ public final class TimelineViewModel {
         if let wholeLibraryLoadTask { return await wholeLibraryLoadTask.value }
         let task = Task { @MainActor [weak self] () -> String? in
             guard let self else { return nil }
+            if self.filter == .all {
+                // One more retry when a trash, a restore or a newer source inventory overtook the listing; nothing
+                // failed then.
+                for _ in 0..<2 {
+                    self.lastWholeLibraryListingFailure = nil
+                    await self.retry()
+                    if self.wholeLibraryInventoryAuthority == .authoritative { return nil }
+                    if let failure = self.lastWholeLibraryListingFailure { return failure }
+                }
+                return nil
+            }
             // One more listing when a cached publication or a trash overtook the first one without making the
             // library known.
             if let failure = await self.readWholeLibrary() { return failure }
@@ -697,7 +720,8 @@ public final class TimelineViewModel {
             // The source inventory admits the listing first, as on every other path that settles the whole library.
             let admission = await admit(projection, as: .authoritative)
             guard publishedBeforeLoad == wholeLibraryPublication, admission != .superseded else { return nil }
-            guard admission == .accepted else { return L10n.string("error.load_library_title") }
+            // The screen's title already says that the library did not load; the app has no sentence of its own here.
+            guard admission == .accepted else { return "" }
             settleWholeLibrary(projection)
             return nil
         } catch {
@@ -1014,7 +1038,10 @@ public final class TimelineViewModel {
                 return
             }
             guard admission == .accepted else {
-                if filter == .all { reportInitialContentFailure() }
+                if filter == .all {
+                    lastWholeLibraryListingFailure = ""
+                    reportInitialContentFailure()
+                }
                 return
             }
             guard filter == .all else {
@@ -1041,6 +1068,7 @@ public final class TimelineViewModel {
             // A cancelled owner cannot publish. A backend cancellation of an active read is a load failure.
             guard !Task.isCancelled, filter == .all else { return }
             initialLoadFailureReason = TimelineRefreshFailurePolicy.reason(for: error)
+            lastWholeLibraryListingFailure = LibraryLoadFailureMessage.message(for: error)
             applyInitialLoad(.failed(message: LibraryLoadFailureMessage.message(for: error), retryable: true))
             // Keep showing the cached timeline on a refresh error; surface failure only if we have
             // nothing to show. The reducer's verdict - not this site - decides the Retry affordance.

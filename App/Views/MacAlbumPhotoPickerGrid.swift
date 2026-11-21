@@ -38,5 +38,7 @@ struct MacAlbumPhotoPickerGrid: View {
                 picker.candidates, sectionID: "album-add-photos", uploadBadges: uploadBadges,
                 restartsPrefetch: false)
         }
+        // Photos that are still backing up keep showing their current upload state while the sheet is open.
+        .onChange(of: uploadBadges) { _, badges in gridModel?.updateTransientUploadBadges(badges) }
     }
 }

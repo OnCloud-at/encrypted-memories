@@ -32,7 +32,8 @@
             await model.update(library: .loaded(photos, authority: .authoritative), albumNodeIDs: [])
             model.replaceSelection(with: Set(photos.prefix(2).map(\.uid)))
             let sheet = AlbumPhotoPickerSheet(
-                model: model, onRetry: {}, onAlbumChanged: {}, grid: { _ in Color.gray })
+                model: model, library: nil, albumItems: nil, albumRevision: 0, onAlbumChanged: {},
+                grid: { _ in Color.gray })
             let texts = try await visibleTexts(ofSheet: sheet, named: "Add Photos sheet", file: "add-photos")
             for visibleText in texts {
                 XCTAssertTrue(visibleText.contains(L10n.string("albums.add_photos_title")), "\(visibleText)")
