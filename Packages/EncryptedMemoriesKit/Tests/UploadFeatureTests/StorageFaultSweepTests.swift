@@ -5,6 +5,21 @@ import XCTest
 /// Runs the fault-injection sweep over every registered storage operation (#1141), and proves with deliberately flawed
 /// probe operations that each fixed rule catches its class of defect.
 final class StorageFaultSweepTests: XCTestCase {
+    /// The points of each registered case in its fault-free run. A change that drops a pass, a statement or a fault
+    /// target of a case changes its count; update the count only together with the reason in the change.
+    private static let pointCounts: [String: Int] = [
+        "catalog.upsertBatch": 5, "catalog.fullScan": 72, "catalog.changeScan": 16, "catalog.missingSources": 32,
+        "catalog.lateRenders": 20, "catalog.expiredHistory": 79, "journal.editReplacement.update": 1,
+        "journal.editReplacement.compact": 2, "journal.editReplacement.create": 2, "journal.revert.save": 1,
+        "journal.revert.remove": 1, "journal.series.save": 1, "journal.series.remove": 1,
+        "backup.resolveRemoteDeletion.keep": 7, "backup.resolveRemoteDeletion.backUpAgain": 7,
+        "backup.replayRemoteDeletion.keep": 9, "backup.replayRemoteDeletion.backUpAgain": 9, "fingerprints.store": 9,
+        "fingerprints.advance": 9, "fingerprints.discontinuity": 5, "trashedSeries.record": 12,
+        "trashedSeries.update": 10, "trashedSeries.finish": 10, "catalog.lateRenderScan": 13,
+        "backup.replaceRemoteDeletion.keep": 10, "backup.replaceRemoteDeletion.backUpAgain": 10,
+        "backup.settleRemoteDeletion.keep": 5, "backup.settleRemoteDeletion.backUpAgain": 5,
+    ]
+
     func testEncodedIssueComparisonKeepsAllFieldsValuesAndArrayOrder() {
         let prefix = "encryptedmemories-backup-issue-v1:"
         func record(_ json: String) -> String { prefix + Data(json.utf8).base64EncodedString() }
@@ -29,7 +44,8 @@ final class StorageFaultSweepTests: XCTestCase {
     /// One assertion over all cases, so a failing case never hides behind an earlier one in the test log.
     func testEveryRegisteredOperationKeepsTheRulesAtEveryPoint() async throws {
         XCTAssertFalse(storageFaultCases.isEmpty)
-        let findings = try await sweepFindings(storageFaultCases)
+        XCTAssertEqual(Set(storageFaultCases.map(\.id)), Set(Self.pointCounts.keys), "every pinned case runs")
+        let findings = try await sweepFindings(storageFaultCases, pointCounts: Self.pointCounts)
         XCTAssertTrue(findings.isEmpty, "\n" + findings.joined(separator: "\n"))
     }
 
@@ -42,8 +58,11 @@ final class StorageFaultSweepTests: XCTestCase {
         XCTAssertTrue(findings.last?.hasPrefix("probe.deleteBeforeReplace violates the rules:") ?? false)
     }
 
-    /// Sweeps every case. A case whose sweep throws becomes a finding and never stops the cases after it.
-    private func sweepFindings(_ cases: [any StorageFaultCase]) async throws -> [String] {
+    /// Sweeps every case. A case whose sweep throws becomes a finding and never stops the cases after it. With
+    /// `pointCounts`, a case whose fault-free run has another number of points is a finding too.
+    private func sweepFindings(
+        _ cases: [any StorageFaultCase], pointCounts: [String: Int]? = nil
+    ) async throws -> [String] {
         var findings: [String] = []
         for faultCase in cases {
             do {
@@ -53,6 +72,11 @@ final class StorageFaultSweepTests: XCTestCase {
                         + "\(report.accepted.count) accepted, " + String(format: "%.2f s", report.seconds))
                 for accepted in report.accepted { print("  \(accepted)") }
                 if report.points.isEmpty { findings.append("\(faultCase.id) runs no point on its stores") }
+                if let pointCounts, pointCounts[faultCase.id] != report.points.count {
+                    findings.append(
+                        "\(faultCase.id) runs \(report.points.count) points, pinned: "
+                            + (pointCounts[faultCase.id].map(String.init) ?? "none"))
+                }
                 if !report.violations.isEmpty {
                     findings.append(
                         "\(faultCase.id) violates the rules:\n"
@@ -137,6 +161,51 @@ final class StorageFaultSweepTests: XCTestCase {
                 "accepted: \($0) — A failed barrier write after the first line is ignored today; owner decision on #1149."
             },
             "still reported, with its reason")
+    }
+
+    func testTheLateRenderPassNeedsItsAcceptedMissingRowAndKeepsItVisible() async throws {
+        var withoutAcceptance = CatalogPassCase(id: "catalog.lateRenders", pass: .lateRenders)
+        withoutAcceptance.acceptsMissingReopenedRow = false
+
+        let strict = try await StorageFaultSweep.run(withoutAcceptance)
+        let accepting = try await StorageFaultSweep.run(CatalogPassCase(id: "catalog.lateRenders", pass: .lateRenders))
+
+        XCTAssertEqual(
+            strict.violatedChecks,
+            [
+                "\(StorageFaultRule.noLoss.rawValue), \(StorageFaultPhase.failedRun.rawValue)",
+                "\(StorageFaultRule.noLoss.rawValue), \(StorageFaultPhase.crashImage.rawValue)",
+            ])
+        XCTAssertEqual(Set(strict.violations.map(\.statement)), ["INSERT OR IGNORE INTO item VALUES(?,?);"])
+        XCTAssertTrue(
+            strict.violations.allSatisfy { $0.detail.contains("queued photo revision [\"text:asset-2#") },
+            "only the re-opened revision of asset-2")
+        XCTAssertTrue(accepting.violations.isEmpty, accepting.violations.map(\.description).joined(separator: "\n"))
+        XCTAssertEqual(accepting.accepted.map(\.violation.description), strict.violations.map(\.description))
+    }
+
+    /// The model table of the sweep reports a failed read instead of an absent row, so a modeled store never decides
+    /// on a read that failed.
+    func testTheModelTableReportsAFailedReadInsteadOfAnAbsentRow() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let table = try StorageFaultTable(url: url)
+        defer { table.close() }
+        XCTAssertEqual(table.insertIfAbsent("asset-1#1", value: "settled"), true)
+
+        let valueFault = try SQLiteReadInterrupt(in: table, matching: "SELECT value FROM item")
+        XCTAssertThrowsError(try table.value(of: "asset-1#1"))
+        XCTAssertTrue(valueFault.fired)
+        valueFault.stop()
+        let prefixFault = try SQLiteReadInterrupt(in: table, matching: "SELECT 1 FROM item")
+        XCTAssertThrowsError(try table.hasKey(withPrefix: "asset-1#"))
+        XCTAssertTrue(prefixFault.fired)
+        prefixFault.stop()
+
+        XCTAssertEqual(try table.value(of: "asset-1#1"), "settled")
+        XCTAssertEqual(try table.value(of: "asset-2#1"), nil)
+        XCTAssertEqual(try table.hasKey(withPrefix: "asset-1#"), true)
+        XCTAssertEqual(try table.hasKey(withPrefix: "asset-2#"), false)
     }
 
     func testAnAcceptanceCoversOnlyItsOwnPointAndMustOccur() async throws {

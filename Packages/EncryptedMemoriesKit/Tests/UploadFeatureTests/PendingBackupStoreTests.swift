@@ -506,11 +506,7 @@ final class PendingBackupStoreTests: XCTestCase {
     }
 
     private func withRawPendingDatabase<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
-        var handle: OpaquePointer?
-        XCTAssertEqual(sqlite3_open_v2(storeURL.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-        let db = try XCTUnwrap(handle)
-        defer { sqlite3_close(db) }
-        return try body(db)
+        try withSQLiteDatabase(at: storeURL, body)
     }
 
     /// Binds `marker` as text with an explicit byte length, so an embedded NUL reaches the column verbatim.

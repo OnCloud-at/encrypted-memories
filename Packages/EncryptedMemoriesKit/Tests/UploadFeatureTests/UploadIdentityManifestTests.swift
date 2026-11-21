@@ -28,26 +28,9 @@ final class UploadIdentityManifestTests: XCTestCase {
     }
 
     private func scalarInteger(at url: URL, sql: String) throws -> Int {
-        var handle: OpaquePointer?
-        guard sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
-            let handle
-        else {
-            sqlite3_close(handle)
-            throw NSError(domain: "UploadIdentityManifestTests", code: 1)
-        }
-        defer { sqlite3_close(handle) }
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK,
-            let statement
-        else {
-            sqlite3_finalize(statement)
-            throw NSError(domain: "UploadIdentityManifestTests", code: 2)
-        }
-        defer { sqlite3_finalize(statement) }
-        guard sqlite3_step(statement) == SQLITE_ROW else {
-            throw NSError(domain: "UploadIdentityManifestTests", code: 3)
-        }
-        return Int(sqlite3_column_int64(statement, 0))
+        try XCTUnwrap(
+            withSQLiteDatabase(at: url, flags: SQLITE_OPEN_READONLY) { try sqliteRows($0, sql, typed: false) }
+                .first.flatMap { Int($0) }, sql)
     }
 
     func testAnUpsertThatCarriesAReadLinkKeepsALinkThatChangedSinceTheRead() throws {

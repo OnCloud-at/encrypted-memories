@@ -1369,5 +1369,51 @@ final class RecordingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Senda
         return UploadBackupSyncScanResult()
     }
 
+    /// The ledger value of a revision whose backup is complete. `enqueue` writes a queued revision with an empty value.
+    static let settled = "settled"
+    /// The prefix of the ledger rows that model the backup state store, one per revision with a state.
+    static let statePrefix = "state "
+
+    /// Discard generation 1 of the modeled queue. Without a ledger, recovery is unavailable, as in the protocol default.
+    func missingSourceDiscardGeneration() async throws -> Int64 {
+        guard ledger != nil else { throw UploadError.backend("Backup source recovery is unavailable") }
+        return 1
+    }
+
+    /// Queues each candidate whose source has no row at all: `UploadBackupSyncEngine.enqueueMissingSources` leaves every
+    /// source with any queue row. The model has no excluded and no backed-up-only sources. Without a ledger, recovery is
+    /// unavailable, as in the protocol default.
+    func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
+        guard let ledger else { throw UploadError.backend("Backup source recovery is unavailable") }
+        for candidate in candidates {
+            guard try !ledger.hasKey(withPrefix: "\(candidate.snapshot.source.identifier)#") else { continue }
+            try await enqueue(candidate)
+        }
+    }
+
+    /// Re-opens each revision with a backup state, as `UploadBackupSyncEngine.reopenBackedUpRevisions` does with
+    /// `UploadBackupState.reopen`: a complete state becomes pending, the candidate is pending work, and a settled queue
+    /// row goes away, so the caller's `enqueueBatch` queues it again. A revision without a state keeps the usual
+    /// classification. Without a ledger nothing re-opens, as in the protocol default.
+    func reopenBackedUpRevisions(
+        _ reopenings: [UploadBackupReopening], deferringWithoutRemoteProof: Bool
+    ) async throws -> [UploadBackupAssetCandidate] {
+        guard let ledger else { return [] }
+        var pending: [UploadBackupAssetCandidate] = []
+        for reopening in reopenings {
+            let snapshot = reopening.candidate.snapshot
+            let key = "\(snapshot.source.identifier)#\(snapshot.revision.rawValue)"
+            guard let state = try ledger.value(of: Self.statePrefix + key) else { continue }
+            if state == Self.settled, !ledger.set(Self.statePrefix + key, value: "pending") {
+                throw UploadError.backend("Backup state could not be updated")
+            }
+            pending.append(reopening.candidate)
+            if try ledger.value(of: key) == Self.settled, !ledger.remove(key) {
+                throw UploadError.backend("Backup queue could not re-open an asset")
+            }
+        }
+        return pending
+    }
+
     func synchronizeQueueToDisk() -> Bool { true }
 }

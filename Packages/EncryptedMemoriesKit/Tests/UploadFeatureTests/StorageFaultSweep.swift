@@ -32,7 +32,9 @@ import XCTest
 // - Inspection: the sweep reads a state only from a copy of the files, never from the files that a restart opens.
 // - Records: the durable keys that the case declares, such as a photo's catalog row or its queue entry.
 // - State: every row of every table of the world's stores, compared for equality. A text column that holds JSON
-//   compares by content, because `JSONEncoder` writes keys in no fixed order.
+//   compares by content, because `JSONEncoder` writes keys in no fixed order. When a stored value differs between two
+//   equal runs, such as a random generation or a JSON blob, a case compares a projection of that table instead
+//   (`setSQLiteRows`).
 //
 // After every point the sweep checks these fixed rules. A case chooses only its atomicity. A case may also accept a
 // known violation of today's code at one named point (`StorageFaultAcceptance`), with its reason: the report prints it
@@ -143,8 +145,9 @@ struct StorageFaultState: Equatable {
     /// The keys that rule I1 protects, by record kind.
     var records: [String: Set<String>] = [:]
 
-    /// Adds every table of the SQLite file at `url`, every row as text with its SQLite type. The file must not be open
-    /// in a store. This is the shared table dump of the test target.
+    /// Adds every table of the SQLite file at `url`, every row as text with its SQLite type. It reads on its own
+    /// connection, so it sees only committed transactions; a store in WAL mode may keep the file open meanwhile. The
+    /// sweep itself passes a copy that no store has open. This is the shared table dump of the test target.
     mutating func addSQLiteTables(of url: URL) throws {
         try withSQLiteDatabase(at: url) { database in
             let names = "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;"
@@ -156,9 +159,25 @@ struct StorageFaultState: Equatable {
         }
     }
 
+    /// Sets the table `table` of the SQLite file at `url` to the rows that `sql` returns, for a table whose stored rows
+    /// differ between two equal runs, such as a random generation or bytes that `JSONEncoder` wrote.
+    mutating func setSQLiteRows(of table: String, in url: URL, sql: String) throws {
+        tables["\(url.lastPathComponent)/\(table)"] = try withSQLiteDatabase(at: url) {
+            try sqliteRows($0, sql).sorted()
+        }
+    }
+
     /// Adds the keys that `sql` returns from the SQLite file at `url` as records of `kind`.
     mutating func addRecords(_ kind: String, of url: URL, sql: String) throws {
         try withSQLiteDatabase(at: url) { records[kind] = Set(try sqliteRows($0, sql)) }
+    }
+}
+
+extension StorageFaultState {
+    /// The tables of the SQLite file at `url` alone.
+    init(tablesOf url: URL) throws {
+        self.init()
+        try addSQLiteTables(of: url)
     }
 }
 
@@ -517,7 +536,7 @@ private final class StatementLog: @unchecked Sendable {
 
 /// A small key-value SQLite store with the connection type of the production stores, so the sweep injects into it the
 /// same way. The probe operations use it, and a case uses it to model a store whose production type it does not run.
-final class StorageFaultTable {
+final class StorageFaultTable: @unchecked Sendable {
     let connection: SQLiteStoreConnection
 
     init(url: URL) throws {
@@ -548,22 +567,67 @@ final class StorageFaultTable {
 
     /// Adds the row `key` unless it exists. True when it added the row, false when the row existed, nil on failure.
     func insertIfAbsent(_ key: String, value: String = "") -> Bool? {
+        step("INSERT OR IGNORE INTO item VALUES(?,?);", binding: [key, value]) { database, statement in
+            guard sqlite3_step(statement) == SQLITE_DONE else { return nil }
+            return sqlite3_changes(database) > 0
+        }
+    }
+
+    /// Writes the row `key` with `value`, replacing an earlier value. False on failure.
+    func set(_ key: String, value: String) -> Bool {
+        step("INSERT OR REPLACE INTO item VALUES(?,?);", binding: [key, value]) { _, statement in
+            sqlite3_step(statement) == SQLITE_DONE ? true : nil
+        } ?? false
+    }
+
+    /// Removes the row `key`. False on failure.
+    func remove(_ key: String) -> Bool {
+        step("DELETE FROM item WHERE key=?;", binding: [key]) { _, statement in
+            sqlite3_step(statement) == SQLITE_DONE ? true : nil
+        } ?? false
+    }
+
+    /// The value of the row `key`, nil when the row is absent. A failed read throws; it never reads as absent.
+    func value(of key: String) throws -> String? {
+        let read: String?? = step("SELECT value FROM item WHERE key=?;", binding: [key]) { _, statement in
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW: return .some(sqlite3_column_text(statement, 0).map { String(cString: $0) })
+            case SQLITE_DONE: return .some(nil)
+            default: return nil
+            }
+        }
+        guard let read else { throw StorageFaultSweepError("the row \(key) cannot be read") }
+        return read
+    }
+
+    /// True when a row key starts with `prefix`. A failed read throws; it never reads as absent.
+    func hasKey(withPrefix prefix: String) throws -> Bool {
+        let sql = "SELECT 1 FROM item WHERE substr(key, 1, length(?1)) = ?1 LIMIT 1;"
+        let read: Bool? = step(sql, binding: [prefix]) { _, statement in
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW: return true
+            case SQLITE_DONE: return false
+            default: return nil
+            }
+        }
+        guard let read else { throw StorageFaultSweepError("the rows of \(prefix) cannot be read") }
+        return read
+    }
+
+    /// Prepares `sql` under the connection lock, binds `texts` in order and hands the statement to `body`. Nil when the
+    /// statement does not prepare or bind, or when `body` returns nil.
+    private func step<Result>(
+        _ sql: String, binding texts: [String], _ body: (OpaquePointer, OpaquePointer?) -> Result?
+    ) -> Result? {
         connection.withLock {
             guard let database = connection.database else { return nil }
             var statement: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(database, "INSERT OR IGNORE INTO item VALUES(?,?);", -1, &statement, nil)
-                    == SQLITE_OK
-            else { return nil }
+            guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
             defer { sqlite3_finalize(statement) }
-            do {
-                try connection.bindText(statement, 1, key)
-                try connection.bindText(statement, 2, value)
-            } catch {
-                return nil
+            for (index, text) in texts.enumerated() {
+                guard (try? connection.bindText(statement, Int32(index + 1), text)) != nil else { return nil }
             }
-            guard sqlite3_step(statement) == SQLITE_DONE else { return nil }
-            return sqlite3_changes(database) > 0
+            return body(database, statement)
         }
     }
 
@@ -616,7 +680,7 @@ func canonicalJSON(_ text: String) -> String {
 
 /// Every row of `sql`, each as its columns joined with " | ", each column as "type:value", or as its text alone when
 /// `typed` is false. JSON text compares by content (`canonicalJSON`).
-private func sqliteRows(_ database: OpaquePointer, _ sql: String, typed: Bool = true) throws -> [String] {
+func sqliteRows(_ database: OpaquePointer, _ sql: String, typed: Bool = true) throws -> [String] {
     var statement: OpaquePointer?
     guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
         throw StorageFaultSweepError("\(sql) does not prepare: \(String(cString: sqlite3_errmsg(database)))")

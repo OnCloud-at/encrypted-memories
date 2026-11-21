@@ -3,14 +3,19 @@ import PhotosCore
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
+@testable import ProtonDriveBackend
 @testable import UploadCore
 
 /// Every storage-changing operation in the fault-injection sweep (#1141). Add a new operation here once; the sweep
 /// covers it from then on.
 let storageFaultCases: [any StorageFaultCase] = [
     CatalogUpsertBatchCase(),
-    CatalogScanCase(id: "catalog.fullScan", identifiers: nil),
-    CatalogScanCase(id: "catalog.changeScan", identifiers: ["asset-2", "asset-3", "asset-4"]),
+    CatalogPassCase(id: "catalog.fullScan", pass: .fullScan),
+    CatalogPassCase(id: "catalog.changeScan", pass: .changeScan(["asset-2", "asset-3", "asset-4"])),
+    CatalogPassCase(id: "catalog.missingSources", pass: .missingSources),
+    CatalogPassCase(id: "catalog.lateRenders", pass: .lateRenders),
+    CatalogPassCase(id: "catalog.lateRenderScan", pass: .lateRenderScan),
+    CatalogPassCase(id: "catalog.expiredHistory", pass: .expiredHistory),
     EditReplacementJournalUpdateCase(id: "journal.editReplacement.update", seededChanges: 2),
     EditReplacementJournalUpdateCase(id: "journal.editReplacement.compact", seededChanges: 1_000),
     EditReplacementJournalCreateCase(),
@@ -18,27 +23,79 @@ let storageFaultCases: [any StorageFaultCase] = [
     PhotoJournalCase(id: "journal.revert.remove", journal: .revert, step: .remove),
     PhotoJournalCase(id: "journal.series.save", journal: .series, step: .save),
     PhotoJournalCase(id: "journal.series.remove", journal: .series, step: .remove),
-    DeletionDecisionCase(keepDeleted: true, startsWithIntent: false),
-    DeletionDecisionCase(keepDeleted: false, startsWithIntent: false),
-    DeletionDecisionCase(keepDeleted: true, startsWithIntent: true),
-    DeletionDecisionCase(keepDeleted: false, startsWithIntent: true),
+    DeletionDecisionCase(keepDeleted: true, start: .noIntent),
+    DeletionDecisionCase(keepDeleted: false, start: .noIntent),
+    DeletionDecisionCase(keepDeleted: true, start: .ownIntent),
+    DeletionDecisionCase(keepDeleted: false, start: .ownIntent),
+    DeletionDecisionCase(keepDeleted: true, start: .stuckOppositeIntent),
+    DeletionDecisionCase(keepDeleted: false, start: .stuckOppositeIntent),
+    DeletionDecisionCase(keepDeleted: true, start: .appliedOppositeIntent),
+    DeletionDecisionCase(keepDeleted: false, start: .appliedOppositeIntent),
+    FingerprintCacheCase(id: "fingerprints.store", step: .store),
+    FingerprintCacheCase(id: "fingerprints.advance", step: .advance),
+    FingerprintCacheCase(id: "fingerprints.discontinuity", step: .discontinuity),
+    TrashedSeriesRestoreCase(id: "trashedSeries.record", step: .record),
+    TrashedSeriesRestoreCase(id: "trashedSeries.update", step: .update),
+    TrashedSeriesRestoreCase(id: "trashedSeries.finish", step: .finish),
 ]
 
-/// A deletion decision followed by launch replay, or launch replay of an already recorded intent. Both call the
-/// production operation on the real queue and journal. The second replay also settles a best-effort settle that
-/// failed after the queue committed. The separate unit test pins that retained intent before the next launch.
+/// A deletion decision on the real queue and journal, by its production operations. By `start`:
+/// - `noIntent`: launch replay, then the decision, then launch replay again. The second replay also settles a
+///   best-effort settle that failed after the queue committed. The separate unit test pins that retained intent before
+///   the next launch.
+/// - `ownIntent`: launch replay of this choice's recorded intent.
+/// - `stuckOppositeIntent`: the opposite choice is recorded and its rows still wait (its queue write failed). The
+///   person's tap runs as `PhotoLibraryBackupController.resolveRemoteDeletion` does: `prepareLatestChoice`, then
+///   `record` (#1482). The next launch's replay follows, without another tap. A tap that reached `record` must be the
+///   choice that this replay applies, even when `record` failed: a take-back would bring the opposite choice back.
+///   The tap is a model of the controller: it reads the row with `entry`, while the controller reads it with
+///   `decisionEntry` and `decisionRows`. Check the pinned points again when the controller's tap changes.
+///   Scope: a restart here taps again before its replay, while a real launch replays first. When one of the four
+///   reads of the tap before `record` fails (points 1 to 4), or its journal append (point 5, accepted below), nothing
+///   durable records the new choice. A real launch then applies the earlier choice, which the person recorded
+///   durably before; the sweep checks this outcome only at point 5. The two reads of `prepareLatestChoice` share one
+///   SQL text, so one acceptance per point cannot name them.
+/// - `appliedOppositeIntent`: the opposite choice moved the rows, but its clear failed. The tap's `prepareLatestChoice`
+///   settles that intent, and the rows no longer wait, so the tap records nothing.
 struct DeletionDecisionCase: StorageFaultCase {
+    enum Start: Sendable {
+        case noIntent, ownIntent, stuckOppositeIntent, appliedOppositeIntent
+    }
+
     struct World {
         let queue: UploadBackupSyncQueueManifestStore
         let journal: EditReplacementJournalFileStore
         let files: StorageFaultFiles
     }
     let keepDeleted: Bool
-    let startsWithIntent: Bool
+    let start: Start
     var id: String {
-        "backup.\(startsWithIntent ? "replayRemoteDeletion" : "resolveRemoteDeletion").\(keepDeleted ? "keep" : "backUpAgain")"
+        let operation =
+            switch start {
+            case .noIntent: "resolveRemoteDeletion"
+            case .ownIntent: "replayRemoteDeletion"
+            case .stuckOppositeIntent: "replaceRemoteDeletion"
+            case .appliedOppositeIntent: "settleRemoteDeletion"
+            }
+        return "backup.\(operation).\(keepDeleted ? "keep" : "backUpAgain")"
     }
     let atomicity = StorageFaultAtomicity.convergesAfterRestart
+
+    /// An inherent limit, not a defect: when the journal append of the new choice itself fails, nothing durable
+    /// records it. The person sees the local-state error, and the last durably recorded choice stands at the next
+    /// launch; the rows then no longer wait, so the tap cannot repeat it. A retry in the same session can still
+    /// succeed.
+    var acceptances: [StorageFaultAcceptance] {
+        guard start == .stuckOppositeIntent else { return [] }
+        let point = "append \(EditReplacementJournalFileStore.logFileName)"
+        let reason =
+            "nothing durable records a new choice whose journal append failed; the person sees the error, and the "
+            + "last durably recorded choice stands at the next launch"
+        return [
+            StorageFaultAcceptance(rule: .honestOutcome, phase: .failedRun, point: point, reason: reason),
+            StorageFaultAcceptance(rule: .restartConverges, phase: .restartAfterFailure, point: point, reason: reason),
+        ]
+    }
     private let source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "decision-photo")
     private let revisions = [UploadBackupRevision(rawValue: 1), UploadBackupRevision(rawValue: 2)]
     private let date = Date(timeIntervalSince1970: 1_720_000_001)
@@ -56,10 +113,16 @@ struct DeletionDecisionCase: StorageFaultCase {
                         updatedAt: date)))
         }
         try world.journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "gone"), for: source)
-        if startsWithIntent {
-            try world.journal.recordDeletionDecision(
-                keepDeleted ? .keptDeleted : .backUpAgain(revisions[1]),
-                revisions: revisions, for: source)
+        switch start {
+        case .noIntent: break
+        case .ownIntent:
+            try world.journal.recordDeletionDecision(choice(keepDeleted), revisions: revisions, for: source)
+        case .stuckOppositeIntent, .appliedOppositeIntent:
+            try world.journal.recordDeletionDecision(choice(!keepDeleted), revisions: revisions, for: source)
+            if start == .appliedOppositeIntent {
+                let rows = try world.journal.pendingDeletionDecision(for: source)
+                XCTAssertTrue(world.queue.updateStates(of: source, rows.map(\.update), updatedAt: date))
+            }
         }
     }
 
@@ -76,6 +139,17 @@ struct DeletionDecisionCase: StorageFaultCase {
     func faultTargets(of world: World) -> [Any] { [world.queue, world.files] }
 
     func run(_ world: World) async -> Bool {
+        switch start {
+        case .noIntent, .ownIntent: await decideAfterReplay(world)
+        case .stuckOppositeIntent, .appliedOppositeIntent: await tapThenNextLaunch(world)
+        }
+    }
+
+    private func choice(_ keep: Bool) -> EditReplacementDeletionChoice {
+        keep ? .keptDeleted : .backUpAgain(revisions[1])
+    }
+
+    private func decideAfterReplay(_ world: World) async -> Bool {
         guard await DeletionDecisionReplay.run(queue: world.queue, journal: world.journal, at: date) else {
             return false
         }
@@ -83,11 +157,34 @@ struct DeletionDecisionCase: StorageFaultCase {
             let row = try world.queue.entry(for: source, revision: revisions[1])
             if row?.state == .failedPermanent {
                 try await DeletionDecisionReplay.record(
-                    keepDeleted ? .keptDeleted : .backUpAgain(revisions[1]),
-                    revisions: revisions, for: source, queue: world.queue, journal: world.journal, at: date)
+                    choice(keepDeleted), revisions: revisions, for: source, queue: world.queue,
+                    journal: world.journal, at: date)
             }
             return await DeletionDecisionReplay.run(queue: world.queue, journal: world.journal, at: date)
         } catch { return false }
+    }
+
+    /// The tap as the controller runs it, then the next launch's replay. A tap that fails before `record` reports the
+    /// failure. A tap whose `record` fails also shows the person the error, but its choice stays recorded, so the
+    /// outcome is the next launch's replay.
+    private func tapThenNextLaunch(_ world: World) async -> Bool {
+        var reachedRecord = false
+        do {
+            _ = try await DeletionDecisionReplay.prepareLatestChoice(
+                for: source, queue: world.queue, journal: world.journal)
+            let row = try world.queue.entry(for: source, revision: revisions[1])
+            if let row, row.state == .failedPermanent,
+                BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
+            {
+                reachedRecord = true
+                try await DeletionDecisionReplay.record(
+                    choice(keepDeleted), revisions: revisions, for: source, queue: world.queue,
+                    journal: world.journal, at: date)
+            }
+        } catch {
+            guard reachedRecord else { return false }
+        }
+        return await DeletionDecisionReplay.run(queue: world.queue, journal: world.journal, at: date)
     }
 
     func close(_ world: World) { world.queue.close() }
@@ -122,6 +219,15 @@ private func catalogLibraries() -> (seed: EditScenarioLibrary, current: EditScen
     current.edit("render-2", identifier: "asset-2", at: Date(timeIntervalSince1970: 1_720_000_500))
     current.delete("asset-3")
     return (seed, current)
+}
+
+/// The seed library of `catalogLibraries`, where Photos now lists the rendered file of asset-2 and leaves its dates
+/// alone, so its revision stays the one that an earlier build backed up.
+private func lateRenderLibrary() -> EditScenarioLibrary {
+    let library = EditScenarioLibrary(directory: FileManager.default.temporaryDirectory)
+    for identifier in ["asset-1", "asset-2", "asset-3"] { library.add(identifier, basename: identifier) }
+    library.publishRender("render-2", identifier: "asset-2")
+    return library
 }
 
 private func catalogStore(in directory: URL) throws -> PhotoLibraryCatalogManifestStore {
@@ -174,47 +280,135 @@ struct CatalogUpsertBatchCase: StorageFaultCase {
     }
 }
 
-/// A catalog scan (`PhotoLibraryCatalogSync.run`) over several chunks: the full scan with its snapshot and removal
-/// sweep when `identifiers` is nil, otherwise the targeted scan of the changed photos. A table next to the catalog
-/// models the queue, so the sweep fails and crashes the queue writes too, and a crash image holds both stores at one
-/// moment.
-struct CatalogScanCase: StorageFaultCase {
+/// A catalog pass of `PhotoLibraryCatalogSync` over chunks of two photos. A table next to the catalog models the queue,
+/// so the sweep fails and crashes the queue writes too, and a crash image holds both stores at one moment.
+/// - `fullScan`: the full scan with its snapshot and removal sweep (`run`).
+/// - `changeScan`: the targeted scan of the changed photos (`run(identifiers:)`).
+/// - `missingSources`: the recovery of the photos whose queue rows an earlier build dropped (`reconcileMissingSources`).
+/// - `lateRenders`: the one-time pass that re-opens stored edits that list their rendered file
+///   (`reconcileLateRendersOnce`).
+/// - `lateRenderScan`: a targeted scan of asset-2, whose rendered file Photos lists only now with unchanged dates. Its
+///   revision was backed up, so the scan re-opens it before it records the render (`run(identifiers:)`).
+/// - `expiredHistory`: a pass whose change history expired (`runPass`). A third table holds the change token that the
+///   pass moves once its snapshot is saved; it is no fault target, as the token lives outside the stores. A restart
+///   whose token moved sees no expired history and must still finish the scan.
+struct CatalogPassCase: StorageFaultCase {
+    enum Pass: Sendable {
+        case fullScan
+        case changeScan([String])
+        case missingSources
+        case lateRenders
+        case lateRenderScan
+        case expiredHistory
+    }
+
     struct World {
         let store: PhotoLibraryCatalogManifestStore
         let queueTable: StorageFaultTable
         let queue: RecordingEnqueuer
+        let tokenTable: StorageFaultTable
     }
 
     let id: String
-    let identifiers: [String]?
+    let pass: Pass
     let atomicity = StorageFaultAtomicity.convergesAfterRestart
-    private let libraries = catalogLibraries()
-    private static let queueName = "queue.sqlite"
 
-    init(id: String, identifiers: [String]?) {
-        self.id = id
-        self.identifiers = identifiers
+    /// The late-render pass and the late-render scan remove the settled queue row of a re-opened revision and then
+    /// queue it again, as `UploadBackupSyncEngine.reopenBackedUpRevisions` and `enqueueBatch` do. When the second write
+    /// fails (the only insert of the pass), the row is missing until a restart: the state stays pending, the render
+    /// stays unrecorded or the pass owed, and the restart queues the revision again (I4 holds).
+    var acceptsMissingReopenedRow = true
+
+    var acceptances: [StorageFaultAcceptance] {
+        switch pass {
+        case .lateRenders, .lateRenderScan: break
+        case .fullScan, .changeScan, .missingSources, .expiredHistory: return []
+        }
+        guard acceptsMissingReopenedRow else { return [] }
+        let point = "INSERT OR IGNORE INTO item VALUES(?,?);"
+        let reason =
+            if case .lateRenderScan = pass {
+                "the re-opened row is missing and the render stays unrecorded until the next scan re-opens and queues "
+                    + "it again"
+            } else {
+                "the re-opened row is missing until the next pass queues it again; decision on #1155"
+            }
+        return [
+            StorageFaultAcceptance(rule: .noLoss, phase: .failedRun, point: point, reason: reason),
+            StorageFaultAcceptance(rule: .noLoss, phase: .crashImage, point: point, reason: reason),
+        ]
     }
+    private let libraries = catalogLibraries()
+    private let lateRender = lateRenderLibrary()
+    private static let queueName = "queue.sqlite"
+    private static let tokenName = "token.sqlite"
+    /// The token of the expired change history, and the token that the pass stores.
+    private static let expiredToken = "expired"
+    private static let currentToken = "current"
 
     func seed(in directory: URL, remote: StorageFaultRemote) async throws {
         let world = try open(directory, remote: remote)
         defer { close(world) }
-        try await sync(libraries.seed, at: 100, store: world.store).run(engine: world.queue)
+        switch pass {
+        case .fullScan, .changeScan, .missingSources, .expiredHistory, .lateRenderScan:
+            try await sync(libraries.seed, at: 100, store: world.store).run(engine: world.queue)
+        case .lateRenders:
+            // An earlier build stored asset-2 with its rendered file listed next to the original.
+            try await sync(libraries.current, at: 100, store: world.store).run(engine: world.queue)
+        }
+        switch pass {
+        case .missingSources:
+            // An earlier build dropped the queue rows of two photos that the catalog keeps.
+            XCTAssertTrue(
+                world.queueTable.execute("DELETE FROM item WHERE key LIKE 'asset-2#%' OR key LIKE 'asset-3#%';"))
+        case .lateRenders, .lateRenderScan:
+            // The earlier build finished the backup of every photo: its queue row is settled, and its state complete.
+            let settled = RecordingEnqueuer.settled
+            XCTAssertTrue(
+                world.queueTable.execute(
+                    "UPDATE item SET value='\(settled)'; "
+                        + "INSERT INTO item SELECT '\(RecordingEnqueuer.statePrefix)' || key, '\(settled)' FROM item;"))
+        case .expiredHistory:
+            XCTAssertEqual(world.tokenTable.insertIfAbsent("token", value: Self.expiredToken), true)
+        case .fullScan, .changeScan:
+            break
+        }
     }
 
     func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
         let queueTable = try StorageFaultTable(url: directory.appendingPathComponent(Self.queueName))
         return World(
-            store: try catalogStore(in: directory), queueTable: queueTable, queue: RecordingEnqueuer(ledger: queueTable)
-        )
+            store: try catalogStore(in: directory), queueTable: queueTable,
+            queue: RecordingEnqueuer(ledger: queueTable),
+            tokenTable: try StorageFaultTable(url: directory.appendingPathComponent(Self.tokenName)))
     }
 
     func faultTargets(of world: World) -> [Any] { [world.store, world.queueTable] }
 
     func run(_ world: World) async -> Bool {
         do {
-            try await sync(libraries.current, at: 200, store: world.store).run(
-                engine: world.queue, identifiers: identifiers)
+            switch pass {
+            case .fullScan:
+                try await sync(libraries.current, at: 200, store: world.store).run(engine: world.queue)
+            case .changeScan(let identifiers):
+                try await sync(libraries.current, at: 200, store: world.store).run(
+                    engine: world.queue, identifiers: identifiers)
+            case .missingSources:
+                try await sync(libraries.seed, at: 200, store: world.store).reconcileMissingSources(engine: world.queue)
+            case .lateRenders:
+                try await sync(libraries.current, at: 200, store: world.store).reconcileLateRendersOnce(
+                    engine: world.queue)
+            case .lateRenderScan:
+                try await sync(lateRender, at: 200, store: world.store).run(
+                    engine: world.queue, identifiers: ["asset-2"])
+            case .expiredHistory:
+                let token = world.tokenTable
+                let expired = try token.value(of: "token") == Self.expiredToken
+                try await sync(libraries.current, at: 200, store: world.store).runPass(
+                    engine: world.queue,
+                    changes: .init(changedIdentifiers: [], deletedIdentifiers: [], requiresFullRescan: expired),
+                    commitChanges: { _ = token.execute("UPDATE item SET value='\(Self.currentToken)';") })
+            }
             return true
         } catch {
             return false
@@ -224,14 +418,20 @@ struct CatalogScanCase: StorageFaultCase {
     func close(_ world: World) {
         world.store.close()
         world.queueTable.close()
+        world.tokenTable.close()
     }
 
     func state(in directory: URL) throws -> StorageFaultState {
         var state = try catalogState(in: directory)
         let queue = directory.appendingPathComponent(Self.queueName)
         try state.addSQLiteTables(of: queue)
-        // One record per photo revision, as `RecordingEnqueuer` keys the ledger.
-        try state.addRecords("queued photo revision", of: queue, sql: "SELECT key FROM item;")
+        // One record per photo revision, as `RecordingEnqueuer` keys the ledger; the modeled backup states are no queue
+        // rows.
+        try state.addRecords(
+            "queued photo revision", of: queue,
+            sql: "SELECT key FROM item WHERE substr(key, 1, \(RecordingEnqueuer.statePrefix.count)) "
+                + "!= '\(RecordingEnqueuer.statePrefix)';")
+        try state.addSQLiteTables(of: directory.appendingPathComponent(Self.tokenName))
         return state
     }
 
@@ -469,5 +669,158 @@ struct PhotoJournalCase: StorageFaultCase {
             try SeriesDissolutionJournalFileStore(accountDataDirectory: directory, fileSystem: fileSystem).remove(
                 forSeries: photo)
         }
+    }
+}
+
+/// One transaction of the store under the exact duplicate details (`ExactDuplicateFingerprintStore`), each as
+/// `ExactDuplicateFingerprintCache` runs it:
+/// - `store`: the details of three photos saved under the cursor of the scan;
+/// - `advance`: the persisted cursor recovered as after a launch, then moved on with the details of two photos dropped;
+/// - `discontinuity`: the cursor of another key epoch, which drops every detail.
+/// Every write of the context holds a new random generation, so the state reads the context without it, and the
+/// details as text, because `JSONEncoder` writes their keys in no fixed order.
+struct FingerprintCacheCase: StorageFaultCase {
+    enum Step: Sendable {
+        case store
+        case advance
+        case discontinuity
+    }
+
+    let id: String
+    let step: Step
+    let atomicity = StorageFaultAtomicity.allOrNothing
+    private static let scope = ExactDuplicateFingerprintStore.Scope(
+        accountID: "account", volumeID: "volume", hashKeyEpoch: "epoch-1")
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let store = try open(directory, remote: remote)
+        defer { store.close() }
+        let snapshot = try XCTUnwrap(store.prepare(scope: Self.scope, eventID: "event-1"))
+        if case .store = step { return }
+        XCTAssertTrue(store.store(Self.details(of: ["a", "b", "c"]), for: snapshot))
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> ExactDuplicateFingerprintStore {
+        try XCTUnwrap(
+            ExactDuplicateFingerprintStore(
+                url: directory.appendingPathComponent(ExactDuplicateFingerprintStore.databaseFileName),
+                cacheDirectory: directory))
+    }
+
+    func faultTargets(of world: ExactDuplicateFingerprintStore) -> [Any] { [world] }
+
+    func run(_ store: ExactDuplicateFingerprintStore) async -> Bool {
+        switch step {
+        case .store:
+            guard let snapshot = store.prepare(scope: Self.scope, eventID: "event-1") else { return false }
+            return store.store(Self.details(of: ["a", "b", "c"]), for: snapshot)
+        case .advance:
+            guard let snapshot = store.prepare(scope: Self.scope, eventID: "event-1") else { return false }
+            return store.advance(from: snapshot, to: "event-2", invalidating: ["a", "b"]) != nil
+        case .discontinuity:
+            let epoch = ExactDuplicateFingerprintStore.Scope(
+                accountID: "account", volumeID: "volume", hashKeyEpoch: "epoch-2")
+            return store.prepare(scope: epoch, eventID: "event-2") != nil
+        }
+    }
+
+    func close(_ world: ExactDuplicateFingerprintStore) { world.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let url = directory.appendingPathComponent(ExactDuplicateFingerprintStore.databaseFileName)
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: url)
+        try state.setSQLiteRows(
+            of: "fingerprint", in: url, sql: "SELECT link_id, CAST(payload AS TEXT) FROM fingerprint;")
+        try state.setSQLiteRows(
+            of: "fingerprint_context", in: url,
+            sql: "SELECT json_remove(CAST(payload AS TEXT), '$.generation') FROM fingerprint_context;")
+        return state
+    }
+
+    private static func details(of nodes: [String]) -> [PhotoUID: ExactDuplicateFingerprint] {
+        Dictionary(
+            uniqueKeysWithValues: nodes.map {
+                (
+                    PhotoUID(volumeID: "volume", nodeID: $0),
+                    ExactDuplicateFingerprint(
+                        captureTime: Date(timeIntervalSince1970: 1_700_000_000), device: "camera-\($0)",
+                        pixelWidth: 100, pixelHeight: 100)
+                )
+            })
+    }
+}
+
+/// One transaction of the journal that restores the frames of a trashed series (`TrashedSeriesRestoreJournal`):
+/// - `record`: one duty replaced, a new one added, and the duty of a main photo that was trashed again dropped;
+/// - `update`: a response that settled one of the two frames of a duty;
+/// - `finish`: a response that settled the last frame of a duty, which removes the duty.
+struct TrashedSeriesRestoreCase: StorageFaultCase {
+    enum Step: Sendable {
+        case record
+        case update
+        case finish
+    }
+
+    let id: String
+    let step: Step
+    let atomicity = StorageFaultAtomicity.allOrNothing
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let journal = try open(directory, remote: remote)
+        defer { journal.close() }
+        try journal.record([Self.duty(1, frames: ["f1", "f2"]), Self.duty(2, frames: ["f3"])])
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> TrashedSeriesRestoreJournal {
+        try XCTUnwrap(
+            TrashedSeriesRestoreJournal(url: directory.appendingPathComponent(TrashedSeriesRestoreJournal.fileName)))
+    }
+
+    func faultTargets(of world: TrashedSeriesRestoreJournal) -> [Any] { [world] }
+
+    func run(_ journal: TrashedSeriesRestoreJournal) async -> Bool {
+        do {
+            switch step {
+            case .record:
+                var later = Self.duty(1, frames: ["f1", "f2"])
+                later.attempts = 1
+                try journal.record(
+                    [later, Self.duty(3, frames: ["f4"])],
+                    mainTrashTimes: [PhotoUID(volumeID: "volume", nodeID: "main-2"): 2_000])
+            case .update:
+                try journal.update(Self.duty(1, frames: ["f2"]))
+            case .finish:
+                try journal.update(Self.duty(2, frames: []))
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func close(_ world: TrashedSeriesRestoreJournal) { world.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let url = directory.appendingPathComponent(TrashedSeriesRestoreJournal.fileName)
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: url)
+        // The payload is the JSON of the duty; compared as text, because `JSONEncoder` writes keys in no fixed order.
+        try state.setSQLiteRows(
+            of: "restore_duties", in: url,
+            sql: "SELECT volume, main, generation, CAST(payload AS TEXT) FROM restore_duties;")
+        return state
+    }
+
+    /// The duty of main photo `index`, with a fixed generation, so two runs write the same rows.
+    private static func duty(_ index: Int, frames: [String]) -> TrashedSeriesRestoreRecord {
+        let main = "main-\(index)"
+        return TrashedSeriesRestoreRecord(
+            generation: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, UInt8(index))),
+            main: PhotoUID(volumeID: "volume", nodeID: main), mainTrashTime: 1_000,
+            frames: frames.map {
+                .init(uid: PhotoUID(volumeID: "volume", nodeID: $0), mainPhotoLinkID: main, trashTime: 1_001)
+            },
+            retryAt: Date(timeIntervalSince1970: 100))
     }
 }
