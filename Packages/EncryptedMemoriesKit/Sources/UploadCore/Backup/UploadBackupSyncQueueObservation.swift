@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// A write to the backup queue, reported after it committed. The pending grid follows the queue through
 /// these notifications instead of polling it.
@@ -40,6 +41,11 @@ public struct UploadBackupQueueRowState: Sendable, Equatable {
     }
 }
 
+private extension Array {
+    /// The array, or nil when it is empty: a complete read without rows is absent.
+    var nonEmpty: [Element]? { isEmpty ? nil : self }
+}
+
 /// Queue reads and change notifications for the pending grid. Only the SQLite store implements it.
 public protocol UploadBackupSyncQueueObserving: Sendable {
     /// Replaces the observer. The store calls it after each committed write, outside its lock.
@@ -57,10 +63,24 @@ public protocol UploadBackupSyncQueueObserving: Sendable {
 }
 
 public extension UploadBackupSyncQueueObserving {
+    /// The rows of these sources as a typed answer (#1154): `found` holds the complete rows, `absent` says that a
+    /// complete read found none, and `unknown` says that the read failed, so nothing is known about the rows. A caller
+    /// never takes an unknown answer for no rows.
+    func decisionRowSet(
+        kind: UploadSourceIdentity.Kind, identifiers: Set<String>
+    ) -> StoreLookup<[UploadBackupQueueRowState]> {
+        StoreLookup(catching: { try decisionRows(kind: kind, identifiers: identifiers).nonEmpty })
+    }
+
+    /// The unsettled rows as a typed answer, with the same three cases as `decisionRowSet`.
+    func decisionUnsettledRowSet() -> StoreLookup<[UploadBackupQueueRowState]> {
+        StoreLookup(catching: { try decisionUnsettledRows().nonEmpty })
+    }
+
     /// True only when a complete read finds no row of these sources. A removal proves itself with this read: a later
     /// health check can pass again after a failed write, so it proves nothing about the removal (#1004).
     func holdsNoRows(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Bool {
-        (try? decisionRows(kind: kind, identifiers: Set(identifiers)))?.isEmpty == true
+        decisionRowSet(kind: kind, identifiers: Set(identifiers)) == .absent
     }
 
     /// Stores without live notifications can still provide the pending-grid reads.

@@ -200,7 +200,10 @@ public extension PhotoLibraryCatalogStore {
     /// also answers nil: the upload metadata then asks Photos, which owns the identifier, so an unknown row never
     /// stands for a missing identifier (#1212).
     func cachedCloudIdentifier(for localIdentifier: String) -> String? {
-        (try? entry(for: localIdentifier))?.cloudIdentifier
+        switch StoreLookup(catching: { try entry(for: localIdentifier) }) {
+        case .found(let row): row.cloudIdentifier
+        case .absent, .unknown: nil
+        }
     }
 }
 
