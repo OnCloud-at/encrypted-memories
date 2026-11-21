@@ -36,7 +36,7 @@ public struct DeletionDecisionRow: Sendable, Equatable {
             let resource = parts.last, !resource.isEmpty, !intent.revisions.isEmpty,
             (entry.keptDeleted == true) != (entry.backUpAgainRevision != nil),
             entry.backUpAgainRevision.map({ intent.revisions.contains($0) }) ?? true
-        else { throw UploadError.backend(L10n.string("backup.error_local_state_unavailable")) }
+        else { throw UploadError.internalFailure(.localStateUnavailable) }
         return intent.revisions.map {
             Self(
                 decisionID: intent.id, sourceKind: kind,
@@ -96,7 +96,7 @@ public enum DeletionDecisionReplay {
             guard
                 PhotoPerformanceSignposts.database.interval(
                     "BackupDecisionQueueWrite", { queue.updateStates(of: source, rows.map(\.update), updatedAt: date) })
-            else { throw UploadError.backend(L10n.string("backup.error_local_state_unavailable")) }
+            else { throw UploadError.internalFailure(.localStateUnavailable) }
         } catch {
             if previous.deletionDecision == nil {
                 do { try journal.restoreDeletionChoice(previous, ifStill: written, for: source) } catch {
@@ -110,7 +110,7 @@ public enum DeletionDecisionReplay {
                     .photoBackup, "decision.choiceKept",
                     [(.init("choice"), .word(choice.keptDeleted == true ? "keepDeleted" : "backUpAgain"))])
             }
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw UploadError.internalFailure(.localStateUnavailable)
         }
         // A failed settle only costs another idempotent replay; the queue already holds the complete choice.
         try? journal.settleDeletionDecision(id: intent.id, for: source)
@@ -125,7 +125,7 @@ public enum DeletionDecisionReplay {
         guard let first = rows.first else { return }
         let updates = try parkedUpdates(rows, queue: queue)
         guard queue.updateStates(of: first.source, updates, updatedAt: date) else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw UploadError.internalFailure(.localStateUnavailable)
         }
         try journal.settleDeletionDecision(id: first.decisionID, for: first.source)
     }
@@ -170,7 +170,7 @@ public enum DeletionDecisionReplay {
         _ rows: [DeletionDecisionRow], queue: UploadBackupSyncQueueManifestStore
     ) throws -> [UploadBackupSyncQueueManifestStore.StateUpdate] {
         guard queue.isOperational() else {
-            throw UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
+            throw UploadError.internalFailure(.localStateUnavailable)
         }
         var updates: [UploadBackupSyncQueueManifestStore.StateUpdate] = []
         for row in rows {
