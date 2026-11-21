@@ -139,6 +139,8 @@ public struct BackupStatus: Sendable, Equatable {
     public var needsAttentionCount = 0
     /// Rows that are not backed up although nothing the person can fix is known. They show in a calm line.
     public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) }
+    /// The failed and final part of `notBackedUpCount`, for a host that lists missing photos in their own line.
+    public var notBackedUpFailedCount: Int { max(0, notBackedUpCount - sourceMissing) }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
     /// list reloads only when its content can differ.
     public var problemListKey: ProblemListKey {
@@ -161,6 +163,18 @@ public struct BackupStatus: Sendable, Equatable {
     var hasOnlyDismissedSourceRechecks: Bool {
         pendingSourceRechecks > 0 && outstandingCount == pendingSourceRechecks
             && !isPreparingRemoteIndex && !remoteIndexPreparationFailed && remoteIndexPreparationIssue == nil
+    }
+
+    /// The status after a watched folder could not be read. The failing subtree has no queue row, so the status shows
+    /// one item that asks the person, rather than claiming that the readable part is the whole tree.
+    public func afterFolderEnumerationFailure() -> BackupStatus {
+        var status = self
+        status.phase = .needsAttention
+        status.failed = max(1, status.failed)
+        status.needsAttentionCount = max(1, status.needsAttentionCount)
+        status.fractionCompleted = nil
+        status.currentItemName = nil
+        return status
     }
 
     /// A finished backup that left rows out: dismissed ones, or rows that are not backed up without anything the

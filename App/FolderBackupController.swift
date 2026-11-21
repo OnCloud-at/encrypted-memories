@@ -142,20 +142,8 @@ final class FolderBackupController {
         lastAppliedStatusProjectionRevision = projection.revision
         status =
             hasFolderEnumerationFailure
-            ? Self.statusAfterFolderEnumerationFailure(projection.status)
+            ? projection.status.afterFolderEnumerationFailure()
             : projection.status
-    }
-
-    private static func statusAfterFolderEnumerationFailure(_ status: BackupStatus) -> BackupStatus {
-        var status = status
-        status.phase = .needsAttention
-        // The failing subtree has no queue row. Surface one run-level attention item rather than
-        // claiming that the successfully enumerated prefix represents the complete tree.
-        status.failed = max(1, status.failed)
-        status.needsAttentionCount = max(1, status.needsAttentionCount)
-        status.fractionCompleted = nil
-        status.currentItemName = nil
-        return status
     }
 
     // MARK: - Folder registry (bookmarks are the App-side boundary)

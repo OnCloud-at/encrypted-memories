@@ -86,13 +86,21 @@ public struct BackupItemOutcome: Sendable, Equatable {
             } else {
                 .continuesByItself
             }
-        let isParked = state == .failed || isPermanentState
-        let raisesAttention =
-            isParked
-            && (category == .decision || (state == .failed && !isFinal && Self.personFixableIssues.contains(issue)))
         self.init(
             issue: issue, category: category, reason: reason, isPermanent: isPermanentState, section: section,
-            raisesAttention: raisesAttention)
+            raisesAttention: Self.raisesAttention(state: state, record: record))
+    }
+
+    /// Whether a stored row raises attention. It builds no localized text, so the queue summary can ask it for every
+    /// parked row. A final or missing row asks the person only for its deletion decision; a failed row for a decision
+    /// or for a cause that only the person can fix; a row that still runs never asks.
+    public static func raisesAttention(state: UploadBackupSyncQueueState, record: BackupIssueRecord?) -> Bool {
+        let issue = record?.kind ?? defaultIssue(for: state)
+        return switch state {
+        case .failedPermanent, .sourceMissing: issue == .deletedElsewhere
+        case .failed: category(of: issue) == .decision || personFixableIssues.contains(issue)
+        default: false
+        }
     }
 
     private init(

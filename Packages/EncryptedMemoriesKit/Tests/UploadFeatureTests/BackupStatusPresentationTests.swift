@@ -104,7 +104,8 @@ final class BackupStatusPresentationTests: XCTestCase {
             XCTAssertEqual(status.photoDisplayProgress?.isChecking, false, "\(issue)")
             let display = BackupStatusPresentation(status)
             XCTAssertEqual(display.headlineKey, headlineKey, "\(issue)")
-            XCTAssertEqual(display.accessory, .waiting, "\(issue)")
+            // A full Proton storage is the person's to fix, so its wait asks the person (D5).
+            XCTAssertEqual(display.accessory, issue == .accountStorage ? .attention : .waiting, "\(issue)")
             XCTAssertFalse(display.isActive, "\(issue)")
             XCTAssertNil(display.progressFraction, "\(issue)")
             XCTAssertNil(display.localizedSubtitle, "\(issue)")

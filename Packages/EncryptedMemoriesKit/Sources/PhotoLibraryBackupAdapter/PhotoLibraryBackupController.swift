@@ -1930,11 +1930,25 @@ public final class PhotoLibraryBackupController {
         }
 
         /// Seeds the three native sections without PhotoKit or a network connection.
+        /// `failedKinds` adds one parked row per kind, after its attempts, named "<kind> failed fixture.heic".
         public func installFailedItemsFixtureForTesting(
-            kinds: [BackupIssueKind] = [.network, .accountStorage, .deletedElsewhere, .unsupported]
+            kinds: [BackupIssueKind] = [.network, .accountStorage, .deletedElsewhere, .unsupported],
+            failedKinds: [BackupIssueKind] = []
         ) -> Bool {
             guard let queueStore, pendingReplacementJournal != nil else { return false }
             let retryAt = Date().addingTimeInterval(3_600)
+            for kind in failedKinds {
+                guard
+                    queueStore.upsert(
+                        .init(
+                            source: UploadSourceIdentity(
+                                kind: .photoLibraryAsset, identifier: "fixture-failed-\(kind.rawValue)"),
+                            revision: .init(rawValue: 1), originalFilename: "\(kind.rawValue) failed fixture.heic",
+                            state: .failed,
+                            lastError: BackupIssueRecord(kind: kind, detail: "Fixture technical detail").persistedValue,
+                            updatedAt: retryAt))
+                else { return false }
+            }
             for kind in kinds {
                 // A remoteService row is a photo that stopped after Proton refused it over three days.
                 let state: UploadBackupSyncQueueState =

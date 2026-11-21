@@ -16,4 +16,10 @@ public enum BackupProblemSection {
             return rows.isEmpty ? nil : Group(id: category, items: rows)
         }
     }
+
+    /// Groups problem rows by the section of their outcome. A row's section can differ from its category's: a failed
+    /// row that the next launch runs again keeps the category that Try again selects, but continues by itself.
+    public static func grouped<Item>(_ items: [Item], item: (Item) -> BackupFailedItem) -> [Group<Item>] {
+        grouped(items, section: { item($0).section })
+    }
 }

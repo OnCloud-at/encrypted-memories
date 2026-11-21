@@ -11,7 +11,10 @@ final class MobileFailedBackupUITests: XCTestCase {
 
     override func tearDown() { app.terminate() }
 
-    private func openSheet(mode: String? = nil, language: String = "en", missingPreview: Bool = false) {
+    /// `calmOnly` checks that the status offers the calm line and no orange line before it opens the list.
+    private func openSheet(
+        mode: String? = nil, language: String = "en", missingPreview: Bool = false, calmOnly: Bool = false
+    ) {
         app.launchArguments = [
             "-EncryptedMemoriesUITestFixture", "-EncryptedMemoriesFailedBackupFixture",
             "-AppleLanguages", "(\(language))", "-AppleLocale", language == "de" ? "de_DE" : "en_US",
@@ -28,6 +31,10 @@ final class MobileFailedBackupUITests: XCTestCase {
         let attention = app.buttons["backup.failedItems"]
         let notBackedUp = app.buttons["backup.notBackedUpItems"]
         let waiting = app.buttons["backup.waitingItems"]
+        if calmOnly {
+            XCTAssertTrue(notBackedUp.waitForExistence(timeout: 10), "the calm line opens the list")
+            XCTAssertFalse(attention.exists, "nothing asks the person")
+        }
         let details =
             attention.waitForExistence(timeout: 5)
             ? attention : notBackedUp.waitForExistence(timeout: 5) ? notBackedUp : waiting
@@ -164,6 +171,11 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertEqual(section("actionNeeded").label, "Action needed")
         XCTAssertTrue(row("permission fixture.heic").exists)
         XCTAssertTrue(app.buttons["backup.retryUserResolvable.sheet"].exists)
+        // A failed row without a cause the person can fix runs again after the next launch.
+        XCTAssertTrue(section("continuesByItself").waitForExistence(timeout: 5))
+        let failed = row("remoteService failed fixture.heic")
+        XCTAssertTrue(failed.waitForExistence(timeout: 5))
+        XCTAssertTrue(failed.label.contains("Not backed up after several tries."))
         XCTAssertTrue(section("notPossible").waitForExistence(timeout: 5))
         XCTAssertEqual(section("notPossible").label, "No further attempts")
         let refused = row("remoteService fixture.heic")
@@ -174,8 +186,7 @@ final class MobileFailedBackupUITests: XCTestCase {
     /// Nothing the person can fix: the status shows a calm line instead of the orange one, and the list has no
     /// Try again.
     func testOnlyCalmRowsOpenFromTheCalmLineWithoutTryAgain() {
-        openSheet(mode: "-EncryptedMemoriesCalmOnlyBackupFixture")
-        XCTAssertFalse(app.buttons["backup.failedItems"].exists)
+        openSheet(mode: "-EncryptedMemoriesCalmOnlyBackupFixture", calmOnly: true)
         XCTAssertTrue(section("notPossible").waitForExistence(timeout: 5))
         XCTAssertTrue(row("remoteService fixture.heic").label.contains("Proton did not accept this photo."))
         XCTAssertFalse(section("actionNeeded").exists)

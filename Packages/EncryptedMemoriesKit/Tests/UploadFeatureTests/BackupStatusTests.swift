@@ -275,6 +275,8 @@ final class BackupStatusTests: XCTestCase {
         failed.total = 2
         failed.failed = 1
         XCTAssertEqual(BackupStatus(manualUploadCheck: failed).phase, .needsAttention)
+        // Every failed manual upload is in the person's own upload list, so each one asks the person.
+        XCTAssertEqual(BackupStatus(manualUploadCheck: failed).needsAttentionCount, 1)
 
         var done = UploadPreparationStatus()
         done.total = 2

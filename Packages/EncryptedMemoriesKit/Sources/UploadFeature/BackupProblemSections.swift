@@ -18,7 +18,7 @@ public struct BackupProblemSections<Row: View>: View {
     }
 
     public var body: some View {
-        ForEach(BackupProblemSection.grouped(rows, section: { $0.item.section })) { section in
+        ForEach(BackupProblemSection.grouped(rows, item: { $0.item })) { section in
             Section {
                 ForEach(section.items) { item in row(item.item) }
             } header: {

@@ -72,6 +72,7 @@ final class BackupAttentionSplitTests: XCTestCase {
         let status = BackupStatus(progress: BackupSyncProgress(summary: summary), isScanning: false)
         XCTAssertEqual(status.needsAttentionCount, 6)
         XCTAssertEqual(status.notBackedUpCount, 4 + 5 + 7 + 8 + 11)
+        XCTAssertEqual(status.notBackedUpFailedCount, 4 + 5 + 8 + 11, "missing photos have their own line")
     }
 
     func testTheSameStoredErrorInAnotherStateIsJudgedByThatState() throws {
@@ -90,6 +91,41 @@ final class BackupAttentionSplitTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(store.summary()).attention, 0)
         seed("row", count: 1, state: .failed, record: .init(kind: .permission, detail: "second"), distinctDetail: false)
         XCTAssertEqual(try XCTUnwrap(store.summary()).attention, 1)
+    }
+
+    /// The split needs the second read of the parked rows; when that read fails, the whole summary is unknown rather
+    /// than a count that calls every parked row calm.
+    func testAFailedParkedReadLeavesTheSummaryUnknown() throws {
+        seed("permission", count: 1, state: .failed, record: .init(kind: .permission, detail: ""))
+        let fault = try SQLiteReadInterrupt(in: store!, matching: "SELECT state, last_error FROM backup_sync_queue")
+        defer { fault.stop() }
+        XCTAssertNil(store.summary())
+        XCTAssertTrue(fault.fired)
+    }
+
+    /// A folder that could not be read has no queue row; the status still asks the person, also next to calm rows.
+    func testAFolderReadFailureAsksThePerson() {
+        let calm = BackupStatus(progress: progress(total: 10, uploaded: 7, failed: 3), isScanning: false)
+        XCTAssertEqual(calm.needsAttentionCount, 0)
+        let failed = calm.afterFolderEnumerationFailure()
+        XCTAssertEqual(failed.phase, .needsAttention)
+        XCTAssertEqual(failed.needsAttentionCount, 1)
+        XCTAssertEqual(failed.notBackedUpCount, 2)
+        XCTAssertNil(failed.fractionCompleted)
+        let empty = BackupStatus().afterFolderEnumerationFailure()
+        XCTAssertEqual(empty.failed, 1)
+        XCTAssertEqual(empty.needsAttentionCount, 1)
+        XCTAssertEqual(BackupStatusPresentation(empty).accessory, .attention)
+    }
+
+    func testAPausedStatusShowsNoCalmLine() {
+        var raw = progress(total: 10, uploaded: 5, waiting: 3, failed: 2)
+        raw.isRunning = true
+        raw.isPausedByPolicy = true
+        let status = BackupStatus(progress: raw, isScanning: false)
+        XCTAssertEqual(status.phase, .paused)
+        XCTAssertEqual(status.notBackedUpCount, 2)
+        XCTAssertNil(BackupStatusPresentation(status).localizedNotBackedUp)
     }
 
     /// A stored error is free text, so ten thousand parked rows are ten thousand groups. Both reads must count them

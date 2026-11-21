@@ -303,9 +303,12 @@ private struct BackupSettingsTab: View {
                 if status.waitingRetry > 0 {
                     Text("settings.backup_row_blocked \(status.waitingRetry)")
                 }
-                if status.failed > 0 {
-                    Text("settings.backup_row_failed \(status.failed)")
+                if status.needsAttentionCount > 0 {
+                    Text("settings.backup_row_failed \(status.needsAttentionCount)")
                         .foregroundStyle(.orange)
+                }
+                if status.notBackedUpFailedCount > 0 {
+                    Text(L10n.string("backup.progress_not_backed_up \(status.notBackedUpFailedCount)"))
                 }
             }
             .font(.system(size: 11).monospacedDigit())
