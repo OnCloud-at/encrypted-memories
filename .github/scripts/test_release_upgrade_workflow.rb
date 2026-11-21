@@ -92,6 +92,77 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     assert_equal "${{ vars.RELEASE_UPGRADE_PROVISIONING }}", plan.fetch("env").fetch("UPGRADE_PROVISIONING")
   end
 
+  def nightly_gate_step
+    @jobs.fetch("prepare").fetch("steps").find { |step| step["id"] == "nightly-gate" }
+  end
+
+  def test_the_nightly_gate_runs_in_prepare_between_the_upgrade_plan_and_the_tag_checkout_with_the_actions_scope
+    steps = @jobs.fetch("prepare").fetch("steps")
+    gate = nightly_gate_step
+    refute_nil gate
+    ids = steps.map { |step| step["id"] }
+    assert_operator ids.index("upgrade-plan"), :<, steps.index(gate)
+    checkout = steps.index { |step| step["uses"].to_s.start_with?("actions/checkout") && step.dig("with", "ref").to_s.include?("steps.release.outputs.tag") }
+    assert_operator steps.index(gate), :<, checkout, "the trusted script runs before the release tag is checked out"
+    assert_equal({"contents" => "read", "actions" => "read"}, @jobs.fetch("prepare").fetch("permissions"))
+    @jobs.each do |name, job|
+      refute job.fetch("permissions", {}).key?("actions"), "#{name} needs no actions scope" unless name == "prepare"
+    end
+    refute gate.key?("continue-on-error"), "a refusal must fail the job"
+    assert_equal "${{ steps.revision.outputs.commit_sha }}", gate.fetch("env").fetch("RELEASE_COMMIT")
+    assert_equal "${{ steps.upgrade-plan.outputs.upgrade_overridden }}", gate.fetch("env").fetch("OVERRIDDEN")
+    assert_equal "${{ inputs.upgrade_override_reason }}", gate.fetch("env").fetch("OVERRIDE_REASON")
+  end
+
+  # The step runs the real script with a fake `gh` that finds no run: the commit reaches the query, a refusal fails the
+  # step, and the override skips the read.
+  def test_the_nightly_gate_step_refuses_a_commit_without_a_run_and_the_override_skips_the_read
+    root = File.expand_path("../..", __dir__)
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    Dir.mktmpdir do |dir|
+      gh = File.join(dir, "gh")
+      File.write(gh, "#!/usr/bin/env bash\necho \"$*\" >> \"$GH_LOG\"\necho '[{\"total_count\":0,\"workflow_runs\":[]}]'\n")
+      File.chmod(0o755, gh)
+      log = File.join(dir, "calls.log")
+      env = {"PATH" => "#{dir}:#{ENV.fetch("PATH")}", "GH_LOG" => log, "GITHUB_STEP_SUMMARY" => File.join(dir, "summary"),
+             "GITHUB_REPOSITORY" => "example/repository", "RELEASE_COMMIT" => commit, "RELEASE_TAG" => "v9.9.9",
+             "OVERRIDE_REASON" => "Hosted runners are down"}
+      run = lambda do |overridden|
+        File.write(log, "")
+        ok = system(env.merge("OVERRIDDEN" => overridden), "bash", "-c", nightly_gate_step.fetch("run"), chdir: root, out: File::NULL, err: File::NULL)
+        [ok, File.read(log)]
+      end
+      ok, calls = run.call("false")
+      refute ok, "a commit without a nightly run must fail the step"
+      assert_includes calls, "head_sha=#{commit}"
+      ok, calls = run.call("true")
+      assert ok, "the deliberate override skips the gate"
+      assert_equal "", calls
+      assert_includes File.read(File.join(dir, "summary")), "Hosted runners are down"
+      # The planner accepts a reason or a tag that starts with a dash (argparse takes such a value with a space as a value
+      # anyway, so the case without a space is the one that counts); the gate must take it as a value, not an option.
+      env = env.merge("OVERRIDE_REASON" => "-urgent", "RELEASE_TAG" => "-v9")
+      ok, calls = run.call("true")
+      assert ok, "a reason that starts with a dash is a value"
+      assert_equal "", calls
+      assert_includes File.read(File.join(dir, "summary")), "-urgent"
+    end
+  end
+
+  def test_the_nightly_gate_step_stops_after_the_time_budget_of_its_script_and_before_the_job_timeout
+    step = nightly_gate_step
+    minutes = IO.popen(["python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import release_nightly_gate as g; " \
+      "print(g.STEP_MINUTES, g.BUDGET_SECONDS)", File.expand_path(__dir__)], &:read).split.map(&:to_i)
+    assert_equal minutes[0], step.fetch("timeout-minutes"), "the step stops at the minutes that the script knows"
+    assert_operator minutes[1] + 30, :<=, step.fetch("timeout-minutes") * 60
+    assert_operator step.fetch("timeout-minutes"), :<, @jobs.fetch("prepare").fetch("timeout-minutes")
+  end
+
+  def test_the_override_input_says_that_it_skips_the_nightly_gate_too
+    inputs = (@workflow["on"] || @workflow.fetch(true)).fetch("workflow_dispatch").fetch("inputs")
+    assert_includes inputs.fetch("upgrade_override_tag").fetch("description"), "nightly UI gate"
+  end
+
   def test_the_runner_disk_step_fails_below_the_declared_minimum_and_reads_it_from_the_matrix
     step = @jobs.fetch("upgrade").fetch("steps").find { |item| item["id"] == "disk" }
     refute_nil step

@@ -153,6 +153,7 @@ jobs:
           python3 -B .github/scripts/test_collect_ui_wait_diagnostics.py
           python3 .github/scripts/test_list_retried_tests.py
           python3 .github/scripts/test_nightly_ui_evidence.py
+          python3 .github/scripts/test_release_nightly_gate.py
           python3 .github/scripts/test_storage_path_policy.py
           python3 .github/scripts/test_storage_evidence.py
           python3 -B .github/scripts/test_create_duo_simulator.py
