@@ -294,8 +294,7 @@ final class MobileDuplicatesUITests: XCTestCase {
     func testMergeAllUsesAnAlertWithShortLocalizedActionsAndCancelKeepsTheGroups() throws {
         for language in ["en", "de"] {
             openDuplicates(fixture: "-EncryptedMemoriesDuplicatesFixture", language: language)
-            let tabTitles =
-                language == "de" ? ["Mediathek", "Sammlungen", "Suchen"] : ["Library", "Collections", "Search"]
+            let tabTitles = language == "de" ? XCUIApplication.germanTabTitles : XCUIApplication.englishTabTitles
             let verticalColumn = try app.verticalTabColumn(titles: tabTitles)
             revealGroup(1)
             // A vertical bar reserves space beside the list; horizontal bars keep the full-window centre.
@@ -377,6 +376,29 @@ final class MobileDuplicatesUITests: XCTestCase {
 
         waitUntilGone(group(0), "every group leaves the list")
         XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 5))
+    }
+
+    /// An alert covers the list behind it and its own buttons, so `tapOnScreen(_:)` fails its check and returns
+    /// without a tap. The same place is clear again after Cancel.
+    func testAnAlertCoversTheListBehindItAndAFailedCheckTapsNothing() {
+        // The failed check is expected below; the test goes on so that a tap after the failed check would show.
+        continueAfterFailure = true
+        openDuplicates()
+        let mergeAll = app.buttons["duplicates.mergeAll"]
+        XCTAssertTrue(mergeAll.waitForExistence(timeout: 5))
+        mergeAll.tap()
+        let alert = app.alerts.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 10))
+        let behind = alert.frame.centreProbe
+        XCTAssertFalse(app.liesOnScreenClearOfBars(behind), "A row behind the alert is covered")
+
+        let cancel = alert.buttons["Cancel"].firstMatch
+        XCTExpectFailure("The alert covers its own button") { app.tapOnScreen(cancel) }
+        XCTAssertTrue(alert.exists, "The failed check tapped nothing, so the alert stays")
+
+        cancel.tap()
+        waitUntilGone(alert, "the alert closes")
+        XCTAssertTrue(app.liesOnScreenClearOfBars(behind), "The place is clear after Cancel")
     }
 
     func testStopEndsMergeAllAfterTheRunningBatchAndKeepsTheOtherGroups() throws {

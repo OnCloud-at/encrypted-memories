@@ -159,6 +159,13 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         let pickerHeight = regularFrame.maxY - bar.convert(bar.bounds, to: regularWindow).minY
         XCTAssertGreaterThanOrEqual(pickerHeight, 370, "The regular picker must show its content")
         XCTAssertLessThanOrEqual(pickerHeight, 381, "The regular picker must keep its height bounded")
+        // The whole view keeps its own bound, so growth above the navigation bar still fails: 390 pt measured on
+        // iOS 27, bound 391 pt, plus the 13 pt that the view of iOS 26.5 reaches up under the popover arrow (403 pt).
+        let wholeViewHeightBound: CGFloat = 391
+        let popoverArrowOvershoot: CGFloat = 13
+        XCTAssertLessThanOrEqual(
+            regularFrame.height, wholeViewHeightBound + popoverArrowOvershoot,
+            "The regular picker view must keep its height bounded")
         XCTAssertGreaterThanOrEqual(regularFrame.minX, regularWindow.bounds.minX - 1)
         XCTAssertLessThanOrEqual(regularFrame.maxX, regularWindow.bounds.maxX + 1)
     }

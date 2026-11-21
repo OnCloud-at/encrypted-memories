@@ -3586,7 +3586,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             let fixture = try makeLaunchResumeFixture(prefix: prefix, source: .mobileDataOff(runtime))
             await fixture.controller.retryFailedAndSync()
-            _ = await waitUntil { fixture.scan.starts.count == 1 }
+            await waitForScanStart(fixture.scan)
             XCTAssertEqual(fixture.scan.owners.values, [.manual], "the person's tap runs its own pass")
             return (fixture, runtime, try XCTUnwrap(fixture.controller.activeExecutionRunID))
         }
@@ -3911,7 +3911,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             XCTAssertTrue(carried, "the task carries the pass that the path started")
             // The protection starts with the pass; the scan records its owner later, before its start count rises.
-            _ = await waitUntil { scan.starts.count == 1 }
+            await waitForScanStart(scan)
             XCTAssertEqual(scan.owners.values, [.manual])
             XCTAssertTrue(probe.results.isEmpty, "the task does not end while the pass runs")
             scan.open.value = true
@@ -3949,7 +3949,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(scan.starts.count, 0)
 
             await controller.retryUserResolvableWork()
-            _ = await waitUntil { scan.starts.count == 1 }
+            await waitForScanStart(scan)
             XCTAssertEqual(scan.owners.values, [.manual], "the person's pass skips the backoff")
             await controller.shutdown()
         }
@@ -4034,7 +4034,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let scan = HeldScan()
             scan.install(on: controller)
             await controller.retryUserResolvableWork()
-            _ = await waitUntil { scan.starts.count == 1 }
+            await waitForScanStart(scan)
             XCTAssertEqual(scan.owners.values, [.manual])
 
             let window = startWindow(controller, scan: scan)
@@ -4058,7 +4058,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let scan = launch.scan
 
             let window = startWindow(controller, scan: scan)
-            _ = await waitUntil { scan.starts.count == 1 }
+            await waitForScanStart(scan)
             launch.releaseResume()
             _ = await waitUntil { controller.launchResumeEndedForTesting }
             scan.open.value = true
@@ -4295,7 +4295,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             }
             let fixture = try makeLaunchResumeFixture(prefix: prefix, source: .mobileDataOff(runtime))
             fixture.releaseResume()
-            _ = await waitUntil { fixture.scan.starts.count == 1 }
+            await waitForScanStart(fixture.scan)
             XCTAssertEqual(fixture.scan.owners.values, [.foreground], "the resume at launch runs an automatic pass")
             let runID = try XCTUnwrap(fixture.controller.activeExecutionRunID)
             runtime.update { $0.executionOpportunity = opportunity }
@@ -5418,6 +5418,14 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         }
         return predicate()
     }
+
+    #if DEBUG
+        /// Waits until the held scan has started a pass. `>= 1` also holds when a second pass starts between two polls.
+        private func waitForScanStart(_ scan: HeldScan, file: StaticString = #filePath, line: UInt = #line) async {
+            let started = await waitUntil { scan.starts.count >= 1 }
+            XCTAssertTrue(started, "the held scan starts a pass", file: file, line: line)
+        }
+    #endif
 
     // MARK: Photos that Proton refused until the backup stopped
 

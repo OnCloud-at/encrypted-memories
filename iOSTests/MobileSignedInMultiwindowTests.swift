@@ -208,12 +208,24 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         let frontGrid2 = try await waitForGrid(in: frontWindow)
         XCTAssertTrue(frontGrid2.thumbnailFeed === fixture.feed)
         let otherScene = try XCTUnwrap(otherWindow.windowScene)
+        // The scene states are read here, after the waits above, and not earlier: a scene that was in the
+        // background then can be inactive or active now.
         let backgroundScenes = windowScenes().filter { $0.activationState == .background }.count
         if otherScene.activationState == .background, backgroundScenes > 1 {
             // With several background scenes (the iPhone Duo simulator keeps every fixture scene because it does
-            // not close scenes) a background window was observed not to update before its scene returns. Bring it
-            // back the way a user does and check it on screen.
-            note("other window checked after its scene returns: \(backgroundScenes) background scenes")
+            // not close scenes) a background window was observed not to get its grid before its scene returns.
+            // This branch skips the check that a window in a background scene restores its grid by itself. The
+            // cause is not proven. Known: the app has no code that refreshes one window after a session change.
+            // `MobileRootView` (EncryptedMemoriesMobileApp.swift) switches on `sessionModel.session` and
+            // `libraryModel.scopePresentationRevision` through SwiftUI observation only, and the `scenePhase` reads
+            // of the root and the tab view concern privacy, links, search and the active window, not the session.
+            // Nothing in the app refreshes a background window on purpose, and nothing blocks it. Not known: whether
+            // SwiftUI or UIKit updates the hierarchy of a background scene, which the system decides; one background
+            // scene (iPad, the first Duo run) restores its grid, several did not. Bring the scene back the way a
+            // user does and check the window on screen.
+            note(
+                "other window checked after its scene returns: \(backgroundScenes) background scenes, "
+                    + "other scene \(name(otherScene.activationState))")
             UIApplication.shared.activateSceneSession(
                 for: UISceneSessionActivationRequest(session: otherScene.session)
             ) { XCTFail("other scene activation failed: \($0)") }
@@ -425,19 +437,19 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         throw MobileFixtureError.unavailable
     }
 
-    /// Switches the native tab of one window: the tab label first, then the hosting tab bar controller.
+    /// Switches the native tab of one window: the tab label first, then the hosting tab bar controller. Both paths
+    /// check that the tab is selected before they return.
     @MainActor private func selectTab(_ tab: MobileTab, in window: UIWindow) async throws {
+        let controller = viewControllers(in: window).compactMap { $0 as? UITabBarController }.first
         if let element = accessibilityElement(labelled: tab.title, in: window), element.accessibilityActivate() {
             note("selected tab '\(tab.title)' through accessibility")
             try await Task.sleep(for: .milliseconds(800))
+            if let controller { try await waitUntilSelected(tab, in: controller) }
             return
         }
-        if let controller = viewControllers(in: window).compactMap({ $0 as? UITabBarController }).first {
-            // The tab bar's own titles give the index, so a tab the app hides (Map) cannot shift it.
-            let titles: [String?] =
-                controller.tabs.isEmpty
-                ? (controller.viewControllers ?? []).map(\.tabBarItem.title) : controller.tabs.map(\.title)
-            let index = titles.firstIndex(of: tab.title) ?? -1
+        if let controller {
+            let titles = tabTitles(of: controller)
+            let index = tabIndex(of: tab, in: controller)
             if controller.tabs.indices.contains(index) {
                 controller.selectedTab = controller.tabs[index]
                 note("selected tab '\(tab.title)' through UITabBarController (tabs=\(controller.tabs.count))")
@@ -454,10 +466,7 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
                 note("tab '\(tab.title)' not selected: index \(index) in \(titles), or the delegate refused")
             }
             try await Task.sleep(for: .milliseconds(800))
-            try await waitUntil("tab '\(tab.title)' is selected") {
-                controller.tabs.indices.contains(index)
-                    ? controller.selectedTab === controller.tabs[index] : controller.selectedIndex == index
-            }
+            try await waitUntilSelected(tab, in: controller)
             return
         }
         note(
@@ -465,6 +474,26 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
                 + viewControllers(in: window).map { String(describing: type(of: $0)) }.joined(separator: ","))
         XCTFail("no way to select tab '\(tab.title)'")
         throw MobileFixtureError.unavailable
+    }
+
+    /// The titles of the tab bar controller's own tabs.
+    @MainActor private func tabTitles(of controller: UITabBarController) -> [String?] {
+        controller.tabs.isEmpty
+            ? (controller.viewControllers ?? []).map(\.tabBarItem.title) : controller.tabs.map(\.title)
+    }
+
+    /// The index of a tab among the tab bar's own titles, so a tab the app hides (Map) cannot shift it. -1 when the
+    /// bar has no such tab.
+    @MainActor private func tabIndex(of tab: MobileTab, in controller: UITabBarController) -> Int {
+        tabTitles(of: controller).firstIndex(of: tab.title) ?? -1
+    }
+
+    @MainActor private func waitUntilSelected(_ tab: MobileTab, in controller: UITabBarController) async throws {
+        let index = tabIndex(of: tab, in: controller)
+        try await waitUntil("tab '\(tab.title)' is selected") {
+            controller.tabs.indices.contains(index)
+                ? controller.selectedTab === controller.tabs[index] : controller.selectedIndex == index
+        }
     }
 
     @MainActor private func viewControllers(in window: UIWindow) -> [UIViewController] {

@@ -8,7 +8,32 @@ func barCoversContent(_ bar: CGRect, in window: CGRect) -> Bool {
     !bar.isEmpty && !(bar.width >= window.width * 0.9 && bar.height >= window.height * 0.9)
 }
 
+/// The frames that cover content, from the frames of the bars and the presentations on screen. A presentation (alert,
+/// sheet, popover, menu) always covers what lies behind it, also when it nearly fills the window like a page sheet;
+/// the window-sized container rule is only for bars.
+func framesCoveringContent(window: CGRect, bars: [CGRect], presentations: [CGRect]) -> [CGRect] {
+    bars.filter { barCoversContent($0, in: window) } + presentations.filter { !$0.isEmpty }
+}
+
+/// The column of the tab buttons that share one midX, as the union of their frames. Nil for no frame, an empty frame,
+/// and for buttons that sit side by side. The strict and the non-asserting check of the vertical bar share this rule.
+func tabColumn(of frames: [CGRect]) -> CGRect? {
+    guard let first = frames.first, !frames.contains(where: \.isEmpty),
+        frames.allSatisfy({ abs($0.midX - first.midX) <= 2 })
+    else { return nil }
+    return frames.dropFirst().reduce(first) { $0.union($1) }
+}
+
+extension CGRect {
+    /// A 40 point square at the centre: a row that a test puts at a place to check what covers it.
+    var centreProbe: CGRect { CGRect(x: midX - 20, y: midY - 20, width: 40, height: 40) }
+}
+
 extension XCUIApplication {
+    /// The titles of the first three tabs, in English and in German.
+    static let englishTabTitles = ["Library", "Collections", "Search"]
+    static let germanTabTitles = ["Mediathek", "Sammlungen", "Suchen"]
+
     /// The viewer's menu button. It reports its long accessibility name or the short system name, in English or
     /// German ("More actions" or "More", "Weitere Aktionen" or "Weitere").
     var viewerMoreButton: XCUIElement {
@@ -40,15 +65,21 @@ extension XCUIApplication {
         tapOnScreen(row, file: file, line: line)
     }
 
-    /// Taps an element at its centre after checking that it lies fully in the window and clear of every bar and the
-    /// keyboard. On iOS 26.5 XCTest reports an element of a SwiftUI list as not hittable, and its own scroll into view
-    /// moves the list back to the top.
+    /// Taps an element at its centre after checking that it lies fully in the window and clear of every bar, the
+    /// keyboard and every alert, sheet, popover and menu. On iOS 26.5 XCTest reports an element of a SwiftUI list as not
+    /// hittable, and its own scroll into view moves the list back to the top. The element belongs to the page: an
+    /// element inside a presentation is covered by that presentation and fails the check. A failed check ends the call
+    /// without a tap.
     func tapOnScreen(_ element: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertTrue(element.waitForExistence(timeout: 10), file: file, line: line)
+        guard element.waitForExistence(timeout: 10) else {
+            XCTFail("\(element) does not exist", file: file, line: line)
+            return
+        }
         let frame = element.frame
-        XCTAssertTrue(
-            liesOnScreenClearOfBars(frame), "\(frame) lies in the window, clear of \(coveringFrames())", file: file,
-            line: line)
+        guard liesOnScreenClearOfBars(frame) else {
+            XCTFail("\(frame) lies in the window, clear of \(coveringFrames())", file: file, line: line)
+            return
+        }
         element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
 
@@ -56,28 +87,37 @@ extension XCUIApplication {
         windows.firstMatch.frame.contains(frame) && !coveringFrames().contains { $0.intersects(frame) }
     }
 
-    /// Every navigation bar, tab bar, toolbar and keyboard on screen that covers content, in any column, and the
-    /// vertical tab bar of iPhone Duo.
+    /// Every navigation bar, tab bar, toolbar and keyboard on screen that covers content, in any column, the
+    /// vertical tab bar of iPhone Duo, and every alert, sheet, popover and menu.
     private func coveringFrames() -> [CGRect] {
-        let window = windows.firstMatch.frame
         let bars = [navigationBars, tabBars, toolbars, keyboards].flatMap(\.allElementsBoundByIndex).filter(\.exists)
             .map(\.frame)
-        return (bars + [verticalTabStrip()].compactMap { $0 }).filter { barCoversContent($0, in: window) }
+        let presentations = [alerts, sheets, popovers, menus].flatMap(\.allElementsBoundByIndex).filter(\.exists)
+            .map(\.frame)
+        return framesCoveringContent(
+            window: windows.firstMatch.frame, bars: bars + [verticalTabStrip()].compactMap { $0 },
+            presentations: presentations)
     }
 
     /// The strip of a vertical tab bar, as iPhone Duo shows it beside the content: the column of the tab buttons
     /// over the full window height. The system reports no tab bar or toolbar element for it. Nil for horizontal tabs.
     func verticalTabStrip() -> CGRect? {
         let window = windows.firstMatch.frame
-        for titles in [["Library", "Collections", "Search"], ["Mediathek", "Sammlungen", "Suchen"]] {
-            let frames = titles.map { barButton(titled: $0) }.filter(\.exists).map(\.frame).filter { !$0.isEmpty }
+        for titles in [Self.englishTabTitles, Self.germanTabTitles] {
+            let frames = titles.compactMap { tabButtonFrame(titled: $0, timeout: 0) }
             guard frames.count == titles.count else { continue }
-            // Horizontal tabs sit side by side; vertical tabs share one column.
-            guard frames.dropFirst().allSatisfy({ abs($0.midX - frames[0].midX) <= 2 }) else { return nil }
-            let column = frames.dropFirst().reduce(frames[0]) { $0.union($1) }
-            return CGRect(x: column.minX, y: window.minY, width: column.width, height: window.height)
+            return tabColumn(of: frames).map {
+                CGRect(x: $0.minX, y: window.minY, width: $0.width, height: window.height)
+            }
         }
         return nil
+    }
+
+    /// The frame of a tab button. It waits up to `timeout` seconds for the button and returns nil when it is missing.
+    private func tabButtonFrame(titled title: String, timeout: TimeInterval) -> CGRect? {
+        let button = barButton(titled: title)
+        guard timeout > 0 ? button.waitForExistence(timeout: timeout) : button.exists else { return nil }
+        return button.frame
     }
 
     /// Read a rendered screen pixel in window coordinates, outside the native button backgrounds.
@@ -138,12 +178,9 @@ extension XCUIApplication {
 
     /// Native tabs can form a horizontal row without a tab-bar accessibility role.
     /// Missing controls and unknown layouts still fail the strict vertical checks.
-    func verticalTabColumn(titles: [String] = ["Library", "Collections", "Search"]) throws -> CGRect? {
+    func verticalTabColumn(titles: [String] = XCUIApplication.englishTabTitles) throws -> CGRect? {
         let frames = try titles.map { title in
-            let button = barButton(titled: title)
-            return try XCTUnwrap(
-                button.waitForExistence(timeout: 10) ? button.frame : nil,
-                "The native bar has no \(title) tab")
+            try XCTUnwrap(tabButtonFrame(titled: title, timeout: 10), "The native bar has no \(title) tab")
         }
         let distinctX = frames.indices.allSatisfy { index in
             frames.dropFirst(index + 1).allSatisfy { abs($0.midX - frames[index].midX) > 1 }
@@ -158,10 +195,9 @@ extension XCUIApplication {
         for frame in frames {
             XCTAssertGreaterThan(frame.width, 0)
             XCTAssertGreaterThan(frame.height, 0)
-            XCTAssertEqual(frame.midX, frames[0].midX, accuracy: 2, "The tabs do not form a vertical column")
         }
+        let column = try XCTUnwrap(tabColumn(of: frames), "The tabs do not form a vertical column")
         XCTAssertGreaterThan(abs(frames[0].midY - frames[1].midY), 1)
-        let column = frames.dropFirst().reduce(frames[0]) { $0.union($1) }
         let window = windows.firstMatch.frame
         XCTAssertTrue(
             column.maxX <= window.midX || column.minX >= window.midX,
