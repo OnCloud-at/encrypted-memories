@@ -11,6 +11,7 @@ HEAD = 'b' * 40
 STORAGE = 'Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/Queue.swift'
 DOC = 'Wiki/Guide.md'
 TEST = 'Packages/EncryptedMemoriesKit/Tests/UploadFeatureTests/QueueTests.swift'
+NOTICE = '::notice title=Storage path classification::Unknown; see the summary.'
 EXPECTED_TEST_TARGETS = (
     'AccountStateCoreTests', 'AlbumSyncCoreTests', 'AppleSecurityCoreTests', 'DeviceRootAppleAdapterTests',
     'MLSearchAppleAdapterTests', 'MLSearchCoreTests', 'MediaByteCacheTests', 'MediaFeedCoreTests',
@@ -179,7 +180,8 @@ class StoragePathPolicyTests(unittest.TestCase):
                 result = self.evaluate([page(paths)], two, two, two)
                 self.assertEqual('UNKNOWN', result['status'])
                 self.assertIn('A protected path was also present.', result['summary'])
-                self.assertTrue(result['annotation'].startswith('::warning'))
+                self.assertEqual(NOTICE, result['annotation'])
+                self.assertNotIn('::warning', result['annotation'])
                 self.assertNotIn('label_action', result)
 
     def test_unknown_mode_summary_reports_protected_path_in_either_order(self):
@@ -323,7 +325,8 @@ class StoragePathPolicyTests(unittest.TestCase):
                 result = self.evaluate([page([item(path)])])
                 self.assertEqual('UNKNOWN', result['status'])
                 self.assertIn('UNKNOWN', result['summary'])
-                self.assertTrue(result['annotation'].startswith('::warning'))
+                self.assertEqual(NOTICE, result['annotation'])
+                self.assertNotIn('::warning', result['annotation'])
 
     def test_duplicate_and_unrecognized_records_are_unknown(self):
         two = snapshot(2)
@@ -419,7 +422,8 @@ class StoragePathPolicyTests(unittest.TestCase):
         result = json.loads(proc.stdout)
         self.assertEqual('UNKNOWN', result['status'])
         self.assertIn('UNKNOWN', result['summary'])
-        self.assertTrue(result['annotation'].startswith('::warning'))
+        self.assertEqual(NOTICE, result['annotation'])
+        self.assertNotIn('::warning', result['annotation'])
         self.assertNotIn('synthetic-test-token', proc.stdout + proc.stderr)
 
     def test_cli_does_not_echo_hostile_revisions(self):
