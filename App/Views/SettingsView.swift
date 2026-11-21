@@ -902,8 +902,7 @@ private struct MacFailedBackupSheet: View {
                                 .accessibilityIdentifier("albumsync.restore.\(item.id)")
                             } else if let controller, item.isPermanent {
                                 Button {
-                                    controller.dismissFailedItem(item)
-                                    pagedList.dismissItem(id: item.id)
+                                    pagedList.resolveDecision(item) { controller.dismissFailedItem(item) }
                                 } label: {
                                     Image(systemName: "xmark.circle")
                                 }
