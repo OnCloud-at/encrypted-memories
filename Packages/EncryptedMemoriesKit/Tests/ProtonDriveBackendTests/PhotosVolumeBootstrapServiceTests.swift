@@ -54,7 +54,7 @@ extension DriveSessionStubSuite {
             #expect(StubURLProtocol.requests().filter { $0.path == "/drive/shares?ShareType=4" }.count == 2)
         }
 
-        @Test func creationProtonAPIErrorKeepsItsProtonMessage() async throws {
+        @Test func creationProtonAPIErrorShowsNoTextOfItsOwn() async throws {
             StubURLProtocol.reset()
             StubURLProtocol.route("GET /drive/shares", json: #"{"Code":1000,"Shares":[]}"#)
             StubURLProtocol.route("POST /drive/photos/volumes", status: 403, json: #"{"Code":403}"#)
@@ -66,7 +66,10 @@ extension DriveSessionStubSuite {
                 _ = try await service.resolve()
                 Issue.record("The API error must fail")
             } catch {
-                #expect(LibraryLoadFailureMessage.message(for: error) == expected.localizedDescription)
+                #expect(error as? ProtonAuthError != nil)
+                #expect(
+                    LibraryLoadFailureMessage.message(for: error) == "",
+                    "the text of the Proton answer never reaches the screen")
                 #expect(expected.localizedDescription.localizedCaseInsensitiveContains("Proton"))
             }
             #expect(StubURLProtocol.requests().filter { $0.path == "/drive/shares?ShareType=4" }.count == 2)

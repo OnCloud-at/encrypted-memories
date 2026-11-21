@@ -9,12 +9,14 @@ struct PhotosShareContext: Sendable, Equatable {
     let rootLinkID: String
 }
 
-enum PhotosVolumeBootstrapError: LocalizedError {
+enum PhotosVolumeBootstrapError: LocalizedError, LibraryLoadFailureSentence {
     case missingSigner
     case creationFailed(underlying: any Error)
 
+    var errorDescription: String? { librarySentence }
+
     /// One generic text for every creation failure: the screen names no cause and stays retryable.
-    var errorDescription: String? {
+    var librarySentence: String {
         switch self {
         case .missingSigner, .creationFailed: L10n.string("error.library_creation_failed")
         }

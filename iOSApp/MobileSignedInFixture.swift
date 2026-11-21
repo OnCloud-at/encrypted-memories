@@ -222,6 +222,13 @@ import os
                     ]
                     : [.failed(message: "Fixture first load failed", retryable: true)]
                 model.applyIsolatedLibraryLoadEventsForTesting(events)
+            case "open-rejected":
+                // Proton rejected the session: the sentence stays and Try again goes.
+                model.applyIsolatedOpenFailureForTesting(
+                    ProtonAuthError.apiError(code: 401, message: "Fixture rejected session"), session: session)
+            case "open-lost-scope":
+                // The drive scope is lost for good: the screen shows its title alone, with no Try again.
+                model.applyIsolatedOpenFailureForTesting(MobileFixtureLostScopeError(), session: session)
             case "empty", "backup-on":
                 installEmptyBackupFixture(enabled: scenario == "backup-on")
             case "unavailable":
@@ -459,6 +466,9 @@ import os
             throw MobileFixtureError.unavailable
         }
     }
+
+    /// A lost drive scope on the account open: no sentence and no Try again.
+    struct MobileFixtureLostScopeError: LibraryChangeTerminalError {}
 
     /// Groups of exact copies in memory. A merge keeps the chosen photo and moves the other copies to Trash.
     /// `checking` leaves the library check running: its index is not built, and its build stays at 1,234 of 15,000.

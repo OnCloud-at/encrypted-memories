@@ -388,24 +388,6 @@
         }
       }
     },
-    "error.no_photos_library": {
-      "extractionState": "manual",
-      "comment": "Shown when the account has no photo share yet.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "No Photos library was found on this account yet."
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Auf diesem Konto wurde noch keine Fotomediathek gefunden."
-          }
-        }
-      }
-    },
     "menu.upload_photos": {
       "extractionState": "manual",
       "comment": "File menu item (⌘U).",

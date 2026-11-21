@@ -148,7 +148,7 @@ struct ProtonFailureCharacterizationTests {
         for code in [400, 401, 403, 408, 409, 429, 500] {
             let error = ProtonAuthError.apiError(code: code, message: "fixture")
             #expect(ProtonFailureClassifier.isUnauthorized(error) == (code == 401))
-            #expect(LibraryOpenFailurePermanence.isPermanent(error) == (code == 401))
+            #expect(!LibraryOpenFailurePresentation(for: error).isRetryable == (code == 401))
         }
         #expect(!ProtonFailureClassifier.isUnauthorized(URLError(.userAuthenticationRequired)))
     }

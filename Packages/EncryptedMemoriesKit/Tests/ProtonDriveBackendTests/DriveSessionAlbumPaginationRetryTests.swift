@@ -55,7 +55,7 @@ extension DriveSessionStubSuite {
                     volumeID: "vol1", albumLinkID: "album1")
                 Issue.record("A failed read returned \(entries.count) partial entries")
             } catch {
-                let cause = (error as? UploadError)?.failureCause
+                let cause = (error as? any FailureClassifiable)?.failureCause
                 #expect(cause == .serviceTemporary)
                 if let cause {
                     let policy = FailurePolicy.resolve(
@@ -64,6 +64,8 @@ extension DriveSessionStubSuite {
                     #expect(policy.presentation == .alert)
                 }
                 #expect(LibraryLoadFailureMessage.message(for: error) == L10n.string("albums.load_failed_message"))
+                // The same sentence is the error's description, for every other reader of the album read.
+                #expect((error as? any LocalizedError)?.errorDescription == L10n.string("albums.load_failed_message"))
             }
             let requests = StubURLProtocol.requests()
             #expect(requests.count == 3, "The invalid page is retried once before the read fails")

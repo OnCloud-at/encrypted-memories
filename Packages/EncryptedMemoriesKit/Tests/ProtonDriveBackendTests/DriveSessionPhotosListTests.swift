@@ -141,9 +141,7 @@ extension DriveSessionStubSuite {
                     Self.albumPage("b", more: true, anchor: "x"),
                 ])
 
-            await #expect(
-                throws: UploadError.retryableBackend(code: nil, message: L10n.string("albums.load_failed_message"))
-            ) {
+            await #expect(throws: AlbumReadIncompleteError()) {
                 _ = try await makeSessionForPhotosListTests().fetchAlbumPhotos(
                     volumeID: "vol1", albumLinkID: "album1")
             }

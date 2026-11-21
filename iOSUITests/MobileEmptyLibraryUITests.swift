@@ -78,6 +78,34 @@ final class MobileEmptyLibraryUITests: XCTestCase {
         assertFailedWithoutEmpty()
     }
 
+    /// The session that Proton rejected: the sentence tells the person to sign in again, and no Try again follows.
+    /// The sign-out is in Settings.
+    func testARejectedSessionShowsTheSentenceWithoutTryAgain() {
+        launch("open-rejected")
+        XCTAssertTrue(app.staticTexts["Couldn’t load your library"].waitForExistence(timeout: 60))
+        XCTAssertTrue(app.staticTexts["Please sign in to Proton again."].waitForExistence(timeout: 20))
+        XCTAssertFalse(app.buttons["Try again"].exists)
+        XCTAssertFalse(app.staticTexts["No photos yet"].exists)
+        attachScreen("Rejected session on open")
+    }
+
+    /// A drive scope that is lost for good: the screen shows its title alone, in the iPhone layout. The description is
+    /// empty, so no other text of the failure and no Try again appears. This runs the iPhone wiring of the open failure:
+    /// a Try again that the wiring always allowed would show here.
+    func testALostDriveScopeShowsTheTitleAloneWithoutTryAgain() {
+        launch("open-lost-scope")
+        let title = app.staticTexts["Couldn’t load your library"]
+        XCTAssertTrue(title.waitForExistence(timeout: 60))
+        XCTAssertFalse(app.buttons["Try again"].exists)
+        XCTAssertFalse(app.staticTexts["No photos yet"].exists)
+        // The navigation title and the update status belong to the library screen, not to the failure.
+        let others = app.staticTexts.allElementsBoundByIndex.map(\.label).filter {
+            $0 != title.label && $0 != "Library" && !$0.hasPrefix("Library is updating")
+        }
+        XCTAssertTrue(others.isEmpty, "the failure shows text besides its title: \(others)")
+        attachScreen("Lost drive scope on open")
+    }
+
     private func assertLoadingWithoutEmpty() {
         // The shared loading cover exposes its localized label, rather than a container identifier.
         XCTAssertTrue(
