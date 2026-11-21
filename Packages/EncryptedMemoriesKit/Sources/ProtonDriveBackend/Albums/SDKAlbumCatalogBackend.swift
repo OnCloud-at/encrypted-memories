@@ -26,6 +26,12 @@ protocol SDKPhotoCatalogClient: AnyObject, Sendable {
     func cancelEnumerateAlbum(cancellationToken: UUID) async throws
     func getNode(nodeUid: SDKNodeUid, cancellationToken: UUID) async throws -> DriveNode?
     func cancelGetNode(cancellationToken: UUID) async throws
+    func enumerateNodes(
+        nodeUids: [SDKNodeUid],
+        cancellationToken: UUID,
+        onNodeEnumerated: @escaping NodeCallback
+    ) async throws
+    func cancelEnumerateNodes(cancellationToken: UUID) async throws
     func leaveSharedNode(nodeUid: SDKNodeUid, cancellationToken: UUID) async throws
     func cancelLeaveSharedNode(cancellationToken: UUID) async throws
 }
@@ -282,6 +288,82 @@ enum SDKNodeRead {
         let key = SDKPresentationNodeReadKey(
             client: ObjectIdentifier(client), volumeID: uid.volumeID, nodeID: uid.nodeID)
         return try await sharing.run(key, operation: read)
+    }
+
+    /// The most UIDs that one `enumerateNodes` call carries. A smaller call fails or finishes sooner, so a failed
+    /// call costs fewer single reads in the fallback below.
+    static let batchSize = 50
+
+    /// One entry for each requested UID, in request order, read with one `enumerateNodes` call for each batch
+    /// and at most `limit` calls at once. The SDK skips a UID without a node, does not order its answers and ends the
+    /// call at the first unrecoverable error. This reader keeps the answer of `getNode` for every UID:
+    /// - A UID that the call did not answer is read again with `getNode`, so a missing node is a node that
+    ///   `getNode` reports as missing, and an error of that node is the error of that node.
+    /// - A call that fails keeps the nodes that it delivered; `getNode` reads the others one by one.
+    /// - Cancellation ends the whole read at once and never starts a single read.
+    /// A UID that the caller repeats gets an answer for each entry from the one node that the call delivered.
+    static func nodes(
+        _ uids: [SDKNodeUid], client: any SDKPhotoCatalogClient, limit: Int,
+        measurement: SupportWorkMeasurementPass? = nil
+    ) async throws -> [(SDKNodeUid, DriveNode?)] {
+        guard uids.count > 1 else {
+            var answers: [(SDKNodeUid, DriveNode?)] = []
+            for uid in uids { answers.append((uid, try await node(uid, client: client, measurement: measurement))) }
+            return answers
+        }
+        let batches = stride(from: 0, to: uids.count, by: batchSize).map {
+            Array(uids[$0..<min($0 + batchSize, uids.count)])
+        }
+        let answers = try await BoundedConcurrency.throwingMap(batches, limit: limit) { batch in
+            try await Self.batch(batch, client: client, measurement: measurement)
+        }
+        return answers.flatMap { $0 }
+    }
+
+    private static func batch(
+        _ uids: [SDKNodeUid], client: any SDKPhotoCatalogClient, measurement: SupportWorkMeasurementPass?
+    ) async throws -> [(SDKNodeUid, DriveNode?)] {
+        let collector = SDKEnumerationCollector<DriveNode>()
+        var failure: (any Error)?
+        do {
+            try await SDKCancellableOperation.run { token in
+                measurement?.record(.nodeCallsStarted)
+                try await client.enumerateNodes(
+                    nodeUids: uids, cancellationToken: token, onNodeEnumerated: { collector.receive($0) })
+                measurement?.record(.nodeCallsReturned)
+            } cancel: { token in
+                try? await client.cancelEnumerateNodes(cancellationToken: token)
+            }
+        } catch {
+            failure = error
+        }
+        let received = collector.snapshot()
+        if let ended = failure ?? received.failure, isCancellation(ended) { throw ended }
+        var byID: [String: DriveNode] = [:]
+        for node in received.elements { byID[uid(of: node).sdkCompatibleIdentifier] = node }
+        var answers: [(SDKNodeUid, DriveNode?)] = []
+        answers.reserveCapacity(uids.count)
+        for requested in uids {
+            if let delivered = byID[requested.sdkCompatibleIdentifier] {
+                answers.append((requested, delivered))
+            } else {
+                answers.append((requested, try await node(requested, client: client, measurement: measurement)))
+            }
+        }
+        return answers
+    }
+
+    private static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || Task.isCancelled || ProtonFailureClassifier.containsSDKCancellation(error)
+    }
+
+    private static func uid(of node: DriveNode) -> SDKNodeUid {
+        switch node {
+        case .folder(let node): node.uid
+        case .file(let node): node.uid
+        case .album(let node): node.uid
+        case .photo(let node): node.uid
+        }
     }
 }
 
@@ -547,9 +629,14 @@ struct SDKAlbumCatalogBackend: AlbumCatalogBackend {
         _ uids: [SDKNodeUid], sharing: SDKPresentationNodeReads? = nil, measurement: SupportWorkMeasurementPass? = nil
     ) async throws -> [(SDKNodeUid, DriveNode?)] {
         let client = client
-        return try await BoundedConcurrency.throwingMap(uids, limit: maximumConcurrentNodeLoads) { uid in
-            (uid, try await SDKNodeRead.node(uid, client: client, sharing: sharing, measurement: measurement))
+        // A viewer read joins a read of the same node that is already running, which a batch cannot do.
+        guard sharing == nil else {
+            return try await BoundedConcurrency.throwingMap(uids, limit: maximumConcurrentNodeLoads) { uid in
+                (uid, try await SDKNodeRead.node(uid, client: client, sharing: sharing, measurement: measurement))
+            }
         }
+        return try await SDKNodeRead.nodes(
+            uids, client: client, limit: maximumConcurrentNodeLoads, measurement: measurement)
     }
 
     private static func ownedSummary(_ album: AlbumNode) -> AlbumSummary {

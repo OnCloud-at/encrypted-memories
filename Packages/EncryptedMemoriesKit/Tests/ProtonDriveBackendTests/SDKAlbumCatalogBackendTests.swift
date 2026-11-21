@@ -183,7 +183,7 @@ struct SDKAlbumCatalogBackendTests {
 
     @Test func diagnosticNodeFactsKeepTheExistingConcurrencyLimit() async throws {
         let client = FakeSDKPhotoCatalogClient(nodeDelay: .milliseconds(1))
-        let photos = (0..<8).map { photoNode(id: "photo-\($0)", albumIDs: []) }
+        let photos = (0..<(SDKNodeRead.batchSize * 8)).map { photoNode(id: "photo-\($0)", albumIDs: []) }
         await client.configureNodes(
             Dictionary(
                 uniqueKeysWithValues: photos.map {
@@ -192,10 +192,11 @@ struct SDKAlbumCatalogBackendTests {
         let measurements = SupportWorkMeasurements()
         let uids = photos.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
         let facts = try await SDKAlbumCatalogBackend(client: client, workMeasurements: measurements).nodeFacts(of: uids)
-        #expect(facts.count == 8)
-        #expect(await client.maximumConcurrentGetNodeCalls <= 4)
+        #expect(facts.count == 400)
+        #expect(await client.maximumConcurrentEnumerateCalls <= 4)
         let state = measurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.nodeFactsBatch.rawValue]
-        #expect(state.counters == [0, 0, 8, 8, 8, 8, 8])
+        // Eight batches of fifty nodes: eight calls, not four hundred.
+        #expect(state.counters == [0, 0, 400, 400, 8, 8, 400])
     }
 
     @Test func detailReadUsesOneRequestForDisplayAndOrderMetadata() async throws {
@@ -409,7 +410,7 @@ struct SDKAlbumCatalogBackendTests {
 
     @Test func ownedCatalogHydratesNodesWithBoundedConcurrency() async throws {
         let client = FakeSDKPhotoCatalogClient(nodeDelay: .milliseconds(30))
-        let albums = (0..<8).map {
+        let albums = (0..<(SDKNodeRead.batchSize * 8)).map {
             albumNode(id: "album-\($0)", name: .success("Album \($0)"), photoCount: Int64($0))
         }
         await client.configureOwned(
@@ -425,7 +426,7 @@ struct SDKAlbumCatalogBackendTests {
             maximumConcurrentNodeLoads: 2
         ).listAlbums()
 
-        #expect(await client.maximumConcurrentGetNodeCalls == 2)
+        #expect(await client.maximumConcurrentEnumerateCalls == 2)
     }
 
     @Test func sharedCatalogFiltersPhotosAndMapsOwnerAndSharingState() async throws {
@@ -1158,6 +1159,246 @@ private actor SharedSnapshotLoaderProbe {
     }
 }
 
+@Suite("SDK album catalog node batches")
+struct SDKNodeBatchReadTests {
+    private func photos(_ count: Int) -> [PhotoNode] {
+        (0..<count).map { photoNode(id: "batch-\($0)", albumIDs: []) }
+    }
+
+    private func configured(_ photos: [PhotoNode], client: FakeSDKPhotoCatalogClient) async {
+        await client.configureNodes(
+            Dictionary(uniqueKeysWithValues: photos.map { ($0.uid.sdkCompatibleIdentifier, DriveNode(photoNode: $0)) }))
+    }
+
+    private func uids(_ photos: [PhotoNode]) -> [PhotoUID] {
+        photos.map { PhotoUID(volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID) }
+    }
+
+    @Test func manyNodesAreReadWithOneCallForEveryBatch() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(120)
+        await configured(all, client: client)
+
+        let facts = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+
+        #expect(facts.count == 120)
+        #expect(await client.getNodeCalls == 0)
+        #expect(await client.enumeratedBatches.map(\.count).sorted() == [20, 50, 50])
+    }
+
+    @Test func batchesRunWithinTheConcurrencyLimit() async throws {
+        // The delay keeps the calls overlapping, so the peak reaches the limit and never passes it.
+        let client = FakeSDKPhotoCatalogClient(nodeDelay: .milliseconds(50))
+        let all = photos(1_000)
+        await configured(all, client: client)
+
+        _ = try await SDKAlbumCatalogBackend(client: client, maximumConcurrentNodeLoads: 3).nodeFacts(of: uids(all))
+
+        #expect(await client.enumerateNodesCalls == 20)
+        #expect(await client.maximumConcurrentEnumerateCalls == 3)
+    }
+
+    @Test func theNodeCallCounterCountsEveryBatchOnce() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(100)
+        await configured(all, client: client)
+        let measurements = SupportWorkMeasurements()
+
+        _ = try await SDKAlbumCatalogBackend(client: client, workMeasurements: measurements).nodeFacts(of: uids(all))
+
+        let state = measurements.workMeasurementSupportSnapshot().passes[SupportMeasurementKind.nodeFactsBatch.rawValue]
+        // requested, unique, calls started, calls returned, facts: 100 nodes took 2 calls instead of 100.
+        #expect(state.counters == [0, 0, 100, 100, 2, 2, 100])
+    }
+
+    @Test func nodesDeliveredInAnyOrderKeepTheirOwnIdentity() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        // Each node has its own capture time, so a node that is paired with the wrong UID shows in its fingerprint.
+        let all = (0..<5).map { photoNode(id: "batch-\($0)", albumIDs: [], captureTime: 1_000 + TimeInterval($0)) }
+        await configured(all, client: client)
+        await client.deliverEnumerationReversed()
+
+        let facts = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+
+        #expect(Set(facts.keys) == Set(uids(all)))
+        for (index, uid) in uids(all).enumerated() {
+            let expected = ExactDuplicateFingerprint(
+                captureTime: Date(timeIntervalSince1970: 1_000 + TimeInterval(index)), mimeType: "image/jpeg")
+            #expect(facts[uid]?.fingerprint == expected, "\(uid.nodeID) keeps the facts of its own node")
+        }
+    }
+
+    @Test func aUIDThatTheCallerRepeatsIsAnsweredForEachEntryWithoutExtraReads() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(6)
+        await configured(all, client: client)
+        let requested = (all + all).map { $0.uid }
+
+        let answers = try await SDKNodeRead.nodes(requested, client: client, limit: 2)
+
+        #expect(answers.map { $0.0.sdkCompatibleIdentifier } == requested.map(\.sdkCompatibleIdentifier))
+        #expect(answers.allSatisfy { $0.1 != nil })
+        #expect(await client.enumerateNodesCalls == 1)
+        #expect(await client.getNodeCalls == 0)
+    }
+
+    @Test func aSingleNodeStillUsesGetNode() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(1)
+        await configured(all, client: client)
+
+        _ = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+
+        #expect(await client.getNodeCalls == 1)
+        #expect(await client.enumerateNodesCalls == 0)
+    }
+
+    @Test func aNodeThatTheBatchSkippedIsConfirmedWithGetNodeBeforeItCountsAsMissing() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(4)
+        await configured(Array(all.dropLast()), client: client)
+
+        await #expect(throws: SDKAlbumCatalogError.self) {
+            _ = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+        }
+        #expect(await client.getNodeCalls == 1)
+    }
+
+    @Test func aFailedBatchKeepsTheNodesItDeliveredAndReadsTheRestOneByOne() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(10)
+        await configured(all, client: client)
+        await client.failEnumeration(at: [all[6].uid.sdkCompatibleIdentifier])
+
+        let facts = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+
+        #expect(facts.count == 10)
+        #expect(await client.enumerateNodesCalls == 1)
+        // The nodes in front of the failing one arrive; every other node, that one included, is read on its own.
+        let delivered = await client.enumerationDelivered
+        #expect(delivered < 10)
+        #expect(await client.getNodeCalls == 10 - delivered)
+    }
+
+    @Test func aStreamedFailureFallsBackTheSameWay() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(6)
+        await configured(all, client: client)
+        await client.failEnumerationCallback(at: [all[2].uid.sdkCompatibleIdentifier])
+
+        let facts = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+
+        #expect(facts.count == 6)
+        // The collector keeps the nodes in front of the first failure and nothing after it.
+        let delivered = await client.enumerationDelivered
+        #expect(await client.getNodeCalls == 6 - delivered)
+        #expect(await client.getNodeCalls >= 1)
+    }
+
+    @Test func aCancellationStreamedByTheSDKNeverFallsBack() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(6)
+        await configured(all, client: client)
+        await client.failEnumerationCallback(at: [all[2].uid.sdkCompatibleIdentifier], with: CancellationError())
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+        }
+        #expect(await client.getNodeCalls == 0)
+    }
+
+    @Test func aNodeThatStillFailsOnItsOwnFailsTheReadWithItsOwnError() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(10)
+        await configured(all, client: client)
+        let broken = all[6].uid.sdkCompatibleIdentifier
+        await client.failEnumeration(at: [broken])
+        await client.failGetNode(broken)
+
+        await #expect(throws: FakeSDKPhotoCatalogClient.FakeNodeFailure.node) {
+            _ = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+        }
+    }
+
+    @Test func aFailedReadIsNeverReadAsAMissingNode() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(10)
+        await configured(all, client: client)
+        await client.failEnumeration(at: [all[0].uid.sdkCompatibleIdentifier])
+        await client.failGetNode(all[0].uid.sdkCompatibleIdentifier)
+
+        do {
+            _ = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+            Issue.record("the read must fail")
+        } catch {
+            #expect(!(error is SDKAlbumCatalogError))
+        }
+    }
+
+    /// A task that is cancelled never starts a `getNode` by itself, so this test cannot show the missing fallback guard:
+    /// `aCancellationReportedByTheSDKNeverFallsBack` and `aCancellationStreamedByTheSDKNeverFallsBack` do, because
+    /// their task is not cancelled. This test covers the native cancel call and the `CancellationError`.
+    @Test func cancellingABatchCancelsTheNativeCall() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(10)
+        await configured(all, client: client)
+        await client.holdEnumerations()
+        let backend = SDKAlbumCatalogBackend(client: client)
+        let requested = uids(all)
+
+        let task = Task { try await backend.nodeFacts(of: requested) }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while await client.enumerateNodesCalls == 0, ContinuousClock.now < deadline { await Task.yield() }
+        // A read that never reaches the batch call fails here instead of waiting for its own end.
+        #expect(await client.enumerateNodesCalls == 1)
+        task.cancel()
+        let cancelledBy = ContinuousClock.now + .seconds(5)
+        while await client.cancelledEnumerateTokens.isEmpty, ContinuousClock.now < cancelledBy {
+            await Task.yield()
+        }
+        let cancelled = await client.cancelledEnumerateTokens.count
+        await client.abandonHeldEnumerations()
+
+        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        #expect(cancelled == 1)
+    }
+
+    @Test func aCancellationReportedByTheSDKNeverFallsBack() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(10)
+        await configured(all, client: client)
+        await client.failEnumeration(at: [all[3].uid.sdkCompatibleIdentifier], with: CancellationError())
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await SDKAlbumCatalogBackend(client: client).nodeFacts(of: uids(all))
+        }
+        #expect(await client.getNodeCalls == 0)
+    }
+
+    @Test func viewerReadsThatShareARunningReadStayOnGetNode() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(8)
+        await configured(all, client: client)
+
+        _ = try await SDKAlbumCatalogBackend(client: client, presentationNodeReads: SDKPresentationNodeReads())
+            .albumMemberships(for: uids(all))
+
+        #expect(await client.enumerateNodesCalls == 0)
+        #expect(await client.getNodeCalls == 8)
+    }
+
+    @Test func readsForAWriteAndTheAlbumListUseBatches() async throws {
+        let client = FakeSDKPhotoCatalogClient()
+        let all = photos(8)
+        await configured(all, client: client)
+
+        _ = try await SDKAlbumCatalogBackend(client: client).currentAlbumMemberships(for: uids(all))
+
+        #expect(await client.enumerateNodesCalls == 1)
+        #expect(await client.getNodeCalls == 0)
+    }
+}
+
 private actor FakeSDKPhotoCatalogClient: SDKPhotoCatalogClient {
     private var ownedUIDs: [SDKNodeUid] = []
     private var sharedUIDs: [SDKNodeUid] = []
@@ -1183,6 +1424,23 @@ private actor FakeSDKPhotoCatalogClient: SDKPhotoCatalogClient {
     private let holdCancelledGetNodes: Bool
     private var heldGetNodes: [UUID: CheckedContinuation<Void, any Error>] = [:]
     private(set) var cancelledGetNodeTokens: [UUID] = []
+    private(set) var enumerateNodesCalls = 0
+    /// The nodes that enumeration calls delivered; a request order that a set made random decides how many.
+    private(set) var enumerationDelivered = 0
+    private(set) var enumeratedBatches: [[String]] = []
+    private(set) var maximumConcurrentEnumerateCalls = 0
+    private(set) var cancelledEnumerateTokens: [UUID] = []
+    private var concurrentEnumerateCalls = 0
+    private var holdEnumerate = false
+    private var heldEnumerations: [UUID: CheckedContinuation<Void, any Error>] = [:]
+    /// The enumeration delivers the nodes in front of the first of these identifiers, then throws.
+    private var enumerationFailsAt: Set<String> = []
+    private var enumerationCallbackFailsAt: Set<String> = []
+    private var enumerationDeliversReversed = false
+    private var enumerationFailure: any Error = FakeNodeFailure.enumeration
+    private var getNodeFailures: [String: any Error] = [:]
+
+    enum FakeNodeFailure: Error { case enumeration, node }
 
     init(
         nodeDelay: Duration = .zero,
@@ -1293,11 +1551,67 @@ private actor FakeSDKPhotoCatalogClient: SDKPhotoCatalogClient {
                 try await withCheckedThrowingContinuation { heldGetNodes[cancellationToken] = $0 }
             }
             concurrentGetNodeCalls -= 1
+            if let failure = getNodeFailures[nodeUid.sdkCompatibleIdentifier] { throw failure }
             return nodes[nodeUid.sdkCompatibleIdentifier]
         } catch {
             concurrentGetNodeCalls -= 1
             throw error
         }
+    }
+
+    func failEnumeration(at uids: Set<String>, with error: any Error = FakeNodeFailure.enumeration) {
+        enumerationFailsAt = uids
+        enumerationFailure = error
+    }
+    func failEnumerationCallback(at uids: Set<String>, with error: any Error = FakeNodeFailure.enumeration) {
+        enumerationCallbackFailsAt = uids
+        enumerationFailure = error
+    }
+    func deliverEnumerationReversed() { enumerationDeliversReversed = true }
+    func failGetNode(_ uid: String, with error: any Error = FakeNodeFailure.node) { getNodeFailures[uid] = error }
+    func holdEnumerations() { holdEnumerate = true }
+
+    func enumerateNodes(
+        nodeUids: [SDKNodeUid], cancellationToken: UUID, onNodeEnumerated: @escaping NodeCallback
+    ) async throws {
+        enumerateNodesCalls += 1
+        enumeratedBatches.append(nodeUids.map(\.sdkCompatibleIdentifier))
+        concurrentEnumerateCalls += 1
+        maximumConcurrentEnumerateCalls = max(maximumConcurrentEnumerateCalls, concurrentEnumerateCalls)
+        defer { concurrentEnumerateCalls -= 1 }
+        if nodeDelay != .zero { try await Task.sleep(for: nodeDelay) }
+        if holdEnumerate {
+            if cancelledEnumerateTokens.contains(cancellationToken) { throw CancellationError() }
+            try await withCheckedThrowingContinuation { heldEnumerations[cancellationToken] = $0 }
+        }
+        let requested = enumerationDeliversReversed ? Array(nodeUids.reversed()) : nodeUids
+        for uid in requested {
+            let id = uid.sdkCompatibleIdentifier
+            if enumerationFailsAt.contains(id) { throw enumerationFailure }
+            if enumerationCallbackFailsAt.contains(id) {
+                // The SDK ends an enumeration at the first error.
+                onNodeEnumerated(.failure(enumerationFailure))
+                return
+            }
+            // The SDK skips a UID that resolves to no node.
+            if let node = nodes[id] {
+                enumerationDelivered += 1
+                onNodeEnumerated(.success(node))
+            }
+        }
+    }
+
+    /// Ends every held call, as a native call that never saw its cancellation would not: a test of a missing
+    /// cancellation fails at its own assertion and does not wait for ever.
+    func abandonHeldEnumerations() {
+        let held = heldEnumerations.values
+        heldEnumerations.removeAll()
+        held.forEach { $0.resume(throwing: CancellationError()) }
+    }
+
+    func cancelEnumerateNodes(cancellationToken: UUID) {
+        cancelledEnumerateTokens.append(cancellationToken)
+        heldEnumerations.removeValue(forKey: cancellationToken)?.resume(throwing: CancellationError())
     }
 
     func cancelGetNode(cancellationToken: UUID) {
