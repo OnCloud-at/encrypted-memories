@@ -484,9 +484,17 @@ runner. An annotation about a full disk (`No space left on device`) or the warni
 full (`running out of disk space`) names a full runner disk instead, at every level and also next to the lost-runner text.
 That is a capacity problem and never retried. Any other annotation, no annotation and an annotation that cannot be read
 leave the cause unknown, and the job is not retried. A failed step, a timeout, a failed job outside the upgrade gate and a
-job record with a missing field or an end before its start are never read as a lost runner. The summary also says whether a re-run of the failed jobs is
-safe: only when the run is at attempt 1 and every failed job lost its runner. In that case re-run the failed jobs by hand.
+job record with a missing field or an end before its start are never read as a lost runner. The summary also says whether
+a re-run of the failed jobs is safe: only when the run is at attempt 1 and every failed job lost its runner.
 The job changes no result and starts only when the upgrade result is `failure`.
+When every failed job lost its runner, the workflow `Retry a lost upgrade runner` re-runs the failed jobs once. A run can be
+re-run only after it has completed, so this is a separate workflow that starts when `Apple release` completes. It acts only
+on a run of `testflight-internal.yml` in this repository that concluded `failure` at attempt 1. It never acts on a second
+attempt, a full runner disk, an unknown cause, a failed step, a timeout or a failed job outside the upgrade gate. It has two
+jobs. The first checks out only the default branch and classifies the failed jobs with the scopes `contents`, `actions` and
+`checks`, all read. The second holds the scope `actions: write` and nothing else, checks out nothing and runs no repository
+code: it asks again that the run is still at attempt 1 and then re-runs the failed jobs. The workflow never uses a field of the
+triggering run inside a script; the scripts get only its id and its attempt as environment variables.
 To deliberately override the gate, dispatch `Apple release` from `main` with an existing published
 `release_tag`, the same value in `upgrade_override_tag`, and a nonempty `upgrade_override_reason`.
 The summary records the override and its reason. Automatic release events cannot override the gate.

@@ -264,6 +264,99 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     end
   end
 
+  def retry_workflow
+    YAML.load_file(File.expand_path("../workflows/upgrade-retry.yml", __dir__))
+  end
+
+  def retry_step(job, name)
+    retry_workflow.dig("jobs", job, "steps")&.find { |step| step["name"] == name }
+  end
+
+  # The retry is a separate workflow because a run can be re-run only after it has completed (#1016).
+  def test_the_retry_runs_after_the_release_workflow_ends_and_only_the_job_that_reruns_holds_the_write_scope
+    workflow = retry_workflow
+    trigger = workflow["on"] || workflow[true]
+    assert_equal [@workflow.fetch("name")], trigger.dig("workflow_run", "workflows")
+    assert_equal ["completed"], trigger.dig("workflow_run", "types")
+    assert_equal({}, workflow["permissions"], "no scope at workflow level")
+    assert_equal %w[classify rerun], workflow.fetch("jobs").keys
+    classify = workflow.dig("jobs", "classify")
+    rerun = workflow.dig("jobs", "rerun")
+    assert_equal({"contents" => "read", "actions" => "read", "checks" => "read"}, classify["permissions"])
+    assert_equal({"actions" => "write"}, rerun["permissions"], "the write scope and nothing else")
+    condition = classify["if"].to_s
+    assert_includes condition, "github.event.workflow_run.conclusion == 'failure'"
+    assert_includes condition, "github.event.workflow_run.run_attempt == 1"
+    assert_includes condition, "github.event.workflow_run.head_repository.full_name == github.repository"
+    assert_includes condition, "github.event.workflow_run.path == '.github/workflows/testflight-internal.yml'"
+    assert_equal "classify", rerun["needs"]
+    assert_equal "needs.classify.outputs.retry == 'true'", rerun["if"]
+    assert_equal "${{ steps.classify.outputs.retry }}", classify.dig("outputs", "retry")
+    assert_equal 1, rerun["steps"].length
+    rerun["steps"].each { |step| refute step.key?("uses"), "the job with the write scope checks out nothing and uses no action" }
+    checkout = classify["steps"].find { |step| step["uses"].to_s.start_with?("actions/checkout") }
+    refute_nil checkout
+    assert_equal({"persist-credentials" => false}, checkout["with"], "the default branch, and the token is not kept")
+    @workflow.fetch("jobs").each_value { |other| refute_equal "write", other.fetch("permissions", {})["actions"] }
+  end
+
+  # The data of the triggering run reaches the steps only as the run id and the attempt, never inside a script.
+  def test_the_retry_steps_take_nothing_from_the_triggering_run_but_its_id_and_attempt
+    classify = retry_step("classify", "Classify the failed jobs")
+    rerun = retry_step("rerun", "Re-run the failed jobs once")
+    assert_equal({"GH_TOKEN" => "${{ github.token }}", "RUN_ID" => "${{ github.event.workflow_run.id }}",
+                  "RUN_ATTEMPT" => "${{ github.event.workflow_run.run_attempt }}"}, classify["env"])
+    assert_equal({"GH_TOKEN" => "${{ github.token }}", "RUN_ID" => "${{ github.event.workflow_run.id }}"}, rerun["env"])
+    retry_workflow.fetch("jobs").each do |name, job|
+      job["steps"].each do |step|
+        next unless step.key?("run")
+        refute_includes step["run"], "github.event.workflow_run.", "#{name}: a script reads no field of the triggering run"
+        refute_includes step["run"], "${{", "#{name}: a script has no expression"
+      end
+    end
+  end
+
+  # The steps run the real classifier through a fake `gh`; a re-run is requested once, for lost runners only.
+  def test_the_retry_reruns_the_failed_jobs_only_when_every_failed_job_lost_its_runner
+    root = File.expand_path("../..", __dir__)
+    classify = retry_step("classify", "Classify the failed jobs")
+    rerun = retry_step("rerun", "Re-run the failed jobs once")
+    refute_nil classify
+    refute_nil rerun
+    lost = recorded_annotations.fetch("lost_runner")
+    disk = recorded_annotations.fetch("disk_full")
+    genuine = lost["job"].merge("id" => 77, "name" => "Test installed upgrades on macOS 27 host (1-of-1)",
+                                "steps" => [{"name" => "Test installed upgrades", "status" => "completed", "conclusion" => "failure", "number" => 1}])
+    notes = {lost.dig("job", "id") => lost["annotations"], disk.dig("job", "id") => disk["annotations"]}
+    {"the real lost runner" => [[lost["job"]], "1", true], "the real full disk" => [[disk["job"]], "1", false],
+     "a lost runner and a full disk" => [[lost["job"], disk["job"]], "1", false],
+     "a lost runner and a failed job" => [[lost["job"], genuine], "1", false],
+     "a failed job" => [[genuine], "1", false], "a second attempt" => [[lost["job"]], "2", false]}.each do |name, (jobs, attempt, expected)|
+      Dir.mktmpdir do |dir|
+        env = write_fake_gh(dir, jobs: jobs, annotations: notes).merge("RUN_ID" => "4242", "RUN_ATTEMPT" => attempt)
+        assert system(env, "bash", "-c", classify.fetch("run"), chdir: root, out: File::NULL, err: File::NULL), name
+        assert_includes File.read(File.join(dir, "calls.log")), "actions/runs/4242/attempts/#{attempt}/jobs"
+        assert_equal expected, File.read(File.join(dir, "output")).include?("retry=true"), name
+      end
+    end
+  end
+
+  def test_the_rerun_requests_the_failed_jobs_once_and_only_while_the_run_is_still_at_attempt_one
+    root = File.expand_path("../..", __dir__)
+    rerun = retry_step("rerun", "Re-run the failed jobs once")
+    {"1" => ["run rerun 4242 --failed --repo example/repository\n"], "2" => []}.each do |attempt, expected|
+      Dir.mktmpdir do |dir|
+        env = write_fake_gh(dir).merge("RUN_ID" => "4242", "GH_CURRENT_ATTEMPT" => attempt)
+        ok = system(env, "bash", "-c", rerun.fetch("run"), chdir: root, out: File::NULL, err: File::NULL)
+        assert ok, "attempt #{attempt.inspect}"
+        calls = File.read(File.join(dir, "calls.log"))
+        assert_includes calls, "api repos/example/repository/actions/runs/4242 --jq .run_attempt"
+        assert_equal expected, calls.lines.grep(/\Arun rerun/), "attempt #{attempt.inspect}"
+        assert_includes File.read(File.join(dir, "summary")), expected.empty? ? "is not re-run" : "re-run once"
+      end
+    end
+  end
+
   def test_the_runner_disk_step_fails_below_the_declared_minimum_and_reads_it_from_the_matrix
     step = @jobs.fetch("upgrade").fetch("steps").find { |item| item["id"] == "disk" }
     refute_nil step
