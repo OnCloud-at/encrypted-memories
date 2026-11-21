@@ -15,8 +15,8 @@ public struct ExactDuplicatesView<Cover: View>: View {
     private let canOpen: (PhotoUID) -> Bool
     private let libraryRevision: UInt64
     private let onOpen: (PhotoUID, String) -> Void
-    private let onShowDiffering: () -> Void
-    private let isCoveredByDiffering: Bool
+    private let onShowReview: (ExactDuplicateReviewList) -> Void
+    private let isCoveredByReview: Bool
     private let cover: (PhotoUID) -> Cover
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The load and the check of this screen, for its whole life. The end of the screen stops them.
@@ -26,14 +26,14 @@ public struct ExactDuplicatesView<Cover: View>: View {
     /// `cornerRadius` is the corner radius of `cover`. `canOpen` tells whether the library shows a photo yet, so
     /// the viewer can open it; a host whose library is not observed passes a `libraryRevision` that changes with the
     /// photos it shows, so a copy that was not ready redraws. `onOpen` receives a photo and the ID of its group.
-    /// `onShowDiffering` shows `ExactDuplicatesDifferingView`, the copies with the same bytes whose details differ.
-    /// While `isCoveredByDiffering`, that list covers this screen: the screen keeps its load and check, so going back
-    /// reads nothing again.
+    /// `onShowReview` shows `ExactDuplicatesReviewView` of a review list, such as the copies with the same bytes whose
+    /// details differ. While `isCoveredByReview`, that list covers this screen: the screen keeps its load and check, so
+    /// going back reads nothing again.
     public init(
         model: ExactDuplicatesModel, confirmsMergeAll: Binding<Bool>, accent: Color, cornerRadius: CGFloat,
         canOpen: @escaping (PhotoUID) -> Bool = { _ in true }, libraryRevision: UInt64 = 0,
-        onOpen: @escaping (PhotoUID, String) -> Void, onShowDiffering: @escaping () -> Void,
-        isCoveredByDiffering: Bool, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
+        onOpen: @escaping (PhotoUID, String) -> Void, onShowReview: @escaping (ExactDuplicateReviewList) -> Void,
+        isCoveredByReview: Bool, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
     ) {
         self.model = model
         _confirmsMergeAll = confirmsMergeAll
@@ -42,8 +42,8 @@ public struct ExactDuplicatesView<Cover: View>: View {
         self.canOpen = canOpen
         self.libraryRevision = libraryRevision
         self.onOpen = onOpen
-        self.onShowDiffering = onShowDiffering
-        self.isCoveredByDiffering = isCoveredByDiffering
+        self.onShowReview = onShowReview
+        self.isCoveredByReview = isCoveredByReview
         self.cover = cover
     }
 
@@ -78,8 +78,8 @@ public struct ExactDuplicatesView<Cover: View>: View {
                 load?.appear()
             }
             .onDisappear {
-                // Under the differing copies the check goes on; the end of the screen stops it.
-                if !isCoveredByDiffering { load?.stop() }
+                // Under a review list the check goes on; the end of the screen stops it.
+                if !isCoveredByReview { load?.stop() }
             }
     }
 
@@ -112,7 +112,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
             } description: {
                 Text(copy.description)
             } actions: {
-                differingButton
+                reviewButtons
             }
             .frame(maxWidth: Self.readableWidth)
         case .stillChecking:
@@ -126,26 +126,28 @@ public struct ExactDuplicatesView<Cover: View>: View {
                     progressRow(line, showsTitle: false)
                         .accessibilityIdentifier("duplicates.checkProgress")
                 }
-                differingButton
+                reviewButtons
             }
             .frame(maxWidth: Self.readableWidth)
         case .groups:
             // Progress of the check changes this view often; the list compares equal and keeps its rows.
             ExactDuplicatesGroupList(
                 model: model, accent: accent, cornerRadius: cornerRadius, reduceMotion: reduceMotion, canOpen: canOpen,
-                libraryRevision: libraryRevision, onOpen: onOpen, onShowDiffering: onShowDiffering, cover: cover
+                libraryRevision: libraryRevision, onOpen: onOpen, onShowReview: onShowReview, cover: cover
             )
             .equatable()
         }
     }
 
-    /// Without identical copies, the copies whose details differ open from a button under the empty state.
-    @ViewBuilder private var differingButton: some View {
-        if let title = model.differingRowTitle {
-            Button(title, action: onShowDiffering)
-                .buttonStyle(.bordered)
-                .monospacedDigit()
-                .accessibilityIdentifier("duplicates.differing")
+    /// Without identical copies, each review list with groups opens from a button under the empty state.
+    @ViewBuilder private var reviewButtons: some View {
+        ForEach(ExactDuplicateReviewList.allCases) { list in
+            if let title = model.reviewRowTitle(list) {
+                Button(title) { onShowReview(list) }
+                    .buttonStyle(.bordered)
+                    .monospacedDigit()
+                    .accessibilityIdentifier(list.identifier)
+            }
         }
     }
 
@@ -216,7 +218,7 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
     let canOpen: (PhotoUID) -> Bool
     let libraryRevision: UInt64
     let onOpen: (PhotoUID, String) -> Void
-    let onShowDiffering: () -> Void
+    let onShowReview: (ExactDuplicateReviewList) -> Void
     let cover: (PhotoUID) -> Cover
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
@@ -231,7 +233,9 @@ private struct ExactDuplicatesGroupList<Cover: View>: View, Equatable {
             VStack(alignment: .leading, spacing: 12) {
                 ExactDuplicatesSummary(model: model)
                     .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
-                ExactDuplicatesDifferingRow(model: model, margin: margin, action: onShowDiffering)
+                ForEach(ExactDuplicateReviewList.allCases) { list in
+                    ExactDuplicatesReviewRow(model: model, list: list, margin: margin) { onShowReview(list) }
+                }
                 ExactDuplicatesStatusRows(model: model, margin: margin)
             }
             .padding(.bottom, DuplicatesLayout.cards ? 0 : 10)
@@ -375,15 +379,15 @@ private struct DuplicatesColumn<Content: View>: View {
     }
 }
 
-/// The row that opens the copies with the same bytes whose details differ, with their count. Hidden while there are
-/// none.
-private struct ExactDuplicatesDifferingRow: View {
+/// The row that opens a review list, with its group count. Hidden while the list has no group.
+private struct ExactDuplicatesReviewRow: View {
     let model: ExactDuplicatesModel
+    let list: ExactDuplicateReviewList
     let margin: CGFloat
     let action: () -> Void
 
     var body: some View {
-        if let title = model.differingRowTitle {
+        if let title = model.reviewRowTitle(list) {
             Button(action: action) {
                 HStack(spacing: 8) {
                     Text(title)
@@ -402,16 +406,17 @@ private struct ExactDuplicatesDifferingRow: View {
                 .duplicatesCard()
             }
             .buttonStyle(.plain)
-            .accessibilityIdentifier("duplicates.differing")
+            .accessibilityIdentifier(list.identifier)
         }
     }
 }
 
-/// The copies with the same bytes whose details differ: an explanation, then each group with the details that differ
-/// and its copies. A tap or click opens a copy in the viewer of the library, where the person can move it to the
-/// trash. Nothing here merges or keeps a copy.
-public struct ExactDuplicatesDifferingView<Cover: View>: View {
+/// A review list, such as the copies with the same bytes whose details differ: an explanation, then each group with
+/// the details that differ and its copies. A tap or click opens a copy in the viewer of the library, where the person
+/// can move it to the trash. Nothing here merges or keeps a copy.
+public struct ExactDuplicatesReviewView<Cover: View>: View {
     private let model: ExactDuplicatesModel
+    private let list: ExactDuplicateReviewList
     private let item: (PhotoUID) -> PhotoItem?
     /// Changes with the photos that the library shows, so a copy that was not ready redraws.
     private let libraryRevision: UInt64
@@ -419,13 +424,15 @@ public struct ExactDuplicatesDifferingView<Cover: View>: View {
     private let cover: (PhotoUID) -> Cover
 
     /// `item` finds a copy in the library; a copy that it does not find yet cannot open. A host whose library is not
-    /// observed passes a `libraryRevision` that changes with the photos it shows. `onOpen` receives a copy and the
-    /// content hash of its group, for `ExactDuplicatesModel.viewerItems(opening:inDiffering:item:)`.
+    /// observed passes a `libraryRevision` that changes with the photos it shows. `onOpen` receives a copy and the ID
+    /// of its group, for `ExactDuplicatesModel.viewerItems(opening:in:groupID:item:)`.
     public init(
-        model: ExactDuplicatesModel, item: @escaping (PhotoUID) -> PhotoItem?, libraryRevision: UInt64 = 0,
-        onOpen: @escaping (PhotoUID, String) -> Void, @ViewBuilder cover: @escaping (PhotoUID) -> Cover
+        model: ExactDuplicatesModel, list: ExactDuplicateReviewList, item: @escaping (PhotoUID) -> PhotoItem?,
+        libraryRevision: UInt64 = 0, onOpen: @escaping (PhotoUID, String) -> Void,
+        @ViewBuilder cover: @escaping (PhotoUID) -> Cover
     ) {
         self.model = model
+        self.list = list
         self.item = item
         self.libraryRevision = libraryRevision
         self.onOpen = onOpen
@@ -434,13 +441,13 @@ public struct ExactDuplicatesDifferingView<Cover: View>: View {
 
     public var body: some View {
         // Read here, not in the lazy column, so a change of the groups redraws the list.
-        let groups = Array(model.differingGroups.enumerated())
+        let groups = Array(model.reviewGroups(list).enumerated())
         DuplicatesColumn(refreshing: nil) { margin in
-            Text(L10n.string("duplicates.differing_message"))
+            Text(list.message)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, DuplicatesLayout.cards ? margin : 0)
-                .accessibilityIdentifier("duplicates.differing.message")
+                .accessibilityIdentifier("\(list.identifier).message")
             ForEach(groups, id: \.element.id) { index, group in
                 section(group, at: index, margin: margin)
             }
@@ -448,15 +455,15 @@ public struct ExactDuplicatesDifferingView<Cover: View>: View {
     }
 
     @ViewBuilder
-    private func section(_ group: ExactDuplicateDifferingGroup, at index: Int, margin: CGFloat) -> some View {
+    private func section(_ group: ExactDuplicateReviewGroup, at index: Int, margin: CGFloat) -> some View {
         let line = Text(model.differenceLine(of: group, item: item))
             .font(DuplicatesLayout.titleFont)
             .foregroundStyle(DuplicatesLayout.titleStyle)
-            .accessibilityIdentifier("duplicates.differing.line.\(index)")
+            .accessibilityIdentifier("\(list.identifier).line.\(index)")
         let model = model
-        let members = ExactDuplicateDifferingMembers(
-            group: group, groupIndex: index, item: item, label: { model.accessibilityLabel(of: $0, in: group) },
-            open: onOpen, cover: cover)
+        let members = ExactDuplicateReviewMembers(
+            group: group, groupIndex: index, identifier: list.identifier, item: item,
+            label: { model.accessibilityLabel(of: $0, in: group) }, open: onOpen, cover: cover)
         if DuplicatesLayout.cards {
             VStack(alignment: .leading, spacing: 8) {
                 line.padding(.horizontal, margin)
@@ -477,10 +484,12 @@ public struct ExactDuplicatesDifferingView<Cover: View>: View {
     }
 }
 
-/// The copies of one differing group, side by side. A tap or click opens a copy that the library shows.
-private struct ExactDuplicateDifferingMembers<Cover: View>: View {
-    let group: ExactDuplicateDifferingGroup
+/// The copies of one group of a review list, side by side. A tap or click opens a copy that the library shows.
+private struct ExactDuplicateReviewMembers<Cover: View>: View {
+    let group: ExactDuplicateReviewGroup
     let groupIndex: Int
+    /// The identifier of the list, which the identifiers of the copies and the group extend.
+    let identifier: String
     let item: (PhotoUID) -> PhotoItem?
     /// The spoken label of a copy.
     let label: (PhotoUID) -> String
@@ -492,7 +501,7 @@ private struct ExactDuplicateDifferingMembers<Cover: View>: View {
             ForEach(Array(group.members.enumerated()), id: \.element) { index, uid in
                 let found = item(uid)
                 Button {
-                    if found != nil { open(uid, group.contentHash) }
+                    if found != nil { open(uid, group.id) }
                 } label: {
                     cover(uid).overlay {
                         if found == nil { ProgressView().controlSize(.small) }
@@ -500,10 +509,10 @@ private struct ExactDuplicateDifferingMembers<Cover: View>: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(label(uid))
-                .accessibilityIdentifier("duplicates.differing.member.\(groupIndex).\(index)")
+                .accessibilityIdentifier("\(identifier).member.\(groupIndex).\(index)")
             }
         }
-        .accessibilityIdentifier("duplicates.differing.group.\(groupIndex)")
+        .accessibilityIdentifier("\(identifier).group.\(groupIndex)")
     }
 }
 

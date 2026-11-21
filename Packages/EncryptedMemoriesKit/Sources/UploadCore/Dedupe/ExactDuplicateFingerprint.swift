@@ -107,7 +107,7 @@ public enum ExactDuplicateDetail: String, CaseIterable, Sendable {
     /// The MIME type.
     case fileType
     /// One copy is a Live Photo and another is not. The fingerprint does not hold it, so it never decides alone that
-    /// copies differ; see `ExactDuplicateDifferingGroup.differences(with:)`.
+    /// copies differ; see `ExactDuplicateReviewGroup.differences(with:)`.
     case livePhoto
 }
 
@@ -125,11 +125,6 @@ public struct ExactDuplicateDifferingGroup: Sendable, Equatable, Identifiable {
         self.contentHash = contentHash
         self.members = members
         self.differences = differences
-    }
-
-    /// `differences`, and `livePhoto` when `item` finds a Live Photo and a photo that is not one among the members.
-    public func differences(with item: (PhotoUID) -> PhotoItem?) -> [ExactDuplicateDetail] {
-        Set(members.compactMap { item($0)?.isLivePhoto }).count > 1 ? differences + [.livePhoto] : differences
     }
 }
 

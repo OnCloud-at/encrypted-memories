@@ -82,18 +82,23 @@
                     )
                 })
             let (screen, screenHost) = host(model: model)
-            for _ in 0..<200 where model.differingRowTitle == nil { try await Task.sleep(for: .milliseconds(10)) }
-            XCTAssertNotNil(model.differingRowTitle)
+            for _ in 0..<200 where model.reviewRowTitle(.differing) == nil {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertNotNil(model.reviewRowTitle(.differing))
             let (list, listHost) = host(
-                ExactDuplicatesDifferingView(model: model, item: { items[$0] }, onOpen: { _, _ in }, cover: Self.tile))
+                ExactDuplicatesReviewView(
+                    model: model, list: .differing, item: { items[$0] }, onOpen: { _, _ in }, cover: Self.tile))
             // Only copies whose details differ: the empty state with its button.
             let only = ExactDuplicatesModel(
                 finder: ScreenshotFinder(
                     groups: [groups[1]], coverage: .complete, build: .none, otherDetails: [members[4]]))
             let (empty, emptyHost) = host(model: only)
-            for _ in 0..<200 where only.differingRowTitle == nil { try await Task.sleep(for: .milliseconds(10)) }
+            for _ in 0..<200 where only.reviewRowTitle(.differing) == nil {
+                try await Task.sleep(for: .milliseconds(10))
+            }
             XCTAssertEqual(only.content, .noDuplicates)
-            XCTAssertNotNil(only.differingRowTitle)
+            XCTAssertNotNil(only.reviewRowTitle(.differing))
             let renders = [("screen", screen, screenHost), ("list", list, listHost), ("only", empty, emptyHost)]
             for (name, window, view) in renders {
                 for appearance in [NSAppearance.Name.aqua, .darkAqua] {
@@ -246,7 +251,7 @@
             host(
                 ExactDuplicatesView(
                     model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
-                    onOpen: { _, _ in }, onShowDiffering: {}, isCoveredByDiffering: false, cover: Self.tile),
+                    onOpen: { _, _ in }, onShowReview: { _ in }, isCoveredByReview: false, cover: Self.tile),
                 width: width, height: height)
         }
 
@@ -295,7 +300,7 @@
             ZStack {
                 ExactDuplicatesView(
                     model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
-                    onOpen: { _, _ in }, onShowDiffering: {}, isCoveredByDiffering: false
+                    onOpen: { _, _ in }, onShowReview: { _ in }, isCoveredByReview: false
                 ) { uid in
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color(hue: Double(uid.nodeID.count % 7) / 7, saturation: 0.45, brightness: 0.8))
@@ -592,7 +597,7 @@
             ExactDuplicatesView(
                 model: model, confirmsMergeAll: .constant(false), accent: .accentColor, cornerRadius: 6,
                 canOpen: { library.canOpen($0) }, libraryRevision: revision.value, onOpen: { _, _ in },
-                onShowDiffering: {}, isCoveredByDiffering: false,
+                onShowReview: { _ in }, isCoveredByReview: false,
                 cover: { _ in Color.teal.frame(width: 60, height: 60) })
         }
     }

@@ -3524,13 +3524,13 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.knownDuplicateCount)
         XCTAssertNil(model.copyCountText)
         XCTAssertEqual(model.content, .noDuplicates, "the screen says that no identical copies exist")
-        XCTAssertEqual(model.differingRowTitle, "\(L10n.string("duplicates.differing_title")) · 1")
+        XCTAssertEqual(model.reviewRowTitle(.differing), "\(L10n.string("duplicates.differing_title")) · 1")
         XCTAssertEqual(
             model.differingGroups,
             [ExactDuplicateDifferingGroup(contentHash: "B", members: [b1, b2], differences: differences)])
-        XCTAssertEqual(model.differingGroup(withContentHash: "B"), model.differingGroups.first)
-        XCTAssertNil(model.differingGroup(withContentHash: "A"))
-        let group = try XCTUnwrap(model.differingGroups.first)
+        XCTAssertEqual(model.reviewGroup(.differing, id: "B"), model.reviewGroups(.differing).first)
+        XCTAssertNil(model.reviewGroup(.differing, id: "A"))
+        let group = try XCTUnwrap(model.reviewGroups(.differing).first)
         XCTAssertEqual(
             group.members.map { model.accessibilityLabel(of: $0, in: group) },
             [L10n.string("duplicates.member_label \(1) \(2)"), L10n.string("duplicates.member_label \(2) \(2)")])
@@ -3541,26 +3541,26 @@ final class ExactDuplicatesModelTests: XCTestCase {
         finder.fingerprints = [a1: described, a2: described, a3: other, b1: described, b2: other]
         let (model, _) = makeModel(finder)
         var route = ExactDuplicatesRoute()
-        route.showDiffering(of: model)
-        XCTAssertFalse(route.showsDiffering(of: model), "nothing opens before the check lists a group")
+        route.show(.differing, of: model)
+        XCTAssertFalse(route.shows(.differing, of: model), "nothing opens before the check lists a group")
         await model.load()
 
-        route.showDiffering(of: model)
-        XCTAssertTrue(route.showsDiffering(of: model))
+        route.show(.differing, of: model)
+        XCTAssertTrue(route.shows(.differing, of: model))
         XCTAssertFalse(route.offersMergeAll(of: model), "Merge All belongs to the duplicates")
         route.back()
-        XCTAssertFalse(route.showsDiffering(of: model))
+        XCTAssertFalse(route.shows(.differing, of: model))
         XCTAssertTrue(route.offersMergeAll(of: model))
 
-        route.showDiffering(of: model)
+        route.show(.differing, of: model)
         model.didTrashElsewhere([a3, b2])
         route.follow(model)
-        XCTAssertFalse(route.showsDiffering(of: model), "the list closes when its last group left")
+        XCTAssertFalse(route.shows(.differing, of: model), "the list closes when its last group left")
         // A rescan lists both groups again, as the deleted copies came back.
         await model.load()
         route.follow(model)
-        XCTAssertNotNil(model.differingRowTitle)
-        XCTAssertFalse(route.showsDiffering(of: model), "the list opens again only when the person opens it")
+        XCTAssertNotNil(model.reviewRowTitle(.differing))
+        XCTAssertFalse(route.shows(.differing, of: model), "the list opens again only when the person opens it")
     }
 
     func testTheRowCountsTheDifferingGroupsAndTheLineNamesTheDetailsThatDiffer() async throws {
@@ -3574,21 +3574,21 @@ final class ExactDuplicatesModelTests: XCTestCase {
             c2: ExactDuplicateFingerprint(durationSeconds: 2, mimeType: "video/quicktime"),
         ]
         let (model, _) = makeModel(finder)
-        XCTAssertNil(model.differingRowTitle, "no row before the check")
+        XCTAssertNil(model.reviewRowTitle(.differing), "no row before the check")
         await model.load()
 
-        XCTAssertEqual(model.differingRowTitle, "\(L10n.string("duplicates.differing_title")) · 3")
+        XCTAssertEqual(model.reviewRowTitle(.differing), "\(L10n.string("duplicates.differing_title")) · 3")
         let line = { (words: [String]) in
             L10n.string("duplicates.differing_line \(ListFormatter.localizedString(byJoining: words))")
         }
-        let b = try XCTUnwrap(model.differingGroups.first { $0.id == "B" })
+        let b = try XCTUnwrap(model.reviewGroup(.differing, id: "B"))
         XCTAssertEqual(
             model.differenceLine(of: b, item: { _ in nil }),
             line(["date", "place", "camera", "dimensions"].map { L10n.string(dynamicKey: "duplicates.detail_\($0)") }))
         let live = { (uid: PhotoUID) in
             PhotoItem(uid: uid, captureTime: Date(), mediaType: "video/mp4", isLivePhoto: uid == c1)
         }
-        let c = try XCTUnwrap(model.differingGroups.first { $0.id == "C" })
+        let c = try XCTUnwrap(model.reviewGroup(.differing, id: "C"))
         XCTAssertEqual(
             model.differenceLine(of: c, item: live),
             line(["duration", "file_type", "live_photo"].map { L10n.string(dynamicKey: "duplicates.detail_\($0)") }))
@@ -3665,12 +3665,12 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let (model, _) = makeModel(finder)
         let load = Task { await model.load(checkAllGroups: true) }
         await assertEventually({ finder.rankGate.hasWaiters }, "the screen checks metadata")
-        XCTAssertNil(model.differingRowTitle, "the screen shows a count only from a finished check")
+        XCTAssertNil(model.reviewRowTitle(.differing), "the screen shows a count only from a finished check")
 
         finder.rankGate.open()
         await load.value
 
-        XCTAssertEqual(model.differingRowTitle, "\(L10n.string("duplicates.differing_title")) · 1")
+        XCTAssertEqual(model.reviewRowTitle(.differing), "\(L10n.string("duplicates.differing_title")) · 1")
         XCTAssertEqual(model.differingGroups.map(\.id), ["A"])
     }
 
@@ -3683,8 +3683,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let (model, _) = makeModel(finder)
         await model.load(checkAllGroups: true)
         var route = ExactDuplicatesRoute()
-        route.showDiffering(of: model)
-        XCTAssertTrue(route.showsDiffering(of: model))
+        route.show(.differing, of: model)
+        XCTAssertTrue(route.shows(.differing, of: model))
         // A later scan, as after an index build, finds a group whose metadata are not read yet.
         finder.replaceScans([.init(groups: [groupA, groupB, groupC], coverage: .complete)])
         finder.rankGate.close()
@@ -3694,12 +3694,12 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         route.follow(model)
 
-        XCTAssertTrue(route.showsDiffering(of: model), "the open list stays while the check runs")
+        XCTAssertTrue(route.shows(.differing, of: model), "the open list stays while the check runs")
         XCTAssertEqual(model.differingGroups.map(\.id), ["A", "B"])
         finder.rankGate.open()
         await rescan.value
         route.follow(model)
-        XCTAssertTrue(route.showsDiffering(of: model))
+        XCTAssertTrue(route.shows(.differing, of: model))
     }
 
     func testAScreenLoadsOnceWhileItLivesAndItsEndStopsTheCheck() async {
@@ -3800,9 +3800,9 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         XCTAssertEqual(model.groups.map(\.id), ["A"], "copies that differ only in Live Photo stay duplicates")
         XCTAssertEqual(model.differingGroups.map(\.id), ["B"])
-        XCTAssertEqual(model.differingGroups.first?.differences(with: item), differences + [.livePhoto])
+        XCTAssertEqual(model.reviewGroups(.differing).first?.differences(with: item), differences + [.livePhoto])
         XCTAssertEqual(
-            model.differingGroups.first?.differences(with: { _ in nil }), differences,
+            model.reviewGroups(.differing).first?.differences(with: { _ in nil }), differences,
             "without the library items, Live Photo is not named")
     }
 
@@ -3815,12 +3815,13 @@ final class ExactDuplicatesModelTests: XCTestCase {
             uid == self.a2 ? nil : PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/heic")
         }
 
-        let opened = model.viewerItems(opening: a3, inDiffering: "A", item: item)
+        let opened = model.viewerItems(opening: a3, in: .differing, groupID: "A", item: item)
 
         XCTAssertEqual(opened?.items.map(\.uid), [a1, a3], "the copies that the library shows, a2 not yet")
         XCTAssertEqual(opened?.index, 1)
-        XCTAssertNil(model.viewerItems(opening: a2, inDiffering: "A", item: item), "the tapped copy is not ready")
-        XCTAssertNil(model.viewerItems(opening: a1, inDiffering: "B", item: item))
+        XCTAssertNil(
+            model.viewerItems(opening: a2, in: .differing, groupID: "A", item: item), "the tapped copy is not ready")
+        XCTAssertNil(model.viewerItems(opening: a1, in: .differing, groupID: "B", item: item))
         XCTAssertEqual(
             model.viewerItems(opening: a1, inGroup: "A", item: item)?.items.map(\.uid), [a1],
             "the identical group shows only its own copies")
