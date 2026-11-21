@@ -36,6 +36,16 @@ public final class SQLiteStatementFaults {
             database: { handle }, withLock: { body in body() }, fails: fails, failures: failures, matches: matches)
     }
 
+    /// Acts on the `db` handle of a store that owns its database without `SQLiteStoreConnection`, read through
+    /// reflection. Nil when the store has no open `db` handle. Pass the store itself, not an Optional. Create and stop
+    /// it while the store runs no operation.
+    public convenience init?(
+        onStore store: Any, fails: Bool = true, failures: Int = .max, matches: @escaping (String) -> Bool
+    ) {
+        guard let handle = storeDatabaseHandle(store) else { return nil }
+        self.init(onDatabase: handle, fails: fails, failures: failures, matches: matches)
+    }
+
     private init(
         database: @escaping () -> OpaquePointer?, withLock: @escaping (() -> Void) -> Void, fails: Bool,
         failures: Int, matches: @escaping (String) -> Bool

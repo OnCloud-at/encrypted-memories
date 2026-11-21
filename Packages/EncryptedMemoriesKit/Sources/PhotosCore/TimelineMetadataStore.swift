@@ -204,7 +204,6 @@ public enum TimelineMetadataReadError: Error {
 public final class TimelineMetadataStore {
     private var db: OpaquePointer?
     private let policy: LibraryDatabasePolicy
-    private let transient = SQLiteStoreSchemaGate.transientDestructor  // SQLITE_TRANSIENT
 
     /// Feature schema versions this build understands. Any mismatch preserves the store and rejects opening it.
     private static let supportedFeatureVersions: [String: Int] = [
@@ -347,9 +346,10 @@ public final class TimelineMetadataStore {
         defer { sqlite3_finalize(upsert) }
         for (feature, version) in supportedFeatureVersions {
             sqlite3_reset(upsert)
-            sqlite3_bind_text(upsert, 1, feature, -1, SQLiteStoreSchemaGate.transientDestructor)
             sqlite3_bind_int(upsert, 2, Int32(version))
-            guard sqlite3_step(upsert) == SQLITE_DONE else { return false }
+            guard SQLiteBinding.bindText(upsert, 1, feature), sqlite3_step(upsert) == SQLITE_DONE else {
+                return false
+            }
         }
         return true
     }
@@ -533,7 +533,12 @@ public final class TimelineMetadataStore {
             #endif
         }
         let digest = Self.timelineDigest(of: ordered)
-        let generation = readMetaInt(Self.metaGenerationKey) ?? 0
+        // A generation that cannot be read is no proof that none is stored: the save must not start again from 1.
+        guard let generation = metaInt(Self.metaGenerationKey) else {
+            return TimelineSaveResult(
+                skippedUnchanged: false, generation: 0, upsertedRows: 0, sweptRows: 0, succeeded: false
+            )
+        }
 
         if digest == readMeta(Self.metaDigestKey) {
             let tokenWriteSucceeded: Bool
@@ -649,8 +654,10 @@ public final class TimelineMetadataStore {
         guard let token, !token.isEmpty else {
             return deleteMeta(Self.metaValidationTokenKey) && deleteMeta(Self.metaValidationTokenStoredAtKey)
         }
-        // Revalidating an unchanged cursor does not make that stored cursor younger.
-        let unchanged = readMeta(Self.metaValidationTokenKey) == token
+        // Revalidating an unchanged cursor does not make that stored cursor younger. A stored cursor that cannot be
+        // read is no proof that it changed, so its time stays, too.
+        let stored = metaRead(Self.metaValidationTokenKey)
+        let unchanged = stored == .stored(token) || stored == .unreadable
         guard writeMeta(Self.metaValidationTokenKey, token) else { return false }
         if unchanged { return true }
         return writeMeta(Self.metaValidationTokenStoredAtKey, String(Date().timeIntervalSince1970))
@@ -687,23 +694,20 @@ public final class TimelineMetadataStore {
         defer { sqlite3_finalize(stmt) }
         for item in items {
             sqlite3_reset(keyStmt)
-            sqlite3_bind_text(keyStmt, 1, item.uid.volumeID, -1, transient)
-            sqlite3_bind_text(keyStmt, 2, item.uid.nodeID, -1, transient)
-            guard sqlite3_step(keyStmt) == SQLITE_DONE else { return false }
+            // A key missing from the scratch set would make the sweep delete its photo, so it fails the save.
+            guard SQLiteBinding.bindText(keyStmt, 1, item.uid.volumeID),
+                SQLiteBinding.bindText(keyStmt, 2, item.uid.nodeID),
+                sqlite3_step(keyStmt) == SQLITE_DONE
+            else { return false }
 
             sqlite3_reset(stmt)
-            sqlite3_bind_text(stmt, 1, item.uid.volumeID, -1, transient)
-            sqlite3_bind_text(stmt, 2, item.uid.nodeID, -1, transient)
             sqlite3_bind_double(stmt, 3, item.captureTime.timeIntervalSince1970)
-            sqlite3_bind_text(stmt, 4, item.mediaType, -1, transient)
             sqlite3_bind_int(stmt, 5, item.isLoopingLivePhoto ? 2 : (item.isLivePhoto ? 1 : 0))
-            if let rel = item.relatedVideoID {
-                sqlite3_bind_text(stmt, 6, rel, -1, transient)
-            } else {
-                sqlite3_bind_null(stmt, 6)
-            }
             if let dur = item.durationSeconds { sqlite3_bind_double(stmt, 7, dur) } else { sqlite3_bind_null(stmt, 7) }
-            guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+            guard SQLiteBinding.bindText(stmt, 1, item.uid.volumeID), SQLiteBinding.bindText(stmt, 2, item.uid.nodeID),
+                SQLiteBinding.bindText(stmt, 4, item.mediaType), SQLiteBinding.bindText(stmt, 6, item.relatedVideoID),
+                sqlite3_step(stmt) == SQLITE_DONE
+            else { return false }
             upserted += Int(sqlite3_changes(db))
         }
         return true
@@ -748,10 +752,11 @@ public final class TimelineMetadataStore {
         for item in items where !item.tags.isEmpty {
             for tag in item.tags.map(\.rawValue).sorted() {
                 sqlite3_reset(insert)
-                sqlite3_bind_text(insert, 1, item.uid.volumeID, -1, transient)
-                sqlite3_bind_text(insert, 2, item.uid.nodeID, -1, transient)
                 sqlite3_bind_int64(insert, 3, Int64(tag))
-                guard sqlite3_step(insert) == SQLITE_DONE else { return false }
+                guard SQLiteBinding.bindText(insert, 1, item.uid.volumeID),
+                    SQLiteBinding.bindText(insert, 2, item.uid.nodeID),
+                    sqlite3_step(insert) == SQLITE_DONE
+                else { return false }
             }
         }
         return sqlite3_exec(
@@ -782,11 +787,11 @@ public final class TimelineMetadataStore {
         for item in items where !item.burstMemberIDs.isEmpty {
             for (seq, member) in item.burstMemberIDs.enumerated() {
                 sqlite3_reset(insert)
-                sqlite3_bind_text(insert, 1, item.uid.volumeID, -1, transient)
-                sqlite3_bind_text(insert, 2, item.uid.nodeID, -1, transient)
                 sqlite3_bind_int64(insert, 3, Int64(seq))
-                sqlite3_bind_text(insert, 4, member, -1, transient)
-                guard sqlite3_step(insert) == SQLITE_DONE else { return false }
+                guard SQLiteBinding.bindText(insert, 1, item.uid.volumeID),
+                    SQLiteBinding.bindText(insert, 2, item.uid.nodeID),
+                    SQLiteBinding.bindText(insert, 4, member), sqlite3_step(insert) == SQLITE_DONE
+                else { return false }
             }
         }
         let sameKey =
@@ -823,7 +828,7 @@ public final class TimelineMetadataStore {
                 nil
             ) == SQLITE_OK
         else { return nil }
-        guard sqlite3_bind_text(stmt, 1, volumeID, -1, transient) == SQLITE_OK else { return nil }
+        guard SQLiteBinding.bindText(stmt, 1, volumeID) else { return nil }
         var result: [String: String] = [:]
         var step = sqlite3_step(stmt)
         while step == SQLITE_ROW {
@@ -850,7 +855,8 @@ public final class TimelineMetadataStore {
 
     /// Upload completion records MIME evidence before the new node can appear in a timeline row.
     /// A remaining evidence-only node therefore requires one authoritative inventory refresh.
-    public func unmaterializedMediaTypeEvidenceNodeIDs(volumeID: String) -> Set<String> {
+    /// Nil for a failed read: it is no proof that every upload is listed.
+    public func unmaterializedMediaTypeEvidenceNodeIDs(volumeID: String) -> Set<String>? {
         var stmt: OpaquePointer?
         guard
             sqlite3_prepare_v2(
@@ -867,15 +873,16 @@ public final class TimelineMetadataStore {
                 &stmt,
                 nil
             ) == SQLITE_OK
-        else { return [] }
+        else { return nil }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, volumeID, -1, transient)
+        guard SQLiteBinding.bindText(stmt, 1, volumeID) else { return nil }
         var result = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let node = sqlite3_column_text(stmt, 0) else { continue }
-            result.insert(String(cString: node))
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            if let node = sqlite3_column_text(stmt, 0) { result.insert(String(cString: node)) }
+            step = sqlite3_step(stmt)
         }
-        return result
+        return step == SQLITE_DONE ? result : nil
     }
 
     /// Removes evidence for nodes absent from a completed authoritative timeline listing.
@@ -898,15 +905,20 @@ public final class TimelineMetadataStore {
             ) == SQLITE_OK
         else { return false }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, volumeID, -1, transient)
-        return sqlite3_step(stmt) == SQLITE_DONE
+        return SQLiteBinding.bindText(stmt, 1, volumeID) && sqlite3_step(stmt) == SQLITE_DONE
     }
 
     /// Monotonic local revision appended to the foreground library-change token. Publishing one
     /// lets an already-open grid reload after a background reconciliation without pretending that
     /// the server's volume event token changed.
     public func mediaTypeEvidenceRevision() -> Int {
-        readMetaInt(Self.metaMediaTypeEvidenceRevisionKey) ?? 0
+        metaInt(Self.metaMediaTypeEvidenceRevisionKey) ?? 0
+    }
+
+    /// The revision after the stored one, or nil when the stored one cannot be read. A failed read must not publish a
+    /// revision that moves back.
+    private func nextMediaTypeEvidenceRevision() -> Int? {
+        metaInt(Self.metaMediaTypeEvidenceRevisionKey).map { $0 + 1 }
     }
 
     /// Publishes one coalesced foreground-refresh signal after a multi-batch reconciliation. The
@@ -915,7 +927,8 @@ public final class TimelineMetadataStore {
     @discardableResult
     public func publishMediaTypeEvidenceRevision() -> Bool {
         SQLiteTransaction.immediate(db) {
-            writeMeta(Self.metaMediaTypeEvidenceRevisionKey, String(mediaTypeEvidenceRevision() + 1))
+            guard let revision = nextMediaTypeEvidenceRevision() else { return false }
+            return writeMeta(Self.metaMediaTypeEvidenceRevisionKey, String(revision))
         }
     }
 
@@ -945,7 +958,7 @@ public final class TimelineMetadataStore {
             ON CONFLICT(vol,node) DO UPDATE SET mime=excluded.mime
             WHERE mime IS NOT excluded.mime;
             """
-        let photoSQL = "UPDATE photos SET mime=? WHERE vol=? AND node=? AND mime IS NOT ?;"
+        let photoSQL = "UPDATE photos SET mime=?1 WHERE vol=?2 AND node=?3 AND mime IS NOT ?1;"
         let insertTagSQL = "INSERT OR IGNORE INTO photo_tags(vol,node,tag) VALUES(?,?,?);"
         let deleteTagSQL = "DELETE FROM photo_tags WHERE vol=? AND node=? AND tag=?;"
         // The statements end after the transaction. After a failed prepare they end after the rollback; they had not
@@ -968,21 +981,19 @@ public final class TimelineMetadataStore {
             for (uid, mime) in classified {
                 sqlite3_reset(evidenceStmt)
                 sqlite3_clear_bindings(evidenceStmt)
-                sqlite3_bind_text(evidenceStmt, 1, uid.volumeID, -1, transient)
-                sqlite3_bind_text(evidenceStmt, 2, uid.nodeID, -1, transient)
-                sqlite3_bind_text(evidenceStmt, 3, mime, -1, transient)
-                guard sqlite3_step(evidenceStmt) == SQLITE_DONE else {
+                guard SQLiteBinding.bindText(evidenceStmt, 1, uid.volumeID),
+                    SQLiteBinding.bindText(evidenceStmt, 2, uid.nodeID),
+                    SQLiteBinding.bindText(evidenceStmt, 3, mime), sqlite3_step(evidenceStmt) == SQLITE_DONE
+                else {
                     return false
                 }
                 changedEvidenceRows += Int(sqlite3_changes(db))
 
                 sqlite3_reset(photoStmt)
                 sqlite3_clear_bindings(photoStmt)
-                sqlite3_bind_text(photoStmt, 1, mime, -1, transient)
-                sqlite3_bind_text(photoStmt, 2, uid.volumeID, -1, transient)
-                sqlite3_bind_text(photoStmt, 3, uid.nodeID, -1, transient)
-                sqlite3_bind_text(photoStmt, 4, mime, -1, transient)
-                guard sqlite3_step(photoStmt) == SQLITE_DONE else {
+                guard SQLiteBinding.bindText(photoStmt, 1, mime), SQLiteBinding.bindText(photoStmt, 2, uid.volumeID),
+                    SQLiteBinding.bindText(photoStmt, 3, uid.nodeID), sqlite3_step(photoStmt) == SQLITE_DONE
+                else {
                     return false
                 }
                 presentationChanged = presentationChanged || sqlite3_changes(db) > 0
@@ -990,18 +1001,19 @@ public final class TimelineMetadataStore {
                 let tagStmt = mime.hasPrefix("video/") ? insertVideoTagStmt : deleteVideoTagStmt
                 sqlite3_reset(tagStmt)
                 sqlite3_clear_bindings(tagStmt)
-                sqlite3_bind_text(tagStmt, 1, uid.volumeID, -1, transient)
-                sqlite3_bind_text(tagStmt, 2, uid.nodeID, -1, transient)
                 sqlite3_bind_int(tagStmt, 3, Int32(PhotoTag.videos.rawValue))
-                guard sqlite3_step(tagStmt) == SQLITE_DONE else {
+                guard SQLiteBinding.bindText(tagStmt, 1, uid.volumeID), SQLiteBinding.bindText(tagStmt, 2, uid.nodeID),
+                    sqlite3_step(tagStmt) == SQLITE_DONE
+                else {
                     return false
                 }
                 presentationChanged = presentationChanged || sqlite3_changes(db) > 0
             }
 
             if publishRevision && (changedEvidenceRows > 0 || presentationChanged) {
-                let revision = mediaTypeEvidenceRevision() + 1
-                guard writeMeta(Self.metaMediaTypeEvidenceRevisionKey, String(revision)) else {
+                guard let revision = nextMediaTypeEvidenceRevision(),
+                    writeMeta(Self.metaMediaTypeEvidenceRevisionKey, String(revision))
+                else {
                     return false
                 }
             }
@@ -1032,9 +1044,9 @@ public final class TimelineMetadataStore {
                 sqlite3_reset(stmt)
                 sqlite3_clear_bindings(stmt)
                 sqlite3_bind_double(stmt, 1, duration)
-                sqlite3_bind_text(stmt, 2, uid.volumeID, -1, transient)
-                sqlite3_bind_text(stmt, 3, uid.nodeID, -1, transient)
-                guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+                guard SQLiteBinding.bindText(stmt, 2, uid.volumeID), SQLiteBinding.bindText(stmt, 3, uid.nodeID),
+                    sqlite3_step(stmt) == SQLITE_DONE
+                else { return false }
                 updated += Int(sqlite3_changes(db))
             }
             return true
@@ -1051,7 +1063,7 @@ public final class TimelineMetadataStore {
     /// The stored motion and playback of the given photos, by node ID, when `rule` chose the stored timeline's motions
     /// (`markRelatedVideosChosen(by:)`). Empty otherwise: an earlier build, or a save after the mark, chose them.
     public func relatedVideos(for uids: [PhotoUID], chosenBy rule: String) -> [String: (id: String, loops: Bool)] {
-        guard !uids.isEmpty, readMeta(Self.metaRelatedVideoRuleKey) == relatedVideoRuleMark(rule) else { return [:] }
+        guard !uids.isEmpty, relatedVideosChosen(by: rule) else { return [:] }
         var stmt: OpaquePointer?
         guard
             sqlite3_prepare_v2(db, "SELECT relvid, live FROM photos WHERE vol=? AND node=?;", -1, &stmt, nil)
@@ -1061,8 +1073,10 @@ public final class TimelineMetadataStore {
         var result: [String: (id: String, loops: Bool)] = [:]
         for uid in uids {
             sqlite3_reset(stmt)
-            sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
-            sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
+            // A key that does not bind is no proof that the photo has no related video: nothing is known.
+            guard SQLiteBinding.bindText(stmt, 1, uid.volumeID), SQLiteBinding.bindText(stmt, 2, uid.nodeID) else {
+                return [:]
+            }
             guard sqlite3_step(stmt) == SQLITE_ROW, let relvid = sqlite3_column_text(stmt, 0) else { continue }
             result[uid.nodeID] = (id: String(cString: relvid), loops: sqlite3_column_int(stmt, 1) == 2)
         }
@@ -1074,17 +1088,21 @@ public final class TimelineMetadataStore {
     /// example an earlier build after a downgrade, voids it. `store_meta` holds it; the schema stays unchanged.
     @discardableResult
     public func markRelatedVideosChosen(by rule: String) -> Bool {
-        writeMeta(Self.metaRelatedVideoRuleKey, relatedVideoRuleMark(rule))
+        guard let mark = relatedVideoRuleMark(rule) else { return false }
+        return writeMeta(Self.metaRelatedVideoRuleKey, mark)
     }
 
     /// Whether `rule` chose the related videos of the stored timeline (`markRelatedVideosChosen(by:)` after the last
     /// save). False after a save that was not marked, so a load must read the types again.
     public func relatedVideosChosen(by rule: String) -> Bool {
-        readMeta(Self.metaRelatedVideoRuleKey) == relatedVideoRuleMark(rule)
+        guard let mark = relatedVideoRuleMark(rule) else { return false }
+        return readMeta(Self.metaRelatedVideoRuleKey) == mark
     }
 
-    private func relatedVideoRuleMark(_ rule: String) -> String {
-        "\(rule)@\(readMetaInt(Self.metaGenerationKey) ?? 0)"
+    /// The mark of `rule` for the stored generation, or nil when the generation cannot be read: a mark for generation 0
+    /// could match a mark that an earlier failed read wrote.
+    private func relatedVideoRuleMark(_ rule: String) -> String? {
+        metaInt(Self.metaGenerationKey).map { "\(rule)@\($0)" }
     }
 
     /// Capture time and media type of the given photos that this store lists, by primary key. The items carry no
@@ -1098,8 +1116,10 @@ public final class TimelineMetadataStore {
         var items: [PhotoItem] = []
         for uid in uids {
             sqlite3_reset(stmt)
-            sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
-            sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
+            // A key that does not bind is no proof that the photo is unknown: nothing is known.
+            guard SQLiteBinding.bindText(stmt, 1, uid.volumeID), SQLiteBinding.bindText(stmt, 2, uid.nodeID) else {
+                return []
+            }
             guard sqlite3_step(stmt) == SQLITE_ROW else { continue }
             items.append(
                 PhotoItem(
@@ -1129,9 +1149,9 @@ public final class TimelineMetadataStore {
                 defer { sqlite3_finalize(stmt) }
                 for uid in uids {
                     sqlite3_reset(stmt)
-                    sqlite3_bind_text(stmt, 1, uid.volumeID, -1, transient)
-                    sqlite3_bind_text(stmt, 2, uid.nodeID, -1, transient)
-                    guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+                    guard SQLiteBinding.bindText(stmt, 1, uid.volumeID), SQLiteBinding.bindText(stmt, 2, uid.nodeID),
+                        sqlite3_step(stmt) == SQLITE_DONE
+                    else { return false }
                 }
             }
             return deleteMeta(Self.metaDigestKey)
@@ -1188,19 +1208,48 @@ public final class TimelineMetadataStore {
 
     // MARK: store_meta
 
-    private func readMeta(_ key: String) -> String? {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT value FROM store_meta WHERE key = ?;", -1, &stmt, nil) == SQLITE_OK else {
-            return nil
+    /// A `store_meta` read: the stored value, no stored value, or a read that failed in its prepare, bind or step.
+    private enum MetaRead: Equatable {
+        case stored(String)
+        case absent
+        case unreadable
+
+        var value: String? {
+            guard case .stored(let value) = self else { return nil }
+            return value
         }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, key, -1, transient)
-        guard sqlite3_step(stmt) == SQLITE_ROW, let value = sqlite3_column_text(stmt, 0) else { return nil }
-        return String(cString: value)
     }
 
-    private func readMetaInt(_ key: String) -> Int? {
-        readMeta(key).flatMap(Int.init)
+    private func metaRead(_ key: String) -> MetaRead {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM store_meta WHERE key = ?;", -1, &stmt, nil) == SQLITE_OK else {
+            return .unreadable
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard SQLiteBinding.bindText(stmt, 1, key) else { return .unreadable }
+        switch sqlite3_step(stmt) {
+        case SQLITE_ROW:
+            guard let value = sqlite3_column_text(stmt, 0) else { return .unreadable }
+            return .stored(String(cString: value))
+        case SQLITE_DONE:
+            return .absent
+        default:
+            return .unreadable
+        }
+    }
+
+    /// The stored value, or nil when no value is stored or the read failed.
+    private func readMeta(_ key: String) -> String? {
+        metaRead(key).value
+    }
+
+    /// The stored integer, 0 when no value or no integer is stored, or nil when the read failed.
+    private func metaInt(_ key: String) -> Int? {
+        switch metaRead(key) {
+        case .stored(let value): Int(value) ?? 0
+        case .absent: 0
+        case .unreadable: nil
+        }
     }
 
     private func writeMeta(_ key: String, _ value: String) -> Bool {
@@ -1208,9 +1257,8 @@ public final class TimelineMetadataStore {
         let sql = "INSERT INTO store_meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, key, -1, transient)
-        sqlite3_bind_text(stmt, 2, value, -1, transient)
-        return sqlite3_step(stmt) == SQLITE_DONE
+        return SQLiteBinding.bindText(stmt, 1, key) && SQLiteBinding.bindText(stmt, 2, value)
+            && sqlite3_step(stmt) == SQLITE_DONE
     }
 
     private func deleteMeta(_ key: String) -> Bool {
@@ -1219,8 +1267,7 @@ public final class TimelineMetadataStore {
             return false
         }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, key, -1, transient)
-        return sqlite3_step(stmt) == SQLITE_DONE
+        return SQLiteBinding.bindText(stmt, 1, key) && sqlite3_step(stmt) == SQLITE_DONE
     }
 
     // MARK: Internal inspection

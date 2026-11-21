@@ -38,17 +38,11 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         PhotoItem(uid: uid, captureTime: Date(timeIntervalSince1970: 500), mediaType: "image/jpeg")
     }
 
-    /// Fails the binds of the first statement whose SQL contains `statement` that starts after the first statement whose
-    /// SQL contains `earlier` finished, or at once without `earlier`.
-    private func failBinds(of statement: String, after earlier: String? = nil) -> BindFailureUntilStep {
-        let fault = BindFailureUntilStep(
-            onDatabase: store.connectionForTesting, statement: statement, after: earlier, limit: Self.limit)
-        if earlier == nil { XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply") }
-        return fault
-    }
-
-    func testSynchronizeWithAKeyThatDoesNotBindFailsBeforeTheScratchInsert() {
-        let fault = failBinds(of: "INSERT OR IGNORE INTO incoming_order", after: "CREATE TEMP TABLE incoming_order")
+    func testSynchronizeWithAKeyThatDoesNotBindFailsBeforeTheScratchInsert() throws {
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT OR IGNORE INTO incoming_order",
+                after: "CREATE TEMP TABLE incoming_order", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.synchronize([photo(Self.long)], classifiedUIDs: []),
@@ -56,26 +50,33 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testSynchronizeWithAKeyThatDoesNotBindFailsBeforeTheOrderUpsert() {
-        let fault = failBinds(of: "INSERT INTO photo_order", after: "INSERT OR IGNORE INTO incoming_order")
+    func testSynchronizeWithAKeyThatDoesNotBindFailsBeforeTheOrderUpsert() throws {
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "INSERT INTO photo_order", after: "INSERT OR IGNORE INTO incoming_order",
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.synchronize([photo(Self.long)], classifiedUIDs: []))
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
     /// The limit drops after the sweep page read: a lowered limit also fails a read of the long key.
-    func testSweepWithAnEndKeyThatDoesNotBindFailsTheSynchronization() {
-        let fault = failBinds(
-            of: "DELETE FROM photo_order WHERE", after: "SELECT vol,node FROM photo_order WHERE (vol,node)>")
+    func testSweepWithAnEndKeyThatDoesNotBindFailsTheSynchronization() throws {
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "DELETE FROM photo_order WHERE",
+                after: "SELECT vol,node FROM photo_order WHERE (vol,node)>", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.synchronize([photo(Self.long)], classifiedUIDs: []), "A sweep that removed nothing is not complete")
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testSweepPageWithACursorThatDoesNotBindFailsTheSynchronization() {
-        let fault = failBinds(
-            of: "SELECT vol,node FROM photo_order WHERE (vol,node)>", after: "DELETE FROM photo_order WHERE")
+    func testSweepPageWithACursorThatDoesNotBindFailsTheSynchronization() throws {
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT vol,node FROM photo_order WHERE (vol,node)>",
+                after: "DELETE FROM photo_order WHERE", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.synchronize([photo(Self.long)], classifiedUIDs: []),
@@ -83,17 +84,20 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testNextPageWithACursorThatDoesNotBindIsAReadFailure() {
+    func testNextPageWithACursorThatDoesNotBindIsAReadFailure() throws {
         XCTAssertTrue(store.synchronize([photo(Self.long)], classifiedUIDs: []))
-        let fault = failBinds(of: "SELECT vol,node,t,")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(onStore: store!, statement: "SELECT vol,node,t,", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertThrowsError(try store.nextPage(after: Self.long), "A cursor that does not bind is no end of the work")
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheMetadataLookup() {
+    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheMetadataLookup() throws {
         XCTAssertTrue(store.synchronize([photo(Self.long)], classifiedUIDs: []))
-        let fault = failBinds(of: "SELECT inspected,mime_seen")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT inspected,mime_seen", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.record([Self.long: TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: 501))]),
@@ -101,9 +105,11 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheClassificationLookup() {
+    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheClassificationLookup() throws {
         XCTAssertTrue(store.synchronize([photo(Self.long)], classifiedUIDs: []))
-        let fault = failBinds(of: "SELECT inspected,mime_seen")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "SELECT inspected,mime_seen", after: nil, limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.record([:], classifiedUIDs: [Self.long]),
@@ -111,9 +117,12 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheMetadataUpdate() {
+    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheMetadataUpdate() throws {
         XCTAssertTrue(store.synchronize([photo(Self.long)], classifiedUIDs: []))
-        let fault = failBinds(of: "UPDATE photo_order SET exact", after: "SELECT inspected,mime_seen")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "UPDATE photo_order SET exact", after: "SELECT inspected,mime_seen",
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.record([Self.long: TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: 501))]),
@@ -121,9 +130,12 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testRecordWithAStableIdentityThatDoesNotBindFailsInsteadOfStoringNull() {
+    func testRecordWithAStableIdentityThatDoesNotBindFailsInsteadOfStoringNull() throws {
         XCTAssertTrue(store.synchronize([photo(Self.short)], classifiedUIDs: []))
-        let fault = failBinds(of: "UPDATE photo_order SET exact", after: "SELECT inspected,mime_seen")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "UPDATE photo_order SET exact", after: "SELECT inspected,mime_seen",
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.record([Self.short: TimelineOrderMetadata(stableIdentity: String(repeating: "i", count: 512))]),
@@ -131,17 +143,23 @@ final class TimelineOrderMetadataBindingFailureTests: XCTestCase {
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheClassificationUpdate() {
+    func testRecordWithAKeyThatDoesNotBindFailsBeforeTheClassificationUpdate() throws {
         XCTAssertTrue(store.synchronize([photo(Self.long)], classifiedUIDs: []))
-        let fault = failBinds(of: "UPDATE photo_order SET mime_seen", after: "SELECT inspected,mime_seen")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "UPDATE photo_order SET mime_seen", after: "SELECT inspected,mime_seen",
+                limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(store.record([:], classifiedUIDs: [Self.long]), "An update that matched no row recorded nothing")
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
-    func testResolvedMetadataWithAKeyThatDoesNotBindFailsItsPublication() {
+    func testResolvedMetadataWithAKeyThatDoesNotBindFailsItsPublication() throws {
         XCTAssertTrue(store.synchronize([photo(Self.long)], classifiedUIDs: []))
-        let fault = failBinds(of: "UPDATE photo_order AS o SET published=1", after: "UPDATE photo_order SET exact")
+        let fault = try XCTUnwrap(
+            BindFailureUntilStep(
+                onStore: store!, statement: "UPDATE photo_order AS o SET published=1",
+                after: "UPDATE photo_order SET exact", limit: Self.limit))
         defer { fault.remove() }
         XCTAssertFalse(
             store.recordResolvedMetadata(

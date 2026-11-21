@@ -17,30 +17,31 @@ enum StubbedLibrary {
         return try await body(directory, store)
     }
 
-    static func routeShare() {
+    static func routeShare(volumeID: String = "vol1") {
         StubURLProtocol.route(
             "GET /drive/shares",
-            json: #"{"Code":1000,"Shares":[{"ShareID":"share1","VolumeID":"vol1","LinkID":"root","State":1}]}"#)
+            json: #"{"Code":1000,"Shares":[{"ShareID":"share1","VolumeID":"\#(volumeID)","LinkID":"root","State":1}]}"#)
     }
 
     /// The feed moves from event `from` to `from + 1`. The SDK reads only the cursor of the version 2 feed; the app
     /// reads the removals from the first one.
-    static func routeEvents(from: Int, removed: [String] = []) {
+    static func routeEvents(from: Int, removed: [String] = [], volumeID: String = "vol1") {
         let to = from + 1
         let events = removed.map {
             #"{"EventType":2,"ContextShareID":"share1","Link":{"LinkID":"\#($0)","Type":2,"State":2}}"#
         }.joined(separator: ",")
-        StubURLProtocol.route("GET /drive/volumes/vol1/events/latest", json: #"{"Code":1000,"EventID":"event-\#(to)"}"#)
         StubURLProtocol.route(
-            "GET /drive/volumes/vol1/events/event-\(from)",
+            "GET /drive/volumes/\(volumeID)/events/latest", json: #"{"Code":1000,"EventID":"event-\#(to)"}"#)
+        StubURLProtocol.route(
+            "GET /drive/volumes/\(volumeID)/events/event-\(from)",
             json: #"{"Code":1000,"EventID":"event-\#(to)","More":0,"Refresh":0,"Events":[\#(events)]}"#)
         for cursor in [from, to] {
             StubURLProtocol.route(
-                "GET /drive/v2/volumes/vol1/events/event-\(cursor)",
+                "GET /drive/v2/volumes/\(volumeID)/events/event-\(cursor)",
                 json: #"{"Code":1000,"EventID":"event-\#(to)","More":false,"Refresh":false,"Events":[]}"#)
         }
         StubURLProtocol.route(
-            "GET /drive/volumes/vol1/events/event-\(to)",
+            "GET /drive/volumes/\(volumeID)/events/event-\(to)",
             json: #"{"Code":1000,"EventID":"event-\#(to)","More":0,"Refresh":0,"Events":[]}"#)
     }
 

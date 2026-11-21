@@ -1015,7 +1015,7 @@ final class TimelineMetadataStoreTests: XCTestCase {
         XCTAssertEqual(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: "vol1"), ["fresh-upload"])
 
         XCTAssertTrue(store.pruneUnmaterializedMediaTypeEvidence(volumeID: "vol1"))
-        XCTAssertTrue(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: "vol1").isEmpty)
+        XCTAssertEqual(store.unmaterializedMediaTypeEvidenceNodeIDs(volumeID: "vol1"), [], "A complete empty read")
         XCTAssertNil(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["fresh-upload"])
         XCTAssertEqual(try XCTUnwrap(store.mediaTypeEvidence(volumeID: "vol1"))["missed-video"], "video/quicktime")
 

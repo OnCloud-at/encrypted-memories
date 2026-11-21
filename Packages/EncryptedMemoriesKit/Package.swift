@@ -155,6 +155,7 @@ let package = Package(
             dependencies: [
                 "ProtonDriveBackend", "ProtonAuth", "PhotosCore", "AlbumSyncCore", "DeviceRootCore", "UploadCore",
                 "UploadTestSupport",
+                "SQLiteTestSupport",
                 .product(name: "ProtonDriveSDK", package: "ProtonDriveSDK"),
                 .product(name: "ProtonCoreCryptoGoInterface", package: "protoncore_ios"),
                 // Crypto round-trip tests require the implementation injected by the app.
