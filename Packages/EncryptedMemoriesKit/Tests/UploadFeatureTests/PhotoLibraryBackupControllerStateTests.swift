@@ -6919,6 +6919,27 @@ extension PhotoLibraryBackupControllerStateTests {
     #endif
 
     #if DEBUG
+        /// A restore check whose queue row cannot be read is unreadable. It neither waits as if the row were absent nor
+        /// enqueues the photo again (#1153).
+        func testARestoreCheckWithAnUnreadableQueueRowIsUnreadableAndEnqueuesNothing() async throws {
+            try await withRestore829Fixture(.burst) { f in
+                let main = try await f.initialBackup()
+                let checked = try f.restoredState(main)
+                let uploads = f.server.uploadRequestCount
+                let rows = f.queue.count()
+                let fault = try SQLiteReadInterrupt(
+                    in: f.queue, matching: "SELECT original_filename, byte_count, state")
+                let outcome = await f.controller.returnToBackup([checked])
+                fault.stop()
+                XCTAssertTrue(fault.fired, "the keyed queue read of the check was interrupted")
+                XCTAssertEqual(outcome[f.key], .unreadable)
+                XCTAssertEqual(f.queue.count(), rows, "an unreadable row enqueues nothing")
+                XCTAssertEqual(f.server.uploadRequestCount, uploads)
+            }
+        }
+    #endif
+
+    #if DEBUG
         func testANewerEditUploadsWhileAnOlderRestoreWaits() async throws {
             for registersRestore in [true, false] {
                 try await withRestore829Fixture(.burst) { f in

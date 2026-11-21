@@ -536,6 +536,18 @@ func queueEntryForTesting(
     }
 }
 
+extension UploadBackupSyncQueueStore {
+    /// The keyed read of a test that inspects one row. A read that fails throws, so a test cannot take a failed read
+    /// for an absent row; a test that expects absence says so through `queueEntryForTesting` or `decisionEntry`.
+    func entry(for source: UploadSourceIdentity, revision: UploadBackupRevision) throws -> UploadBackupSyncQueueEntry? {
+        switch try decisionEntry(for: source, revision: revision) {
+        case .found(let row): return row
+        case .absent: return nil
+        case .unknown: throw SQLiteStoreUnknownReadError()
+        }
+    }
+}
+
 /// State-store fakes keep their single-row probes in the test target. Production stores implement the batch contract.
 protocol UploadBackupStateTestStore: UploadBackupStateStore {
     func record(for source: UploadSourceIdentity, revision: UploadBackupRevision) -> UploadBackupAssetRecord?

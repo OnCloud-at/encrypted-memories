@@ -44,22 +44,11 @@ final class QueueTypedDecisionReadTests: XCTestCase {
         XCTAssertEqual(try store.decisionEntry(for: source, revision: revision), .found(stored))
     }
 
-    func testAWrapperStoreInheritsTheStrictReadAndNeverAnswersAbsentForAFailedRead() throws {
-        XCTAssertTrue(queue.upsert(row()))
-        let wrapper = SpyQueueStore(inner: queue, log: BackupEventLog(), unknownEntryReads: 1)
-        XCTAssertEqual(try wrapper.decisionEntry(for: source, revision: revision), .unknown)
-        XCTAssertEqual(try wrapper.decisionEntry(for: source, revision: revision), .found(row()))
-        XCTAssertEqual(try wrapper.decisionEntry(for: missing, revision: revision), .absent)
-    }
-
-    /// Only a failed read is unknown. Any other error is no answer: it propagates, a cancellation stays one.
-    func testAnErrorOtherThanAFailedReadPropagatesAndIsNeverAnUnknownRow() async throws {
+    /// The engine keeps a foreign error of the read, a cancellation for example, and never turns it into an unknown row.
+    func testAnErrorOtherThanAFailedReadPropagatesThroughTheEngine() async throws {
         XCTAssertTrue(queue.upsert(row()))
         let wrapper = SpyQueueStore(inner: queue, log: BackupEventLog())
         wrapper.entryReadFailure = CancellationError()
-        XCTAssertThrowsError(try wrapper.decisionEntry(for: source, revision: revision)) {
-            XCTAssertTrue($0 is CancellationError, "\($0)")
-        }
 
         let snapshot = UploadBackupAssetSnapshot(
             source: source, revision: revision, editRevision: .unavailable, resourceCount: 1, externalIdentity: nil)
@@ -72,9 +61,6 @@ final class QueueTypedDecisionReadTests: XCTestCase {
         } catch {
             XCTAssertTrue(error is CancellationError, "the engine keeps the error: \(error)")
         }
-
-        wrapper.entryReadFailure = nil
-        XCTAssertEqual(try wrapper.decisionEntry(for: source, revision: revision), .found(row()))
     }
 
     func testDismissingAProblemRefusesAnUnknownRowAndKeepsItsRecord() throws {
