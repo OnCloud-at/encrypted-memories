@@ -1,0 +1,61 @@
+// Host decision canary (#1157): the platform types in every pattern form. The host rules must report nothing here,
+// with or without a module path. A declaration that stores a domain error is no pattern and no cast.
+enum Phase {
+    case failed(AlbumError)
+    case blocked(reason: UploadError)
+}
+
+func allowedPatterns(result: Result<Int, any Error>, error: any Error) {
+    do {
+        try work()
+    } catch CancellationError() {
+        return
+    } catch URLError.timedOut {
+        retry()
+    } catch Foundation.URLError.cancelled {
+        retry()
+    } catch CocoaError.fileNoSuchFile {
+        retry()
+    } catch Foundation.CocoaError.fileReadNoPermission {
+        retry()
+    } catch DecodingError.dataCorrupted(let context) {
+        log(context)
+    } catch Swift.DecodingError.keyNotFound(let key, let context) {
+        log(key, context)
+    } catch EncodingError.invalidValue(let value, let context) {
+        log(value, context)
+    } catch let decoding as DecodingError {
+        log(decoding)
+    } catch {
+        // A comment may name a pattern: if case UploadError.quota = error, case .failure(AlbumError.notFound),
+        // catch UploadError.quota, error as AlbumError.
+        if case URLError.timedOut = error { retry() }
+        guard case Foundation.CocoaError.fileNoSuchFile = error else { return }
+        if case let DecodingError.dataCorrupted(context) = error { log(context) }
+        if case EncodingError.invalidValue = error { retry() }
+        if case Swift.DecodingError.keyNotFound = error { retry() }
+        let native = error as NSError
+        let localized = error as LocalizedError
+        let anyLocalized = error as any Foundation.LocalizedError
+        let anyError = error as any Error
+        log(native, localized, anyLocalized, anyError)
+    }
+    switch result {
+    case .failure(let typed as URLError): show(typed)
+    case let .failure(typed as DecodingError): show(typed)
+    case .failure(URLError.timedOut): retry()
+    case .failure(Foundation.URLError.cancelled): retry()
+    case let .failure(CocoaError.fileNoSuchFile): retry()
+    case .failure(DecodingError.dataCorrupted(let context)): log(context)
+    case .failure(Swift.EncodingError.invalidValue): retry()
+    case .failure(CancellationError()): retry()
+    case .failure(let typed) where typed is Swift.CancellationError: retry()
+    case .success(let value): show(value)
+    default: break
+    }
+    switch phase {
+    case URLError.timedOut: retry()
+    case Foundation.DecodingError.dataCorrupted: retry()
+    default: break
+    }
+}

@@ -63,6 +63,8 @@ func forbidden() {
         // A web address in a string does not hide the site behind it.
         // expect: no_domain_error_decision_in_host
         _ = (URL(string: "https://example.invalid"), error as? AlbumError)
+        // expect: no_domain_error_decision_in_host
+        _ = URL(string: "https://example.invalid"); switch error { default: break }
     }
     // expect: no_store_health_check_in_host
     _ = pendingStore?.isOperational() == true
