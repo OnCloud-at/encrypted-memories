@@ -288,10 +288,10 @@ public struct AlbumCapabilities: Sendable, Equatable {
         canSetCover: false
     )
 
-    /// SDK reads plus the narrow direct-HTTP write surface that the Swift API of the SDK cannot replace.
-    /// The HTTP writes resolve the account's own Photos share, volume and root key, so they address
-    /// only owned albums. `canWriteSharedAlbums` therefore stays false.
-    public static let sdkCatalogWithHTTPWrites = AlbumCapabilities(
+    /// SDK reads and the five SDK album writes (create, cover, delete, add, remove).
+    /// The writes address an album by its bare node identifier in the account's own Photos volume, so they
+    /// address only owned albums. `canWriteSharedAlbums` therefore stays false.
+    public static let sdkCatalogAndWrites = AlbumCapabilities(
         canList: true,
         canCreate: true,
         canDelete: true,

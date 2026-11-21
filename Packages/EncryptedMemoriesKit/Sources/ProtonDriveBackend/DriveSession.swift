@@ -450,24 +450,6 @@ extension DriveSession {
         )
     }
 
-    /// Sets an album's cover to an already-uploaded photo. A cleartext LinkID reference (no crypto) - matches the
-    /// Proton web client: PUT the album link with the chosen photo's link id.
-    func setAlbumCover(volumeID: String, albumLinkID: String, coverLinkID: String) async throws {
-        try await send(
-            "/drive/photos/volumes/\(volumeID)/albums/\(albumLinkID)", method: "PUT", body: ["CoverLinkID": coverLinkID]
-        )
-    }
-
-    /// Permanently deletes the album container while preserving every photo in the timeline. Proton refuses
-    /// this safe form when an album contains photos that exist nowhere else; callers must surface that failure
-    /// instead of retrying with `DeleteAlbumPhotos=1`, which would permanently delete those originals.
-    func deleteAlbum(volumeID: String, albumLinkID: String) async throws {
-        try await send(
-            "/drive/photos/volumes/\(volumeID)/albums/\(albumLinkID)?DeleteAlbumPhotos=0",
-            method: "DELETE"
-        )
-    }
-
     /// The web client's `BATCH_REQUEST_SIZE` for link mutations - larger batches get per-item errors.
     private static let batchRequestSize = 50
     /// The web client's chunk size for `links/fetch_metadata`.

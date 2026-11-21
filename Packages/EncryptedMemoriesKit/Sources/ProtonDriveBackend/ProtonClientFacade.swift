@@ -116,8 +116,9 @@ public final class ProtonClientFacade {
         identityComposition: UploadIdentityResolverComposition,
         settlementStore: UploadManualSettlementStore?
     ) -> ProtonClientFacade {
-        // Albums: SDK 0.33.1 is the sole catalog/sharing/membership reader. Direct Photos HTTP is
-        // retained only for the album writes, which the app does not yet send through the SDK.
+        // Albums: SDK 0.33.1 is the catalog/sharing/membership reader and sends the five album writes
+        // (create, cover, delete, add, remove). Direct Photos HTTP remains for two uses: Album Sync creates albums and
+        // attaches photos through the album write service, and the photos of an owned album are listed over HTTP.
         // Recently Deleted lists photos that left every inventory. The coordinator authorizes their
         // thumbnails from that listing; a weak reference keeps the bridge from retaining the coordinator.
         bridge.setIdentitiesOutsideInventoryObserver { [weak librarySources] uids, sequence in
@@ -125,32 +126,9 @@ public final class ProtonClientFacade {
         }
         let albumWrite = bridge.makeAlbumWriteService()
         let albumCatalog = bridge.makeAlbumCatalogBackend()
-        let albumWrites = HTTPAlbumWriteBackend(
-            setCoverProvider: { albumID, photoUID in
-                try await bridge.setAlbumCover(albumID: albumID, photoUID: photoUID)
-            },
-            createProvider: { name in try await albumWrite.createAlbum(name: name) },
-            deleteProvider: { albumID in try await bridge.deleteAlbum(albumID: albumID) },
-            addProvider: { photoUIDs, albumID in
-                let result = try await albumWrite.attach(
-                    photoUIDs.map { AlbumAttachRequestItem(uid: $0) }, albumID: albumID
-                )
-                if result.failedCount > 0 {
-                    DebugLog.log(
-                        "[AlbumWrite] membership incomplete selected=\(photoUIDs.count) "
-                            + "ok=\(result.attachedCount + result.alreadyMemberCount) failed=\(result.failedCount) "
-                            + "reason=\(result.firstFailureMessage ?? "unknown")"
-                    )
-                }
-                try result.requireComplete(for: photoUIDs)
-            },
-            removeProvider: { photoUIDs, albumID in
-                try await bridge.removePhotos(photoUIDs, fromAlbum: albumID)
-            }
-        )
         let albumsRepo = AlbumsRepository(
             catalogBackend: albumCatalog,
-            writeBackend: albumWrites,
+            writeBackend: bridge.makeAlbumWriteBackend(),
             didLeaveSharedAlbum: { album in
                 await librarySources.revokeAdditionalSource(for: album)
             }

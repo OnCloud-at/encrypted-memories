@@ -11,9 +11,8 @@ public protocol AlbumManaging: AlbumOperations {
     func createAlbum(name: String, adding photoUIDs: [PhotoUID]) async throws -> AlbumID
 }
 
-/// Default implementation over separate catalog and write backends. This split makes the SDK the
-/// only owned/shared catalog and membership reader while preserving the narrow HTTP write surface
-/// for the album writes the app does not yet send through the SDK.
+/// Default implementation over separate catalog and write backends. The SDK is the only owned/shared
+/// catalog and membership reader and sends the five album writes for the owned Photos volume.
 public actor AlbumsRepository: AlbumManaging {
     public nonisolated let capabilities: AlbumCapabilities
     private let catalogBackend: any AlbumCatalogBackend
@@ -21,7 +20,7 @@ public actor AlbumsRepository: AlbumManaging {
     private let didLeaveSharedAlbum: @Sendable (AlbumNodeIdentifier) async -> Void
     private var albumCatalogCache: [AlbumSummary]?
     /// Last shared-with-me catalog. Owned-album writes take a bare link id, so this guards against a
-    /// shared album reaching the owned-share HTTP path.
+    /// shared album reaching the owned-volume write path.
     private var sharedAlbumCatalogCache: [SharedAlbumSummary] = []
     private var hasLoadedSharedAlbumCatalog = false
     /// Session-local on-demand membership cache. Successful writes update it in place, so opening a
@@ -36,7 +35,7 @@ public actor AlbumsRepository: AlbumManaging {
     public init(
         catalogBackend: any AlbumCatalogBackend,
         writeBackend: any AlbumWriteBackend,
-        capabilities: AlbumCapabilities = .sdkCatalogWithHTTPWrites,
+        capabilities: AlbumCapabilities = .sdkCatalogAndWrites,
         didLeaveSharedAlbum: @escaping @Sendable (AlbumNodeIdentifier) async -> Void = { _ in }
     ) {
         self.catalogBackend = catalogBackend

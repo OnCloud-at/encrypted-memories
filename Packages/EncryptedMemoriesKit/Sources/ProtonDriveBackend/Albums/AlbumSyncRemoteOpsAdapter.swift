@@ -5,8 +5,9 @@ import PhotosCore
 import UploadCore
 
 /// `AlbumSyncCore.AlbumSyncRemoteAlbumOps` over the album write service + the bridge's decrypted
-/// album listing. Thin translation only - if Proton's SDK gains album-write APIs, this adapter is
-/// the single type to swap.
+/// album listing. Thin translation only. Album Sync still creates albums and attaches photos over the
+/// Drive web API (the five album writes of the app use the SDK, see `SDKAlbumWriteBackend`); this
+/// adapter is the single type to swap when Album Sync moves to the SDK album calls.
 struct ProtonAlbumSyncRemoteOps: AlbumSyncRemoteAlbumOps {
     let service: ProtonAlbumWriteService
     /// The bridge's album listing (ids + decrypted titles) - shared with the sidebar/repository.

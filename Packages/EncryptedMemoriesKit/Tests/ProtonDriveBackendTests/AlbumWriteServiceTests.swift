@@ -878,27 +878,5 @@ extension DriveSessionStubSuite {
             #expect(entry["Hash"] as? String == fixture.hmacHex(fixture.photoName, keyToken: albumHashToken))
             #expect(entry["ContentHash"] as? String == fixture.hmacHex("ff00", keyToken: albumHashToken))
         }
-
-        @Test func removeFromAlbumUsesVerifiedEndpointAndTenItemBatches() async throws {
-            StubURLProtocol.reset()
-            StubURLProtocol.route(
-                "POST /drive/photos/volumes/vol1/albums/album1/remove-multiple",
-                json: #"{"Code":1001}"#
-            )
-
-            let linkIDs = (1...11).map { "p\($0)" }
-            try await makeStubbedSession().removeFromAlbum(
-                volumeID: "vol1",
-                albumLinkID: "album1",
-                linkIDs: linkIDs
-            )
-
-            let requests = StubURLProtocol.requests().filter {
-                $0.path == "/drive/photos/volumes/vol1/albums/album1/remove-multiple"
-            }
-            #expect(requests.count == 2)
-            #expect(try body(of: requests[0])["LinkIDs"] as? [String] == Array(linkIDs.prefix(10)))
-            #expect(try body(of: requests[1])["LinkIDs"] as? [String] == ["p11"])
-        }
     }
 }

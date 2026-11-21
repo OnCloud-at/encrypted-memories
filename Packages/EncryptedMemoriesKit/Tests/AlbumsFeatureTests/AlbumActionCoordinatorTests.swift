@@ -52,7 +52,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
 
     @MainActor
     func testAlbumLoadingPlaceholdersDisappearPermanentlyAfterInitialRefresh() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
         XCTAssertTrue(coordinator.showsAlbumLoadingPlaceholder)
@@ -78,7 +78,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
     @MainActor
     func testRetryAfterAFailedLoadShowsLoadingUntilTheResultArrives() async {
         struct Offline: Error {}
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.listError = Offline()
         backend.sharedListError = Offline()
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
@@ -112,7 +112,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
     @MainActor
     func testRetryThatFindsNoAlbumsShowsTheEmptyList() async {
         struct Offline: Error {}
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.listError = Offline()
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         await coordinator.refresh()
@@ -129,7 +129,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
     @MainActor
     func testRetryThatFindsAlbumsShowsThem() async {
         struct Offline: Error {}
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.listError = Offline()
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         await coordinator.refresh()
@@ -147,7 +147,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
     /// the loading row.
     @MainActor
     func testReloadOfAnEmptyListThatLoadedFineKeepsTheEmptyList() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         await coordinator.refresh()
         await coordinator.refreshSharedAlbums()
@@ -173,7 +173,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
 
     @MainActor
     func testCreateAndAddRefreshesSharedAlbumState() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
         let outcome = await coordinator.createAlbum(
@@ -190,7 +190,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
 
     @MainActor
     func testCreatedAlbumMembershipFailureKeepsAlbumAndReportsRetryOutcome() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.addError = AlbumError.partialAdd(succeeded: 1, total: 2, message: "retry later")
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
@@ -208,7 +208,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
 
     @MainActor
     func testExistingAlbumAddFailurePreservesSelectionForRetry() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.addError = NSError(
             domain: "ProtonAlbumAPI",
             code: 2_000,
@@ -226,7 +226,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
 
     @MainActor
     func testSharedCatalogRefreshAndLeaveUpdateOneSharedStateMachine() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         backend.sharedAlbums = [sharedAlbum("one"), sharedAlbum("two")]
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
 
@@ -246,7 +246,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
         let second = coordinatorUID("two")
         let albumID = "album-existing"
         let backend = FakeAlbumBackend(
-            capabilities: .sdkCatalogWithHTTPWrites,
+            capabilities: .sdkCatalogAndWrites,
             albums: [AlbumSummary(id: albumID, title: "Existing", photoCount: 1, coverPhotoID: nil)]
         )
         backend.memberships[first] = [AlbumNodeIdentifier(volumeID: "volume", nodeID: albumID)]
@@ -270,7 +270,7 @@ final class AlbumActionCoordinatorTests: XCTestCase {
 
     @MainActor
     func testLargeSelectionDoesNotSchedulePerPhotoMembershipReads() async {
-        let backend = FakeAlbumBackend(capabilities: .sdkCatalogWithHTTPWrites)
+        let backend = FakeAlbumBackend(capabilities: .sdkCatalogAndWrites)
         let coordinator = AlbumActionCoordinator(repository: repository(backend))
         let selection = (0...AlbumActionCoordinator.membershipSelectionLimit)
             .map { coordinatorUID("\($0)") }

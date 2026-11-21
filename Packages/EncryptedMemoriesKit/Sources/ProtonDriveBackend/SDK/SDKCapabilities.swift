@@ -6,7 +6,7 @@ import UploadCore
 /// sign-in for diagnostics - nothing here currently gates UI.
 ///
 /// The album + upload sections are not hand-rolled here: they reference the same canonical capability
-/// presets the UI gates on (`AlbumCapabilities.sdkCatalogWithHTTPWrites`, `UploadBackendCapabilities.sdkUploader`),
+/// presets the UI gates on (`AlbumCapabilities.sdkCatalogAndWrites`, `UploadBackendCapabilities.sdkUploader`),
 /// so the diagnostic can't drift from the real backend.
 struct SDKCapabilities {
     // EncryptedMemoriesClient - present and wrapped by `DriveSDKBridge`.
@@ -27,12 +27,14 @@ struct SDKCapabilities {
     /// Upload capabilities, as the UI sees them (the wired SDK uploader). Single source of truth.
     var upload = UploadBackendCapabilities.sdkUploader
 
-    /// The app reads the album catalog, sharing and membership through SDK 0.33.1. Direct Photos HTTP remains only
-    /// for the album writes: the Swift API of SDK 0.33.1 binds them, but the app does not use these bindings yet.
+    /// The app reads the album catalog, sharing and membership through SDK 0.33.1 and sends the five album writes
+    /// (create, cover, delete, add, remove) through its album calls. Direct Photos HTTP remains for two uses: Album
+    /// Sync creates albums and attaches photos through the album write service, and the photos of an owned album are
+    /// listed over HTTP.
     var albumReadAPIsAvailable = true
     var photoTagUpdatesAvailable = true
-    var albumsViaSDK = false
-    var albums = AlbumCapabilities.sdkCatalogWithHTTPWrites
+    var albumsViaSDK = true
+    var albums = AlbumCapabilities.sdkCatalogAndWrites
 
     static let current = SDKCapabilities()
 

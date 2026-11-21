@@ -100,7 +100,8 @@ private enum MainResponseEvaluation {
 
 // MARK: - Service
 
-/// Performs direct album writes with Proton node cryptography.
+/// Performs the album writes of Album Sync (create, attach, children) over the Drive web API with Proton node
+/// cryptography. The five album writes of the app use the SDK (`SDKAlbumWriteBackend`).
 /// Re-encrypts existing photo metadata for the album without moving media bytes.
 /// Logs only counts and error codes, never names, hashes, passphrases, or key material.
 actor ProtonAlbumWriteService {
@@ -186,15 +187,7 @@ actor ProtonAlbumWriteService {
     private nonisolated func withAdmission<T: Sendable>(
         _ operation: @escaping @Sendable (isolated ProtonAlbumWriteService) async throws -> T
     ) async throws -> T {
-        guard let requestCause else { return try await admitted(operation) }
-        return try await requestCause.run { try await admitted(operation) }
-    }
-
-    private nonisolated func admitted<T: Sendable>(
-        _ operation: @escaping @Sendable (isolated ProtonAlbumWriteService) async throws -> T
-    ) async throws -> T {
-        guard let admission else { return try await operation(self) }
-        return try await admission.withAdmission { [self] in
+        try await RequestAdmission(gate: admission, requestCause: requestCause).run { [self] in
             try await operation(self)
         }
     }
@@ -915,21 +908,6 @@ extension DriveSession {
             throw ProtonAlbumWriteError.malformedAddResponse
         }
         return responses
-    }
-
-    /// `POST /drive/photos/volumes/{volumeID}/albums/{albumLinkID}/remove-multiple` removes only
-    /// album membership. Proton's official Drive SDK batches this endpoint at ten link IDs and treats
-    /// each successful batch as atomic because the response has no reliable per-photo result contract.
-    func removeFromAlbum(volumeID: String, albumLinkID: String, linkIDs: [String]) async throws {
-        guard !linkIDs.isEmpty else { return }
-        for chunk in linkIDs.chunked(by: 10) {
-            try Task.checkCancellation()
-            _ = try await send(
-                "/drive/photos/volumes/\(volumeID)/albums/\(albumLinkID)/remove-multiple",
-                method: "POST",
-                body: ["LinkIDs": chunk]
-            )
-        }
     }
 
     /// `POST /drive/shares/{shareID}/links/fetch_metadata` with the attach path's tolerant DTO.

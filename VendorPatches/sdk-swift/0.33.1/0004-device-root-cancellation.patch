@@ -1,3 +1,208 @@
+diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+index e22b354..028975b 100644
+--- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
++++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
+@@ -242,0 +243,39 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
++
++    private func runCancellableRequest<Request: Message, Response: Sendable, State: Sendable>(
++        identifier: OperationIdentifier,
++        makeRequest: (ObjectHandle) -> Request,
++        state: State,
++        scope: CallbackScope = .operation,
++        owner: (any AnyObject & Sendable)? = nil
++    ) async throws -> Response {
++        let tokenSource = try await CancellationTokenSource(logger: logger)
++        if Task.isCancelled {
++            await tokenSource.freeAndWait()
++            throw CancellationError()
++        }
++        let cancellationState = EventEnumerationCancellationState(tokenSource: tokenSource)
++        activeEventEnumerations[identifier] = cancellationState
++        do {
++            let response: Response = try await SDKRequestHandler.sendCancellable(
++                makeRequest(tokenSource.handle), state: state, scope: scope, owner: owner,
++                requestCancellation: cancellationState.requestCancellation, logger: logger)
++            await releaseEventEnumeration(identifier: identifier, state: cancellationState, cancellationRequested: false)
++            return response
++        } catch is CancellationError {
++            await releaseEventEnumeration(identifier: identifier, state: cancellationState, cancellationRequested: true)
++            throw CancellationError()
++        } catch {
++            await releaseEventEnumeration(
++                identifier: identifier, state: cancellationState,
++                cancellationRequested: Task.isCancelled)
++            throw error
++        }
++    }
++
++    private func cancelCancellableRequest(identifier: OperationIdentifier) async throws {
++        guard let state = activeEventEnumerations.removeValue(forKey: identifier) else {
++            throw ProtonDriveSDKError(
++                interopError: .noCancellationTokenForIdentifier(operation: identifier.operationName))
++        }
++        await state.cancelAndRelease()
++    }
+@@ -416,12 +455,9 @@ extension EncryptedMemoriesClient {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.createAlbum(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .createAlbum(cancellationToken))
+-        }
+-
+-        let request = Proton_Drive_Sdk_DrivePhotosClientCreateAlbumRequest.with {
+-            $0.clientHandle = Int64(clientHandle)
+-            $0.name = name
+-            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+-        }
+-
+-        let sdkNode: Proton_Drive_Sdk_Node = try await SDKRequestHandler.send(request, logger: logger)
++        let sdkNode: Proton_Drive_Sdk_Node = try await runCancellableRequest(
++            identifier: .createAlbum(cancellationToken),
++            makeRequest: { tokenHandle in
++                Proton_Drive_Sdk_DrivePhotosClientCreateAlbumRequest.with {
++                    $0.clientHandle = Int64(clientHandle)
++                    $0.name = name
++                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
++                }
++            }, state: ())
+@@ -432 +468 @@ extension EncryptedMemoriesClient {
+-        try await cancelOperation(identifier: .createAlbum(cancellationToken))
++        try await cancelCancellableRequest(identifier: .createAlbum(cancellationToken))
+@@ -443,18 +479,15 @@ extension EncryptedMemoriesClient {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.updateAlbum(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .updateAlbum(cancellationToken))
+-        }
+-
+-        let request = Proton_Drive_Sdk_DrivePhotosClientUpdateAlbumRequest.with {
+-            $0.clientHandle = Int64(clientHandle)
+-            $0.albumUid = albumUid.sdkCompatibleIdentifier
+-            if let name {
+-                $0.name = name
+-            }
+-            if let coverPhotoUid {
+-                $0.coverPhotoUid = coverPhotoUid.sdkCompatibleIdentifier
+-            }
+-            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+-        }
+-
+-        let sdkNode: Proton_Drive_Sdk_Node = try await SDKRequestHandler.send(request, logger: logger)
++        let sdkNode: Proton_Drive_Sdk_Node = try await runCancellableRequest(
++            identifier: .updateAlbum(cancellationToken),
++            makeRequest: { tokenHandle in
++                Proton_Drive_Sdk_DrivePhotosClientUpdateAlbumRequest.with {
++                    $0.clientHandle = Int64(clientHandle)
++                    $0.albumUid = albumUid.sdkCompatibleIdentifier
++                    if let name {
++                        $0.name = name
++                    }
++                    if let coverPhotoUid {
++                        $0.coverPhotoUid = coverPhotoUid.sdkCompatibleIdentifier
++                    }
++                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
++                }
++            }, state: ())
+@@ -465 +498 @@ extension EncryptedMemoriesClient {
+-        try await cancelOperation(identifier: .updateAlbum(cancellationToken))
++        try await cancelCancellableRequest(identifier: .updateAlbum(cancellationToken))
+@@ -476,14 +509,11 @@ extension EncryptedMemoriesClient {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.deleteAlbum(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .deleteAlbum(cancellationToken))
+-        }
+-
+-        let request = Proton_Drive_Sdk_DrivePhotosClientDeleteAlbumRequest.with {
+-            $0.clientHandle = Int64(clientHandle)
+-            $0.albumUid = albumUid.sdkCompatibleIdentifier
+-            $0.force = config == .force
+-            $0.saveToTimeline = config == .saveToTimeline
+-            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+-        }
+-
+-        let _: Void = try await SDKRequestHandler.send(request, logger: logger)
++        let _: Void = try await runCancellableRequest(
++            identifier: .deleteAlbum(cancellationToken),
++            makeRequest: { tokenHandle in
++                Proton_Drive_Sdk_DrivePhotosClientDeleteAlbumRequest.with {
++                    $0.clientHandle = Int64(clientHandle)
++                    $0.albumUid = albumUid.sdkCompatibleIdentifier
++                    $0.force = config == .force
++                    $0.saveToTimeline = config == .saveToTimeline
++                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
++                }
++            }, state: ())
+@@ -493 +523 @@ extension EncryptedMemoriesClient {
+-        try await cancelOperation(identifier: .deleteAlbum(cancellationToken))
++        try await cancelCancellableRequest(identifier: .deleteAlbum(cancellationToken))
+@@ -503,5 +532,0 @@ extension EncryptedMemoriesClient {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.addPhotosToAlbum(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .addPhotosToAlbum(cancellationToken))
+-        }
+-
+@@ -509,14 +534,11 @@ extension EncryptedMemoriesClient {
+-        let request = Proton_Drive_Sdk_DrivePhotosClientAddPhotosToAlbumRequest.with {
+-            $0.clientHandle = Int64(clientHandle)
+-            $0.albumUid = albumUid.sdkCompatibleIdentifier
+-            $0.photoUids = photoUids.map(\.sdkCompatibleIdentifier)
+-            $0.yieldAction = Int64(ObjectHandle(callback: cNodeResultEnumerationCallback))
+-            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+-        }
+-        let _: Void = try await SDKRequestHandler.send(
+-            request,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        let _: Void = try await runCancellableRequest(
++            identifier: .addPhotosToAlbum(cancellationToken),
++            makeRequest: { tokenHandle in
++                Proton_Drive_Sdk_DrivePhotosClientAddPhotosToAlbumRequest.with {
++                    $0.clientHandle = Int64(clientHandle)
++                    $0.albumUid = albumUid.sdkCompatibleIdentifier
++                    $0.photoUids = photoUids.map(\.sdkCompatibleIdentifier)
++                    $0.yieldAction = Int64(ObjectHandle(callback: cNodeResultEnumerationCallback))
++                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
++                }
++            }, state: WeakReference(value: callbackState), scope: .ownerManaged, owner: callbackState)
+@@ -526 +548 @@ extension EncryptedMemoriesClient {
+-        try await cancelOperation(identifier: .addPhotosToAlbum(cancellationToken))
++        try await cancelCancellableRequest(identifier: .addPhotosToAlbum(cancellationToken))
+@@ -536,5 +557,0 @@ extension EncryptedMemoriesClient {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.removePhotosFromAlbum(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .removePhotosFromAlbum(cancellationToken))
+-        }
+-
+@@ -542,14 +559,11 @@ extension EncryptedMemoriesClient {
+-        let request = Proton_Drive_Sdk_DrivePhotosClientRemovePhotosFromAlbumRequest.with {
+-            $0.clientHandle = Int64(clientHandle)
+-            $0.albumUid = albumUid.sdkCompatibleIdentifier
+-            $0.photoUids = photoUids.map(\.sdkCompatibleIdentifier)
+-            $0.yieldAction = Int64(ObjectHandle(callback: cNodeResultEnumerationCallback))
+-            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+-        }
+-        let _: Void = try await SDKRequestHandler.send(
+-            request,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        let _: Void = try await runCancellableRequest(
++            identifier: .removePhotosFromAlbum(cancellationToken),
++            makeRequest: { tokenHandle in
++                Proton_Drive_Sdk_DrivePhotosClientRemovePhotosFromAlbumRequest.with {
++                    $0.clientHandle = Int64(clientHandle)
++                    $0.albumUid = albumUid.sdkCompatibleIdentifier
++                    $0.photoUids = photoUids.map(\.sdkCompatibleIdentifier)
++                    $0.yieldAction = Int64(ObjectHandle(callback: cNodeResultEnumerationCallback))
++                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
++                }
++            }, state: WeakReference(value: callbackState), scope: .ownerManaged, owner: callbackState)
+@@ -559 +573 @@ extension EncryptedMemoriesClient {
+-        try await cancelOperation(identifier: .removePhotosFromAlbum(cancellationToken))
++        try await cancelCancellableRequest(identifier: .removePhotosFromAlbum(cancellationToken))
 diff --git a/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift b/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift
 index b8d0022..2754016 100644
 --- a/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift
