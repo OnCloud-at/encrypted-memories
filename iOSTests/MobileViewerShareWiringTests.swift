@@ -357,6 +357,9 @@ final class MobileViewerShareWiringTests: XCTestCase {
     // MARK: - Harness
 
     private static let shareLabel = String(localized: "viewer.share_action")
+    /// The bottom bar is the system floating bar: Share mounts as a bar button control that shows this symbol and
+    /// carries the toolbar action, with no accessibility label in this environment.
+    private static let shareSymbol = "square.and.arrow.up"
 
     /// Suspends an awaiting burst-group read until `open()` runs. `arrivals` proves the read started.
     /// The lock is taken only in synchronous helpers: `NSLock` must not be used across an `await`.
@@ -529,11 +532,11 @@ final class MobileViewerShareWiringTests: XCTestCase {
 
         func tryActivatingShare() -> Bool {
             let label = MobileViewerShareWiringTests.shareLabel
-            if let element = accessibilityElement(labelled: label, in: window), element.accessibilityActivate() {
+            if let element = visibleAccessibilityElement(labelled: label, in: window), element.accessibilityActivate() {
                 return true
             }
             if let item = barButtonItem(labelled: label, in: window), trigger(item) { return true }
-            if let control = shareBarButtonControl() {
+            if let control = barButtonControl(showing: MobileViewerShareWiringTests.shareSymbol, in: window) {
                 control.sendActions(for: .touchUpInside)
                 return true
             }
@@ -546,8 +549,10 @@ final class MobileViewerShareWiringTests: XCTestCase {
         func shareIsEnabled() -> Bool? {
             let label = MobileViewerShareWiringTests.shareLabel
             if let item = barButtonItem(labelled: label, in: window) { return item.isEnabled }
-            if let control = shareBarButtonControl() { return control.isEnabled }
-            if let element = accessibilityElement(labelled: label, in: window) {
+            if let control = barButtonControl(showing: MobileViewerShareWiringTests.shareSymbol, in: window) {
+                return control.isEnabled
+            }
+            if let element = visibleAccessibilityElement(labelled: label, in: window) {
                 return !element.accessibilityTraits.contains(.notEnabled)
             }
             return nil
@@ -562,18 +567,6 @@ final class MobileViewerShareWiringTests: XCTestCase {
             }
             print("share-enabled diagnostics: \(hierarchyDiagnostics())")
             return false
-        }
-
-        /// The bottom bar is the system floating bar: the Share item mounts as a bar-button
-        /// control that carries the share symbol and the toolbar action, with no accessibility
-        /// label in this environment. The symbol identifies it.
-        private func shareBarButtonControl() -> UIControl? {
-            descendants(window).compactMap { $0 as? UIControl }.first { control in
-                guard String(describing: type(of: control)).contains("BarButton") else { return false }
-                guard control.isUserInteractionEnabled else { return false }
-                let description = String(describing: control)
-                return description.contains("square.and.arrow.up")
-            }
         }
 
         private var activationFailures = 0
@@ -691,39 +684,6 @@ final class MobileViewerShareWiringTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(50))
             }
             return false
-        }
-
-        private func accessibilityElement(labelled label: String, in rootObject: NSObject) -> NSObject? {
-            if let view = rootObject as? UIView {
-                if view.isHidden || view.alpha < 0.01 || view.accessibilityElementsHidden { return nil }
-            }
-            if rootObject.isAccessibilityElement, rootObject.accessibilityLabel == label {
-                return rootObject
-            }
-            if let container = rootObject as? UIView {
-                for element in container.accessibilityElements ?? [] {
-                    if let object = element as? NSObject,
-                        let match = accessibilityElement(labelled: label, in: object)
-                    {
-                        return match
-                    }
-                }
-                for subview in container.subviews {
-                    if let match = accessibilityElement(labelled: label, in: subview) { return match }
-                }
-            } else {
-                let count = rootObject.accessibilityElementCount()
-                if count != NSNotFound, count > 0 {
-                    for index in 0..<count {
-                        if let object = rootObject.accessibilityElement(at: index) as? NSObject,
-                            let match = accessibilityElement(labelled: label, in: object)
-                        {
-                            return match
-                        }
-                    }
-                }
-            }
-            return nil
         }
 
         func close() {

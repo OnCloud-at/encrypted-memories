@@ -57,9 +57,11 @@ final class MobileTimelineChromeTests: XCTestCase {
         let uid = fixture.items[2].uid
         var transaction = Transaction()
         transaction.disablesAnimations = true
+        // Info opens through the viewer's own button below. Asking for Info with the unanimated cover itself lost the
+        // inspector when the photo was ready within a few milliseconds; the animated app route keeps it.
         withTransaction(transaction) {
             router.presentation = MobileViewerPresentation(
-                index: 2, items: fixture.items, context: ViewerCollectionContext(filter: .all), showsInfoInitially: true
+                index: 2, items: fixture.items, context: ViewerCollectionContext(filter: .all)
             )
         }
         func controllers(_ controller: UIViewController) -> [UIViewController] {
@@ -77,7 +79,19 @@ final class MobileTimelineChromeTests: XCTestCase {
         try await waitUntil("SETUP: the production cover contains a zoomable photo") { currentPhotoViewport() != nil }
         let viewer = try XCTUnwrap(root.presentedViewController)
         let pager = try XCTUnwrap(currentPager())
-        try await waitUntil("SETUP: Info and the media viewport finish their initial layout") {
+        try await activate(label: String(localized: "viewer.info_action"), symbol: "info.circle", in: window)
+        // A timeout names the missing part: the viewport, the photo, or Info as a sheet or a column.
+        let setupState: @MainActor () -> String = {
+            let viewport = currentPhotoViewport()
+            let image = viewport.flatMap { descendants($0).compactMap { $0 as? UIImageView }.first }
+            return "viewport=\(String(describing: viewport?.bounds.size))"
+                + " image=\(String(describing: image?.bounds.size)) loaded=\(image?.image != nil)"
+                + " info=\(viewer.presentedViewController.map { "\(type(of: $0))" } ?? "none")"
+                + " viewer=\(viewer.view.bounds.width) pager=\(pager.view.bounds.width)"
+                + " samePager=\(currentPager() === pager) cover=\(root.presentedViewController === viewer)"
+                + " widthClass=\(viewer.traitCollection.horizontalSizeClass.rawValue)"
+        }
+        try await waitUntil("SETUP: Info and the media viewport finish their initial layout", state: setupState) {
             guard let viewport = currentPhotoViewport(), viewport.bounds.width > 0,
                 let image = descendants(viewport).compactMap({ $0 as? UIImageView }).first, image.bounds.width > 0
             else { return false }
@@ -343,7 +357,7 @@ final class MobileTimelineChromeTests: XCTestCase {
         let selectingTitle = try XCTUnwrap(titleFrame(L10n.selectionCenterText(selectedCount: 0), in: window))
         report.append("selecting: items=\(selectingLabels) title=\(selectingTitle)")
         XCTAssertNil(
-            accessibilityElement(labelled: optionsLabel, in: window),
+            visibleAccessibilityElement(labelled: optionsLabel, in: window),
             "the options menu leaves the bar in selection mode instead of hiding behind opacity")
         if #available(iOS 27.0, *) {
             XCTAssertNil(
@@ -431,17 +445,9 @@ final class MobileTimelineChromeTests: XCTestCase {
         return nil
     }
 
-    @MainActor private func accessibilityElement(labelled label: String, in root: UIView) -> UIView? {
-        if root.isHidden || root.alpha < 0.01 || root.accessibilityElementsHidden { return nil }
-        if root.isAccessibilityElement, root.accessibilityLabel == label { return root }
-        for subview in root.subviews {
-            if let match = accessibilityElement(labelled: label, in: subview) { return match }
-        }
-        return nil
-    }
-
-    /// Activates a bar item the way a pointer or VoiceOver would: the item's action, then its custom control.
-    @MainActor private func activate(label: String, in window: UIWindow) async throws {
+    /// Activates a bar item the way a pointer or VoiceOver would: the item's action, then its custom control. A button
+    /// of a grouped SwiftUI toolbar item has no UIBarButtonItem; `symbol` finds its bar button control.
+    @MainActor private func activate(label: String, symbol: String? = nil, in window: UIWindow) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now + .seconds(15)
         while clock.now < deadline {
@@ -458,31 +464,61 @@ final class MobileTimelineChromeTests: XCTestCase {
                         report.append("activated '\(label)' through UIControl")
                         return
                     }
-                    if let element = accessibilityElement(labelled: label, in: custom), element.accessibilityActivate()
+                    if let element = visibleAccessibilityElement(labelled: label, in: custom),
+                        element.accessibilityActivate()
                     {
                         report.append("activated '\(label)' through accessibility")
                         return
                     }
                 }
             }
-            if let element = accessibilityElement(labelled: label, in: window), element.accessibilityActivate() {
+            if let element = visibleAccessibilityElement(labelled: label, in: window), element.accessibilityActivate() {
                 report.append("activated '\(label)' through window accessibility")
                 return
             }
+            // A grouped toolbar button: its labelled control on iPhone, its symbol's bar button on iPhone Duo. Only an
+            // enabled control counts, because sending actions to a disabled one does nothing.
+            if let symbol {
+                let enabled = descendants(window).compactMap { $0 as? UIControl }.filter {
+                    $0.isEnabled && $0.isUserInteractionEnabled
+                }
+                if let control = enabled.first(where: { $0.accessibilityLabel == label }) {
+                    control.sendActions(for: .touchUpInside)
+                    report.append("activated '\(label)' through its labelled control")
+                    return
+                }
+                if let control = barButtonControl(showing: symbol, in: window), control.isEnabled {
+                    control.sendActions(for: .touchUpInside)
+                    report.append("activated '\(label)' through the bar button showing \(symbol)")
+                    return
+                }
+            }
             try await Task.sleep(for: .milliseconds(200))
         }
-        report.append("DIAGNOSTICS for '\(label)': items=\(barItemLabels(in: window))")
-        XCTFail("no activatable bar item labelled '\(label)'")
+        // The topmost presentation first: the views below a cover stay in the window and would fill the list.
+        var top: UIViewController? = window.rootViewController
+        while let presented = top?.presentedViewController { top = presented }
+        let labels = visibleAccessibilityElements(in: top?.view ?? window).compactMap(\.accessibilityLabel)
+        let barControls = descendants(window).compactMap { $0 as? UIControl }
+            .filter { String(describing: type(of: $0)).contains("BarButton") }
+            .map { "\(type(of: $0)) label=\($0.accessibilityLabel ?? "-")" }
+        let found =
+            "items=\(barItemLabels(in: window)) top=\(labels.filter { !$0.isEmpty }.prefix(60))"
+            + " barControls=\(barControls)"
+        report.append("DIAGNOSTICS for '\(label)': \(found)")
+        XCTFail("no activatable bar item labelled '\(label)' (\(found))")
         throw MobileFixtureError.unavailable
     }
 
     @MainActor private func waitUntil(
-        _ what: String, timeout: Duration = .seconds(20), _ condition: @MainActor () -> Bool
+        _ what: String, timeout: Duration = .seconds(20), state: (@MainActor () -> String)? = nil,
+        _ condition: @MainActor () -> Bool
     ) async throws {
         let held = try await pollUntil(timeout: timeout, every: .milliseconds(100)) { condition() }
         if held { return }
-        report.append("TIMEOUT: \(what)")
-        XCTFail("timed out: \(what)")
+        let detail = state.map { " (\($0()))" } ?? ""
+        report.append("TIMEOUT: \(what)\(detail)")
+        XCTFail("timed out: \(what)\(detail)")
         throw MobileFixtureError.unavailable
     }
 }

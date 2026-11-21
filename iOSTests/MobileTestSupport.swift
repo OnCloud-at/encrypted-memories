@@ -27,6 +27,41 @@ import XCTest
     }
 }
 
+/// Every visible accessibility element below `root`, including the elements that SwiftUI exposes inside a hosting
+/// view, such as one button of a grouped toolbar item.
+@MainActor func visibleAccessibilityElements(in root: NSObject) -> [NSObject] {
+    if let view = root as? UIView, view.isHidden || view.alpha < 0.01 || view.accessibilityElementsHidden { return [] }
+    var found = root.isAccessibilityElement ? [root] : []
+    if let container = root as? UIView {
+        for case let element as NSObject in container.accessibilityElements ?? [] {
+            found += visibleAccessibilityElements(in: element)
+        }
+        return found + container.subviews.flatMap { visibleAccessibilityElements(in: $0) }
+    }
+    let count = root.accessibilityElementCount()
+    guard count != NSNotFound, count > 0 else { return found }
+    for index in 0..<count {
+        if let element = root.accessibilityElement(at: index) as? NSObject {
+            found += visibleAccessibilityElements(in: element)
+        }
+    }
+    return found
+}
+
+/// The enabled bar button control that shows the SF Symbol `symbol`. SwiftUI renders the buttons of a grouped toolbar
+/// item, such as the viewer's Favorite, Add to Album and Info capsule, without a separate UIBarButtonItem.
+@MainActor func barButtonControl(showing symbol: String, in window: UIWindow) -> UIControl? {
+    descendants(window).compactMap { $0 as? UIControl }.first { control in
+        String(describing: type(of: control)).contains("BarButton") && control.isUserInteractionEnabled
+            && String(describing: control).contains(symbol)
+    }
+}
+
+/// The first visible accessibility element with `label` below `root`.
+@MainActor func visibleAccessibilityElement(labelled label: String, in root: NSObject) -> NSObject? {
+    visibleAccessibilityElements(in: root).first { $0.accessibilityLabel == label }
+}
+
 /// Checks `condition` every `interval` until it holds or `timeout` has passed, then checks it once more.
 /// Returns whether it held at the last check. The condition runs on the caller's isolation.
 func pollUntil(
