@@ -20,9 +20,9 @@ public struct BackupItemOutcome: Sendable, Equatable {
     /// decision or for a cause only the person can fix. Every other row that is not backed up stays calm.
     public let raisesAttention: Bool
 
-    /// Causes that only the person can fix: access to the photos, the Proton account storage, and a backup that
-    /// cannot continue until the app restarts.
-    private static let personFixableIssues: Set<BackupIssueKind> = [.permission, .accountStorage, .localState]
+    /// Causes that only the person can fix: access to the photos and the Proton account storage. A failure of the app's
+    /// own state is not one of them; a restart does not reliably fix it, so its row stays calm.
+    private static let personFixableIssues: Set<BackupIssueKind> = [.permission, .accountStorage]
 
     /// A reason without a queue row.
     public init(issue: BackupIssueKind) {

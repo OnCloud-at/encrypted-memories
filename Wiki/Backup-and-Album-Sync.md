@@ -41,7 +41,7 @@ When it is off and the device uses cellular data or Personal Hotspot, the backup
 
 ## Photos that are not backed up yet
 
-The Backup page shows how many photos are not backed up yet. The orange line **N couldn’t be backed up** appears only when you can do something: allow access to the photos, free up Proton storage, restart the app, or decide about a photo. Photos that are not backed up without anything for you to do show in the grey line **N files not backed up**. Tap or click either line, or **N waiting for Proton**, to open **Photos not backed up**. The list names each photo and the reason. The list has up to three sections:
+The Backup page shows how many photos are not backed up yet. The orange line **N couldn’t be backed up** appears only when you can do something: allow access to the photos, free up Proton storage, or decide about a photo. Photos that are not backed up without anything for you to do show in the grey line **N files not backed up**. Tap or click either line, or **N waiting for Proton**, to open **Photos not backed up**. The list names each photo and the reason. The list has up to three sections:
 
 - **Action needed**: you can fix the problem, or you must decide. Example: **Your Proton storage is full. Free up space or upgrade your plan.**
 - **Continues by itself**: the backup tries again later, at the latest after the next start of the app. Examples: **Not enough space on this device.**, **Connection interrupted.**, or **Not backed up after several tries.**

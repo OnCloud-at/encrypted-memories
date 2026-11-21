@@ -64,15 +64,15 @@ final class BackupAttentionSplitTests: XCTestCase {
         let summary = try XCTUnwrap(store.summary())
         XCTAssertEqual(summary.failed, 1 + 2 + 3 + 4 + 5 + 8 + 11)
         XCTAssertEqual(summary.sourceMissing, 7)
-        XCTAssertEqual(summary.attention, 1 + 2 + 3)
+        XCTAssertEqual(summary.attention, 1 + 2, "a failure of the app's own state is calm")
         XCTAssertEqual(summary.dismissedFailures, 10)
         XCTAssertEqual(summary.waiting, 9)
         XCTAssertEqual(try XCTUnwrap(store.summary()), summary, "a second read gives the same split")
 
         let status = BackupStatus(progress: BackupSyncProgress(summary: summary), isScanning: false)
-        XCTAssertEqual(status.needsAttentionCount, 6)
-        XCTAssertEqual(status.notBackedUpCount, 4 + 5 + 7 + 8 + 11)
-        XCTAssertEqual(status.notBackedUpFailedCount, 4 + 5 + 8 + 11, "missing photos have their own line")
+        XCTAssertEqual(status.needsAttentionCount, 3)
+        XCTAssertEqual(status.notBackedUpCount, 3 + 4 + 5 + 7 + 8 + 11)
+        XCTAssertEqual(status.notBackedUpFailedCount, 3 + 4 + 5 + 8 + 11, "missing photos have their own line")
     }
 
     func testTheSameStoredErrorInAnotherStateIsJudgedByThatState() throws {
