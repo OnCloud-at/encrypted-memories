@@ -4876,6 +4876,7 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
         XCTAssertEqual(scan?.groups, [PossibleDuplicateGroup(members: [a.uid, b.uid], differences: [.fileType])])
         XCTAssertEqual(scan?.byteSizes, [a.uid: 4_000_000, b.uid: 1_500_000])
+        XCTAssertEqual(scan?.fingerprints, [a.uid: possibleDetails(), b.uid: possibleDetails(type: "image/heic")])
         XCTAssertEqual(server.readCounts.sharingMembers, 2, "only the candidates cost a node read")
     }
 

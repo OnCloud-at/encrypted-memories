@@ -536,9 +536,10 @@ public struct ExactDuplicateFinder: Sendable {
         log(
             "possible duplicates candidates=\(candidates.count) reads=\(reads.count) groups=\(groups.count) "
                 + "duration=\(start.duration(to: .now))")
+        let memberFacts = facts.filter { members.contains($0.key) }
         return PossibleDuplicateScan(
-            groups: groups,
-            byteSizes: facts.filter { members.contains($0.key) }.compactMapValues(\.byteSize))
+            groups: groups, byteSizes: memberFacts.compactMapValues(\.byteSize),
+            fingerprints: memberFacts.mapValues(\.fingerprint))
     }
 
     private typealias GroupFacts = [PhotoUID: ExactDuplicateNodeFacts]

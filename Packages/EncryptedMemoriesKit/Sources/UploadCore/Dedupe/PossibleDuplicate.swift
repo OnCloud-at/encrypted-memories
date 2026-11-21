@@ -131,10 +131,16 @@ public struct PossibleDuplicateScan: Sendable, Equatable {
     public let groups: [PossibleDuplicateGroup]
     /// The file size of each member that its node states.
     public let byteSizes: [PhotoUID: Int64]
+    /// The details of each member, so the groups can follow a copy that leaves without a new read.
+    public let fingerprints: [PhotoUID: ExactDuplicateFingerprint]
 
-    public init(groups: [PossibleDuplicateGroup] = [], byteSizes: [PhotoUID: Int64] = [:]) {
+    public init(
+        groups: [PossibleDuplicateGroup] = [], byteSizes: [PhotoUID: Int64] = [:],
+        fingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
+    ) {
         self.groups = groups
         self.byteSizes = byteSizes
+        self.fingerprints = fingerprints
     }
 }
 
