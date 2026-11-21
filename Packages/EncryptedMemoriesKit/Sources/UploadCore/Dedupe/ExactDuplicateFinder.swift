@@ -18,6 +18,8 @@ public protocol ExactDuplicateRemote: PhotoCarryOverRemote {
     func restoreDuplicates(_ uids: [PhotoUID]) async throws
     /// The capture dates that the device already knows, without a request. Unknown photos are left out.
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date]
+    /// The photos of the device's stored timeline, without a request. Nil while no stored timeline can be read.
+    func libraryItems() async -> [PhotoItem]?
     /// The sharing state and the size of each photo, from one node read for each photo. A trash ends the sharing.
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts]
 }
@@ -508,6 +510,35 @@ public struct ExactDuplicateFinder: Sendable {
             "[Duplicates] ranking groups=\(groups.count) members=\(members.count) failedGroups=\(failed) "
                 + "nodeReads=\(members.count) "
                 + "duration=\(start.duration(to: .now))")
+    }
+
+    /// Different files of the library that are possibly the same photo, by `policy`. The candidates come from the
+    /// stored timeline without a request, and only their nodes are read, one candidate group at a time and
+    /// `rankingConcurrency` groups at once. The copies of `sameBytes` after their first copy are no candidates. A
+    /// failed read leaves out only its candidate group. Nil while the stored timeline cannot be read, because then
+    /// nothing is known about the candidates.
+    public func possibleDuplicates(
+        excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
+    ) async -> PossibleDuplicateScan? {
+        let start = ContinuousClock.now
+        guard let items = await remote.libraryItems() else { return nil }
+        let candidates = PossibleDuplicateCandidates.groups(
+            of: items, sameBytes: sameBytes.map(\.members),
+            includesVideos: policy.includesVideos)
+        let remote = remote
+        let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) { members in
+            try? await remote.nodeFacts(of: members)
+        }
+        var facts: [PhotoUID: ExactDuplicateNodeFacts] = [:]
+        for case let read?? in reads { facts.merge(read) { first, _ in first } }
+        let groups = policy.groups(of: candidates, fingerprints: facts.mapValues(\.fingerprint))
+        let members = Set(groups.flatMap(\.members))
+        log(
+            "possible duplicates candidates=\(candidates.count) reads=\(reads.count) groups=\(groups.count) "
+                + "duration=\(start.duration(to: .now))")
+        return PossibleDuplicateScan(
+            groups: groups,
+            byteSizes: facts.filter { members.contains($0.key) }.compactMapValues(\.byteSize))
     }
 
     private typealias GroupFacts = [PhotoUID: ExactDuplicateNodeFacts]

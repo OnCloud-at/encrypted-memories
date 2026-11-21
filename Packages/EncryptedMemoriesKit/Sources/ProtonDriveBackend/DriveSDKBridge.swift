@@ -3126,6 +3126,11 @@ extension DriveSDKBridge: ExactDuplicateRemote {
         return Dictionary(items.map { ($0.uid, $0.captureTime) }, uniquingKeysWith: { first, _ in first })
     }
 
+    /// Reads the stored timeline, so finding the candidates of possibly identical photos costs no request.
+    func libraryItems() async -> [PhotoItem]? {
+        try? await withOpenSession(cause: .local) { bridge in try bridge.timelineStore?.load() }
+    }
+
     /// Reads the node of each photo, so only the members of the groups that the screen ranks or merges cost a read.
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         guard !uids.isEmpty else { return [:] }

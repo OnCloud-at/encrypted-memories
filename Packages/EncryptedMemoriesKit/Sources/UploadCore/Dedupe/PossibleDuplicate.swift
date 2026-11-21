@@ -126,6 +126,18 @@ public struct PossibleDuplicateGroup: Sendable, Equatable, Identifiable {
     }
 }
 
+/// The result of the check of possibly identical photos.
+public struct PossibleDuplicateScan: Sendable, Equatable {
+    public let groups: [PossibleDuplicateGroup]
+    /// The file size of each member that its node states.
+    public let byteSizes: [PhotoUID: Int64]
+
+    public init(groups: [PossibleDuplicateGroup] = [], byteSizes: [PhotoUID: Int64] = [:]) {
+        self.groups = groups
+        self.byteSizes = byteSizes
+    }
+}
+
 /// The candidates of the check of possibly identical photos, from the library alone, without a request.
 public enum PossibleDuplicateCandidates {
     /// Groups of two or more library items with the same capture second and the same kind, in the order of `items`.

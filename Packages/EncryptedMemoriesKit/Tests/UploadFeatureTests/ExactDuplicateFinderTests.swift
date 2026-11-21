@@ -4849,6 +4849,74 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(server.links.first { $0.linkID == chosen.nodeID }?.favorite, true, "the favorite moved")
         XCTAssertEqual(violations, [])
     }
+
+    // MARK: - Possibly the same photo
+
+    private func libraryPhoto(_ node: String, second offset: TimeInterval = 0, type: String = "image/jpeg") -> PhotoItem
+    {
+        PhotoItem(uid: PhotoUID(volumeID: "vol", nodeID: node), captureTime: date(offset), mediaType: type)
+    }
+
+    private func possibleDetails(type: String = "image/jpeg") -> ExactDuplicateFingerprint {
+        ExactDuplicateFingerprint(
+            captureTime: date(0), device: "Camera", pixelWidth: 4000, pixelHeight: 3000, mimeType: type)
+    }
+
+    func testPossibleDuplicatesReadOnlyTheCandidatesAndGroupThemByThePolicy() async {
+        let (a, b, c) = (libraryPhoto("a"), libraryPhoto("b"), libraryPhoto("c"))
+        server.setLibraryItems([a, b, c, libraryPhoto("other-second", second: 1), libraryPhoto("v", type: "video/mp4")])
+        server.setFingerprint(possibleDetails(), of: a.uid)
+        server.setFingerprint(possibleDetails(type: "image/heic"), of: b.uid)
+        server.setNodeSize(4_000_000, of: a.uid)
+        server.setNodeSize(1_500_000, of: b.uid)
+        let sameBytes = ExactDuplicateGroup(contentHash: "h", hashKeyEpoch: epoch, members: [b.uid, c.uid])
+
+        let scan = await finder.possibleDuplicates(
+            excluding: [sameBytes], policy: PossibleDuplicatePolicy(rule: .strict, includesVideos: true))
+
+        XCTAssertEqual(scan?.groups, [PossibleDuplicateGroup(members: [a.uid, b.uid], differences: [.fileType])])
+        XCTAssertEqual(scan?.byteSizes, [a.uid: 4_000_000, b.uid: 1_500_000])
+        XCTAssertEqual(server.readCounts.sharingMembers, 2, "only the candidates cost a node read")
+    }
+
+    func testAFailedReadLeavesOutOnlyItsCandidateGroup() async {
+        let early = [libraryPhoto("a"), libraryPhoto("b")]
+        let late = [libraryPhoto("x", second: 7), libraryPhoto("y", second: 7)]
+        server.setLibraryItems(early + late)
+        for item in early { server.setFingerprint(possibleDetails(), of: item.uid) }
+        for item in late {
+            server.setFingerprint(
+                ExactDuplicateFingerprint(
+                    captureTime: date(7), device: "Camera", pixelWidth: 4000, pixelHeight: 3000,
+                    mimeType: item.uid.nodeID == "x" ? "image/jpeg" : "image/png"), of: item.uid)
+        }
+        server.loseNode(early[1].uid)
+
+        let scan = await finder.possibleDuplicates(
+            excluding: [], policy: PossibleDuplicatePolicy(rule: .sameShape, includesVideos: true))
+
+        XCTAssertEqual(scan?.groups, [PossibleDuplicateGroup(members: late.map(\.uid), differences: [.fileType])])
+    }
+
+    func testALibraryWithoutCandidatesCostsNoRead() async {
+        server.setLibraryItems([libraryPhoto("a"), libraryPhoto("b", second: 1), libraryPhoto("v", type: "video/mp4")])
+
+        let scan = await finder.possibleDuplicates(
+            excluding: [], policy: PossibleDuplicatePolicy(rule: .sameSecond, includesVideos: true))
+
+        XCTAssertEqual(scan, PossibleDuplicateScan())
+        XCTAssertEqual(server.readCounts.sharingMembers, 0)
+    }
+
+    func testAnUnreadableTimelineGivesNoResultInsteadOfNoGroups() async {
+        server.setLibraryItems(nil)
+
+        let scan = await finder.possibleDuplicates(
+            excluding: [], policy: PossibleDuplicatePolicy(rule: .sameSecond, includesVideos: true))
+
+        XCTAssertNil(scan, "an unknown library must not read as a library without possible duplicates")
+        XCTAssertEqual(server.readCounts.sharingMembers, 0)
+    }
 }
 
 /// Counts the reads of the manifest rows that name a remote link.

@@ -89,6 +89,8 @@ final class EditScenarioServer: PhotoUploading, UploadDuplicateChecking, EditRep
     private var sharedLinks: Set<String> = []
     private var nodeSizes: [String: Int64] = [:]
     private var nodeFingerprints: [String: ExactDuplicateFingerprint] = [:]
+    /// The photos of the device's stored timeline.
+    private var storedLibrary: [PhotoItem]? = []
     private var missingNodes: Set<String> = []
     private var covers: [String: String] = [:]
     private var failCoverWrite = false
@@ -918,6 +920,7 @@ extension EditScenarioDuplicateRemote {
     func trashDuplicates(_ uids: [PhotoUID]) async throws { try await base.trashDuplicates(uids) }
     func restoreDuplicates(_ uids: [PhotoUID]) async throws { try await base.restoreDuplicates(uids) }
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { await base.captureDates(of: uids) }
+    func libraryItems() async -> [PhotoItem]? { await base.libraryItems() }
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts] {
         try await base.nodeFacts(of: uids)
     }
@@ -1050,6 +1053,11 @@ extension EditScenarioServer: ExactDuplicateRemote {
 
     /// The node of the photo states this file size.
     func setNodeSize(_ size: Int64, of uid: PhotoUID) { lock.withLock { nodeSizes[uid.nodeID] = size } }
+
+    /// The device's stored timeline holds these photos; nil when it cannot be read.
+    func setLibraryItems(_ items: [PhotoItem]?) { lock.withLock { storedLibrary = items } }
+
+    func libraryItems() async -> [PhotoItem]? { lock.withLock { storedLibrary } }
 
     /// The node of the photo carries this metadata. Without one, the node has no metadata.
     func setFingerprint(_ fingerprint: ExactDuplicateFingerprint, of uid: PhotoUID) {
