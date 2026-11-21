@@ -15,6 +15,7 @@ on:
       - "scripts/verify-ios-app-tests.sh"
       - "scripts/build-paths.sh"
       - ".github/scripts/run_ui_tests_with_retry.sh"
+      - ".github/scripts/create_duo_simulator.py"
       - ".github/workflows/duo-ui-tests.yml"
 
 permissions:
@@ -60,29 +61,7 @@ jobs:
         id: duo
         run: |
           set -euo pipefail
-          udid="$(python3 - <<'PY'
-          import json, subprocess, sys
-
-          def simctl(*args):
-              return json.loads(subprocess.run(["xcrun", "simctl", *args, "-j"], check=True, capture_output=True, text=True).stdout)
-
-          # The runtime that belongs to the pinned Xcode 27.1; a newer runtime comes with a new Xcode pin.
-          types = [t for t in simctl("list", "devicetypes")["devicetypes"] if t["name"] == "iPhone Duo"]
-          runtimes = [
-              r for r in simctl("list", "runtimes")["runtimes"]
-              if r.get("isAvailable") and r.get("platform") == "iOS" and r["version"].startswith("27.1")
-              and any(t["name"] == "iPhone Duo" for t in r.get("supportedDeviceTypes", []))
-          ]
-          if not types or not runtimes:
-              sys.exit(0)
-          runtime = max(runtimes, key=lambda r: r["buildversion"])
-          sys.stderr.write("runtime " + runtime["identifier"] + " build " + runtime["buildversion"] + "\n")
-          created = subprocess.run(
-              ["xcrun", "simctl", "create", "iPhone Duo UI tests", types[0]["identifier"], runtime["identifier"]],
-              check=True, capture_output=True, text=True).stdout.strip()
-          print(created)
-          PY
-          )"
+          udid="$(python3 -I .github/scripts/create_duo_simulator.py --name "iPhone Duo UI tests")"
           if [[ -z "$udid" ]]; then
             {
               echo "### iPhone Duo UI tests: no iPhone Duo runtime"
