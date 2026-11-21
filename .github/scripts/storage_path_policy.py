@@ -61,7 +61,7 @@ def result(status, reason, revision=None, protected_present=None, unknown_paths=
             and SHA.fullmatch(revision['base']) is not None and isinstance(revision.get('head'), str)
             and SHA.fullmatch(revision['head']) is not None):
         summary += f" Before snapshot base {revision['base']} and head {revision['head']}."
-    annotation = ('::warning title=Storage path classification::Unknown; see the summary.'
+    annotation = ('::notice title=Storage path classification::Unknown; see the summary.'
                   if status == 'UNKNOWN' else '')
     return {'status': status, 'summary': summary, 'annotation': annotation,
             'protected_present': protected_present, 'unknown_paths': list(unknown_paths)[:UNKNOWN_PATH_LIMIT],

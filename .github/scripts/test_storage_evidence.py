@@ -413,12 +413,15 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn(('POST', f'issues/{NUMBER}/labels', {'labels': [evidence.LABEL]}), api.writes())
         self.assertIn('Mutation evidence', summary)
         self.assertNotIn('::warning', out)
+        self.assertNotIn('::notice', out)
 
-    def test_an_undetermined_change_warns_visibly_and_writes_nothing(self):
+    def test_an_undetermined_change_leaves_a_visible_notice_and_writes_nothing(self):
         api, code, out, summary = self.run_main([record(UNCLASSIFIED)])
         self.assertEqual(0, code)
         self.assertEqual([], api.writes())
-        self.assertIn('::warning title=Storage path classification::Unknown; see the summary.', out)
+        self.assertIn('::notice title=Storage path classification::Unknown; see the summary.', out)
+        self.assertNotIn('::warning', out)
+        self.assertNotIn('::error', out)
         self.assertIn('undetermined', summary)
 
     def run_with_summary(self, table):
