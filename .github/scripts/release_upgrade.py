@@ -320,6 +320,136 @@ def validate_override(event, ref, tag, confirmation, reason):
     return True
 
 
+UPGRADE_JOB_PREFIX = "Test installed upgrades on "
+# The timeout-minutes of the upgrade job in testflight-internal.yml; the workflow test compares both values.
+JOB_TIMEOUT_MINUTES = 180
+# A job that ran this close to its limit hit the limit: a retry would only wait for the same timeout again.
+TIMEOUT_MARGIN_MINUTES = 5
+NOT_FAILED = ("success", "skipped", "neutral")
+# What the check-run annotations of a job say when it ended without a failed step. Real records: a lost runner (run
+# 38193953552) says the first text, a full runner disk (run 38181793360) says the second. The third is the warning of the
+# runner itself when its disk is nearly full; it comes from the source of the runner and appears at the warning level.
+LOST_RUNNER_TEXT = "lost communication with the server"
+DISK_FULL_TEXTS = ("No space left on device", "running out of disk space")
+ANNOTATION_READ_SECONDS = 60
+
+
+def job_run_minutes(job):
+    def moment(key):
+        return datetime.fromisoformat(job[key].replace("Z", "+00:00"))
+    return (moment("completed_at") - moment("started_at")).total_seconds() / 60
+
+
+def annotation_kind(annotations):
+    """`disk-full`, `lost-runner` or `unknown`, from the check-run annotations of a job that ended without a failed step.
+
+    A full or nearly full runner disk, at every annotation level, wins over every other text. A lost runner needs its text
+    in an annotation of level `failure`.
+    Annotations that are not a list of objects with a text, an empty list and every other text are `unknown`."""
+    if not isinstance(annotations, list) or not all(isinstance(note, dict) and isinstance(note.get("message"), str)
+                                                    for note in annotations):
+        return "unknown"
+    if any(text in note["message"] for note in annotations for text in DISK_FULL_TEXTS):
+        return "disk-full"
+    if any(LOST_RUNNER_TEXT in note["message"] and note.get("annotation_level") == "failure" for note in annotations):
+        return "lost-runner"
+    return "unknown"
+
+
+def read_annotations(job_id):
+    """The check-run annotations of a job through `gh` (needs the `checks: read` scope). Every failure raises."""
+    repository = os.environ["GITHUB_REPOSITORY"]
+    completed = subprocess.run(
+        ["gh", "api", "--paginate", "--slurp", f"repos/{repository}/check-runs/{job_id}/annotations?per_page=100"],
+        capture_output=True, text=True, timeout=ANNOTATION_READ_SECONDS)
+    if completed.returncode:
+        raise UpgradeError(f"The annotations of job {job_id} could not be read")
+    return [note for page in json.loads(completed.stdout) for note in page]
+
+
+def classify_job(job, annotations_of):
+    """Why a job of the release run did not succeed, from its job record (the jobs answer of the GitHub API).
+
+    `lost-runner` is a job of the upgrade gate that ended without a failed step and before its time limit, whose
+    annotations say that the hosted runner lost communication with the server. The other kinds are never retried:
+    `step-failed` (the journey or a setup step failed), `timeout`, `not-failure` (the job was cancelled or timed out, not
+    failed), `disk-full` (the runner disk was full or nearly full: a capacity problem that a retry would only hide),
+    `unknown` (no step failed, but the annotations do not name a lost runner or cannot be read), `other-job` (a job
+    outside the upgrade gate) and `unreadable` (a missing field, or an end before the start).
+    `annotations_of` takes the id of the job and returns its annotations; it is called only when the record alone cannot
+    decide."""
+    if not str(job.get("name")).startswith(UPGRADE_JOB_PREFIX):
+        return "other-job"
+    steps = job.get("steps")
+    try:
+        minutes = job_run_minutes(job)
+    except (KeyError, TypeError, AttributeError, ValueError):
+        return "unreadable"
+    if minutes < 0:
+        return "unreadable"
+    if not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps):
+        return "unreadable"
+    if any(step.get("conclusion") == "failure" for step in steps):
+        return "step-failed"
+    if minutes >= JOB_TIMEOUT_MINUTES - TIMEOUT_MARGIN_MINUTES:
+        return "timeout"
+    if job.get("conclusion") != "failure":
+        return "not-failure"
+    job_id = job.get("id")
+    if type(job_id) is not int:
+        return "unknown"
+    try:
+        return annotation_kind(annotations_of(job_id))
+    except (UpgradeError, OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def classify_failed_jobs(jobs, annotations_of):
+    """(name, kind) of every finished job that did not succeed. A job that still runs is not a failure."""
+    return [(job.get("name"), classify_job(job, annotations_of)) for job in jobs
+            if job.get("status") == "completed" and job.get("conclusion") not in NOT_FAILED]
+
+
+NOT_RETRIED = {
+    "step-failed": "a step failed in {name}",
+    "timeout": "{name} ran into its time limit",
+    "not-failure": "{name} did not conclude with a failure",
+    "disk-full": "the runner disk of {name} was full",
+    "unknown": "{name} ended without a failed step, and its annotations do not name a lost runner",
+    "other-job": "{name} is not a job of the upgrade gate",
+    "unreadable": "the record of {name} is unreadable",
+}
+
+
+def retry_decision(failed, run_attempt):
+    """Whether the failed jobs of the run are all lost runners, so that one re-run is safe, and the reason.
+
+    `failed` is the list that `classify_failed_jobs` returns."""
+    if run_attempt != 1:
+        return False, f"The run is at attempt {run_attempt}; a lost runner is retried once only."
+    if not failed:
+        return False, "There is no failed job in this attempt."
+    blocking = [NOT_RETRIED[kind].format(name=name) for name, kind in failed if kind != "lost-runner"]
+    if blocking:
+        return False, "Not retried: " + "; ".join(blocking) + "."
+    return True, "Every failed job lost its runner: no step failed and the annotations say so."
+
+
+def report_classification(jobs, run_attempt, annotations_of):
+    by_name = {job.get("name"): job for job in jobs}
+    failed = classify_failed_jobs(jobs, annotations_of)
+    for name, kind in failed:
+        if kind == "lost-runner":
+            report(f"Infrastructure loss: {name} lost its runner. No step failed after {job_run_minutes(by_name[name]):.0f} minutes.")
+        else:
+            report(f"{name}: " + NOT_RETRIED[kind].format(name="this job") + ".")
+    retry, reason = retry_decision(failed, run_attempt)
+    report(reason + (" A re-run of the failed jobs is safe." if retry else ""))
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"retry={str(retry).lower()}\n")
+
+
 def report(message):
     print(message, flush=True)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
@@ -339,6 +469,17 @@ def main():
         if available < minimum:
             raise UpgradeError(f"Insufficient free disk: {available:.1f} GiB available, {minimum:.1f} GiB required")
         report(f"Free disk: {available:.1f} GiB; required minimum {minimum:.1f} GiB")
+        return
+    if len(sys.argv) == 4 and sys.argv[1] == "--classify-jobs":
+        try:
+            pages = json.loads(Path(sys.argv[2]).read_text())
+            jobs = [job for page in pages for job in page["jobs"]]
+            if not isinstance(pages, list) or not all(isinstance(job, dict) for job in jobs):
+                raise TypeError("expected a list of pages that hold lists of job records")
+            attempt = int(sys.argv[3])
+        except (KeyError, TypeError, ValueError) as error:
+            raise UpgradeError(f"The jobs of the run could not be read: {error!r}") from error
+        report_classification(jobs, attempt, read_annotations)
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", type=Path, required=True)

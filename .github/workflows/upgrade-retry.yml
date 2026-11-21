@@ -1,0 +1,71 @@
+name: Retry a lost upgrade runner
+
+# A hosted runner that goes away ends an upgrade job of the Apple release workflow without a failed step (#1016).
+# When the release run has failed, this workflow re-runs its failed jobs once, but only when every failed job lost its
+# runner (.github/scripts/release_upgrade.py, --classify-jobs: the check-run annotations must say so, a full runner disk
+# is not retried) and the run is at attempt 1. A run can be re-run only after it has completed, so a job inside the release
+# run cannot do this. The workflow runs from the default branch and checks out only that branch. The job that classifies
+# has read scopes only. The job that re-runs holds the write scope, checks out nothing and runs no repository code.
+on:
+  workflow_run:
+    workflows: [Apple release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  classify:
+    name: Classify the failed jobs
+    if: >-
+      github.event.workflow_run.conclusion == 'failure'
+      && github.event.workflow_run.run_attempt == 1
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.event.workflow_run.path == '.github/workflows/testflight-internal.yml'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    outputs:
+      retry: ${{ steps.classify.outputs.retry }}
+    steps:
+      - name: Check out trusted automation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Classify the failed jobs
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
+            > "$RUNNER_TEMP/run-jobs.json"
+          python3 -I .github/scripts/release_upgrade.py --classify-jobs "$RUNNER_TEMP/run-jobs.json" "$RUN_ATTEMPT"
+
+  rerun:
+    name: Re-run the failed jobs once
+    needs: classify
+    if: needs.classify.outputs.retry == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-run the failed jobs once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          attempt="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq .run_attempt)"
+          if [[ "$attempt" != "1" ]]; then
+            echo "Run $RUN_ID is at attempt $attempt now. It is not re-run." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh run rerun "$RUN_ID" --failed --repo "$GITHUB_REPOSITORY"
+          echo "The failed jobs of run $RUN_ID lost their runners. They were re-run once." >> "$GITHUB_STEP_SUMMARY"
