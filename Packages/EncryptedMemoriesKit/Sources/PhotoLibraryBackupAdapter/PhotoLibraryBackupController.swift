@@ -915,21 +915,32 @@ public final class PhotoLibraryBackupController {
         }
     }
 
-    /// Hides a permanent item warning without ever changing the backup-success count.
-    public func dismissFailedItem(_ item: BackupFailedItem) {
+    /// Hides a permanent item warning without ever changing the backup-success count. True when the row was dismissed.
+    /// A row that cannot be read is not dismissed: the person sees the local-state message that the deletion choice
+    /// shows. A row that is gone needs no dismissal and stays silent.
+    @discardableResult
+    public func dismissFailedItem(_ item: BackupFailedItem) -> Bool {
         guard item.isPermanent, item.issue != .deletedElsewhere,
             let source = item.source,
-            let revision = item.revision, let queueStore,
-            let current = Self.foundRow(in: queueStore, source: source, revision: revision),
-            BackupIssueRecord.decode(current.lastError)?.kind != .deletedElsewhere,
-            queueStore.dismissPermanentFailure(
-                source: source,
-                revision: revision,
-                updatedAt: Date()
-            ) == true
-        else { return }
-        noteProblemListChange()
-        refreshFromQueue()
+            let revision = item.revision, let queueStore
+        else { return false }
+        let lookup: StoreLookup<UploadBackupSyncQueueEntry>
+        do { lookup = try queueStore.decisionEntry(for: source, revision: revision) } catch { lookup = .unknown }
+        switch lookup {
+        case .absent:
+            return false
+        case .unknown:
+            lastMessage = UploadError.InternalFailure.localStateMessage
+            refreshFromQueue()
+            return false
+        case .found(let current):
+            guard BackupIssueRecord.decode(current.lastError)?.kind != .deletedElsewhere,
+                queueStore.dismissPermanentFailure(source: source, revision: revision, updatedAt: Date()) == true
+            else { return false }
+            noteProblemListChange()
+            refreshFromQueue()
+            return true
+        }
     }
 
     public let bulkPhotoActions = BulkPhotoActionRunner()

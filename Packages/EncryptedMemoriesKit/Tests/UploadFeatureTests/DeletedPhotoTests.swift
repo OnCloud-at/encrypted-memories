@@ -778,6 +778,98 @@ final class DeletedPhotoTests: XCTestCase {
         }
     #endif
 
+    /// Dismissing a problem whose queue row cannot be read shows the local-state message that the deletion choice
+    /// shows, and changes nothing. A row that is certainly gone stays silent, and a dismissal that works shows none (#1153).
+    #if DEBUG
+        @MainActor
+        func testDismissingAProblemWithAnUnreadableRowShowsTheLocalStateMessage() async throws {
+            let suite = "dismissal-unreadable-message-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            let row = UploadBackupSyncQueueEntry(
+                source: source, revision: UploadBackupRevision(date: date), originalFilename: "photo.heic",
+                state: .failedPermanent,
+                lastError: BackupIssueRecord(kind: .remoteDraftStale, detail: "Stale").persistedValue,
+                updatedAt: date)
+            XCTAssertTrue(queue.upsert(row))
+            let item = BackupFailedItem(
+                id: "stale", filename: "photo.heic", reason: "stale", isPermanent: true,
+                issue: .remoteDraftStale, source: source, revision: row.revision)
+
+            let gone = BackupFailedItem(
+                id: "gone", filename: "photo.heic", reason: "stale", isPermanent: true, issue: .remoteDraftStale,
+                source: source, revision: UploadBackupRevision(date: date.addingTimeInterval(900)))
+            controller.dismissFailedItem(gone)
+            XCTAssertNil(controller.lastMessage, "a row that is gone is no failure")
+
+            var other = row
+            other.revision = UploadBackupRevision(date: date.addingTimeInterval(60))
+            XCTAssertTrue(queue.upsert(other))
+            let working = BackupFailedItem(
+                id: "working", filename: "photo.heic", reason: "stale", isPermanent: true, issue: .remoteDraftStale,
+                source: source, revision: other.revision)
+            controller.dismissFailedItem(working)
+            XCTAssertNil(controller.lastMessage, "a dismissal that works shows no message")
+            XCTAssertEqual(try queue.entry(for: other.source, revision: other.revision)?.state, .dismissedFailure)
+
+            for _ in 0..<5 { await Task.yield() }  // let the refresh of the earlier dismissal finish before the fault
+            let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
+            controller.dismissFailedItem(item)
+            fault.stop()
+            XCTAssertTrue(fault.fired)
+            XCTAssertEqual(controller.lastMessage, UploadError.InternalFailure.localStateMessage)
+            XCTAssertEqual(try queue.entry(for: row.source, revision: row.revision), row, "the row stays as it was")
+            await controller.shutdown()
+        }
+
+        /// The open list drops a problem only when the controller dismissed it. A row that could not be read stays in
+        /// the list, as a deletion choice that did not commit stays (#1153).
+        @MainActor
+        func testAProblemThatCouldNotBeDismissedStaysInTheOpenList() async throws {
+            let suite = "dismissal-list-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            let rows = [0.0, 60.0].map { offset in
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: UploadBackupRevision(date: date.addingTimeInterval(offset)),
+                    originalFilename: "photo.heic", state: .failedPermanent,
+                    lastError: BackupIssueRecord(kind: .remoteDraftStale, detail: "Stale").persistedValue,
+                    updatedAt: date)
+            }
+            for row in rows { XCTAssertTrue(queue.upsert(row)) }
+            let session = controller.makeProblemListSession()
+            session.requestRefresh()
+            await session.waitUntilIdle()
+            XCTAssertEqual(session.rows.count, 2)
+            let unreadable = try XCTUnwrap(session.rows.first { $0.item.revision == rows[0].revision }).item
+            let readable = try XCTUnwrap(session.rows.first { $0.item.revision == rows[1].revision }).item
+
+            let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
+            let refused = session.resolveDecision(unreadable) { controller.dismissFailedItem(unreadable) }
+            fault.stop()
+            XCTAssertTrue(fault.fired)
+            XCTAssertFalse(refused, "an unreadable row is not dismissed")
+            XCTAssertTrue(session.rows.contains { $0.item.id == unreadable.id }, "the row stays in the open list")
+            await session.waitUntilIdle()
+            XCTAssertTrue(session.rows.contains { $0.item.id == unreadable.id })
+
+            XCTAssertTrue(session.resolveDecision(readable) { controller.dismissFailedItem(readable) })
+            XCTAssertFalse(session.rows.contains { $0.item.id == readable.id }, "a dismissed row leaves the list")
+            await session.shutdown()
+            await controller.shutdown()
+        }
+    #endif
+
     @MainActor
     func testB1PartialRevisionReadStopsRemoteDeletionDecision() async throws {
         try await assertRemoteDecisionReadFailure(

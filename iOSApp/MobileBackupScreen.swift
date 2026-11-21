@@ -559,8 +559,7 @@ struct MobileFailedBackupSheet: View {
                                         deletionActions(for: item, place: "swipe")
                                     } else if item.isPermanent, let controller {
                                         Button(L10n.string("backup.failed_item_dismiss")) {
-                                            controller.dismissFailedItem(item)
-                                            pagedList.dismissItem(id: item.id)
+                                            pagedList.resolveDecision(item) { controller.dismissFailedItem(item) }
                                         }
                                         .tint(ProtonColor.textWeak)
                                         .accessibilityIdentifier(
