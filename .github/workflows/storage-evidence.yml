@@ -1,0 +1,35 @@
+name: Storage evidence
+
+# Labels a pull request that changes storage paths and lists the evidence that it needs (issue #1142).
+# The workflow runs on pull_request_target and so holds write access. It checks out the base branch only and
+# never reads or runs pull request content: storage_evidence.py takes names, statuses and git modes from the
+# GitHub API and writes one label and one comment. It informs only. It is not a required check and never
+# blocks a merge.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+concurrency:
+  group: storage-evidence-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    name: Storage evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Classify the changed paths and update the label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 -I .github/scripts/storage_evidence.py

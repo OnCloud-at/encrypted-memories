@@ -900,6 +900,48 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_includes (duo["on"] || duo.fetch(true)).fetch("pull_request").fetch("paths"), ".github/scripts/create_duo_simulator.py"
   end
 
+  # The storage evidence workflow (issue #1142) runs with write access on `pull_request_target`. It must never
+  # check out, read or run pull request content, so the contract pins its trigger, its rights and its steps.
+  def test_the_storage_evidence_workflow_never_runs_pull_request_code_and_has_minimal_rights
+    path = File.join(WORKFLOWS, "storage-evidence.yml")
+    assert File.exist?(path), "the storage evidence workflow must exist"
+    workflow = YAML.load_file(path)
+    events = workflow["on"] || workflow.fetch(true)
+    assert_equal ["pull_request_target"], events.keys, "no merge_group, no pull_request, no workflow_dispatch"
+    # `edited` also fires for a retarget of the base branch, which changes the diff; a title edit costs one cheap run
+    # that writes nothing, because the label and the comment are already right.
+    assert_equal %w[edited opened reopened synchronize], events.fetch("pull_request_target").fetch("types").sort
+    assert_equal({}, workflow.fetch("permissions"), "no rights at workflow level")
+    jobs = workflow.fetch("jobs")
+    assert_equal ["classify"], jobs.keys
+    job = jobs.fetch("classify")
+    refute_includes REQUIRED_CHECKS, job.fetch("name"), "the evidence job is never a required check"
+    assert_equal({"contents" => "read", "pull-requests" => "write"}, job.fetch("permissions"))
+    assert_equal "ubuntu-24.04", job.fetch("runs-on")
+    assert_equal 10, job.fetch("timeout-minutes")
+    refute job.key?("continue-on-error"), "a failed label write must show"
+    assert_equal({"group" => "storage-evidence-${{ github.event.pull_request.number }}", "cancel-in-progress" => true},
+                 workflow.fetch("concurrency"))
+    steps = job.fetch("steps")
+    assert_equal 2, steps.size, "checkout of the base branch and the script, nothing else"
+    checkout, script = steps
+    assert_match(%r{\Aactions/checkout@[0-9a-f]{40}\z}, checkout.fetch("uses"))
+    # No ref, repository or token input: pull_request_target checks out the base branch, never the pull request.
+    assert_equal({"persist-credentials" => false}, checkout.fetch("with"))
+    assert_equal "python3 -I .github/scripts/storage_evidence.py", script.fetch("run")
+    assert_equal({"GH_TOKEN" => "${{ github.token }}", "PR_NUMBER" => "${{ github.event.pull_request.number }}"}, script.fetch("env"))
+    refute script.key?("working-directory")
+    # Nothing in the workflow reads the head of the pull request.
+    refute_match(/pull_request\.head|head\.(ref|sha|repo)|head_ref|merge_commit/, JSON.generate(workflow))
+  end
+
+  def test_the_storage_tests_run_in_the_hygiene_job
+    hygiene = @workflow.fetch("jobs").fetch("repository-hygiene").fetch("steps").find { |step| step["name"] == "Test GitHub automation" }
+    %w[test_storage_path_policy.py test_storage_evidence.py].each do |file|
+      assert_includes hygiene.fetch("run"), "python3 .github/scripts/#{file}"
+    end
+  end
+
   def test_full_verification_uses_four_mac_runners_without_hygiene_waits
     mac_jobs = @workflow.fetch("jobs").select { |_, job| job["runs-on"] == "xcode-27" }
     assert_equal ["ios-ui-verification", "ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort

@@ -94,6 +94,19 @@ Run the full local gates only when your change touches storage, a migration, bac
 ./scripts/verify-universal-core.sh fast
 ```
 
+A pull request that changes storage paths gets the label `storage` and one comment that lists the evidence:
+mutation evidence with one row per safety guard, an independent review, and the full local gates above.
+`PROTECTED_MODULES` in `.github/scripts/storage_path_policy.py` defines the storage paths once, and the workflow
+`.github/workflows/storage-evidence.yml` sets the label. A test fails when a package module has no classification.
+Decide for the new module whether it holds a store (database, journal, file store, keychain, deletion): add it to
+`PROTECTED_MODULES` if it does, otherwise to `EXPECTED_UNCLASSIFIED_MODULES` in `.github/scripts/test_storage_path_policy.py`.
+These two lists are the only places to change. No test pins the list of protected modules itself: it sits in
+`.github/scripts`, which the classification treats as unclassified, so a person reviews every change that moves a
+module out of it. When a change cannot be classified, the job summary of the workflow run
+says `undetermined` and lists the unclassified paths. The label stays as it is, and a comment appears only when a storage
+path is also present. A failed or malformed read of the GitHub API ends the job red and changes nothing.
+The label and the comment only inform: they never block a merge and are not required checks.
+
 A pull request runs repository hygiene and the Swift style check on Linux. The merge queue runs the package
 tests, the iOS app tests and both platform builds before the merge. Changes only to `Wiki/**`, `site/**`,
 the root `README.md` or `SECURITY.md` skip these macOS jobs when the queue uses ALLGREEN and no Swift file changed;
