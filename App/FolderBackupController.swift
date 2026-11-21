@@ -424,7 +424,7 @@ final class FolderBackupController {
 
     private func recordFolderEnumerationFailure(_ message: String) {
         hasFolderEnumerationFailure = true
-        status = Self.statusAfterFolderEnumerationFailure(status)
+        status = status.afterFolderEnumerationFailure()
         reportSyncMessage(message)
     }
 
