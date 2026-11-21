@@ -11,16 +11,28 @@
 # (`HOST_ROOT` below is the root of the checkout; `scripts/lint-swift.sh` fills it in). A host draws and starts native
 # things; it does not decide from an error type or from the health of a store. The core decides and the host asks it
 # (for example `TimelineRefreshFailurePolicy`). The tokens that a host may not use:
-# - `catch let e as T`, `catch is T`, `case let e as T`, `case is T`, `x is T`, `x as? T`, `x as! T` and `catch T.case`,
-#   where T ends in Error or Failure, also with a module path (`Module.Sub.T`), `any T` or `(any T)`;
+# - a cast to T: `x as T`, `x as? T`, `x as! T`, `x is T`, also inside a pattern (`catch let e as T`, `catch is T`,
+#   `case let e as T`, `case .failure(let e as T)`, `case let .failure(e as T)`);
+# - a pattern that names T: `catch T.case`, `if case T.case = error`, `guard case T.case = error`, `case T.case:`
+#   and `case .failure(T.case)`, also `case let T.case(value)`;
+#   T ends in Error or Failure, also with a module path (`Module.Sub.T`), `any T` or `(any T)`;
 # - `switch` over a value whose name ends in err, error or failure, also `switch error.code` and `switch (error as? X)`;
 # - `.isOperational()` and `.isReadable`, which ask a store whether it works.
 # `CancellationError`, `URLError`, `NSError`, `CocoaError`, `DecodingError`, `EncodingError` and `LocalizedError` are
-# platform types and stay allowed, also with a module path. A `//` that follows a colon (a web address) does not start a
-# comment.
+# platform types and stay allowed in every one of these forms, also with a module path. The list is closed: any other
+# Apple error type (`POSIXError`, `PHPhotosError`, `CKError`, `NWError`) counts as T until it joins the list. A `//`
+# that follows a colon (a web address) does not start a comment.
 # The tokens are all the gate sees. What it does not see:
 # - a decision on a core failure value, for example `failure.isRetryable` at `iOSApp/MobilePhotoViewer.swift:1993`;
 # - another method name for a store health check, and an error type whose name does not end in Error or Failure;
+# - a pattern without a type name: `catch .quotaExceeded`, `case .failure(.quotaExceeded)` and
+#   `if case .quotaExceeded = error`;
+# - a comparison with a case: `error == T.case`, `error != T.case`, `error ~= T.case`, and a metatype check such as
+#   `type(of: error) == T.self`;
+# - a pattern that names T below a second payload (`case .a(.b(T.case))`), or after a comma in one `case` or one
+#   `catch` (`catch URLError.timedOut, AlbumError.x`);
+# - a cast to a collection of T (`as? [T]`, `as? Array<T>`);
+# - a declaration that stores T (`case failed(AlbumError)` in an enum): only a pattern or a cast reads the type;
 # - a site after `//` inside a string, and a token inside a string or a `/* … */` comment (reported, as for the
 #   store-read rules below);
 # - a file outside `App/` and `iOSApp/`.
@@ -81,12 +93,12 @@ custom_rules:
   no_domain_error_decision_in_host:
     name: Host decision from an error type
     included: &host_sources '^HOST_ROOT/(?:App|iOSApp)/'
-    regex: '(?<!(?:^|[^:])//[^\n]{0,300})(?:(?:\b(?:catch|case)\s+(?:let\s+\w{1,64}\s+as\s+|is\s+)|\bas[?!]\s*|\bis\s+)(?:\(\s*)?(?:any\s+)?(?:\w{1,64}\.){0,8}(?!(?:CancellationError|URLError|NSError|LocalizedError|CocoaError|DecodingError|EncodingError)\b)[A-Z]\w{0,64}(?:Error|Failure)\b|\bcatch\s+(?:\w{1,64}\.){0,8}(?!(?:CancellationError|URLError|CocoaError)\b)[A-Z]\w{0,64}(?:Error|Failure)\s*\.|\bswitch\s+\(?\s*[\w.?!]{0,100}?(?:[eE]rr(?:or)?|[fF]ailure)\b)'
+    regex: '(?:\bas(?:[?!]\s*|\s+)|\bis\s+|\b(?:catch|case)\s+(?:let\s+)?(?:\.\s*\w{1,64}\s*\(\s*)?)(?<!(?:^|[^:])//[^\n]{0,300})(?:\(\s*)?(?:any\s+)?(?:\w{1,64}\.){0,8}(?!(?:CancellationError|URLError|NSError|LocalizedError|CocoaError|DecodingError|EncodingError)\b)[A-Z]\w{0,64}(?:Error|Failure)\b|\bswitch\s+(?<!(?:^|[^:])//[^\n]{0,300})\(?\s*[\w.?!]{0,100}?(?:[eE]rr(?:or)?|[fF]ailure)\b'
     message: "A host does not decide from an error type; ask the core, which returns what the host draws."
     severity: error
   no_store_health_check_in_host:
     name: Host decision from a store check
     included: *host_sources
-    regex: '(?<!(?:^|[^:])//[^\n]{0,300})(?:\.\s*isOperational\s*\(|\.\s*isReadable\b)'
+    regex: '\.(?<!(?:^|[^:])//[^\n]{0,300})\s*(?:isOperational\s*\(|isReadable\b)'
     message: "A host does not ask a store whether it works; ask the core, which returns what the host draws."
     severity: error

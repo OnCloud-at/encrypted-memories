@@ -1,0 +1,50 @@
+// Host decision canary (#1157): a host that names a domain error type in a pattern. `scripts/verify-swift-style.sh`
+// copies this file below `App/` and lints it. Each `expect` comment names the rule that must report the next line; no
+// other line may be reported.
+func forbiddenPatterns(result: Result<Int, any Error>, error: any Error) {
+    do {
+        try work()
+        // expect: no_domain_error_decision_in_host
+    } catch UploadError.quotaExceeded {
+        retry()
+        // expect: no_domain_error_decision_in_host
+    } catch UploadCore.UploadError.partial(let count) {
+        show(count)
+    } catch {
+        // expect: no_domain_error_decision_in_host
+        if case UploadError.quotaExceeded = error { retry() }
+        // expect: no_domain_error_decision_in_host
+        guard case UploadError.quotaExceeded = error else { return }
+        // expect: no_domain_error_decision_in_host
+        if case let UploadError.partial(count) = error { show(count) }
+        // expect: no_domain_error_decision_in_host
+        guard case UploadCore.UploadError.quotaExceeded = error else { return }
+        // expect: no_domain_error_decision_in_host
+        let typed = error as AlbumError
+        show(typed)
+    }
+    switch result {
+    // expect: no_domain_error_decision_in_host
+    case .failure(let typed as AlbumError): show(typed)
+    // expect: no_domain_error_decision_in_host
+    case let .failure(typed as AlbumError): show(typed)
+    // expect: no_domain_error_decision_in_host
+    case .failure(AlbumError.notFound): retry()
+    // expect: no_domain_error_decision_in_host
+    case .failure(UploadCore.UploadError.quotaExceeded): retry()
+    // expect: no_domain_error_decision_in_host
+    case let .failure(UploadError.partial(count)): show(count)
+    // expect: no_domain_error_decision_in_host
+    case .failure(let typed) where typed is any StorageFailure: retry()
+    // A web address in a string does not hide the site behind it.
+    // expect: no_domain_error_decision_in_host
+    case .failure(let typed) where (URL(string: "https://example.invalid"), typed as? AlbumError).1 != nil: retry()
+    default: break
+    }
+    // A case that names a domain error type, whatever the value that the switch reads.
+    switch phase {
+    // expect: no_domain_error_decision_in_host
+    case AlbumError.notFound: retry()
+    default: break
+    }
+}

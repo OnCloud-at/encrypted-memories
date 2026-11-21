@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -139,11 +140,33 @@ echo "Done linting!"
             ('/Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/',
              ['DecisionReadCanary.swift', 'DisplayReadCanary.swift', 'DisabledReadCanary.swift']),
             ('/App/', ['HostDecisionReadCanary.swift', 'HostDisplayReadCanary.swift', 'HostDisabledReadCanary.swift']),
+            ('/iOSApp/', ['HostPatternDecisionReadCanary.swift', 'HostPatternDisplayReadCanary.swift']),
             ('/App/leak-root/Packages/EncryptedMemoriesKit/Sources/PhotosCore/', ['LeakCanary.swift']),
         ]:
             for name in names:
                 with self.subTest(file=name):
                     self.assertTrue(any(path.endswith(tree + name) for path in linted), f'{tree}{name} not linted')
+
+    def test_a_missing_disabled_canary_stops_the_check_instead_of_skipping_it(self):
+        # The sets of the core and of `App/` carry a disabled canary; a deleted or renamed file must not turn the
+        # `swiftlint:disable` check into a silent pass.
+        swiftlint = self.canary_swiftlint()
+        format_tool = tool(self.dir, 'swift-format', 'exit 0\n')
+        for name in ['Disabled.swift.txt', 'HostDisabled.swift.txt']:
+            with self.subTest(missing=name):
+                tree = self.dir / ('tree-' + name)
+                shutil.copytree(ROOT / 'scripts', tree / 'scripts')
+                for config in ['.swiftlint.yml', '.swiftlint-decision-reads.yml', '.swiftlint-decision-reads-baseline',
+                               '.swift-format']:
+                    shutil.copy(ROOT / config, tree / config)
+                (tree / 'scripts' / 'decision-read-canary' / name).unlink()
+                env = dict(os.environ, SWIFTLINT_EXECUTABLE=str(swiftlint), SWIFT_FORMAT_EXECUTABLE=str(format_tool))
+                for key in ['BASE_SHA', 'HEAD_SHA']:
+                    env.pop(key, None)
+                result = subprocess.run(['bash', str(tree / 'scripts' / 'verify-swift-style.sh')], capture_output=True,
+                                        text=True, env=env, cwd=tree)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(name, result.stderr)
 
     def test_a_swiftlint_that_reports_a_display_read_fails_the_check(self):
         swiftlint = self.canary_swiftlint(display_fires=True)
@@ -210,12 +233,12 @@ class DecisionReadBaseline(unittest.TestCase):
         self.git('commit', '-q', '--allow-empty', '-m', 'baseline')
         return self.git('rev-parse', 'HEAD')
 
-    def swiftlint(self, sites=0, decision_output=None, decision_status=None):
-        # The main configuration finds nothing; the decision-read configuration reports `sites` violations in FILE.
-        # Like the real tool, it prints the path with every symbolic link resolved.
+    def swiftlint(self, sites=0, decision_output=None, decision_status=None, rule=None, file=None):
+        # The main configuration finds nothing; the decision-read configuration reports `sites` violations of `rule` in
+        # `file` (RULE and FILE by default). Like the real tool, it prints the path with every symbolic link resolved.
         lines = decision_output if decision_output is not None else '\n'.join(
-            f'{os.path.realpath(self.repo)}/{self.FILE}:{line}:5: error: Strict store read in decision code '
-            f'Violation: m. ({self.RULE})' for line in range(1, sites + 1))
+            f'{os.path.realpath(self.repo)}/{file or self.FILE}:{line}:5: error: Strict store read in decision code '
+            f'Violation: m. ({rule or self.RULE})' for line in range(1, sites + 1))
         status = decision_status if decision_status is not None else (2 if sites else 0)
         return tool(self.dir, 'swiftlint', f'''if [[ "$1" == "version" ]]; then echo 0.65.1; exit 0; fi
 if [[ "$*" == *.swiftlint-decision-reads.yml* ]]; then
@@ -240,15 +263,46 @@ echo "Done linting!"
                 result = self.lint(self.swiftlint(sites), self.FILE)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @staticmethod
+    def included_patterns(config):
+        """Returns the `included` pattern of each rule of a configuration, with its YAML aliases resolved."""
+        anchors, patterns, rule = {}, {}, None
+        for line in config.splitlines():
+            if match := re.match(r'^  ([a-z_]+):\s*$', line):
+                rule = match.group(1)
+            elif match := re.match(r"^    included: (?:&(\w+) )?(?:\*(\w+)|'(.*)')$", line):
+                value = anchors[match.group(2)] if match.group(2) else match.group(3)
+                if match.group(1):
+                    anchors[match.group(1)] = value
+                patterns[rule] = value
+        return patterns
+
     def test_the_host_rules_are_anchored_to_the_root_of_the_checkout(self):
         # SwiftLint matches the host rules against absolute paths, so a directory called App above the checkout would
-        # make every file a host file. The configuration that SwiftLint reads names the root of the checkout.
+        # make every file a host file. The configuration that SwiftLint reads names the root of the checkout; check
+        # which paths its `included` pattern of each host rule accepts.
         self.assertEqual(self.lint(self.swiftlint(), self.FILE).returncode, 0)
         config = (self.dir / 'decision-config').read_text()
-        root = os.path.realpath(self.repo).removeprefix('/private')
-        escaped = re.sub(r'([][\\.*^$#+?(){}|])', r'\\\1', root)
-        self.assertIn("included: &host_sources '^(?:/private)?" + escaped + "/(?:App|iOSApp)/'", config)
         self.assertNotIn('HOST_ROOT', config)
+        root = os.path.realpath(self.repo)
+        # The temporary directory is a symbolic link below /private on macOS; SwiftLint can print either spelling.
+        other = root.removeprefix('/private') if root.startswith('/private/') else '/private' + root
+        patterns = self.included_patterns(config)
+        for rule in ['no_domain_error_decision_in_host', 'no_store_health_check_in_host']:
+            pattern = re.compile(patterns[rule])
+            for base in [root, other]:
+                for path, is_host in [
+                    (f'{base}/App/Views/MainView.swift', True),
+                    (f'{base}/iOSApp/MobileLibraryModel.swift', True),
+                    (f'{base}/Packages/EncryptedMemoriesKit/Sources/PhotosCore/App/Leak.swift', False),
+                    (f'{base}/Packages/EncryptedMemoriesKit/Sources/PhotosCore/iOSApp/Leak.swift', False),
+                    (f'{base}/{self.FILE}', False),
+                    (f'{base}/Apps/Other.swift', False),
+                    (f'{base}-other/App/Other.swift', False),
+                    ('/elsewhere/App/Other.swift', False),
+                ]:
+                    with self.subTest(rule=rule, path=path.replace(base, '<root>')):
+                        self.assertEqual(bool(pattern.search(path)), is_host)
 
     def test_a_decision_read_beyond_the_baseline_fails_and_names_its_site(self):
         result = self.lint(self.swiftlint(3), self.FILE)
@@ -423,6 +477,27 @@ echo "Done linting!"
                 result = self.lint(self.swiftlint(sites), self.FILE)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertNotIn('Notice: lower the decision-read baseline:', result.stdout)
+
+    def test_the_checked_in_host_baseline_lines_have_no_slack_for_their_existing_sites(self):
+        # The real full lint reports exactly these host sites (#1157). Use the checked-in allowance, not the scratch
+        # baseline. When a change removes a host site, it lowers its baseline line and its count here in the same commit.
+        baseline = '.swiftlint-decision-reads-baseline'
+        (self.repo / baseline).write_bytes((ROOT / baseline).read_bytes())
+        for count, rule, file in [
+            (1, 'no_domain_error_decision_in_host', 'App/FolderBackupController.swift'),
+            (2, 'no_store_health_check_in_host', 'App/FolderBackupController.swift'),
+            (1, 'no_store_health_check_in_host', 'App/Views/MainView.swift'),
+            (1, 'no_store_health_check_in_host', 'iOSApp/MobileLibraryModel.swift'),
+        ]:
+            source = self.repo / file
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text('let reader = 1\n')
+            for sites, status in [(count, 0), (count + 1, 1)]:
+                with self.subTest(rule=rule, file=file, sites=sites):
+                    result = self.lint(self.swiftlint(sites, rule=rule, file=file), file)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    # A file with a line for another rule gets that rule's notice, because the run reports only `rule`.
+                    self.assertNotIn(f'Notice: lower the decision-read baseline: {rule} {file}:', result.stdout)
 
     def test_a_malformed_baseline_at_the_head_fails_with_a_clean_working_tree(self):
         head = self.commit_baseline(f'two {self.RULE} {self.FILE}\n')

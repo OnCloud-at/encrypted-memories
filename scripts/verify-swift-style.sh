@@ -16,18 +16,22 @@ if bash scripts/lint-swift.sh "$canary_directory/StyleCanary.swift" > /dev/null 
   exit 1
 fi
 # The store-read rules check core sources only (the StoreLookup rule checks every file), and the host rules check only
-# the two app trees, so the canary files sit below a core source path and below `App/`. SwiftLint must report exactly
-# the lines that the `expect` comments of the forbidden canary name, nothing in the allowed one, and a comment that
-# turns a decision rule off must fail.
+# the two app trees, so the canary files sit below a core source path, below `App/` and below `iOSApp/`. SwiftLint
+# must report exactly the lines that the `expect` comments of the forbidden canary name, nothing in the allowed one,
+# and a comment that turns a decision rule off must fail.
 check_decision_canary() {
-  local directory="$1" prefix="$2" host_root="$3" forbidden allowed disabled
+  local directory="$1" prefix="$2" host_root="$3" with_disabled="$4" forbidden allowed disabled
   forbidden="$directory/${prefix}DecisionReadCanary.swift"
   allowed="$directory/${prefix}DisplayReadCanary.swift"
   disabled="$directory/${prefix}DisabledReadCanary.swift"
   mkdir -p "$directory"
   cp "scripts/decision-read-canary/${prefix}Forbidden.swift.txt" "$forbidden"
   cp "scripts/decision-read-canary/${prefix}Allowed.swift.txt" "$allowed"
-  cp "scripts/decision-read-canary/${prefix}Disabled.swift.txt" "$disabled"
+  # A set that says "no" has no disabled file and shares the disable check of its sibling set. A set that says "yes"
+  # must have the file: a missing file stops the script here instead of skipping the check.
+  if [[ "$with_disabled" == "yes" ]]; then
+    cp "scripts/decision-read-canary/${prefix}Disabled.swift.txt" "$disabled"
+  fi
   local expected_decision_reads reported_decision_reads decision_canary_output display_canary_output
   expected_decision_reads="$(
     grep -n '// expect: ' "$forbidden" |
@@ -49,13 +53,14 @@ check_decision_canary() {
     printf '%s\n' "$display_canary_output" >&2
     exit 1
   fi
-  if DECISION_HOST_ROOT="$host_root" bash scripts/lint-swift.sh "$disabled" > /dev/null 2>&1; then
+  if [[ "$with_disabled" == "yes" ]] && DECISION_HOST_ROOT="$host_root" bash scripts/lint-swift.sh "$disabled" > /dev/null 2>&1; then
     echo "A comment that turns off a decision-read rule passed the canary; the style check does not run completely." >&2
     exit 1
   fi
 }
-check_decision_canary "$canary_directory/Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup" "" "$canary_directory"
-check_decision_canary "$canary_directory/App" "Host" "$canary_directory"
+check_decision_canary "$canary_directory/Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup" "" "$canary_directory" yes
+check_decision_canary "$canary_directory/App" "Host" "$canary_directory" yes
+check_decision_canary "$canary_directory/iOSApp" "HostPattern" "$canary_directory" no
 # The host rules match absolute paths below the root of the checkout. A directory called App above the checkout must not
 # turn a core file into a host file.
 leak_root="$canary_directory/App/leak-root"
