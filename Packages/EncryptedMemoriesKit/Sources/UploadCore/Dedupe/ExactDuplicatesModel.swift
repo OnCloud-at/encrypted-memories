@@ -566,6 +566,8 @@ public final class ExactDuplicatesModel {
     /// The groups of the last scan, one for each content hash, in the order of the scan, without the copies that left
     /// the library since.
     @ObservationIgnored private var scannedGroups: [ExactDuplicateGroup] = []
+    /// The file size of each content hash of the last scan, for the tiles of the differing copies.
+    @ObservationIgnored private var scannedSizes: [String: Int64] = [:]
     /// The candidates of the last scan that a ranking already read and found to be no duplicates. They leave the list,
     /// but the check of a reopened screen counts them as done.
     @ObservationIgnored private var checkedNonDuplicates = 0
@@ -780,9 +782,25 @@ public final class ExactDuplicatesModel {
                 ExactDuplicateReviewGroup(id: $0.contentHash, members: $0.members, differences: $0.differences)
             }
         case .possible:
-            possibleGroups.map {
-                ExactDuplicateReviewGroup(id: $0.id, members: $0.members, differences: $0.differences)
+            possibleGroups.map { group in
+                // Different files mostly differ in size; the size is no detail of the fingerprint.
+                let sizes = Set(group.members.compactMap { possibleSizes[$0] })
+                let differences = group.differences + (sizes.count > 1 ? [.fileSize] : [])
+                return ExactDuplicateReviewGroup(
+                    id: group.id, members: group.members,
+                    differences: ExactDuplicateDetail.allCases.filter(differences.contains))
             }
+        }
+    }
+
+    /// The file size of `member` on its tile in `list`. Nil while no read stated it.
+    public func byteSize(of member: PhotoUID, in list: ExactDuplicateReviewList) -> Int64? {
+        switch list {
+        case .differing:
+            // Copies with the same bytes have the size of their content hash.
+            differingGroups.first { $0.members.contains(member) }.flatMap { scannedSizes[$0.contentHash] }
+        case .possible:
+            possibleSizes[member]
         }
     }
 
@@ -820,6 +838,7 @@ public final class ExactDuplicatesModel {
             case .dimensions: L10n.string("duplicates.detail_dimensions")
             case .duration: L10n.string("duplicates.detail_duration")
             case .fileType: L10n.string("duplicates.detail_file_type")
+            case .fileSize: L10n.string("duplicates.detail_file_size")
             case .livePhoto: L10n.string("duplicates.detail_live_photo")
             }
         }
@@ -1117,6 +1136,7 @@ public final class ExactDuplicatesModel {
             }
             groups = shown
             scannedGroups = scan.groups
+            scannedSizes = scan.byteSizes
             storedFingerprints = stored
             showDifferingGroups()
             checkedNonDuplicates = nonDuplicates

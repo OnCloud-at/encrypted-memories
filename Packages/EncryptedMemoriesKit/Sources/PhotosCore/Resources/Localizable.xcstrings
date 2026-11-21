@@ -7000,6 +7000,20 @@
         "de": { "stringUnit": { "state": "translated", "value": "Diese Kopien haben dasselbe Bild, aber Datum, Ort oder andere Angaben weichen ab. Öffne eine Kopie zum Vergleichen. Lege die Kopien, die du nicht brauchst, in den Papierkorb. Aus „Zuletzt gelöscht“ kannst du sie wiederherstellen." } }
       }
     },
+    "duplicates.possible_title": {
+      "comment": "Row in the Duplicates summary and title of the list of different files that are possibly the same photo.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Possibly the Same Photo" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Vielleicht dasselbe Foto" } }
+      }
+    },
+    "duplicates.possible_message": {
+      "comment": "Explanation at the top of the list of different files that are possibly the same photo.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "These photos were taken in the same second with the same camera, but they are different files, for example a smaller copy or another format. Compare them before you move one to the Trash. You can restore them from Recently Deleted." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Diese Fotos wurden in derselben Sekunde mit derselben Kamera aufgenommen, sind aber verschiedene Dateien, zum Beispiel eine kleinere Kopie oder ein anderes Format. Vergleiche sie, bevor du eines in den Papierkorb legst. Aus „Zuletzt gelöscht“ kannst du sie wiederherstellen." } }
+      }
+    },
     "duplicates.differing_line %@": {
       "comment": "Above one group of copies whose details differ. %@ is a list of details, for example date and place.",
       "extractionState": "manual",
@@ -7048,6 +7062,13 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "file type" } },
         "de": { "stringUnit": { "state": "translated", "value": "Dateityp" } }
+      }
+    },
+    "duplicates.detail_file_size": {
+      "comment": "A detail that differs between copies: the file size.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "file size" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Dateigröße" } }
       }
     },
     "duplicates.detail_live_photo": {

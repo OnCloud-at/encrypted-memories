@@ -3997,6 +3997,83 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertFalse(model.isCheckingPossibleDuplicates)
     }
 
+    func testThePossibleListHasItsRowLineSizesAndViewerGroup() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.load()
+        XCTAssertNil(model.reviewRowTitle(.possible), "no row before the check")
+
+        await model.checkPossibleDuplicates(policy: shape)
+
+        XCTAssertEqual(model.reviewRowTitle(.possible), "\(L10n.string("duplicates.possible_title")) · 1")
+        XCTAssertNotEqual(L10n.string("duplicates.possible_title"), "duplicates.possible_title")
+        let group = try XCTUnwrap(model.reviewGroups(.possible).first)
+        XCTAssertEqual(
+            group, ExactDuplicateReviewGroup(id: "v/x1", members: [x1, x2, x3], differences: [.fileType, .fileSize]))
+        XCTAssertEqual(
+            model.differenceLine(of: group, item: { _ in nil }),
+            L10n.string(
+                "duplicates.differing_line \(ListFormatter.localizedString(byJoining: [L10n.string("duplicates.detail_file_type"), L10n.string("duplicates.detail_file_size")]))"
+            ))
+        XCTAssertEqual(model.byteSize(of: x2, in: .possible), 2)
+        let item = { (uid: PhotoUID) in PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/jpeg") }
+        let opened = model.viewerItems(opening: x2, in: .possible, groupID: "v/x1", item: item)
+        XCTAssertEqual(opened?.items.map(\.uid), [x1, x2, x3])
+        XCTAssertEqual(opened?.index, 1)
+    }
+
+    func testCopiesOfTheSameSizeNameNoFileSize() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = PossibleDuplicateScan(
+            groups: [PossibleDuplicateGroup(members: [x1, x3], differences: [.fileType])], byteSizes: [x1: 5, x3: 5],
+            fingerprints: [x1: .possiblePhoto(type: "image/jpeg"), x3: .possiblePhoto(type: "image/heic")])
+        let (model, _) = makeModel(finder)
+
+        await model.checkPossibleDuplicates(policy: shape)
+
+        XCTAssertEqual(model.reviewGroups(.possible).first?.differences, [.fileType])
+    }
+
+    func testTheTilesOfTheDifferingCopiesShowTheSizeOfTheirBytes() async {
+        let finder = FakeDuplicateFinder(
+            scans: [.init(groups: [groupA, groupB], coverage: .complete, byteSizes: ["B": 500])])
+        finder.fingerprints = [a1: described, a2: described, a3: described, b1: described, b2: other]
+        let (model, _) = makeModel(finder)
+
+        await model.load()
+
+        XCTAssertEqual(model.reviewGroups(.differing).map(\.id), ["B"])
+        XCTAssertEqual(model.byteSize(of: b2, in: .differing), 500)
+        XCTAssertNil(model.byteSize(of: a1, in: .differing), "a copy of no differing group has no size there")
+        XCTAssertEqual(
+            model.reviewGroups(.differing).first?.differences.contains(.fileSize), false,
+            "copies with the same bytes have the same size")
+    }
+
+    func testTheRouteOpensThePossibleListAloneAndClosesItWithItsLastGroup() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: other]
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.load()
+        await model.checkPossibleDuplicates(policy: shape)
+        var route = ExactDuplicatesRoute()
+
+        route.show(.possible, of: model)
+
+        XCTAssertTrue(route.shows(.possible, of: model))
+        XCTAssertFalse(route.shows(.differing, of: model), "one list at a time")
+        XCTAssertEqual(route.opened, .possible)
+        XCTAssertFalse(route.offersMergeAll(of: model))
+
+        model.didTrashElsewhere([x1, x2])
+        route.follow(model)
+
+        XCTAssertNil(route.opened, "the list closes when its last group left")
+        XCTAssertTrue(route.offersMergeAll(of: model))
+    }
+
     func testACopyThatAMergeMovedToRecentlyDeletedLeavesThePossibleGroups() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         let scanned = PossibleDuplicateScan(

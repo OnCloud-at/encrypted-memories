@@ -75,7 +75,7 @@ public struct ExactDuplicateFingerprint: Sendable, Hashable {
         case .dimensions: pixelWidth == other.pixelWidth && pixelHeight == other.pixelHeight
         case .duration: durationSeconds == other.durationSeconds
         case .fileType: mimeType == other.mimeType
-        case .livePhoto: true
+        case .fileSize, .livePhoto: true
         }
     }
 
@@ -106,6 +106,8 @@ public enum ExactDuplicateDetail: String, CaseIterable, Sendable {
     case duration
     /// The MIME type.
     case fileType
+    /// The size of the file. The fingerprint does not hold it; only different files can differ in it.
+    case fileSize
     /// One copy is a Live Photo and another is not. The fingerprint does not hold it, so it never decides alone that
     /// copies differ; see `ExactDuplicateReviewGroup.differences(with:)`.
     case livePhoto
