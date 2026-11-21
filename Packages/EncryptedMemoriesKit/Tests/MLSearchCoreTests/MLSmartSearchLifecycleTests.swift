@@ -15,6 +15,7 @@ import Testing
         private var payloads: [URL: Data]
         private var failuresRemaining: [URL: Int]
         private let failure: any Error
+        private let strayFile: String?
         private(set) var downloads = 0
         private var blocksNext = false
         private var blocked = false
@@ -23,11 +24,12 @@ import Testing
 
         init(
             payloads: [URL: Data], failFirst: [URL: Int] = [:],
-            failure: any Error = URLError(.networkConnectionLost)
+            failure: any Error = URLError(.networkConnectionLost), strayFile: String? = nil
         ) {
             self.payloads = payloads
             self.failuresRemaining = failFirst
             self.failure = failure
+            self.strayFile = strayFile
         }
 
         func download(
@@ -77,6 +79,11 @@ import Testing
                 await progress(total * Int64(step) / 4, total)
             }
             try payload.write(to: destination)
+            // A file that no plan names, left in the staging tree beside the artifact.
+            if let strayFile {
+                try Data("stray".utf8).write(
+                    to: destination.deletingLastPathComponent().appendingPathComponent(strayFile))
+            }
         }
 
         var downloadCount: Int { lock.withLock { downloads } }
@@ -1441,6 +1448,150 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: staging.path))
         #expect(await waitForCompleteIndex(harness, total: 1))
         #expect(!(try await harness.lifecycle.search("anything", limit: 3)).isEmpty)
+        await harness.lifecycle.shutdown()
+    }
+
+    /// The same catalog entry fails the same way on every attempt, so the person gets the plain installation
+    /// failure and no Try again. The failure is not a download or verification problem that a new download could
+    /// clear.
+    @Test(arguments: [
+        MLModelInstallError.licenseProhibitsDistribution,
+        .notDownloadable,
+        .unsafeArtifactPath("Model.mlmodelc/../escape"),
+        .ambiguousModelArtifact,
+    ])
+    func aFailureThatTheSameEntryAlwaysRepeatsOffersNoRetry(error: MLModelInstallError) async throws {
+        let payload = Data("fixed-failure".utf8)
+        let (entry, url) = downloadableEntry(id: "fixed-failure", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")],
+            transportOverride: ScriptedTransport(payloads: [url: payload], failFirst: [url: 1], failure: error))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+
+        let failed = await harness.lifecycle.currentSnapshot()
+        guard case .failed(let failure) = failed.phase else {
+            Issue.record("the transfer must fail")
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(failure.kind == .installation)
+        #expect(!failure.isRetryable)
+        let presentation = MLSmartSearchModelPresentation(snapshot: failed)
+        #expect(!presentation.canRetry)
+        #expect(presentation.statusText == L10n.string("mlsearch.status_failed_installation"))
+
+        await harness.lifecycle.retry()
+        #expect(harness.transport.downloadCount == 1, "a Retry that cannot help must not download again")
+        await harness.lifecycle.shutdown()
+    }
+
+    /// The staging tree on disk is local state: the next attempt can read it differently. The failure is not the
+    /// entry's, so the person keeps Try again (the real installer, the real tree check).
+    @Test func aStagingTreeThatCannotBeVerifiedKeepsItsRetry() async throws {
+        let payload = Data("stray-in-staging".utf8)
+        let (entry, url) = downloadableEntry(id: "stray-in-staging", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")],
+            transportOverride: ScriptedTransport(payloads: [url: payload], strayFile: "stray.tmp"))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+
+        let failed = await harness.lifecycle.currentSnapshot()
+        guard case .failed(let failure) = failed.phase else {
+            Issue.record("the install must fail")
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(failure.kind == .installation)
+        #expect(failure.isRetryable)
+        #expect(MLSmartSearchModelPresentation(snapshot: failed).canRetry)
+        await harness.lifecycle.shutdown()
+    }
+
+    /// The paths of the plan alone make the layout ambiguous, so no new download of the same entry helps: the plan
+    /// names two model packages, or it lacks a resource that the entry declares it needs.
+    @Test(arguments: [false, true])
+    func aLayoutThatThePlanMakesAmbiguousOffersNoRetry(declaresAMissingResource: Bool) async throws {
+        let payload = Data("plan-layout".utf8)
+        let paths =
+            declaresAMissingResource
+            ? ["Model.mlmodelc/weights.bin"] : ["First.mlmodelc/weights.bin", "Second.mlmodelc/weights.bin"]
+        let urls = paths.map { URL(string: "https://example.test/plan-layout/\($0)")! }
+        let items = zip(paths, urls).map { path, url in
+            MLModelDownloadPlan.Item(
+                url: url,
+                artifact: MLModelArtifactSpec(
+                    relativePath: path, sha256: sha256(payload), byteCount: Int64(payload.count)))
+        }
+        let entry = MLModelCatalogEntry(
+            id: MLModelID("plan-layout"),
+            displayName: "plan-layout",
+            family: "Test",
+            descriptor: MLModelDescriptor(identifier: "plan-layout", version: 1, embeddingDimension: 4),
+            tokenizerID: "t",
+            preprocessingID: "p",
+            runtimeResourcePaths: declaresAMissingResource ? ["tokenizer.json"] : [],
+            license: .mit,
+            releaseTrack: .developerOnly,
+            estimatedInstalledBytes: Int64(payload.count * paths.count),
+            downloadPlan: MLModelDownloadPlan(revision: "rev1", items: items)
+        )
+        let transport = ScriptedTransport(payloads: Dictionary(uniqueKeysWithValues: urls.map { ($0, payload) }))
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [:], assets: [uid("asset")],
+            transportOverride: transport)
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+
+        let failed = await harness.lifecycle.currentSnapshot()
+        guard case .failed(let failure) = failed.phase else {
+            Issue.record("the install must fail")
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(failure.kind == .installation)
+        #expect(!failure.isRetryable)
+        #expect(!MLSmartSearchModelPresentation(snapshot: failed).canRetry)
+        let downloads = transport.downloadCount
+        await harness.lifecycle.retry()
+        #expect(transport.downloadCount == downloads, "a Retry that cannot help must not download again")
+        await harness.lifecycle.shutdown()
+    }
+
+    /// A new download can clear these: the bytes, the space or the local files may differ the next time.
+    @Test(arguments: [
+        (MLModelInstallError.checksumMismatch(artifact: "x"), MLSmartSearchFailure.Kind.verification),
+        (.sizeMismatch(artifact: "x", expected: 1, actual: 2), .verification),
+        (.artifactMissing("x"), .installation),
+        (.installRecordUnreadable, .installation),
+    ])
+    func aFailureThatANewDownloadCanClearKeepsItsRetry(
+        error: MLModelInstallError, kind: MLSmartSearchFailure.Kind
+    )
+        async throws
+    {
+        let payload = Data("clearable-failure".utf8)
+        let (entry, url) = downloadableEntry(id: "clearable-failure", payload: payload)
+        let harness = try makeHarness(
+            catalog: MLModelCatalog(entries: [entry]), payloads: [url: payload], assets: [uid("asset")],
+            transportOverride: ScriptedTransport(payloads: [url: payload], failFirst: [url: 1], failure: error))
+        defer { try? FileManager.default.removeItem(at: harness.layout.rootDirectory) }
+        await harness.lifecycle.start()
+        await harness.lifecycle.enable(with: entry.id)
+
+        let failed = await harness.lifecycle.currentSnapshot()
+        guard case .failed(let failure) = failed.phase else {
+            Issue.record("the transfer must fail")
+            await harness.lifecycle.shutdown()
+            return
+        }
+        #expect(failure.kind == kind)
+        #expect(failure.isRetryable)
+        #expect(MLSmartSearchModelPresentation(snapshot: failed).canRetry)
         await harness.lifecycle.shutdown()
     }
 

@@ -153,7 +153,6 @@ public struct MLDerivedPipelineProgress: Codable, Equatable, Sendable {
     /// Unique assets with at least one genuine permanent analysis failure. Optional unsupported
     /// requests, removed sources and empty results never contribute to this user-facing count.
     public let unavailableAssets: Int
-    public let unavailableAssetReasons: [MLPipelineFailureReason: Int]
     public let generation: UInt64
 
     public init(
@@ -163,7 +162,6 @@ public struct MLDerivedPipelineProgress: Codable, Equatable, Sendable {
         permanentFailure: Int,
         retryPending: Int,
         unavailableAssets: Int = 0,
-        unavailableAssetReasons: [MLPipelineFailureReason: Int] = [:],
         generation: UInt64
     ) {
         self.total = max(0, total)
@@ -172,7 +170,6 @@ public struct MLDerivedPipelineProgress: Codable, Equatable, Sendable {
         self.permanentFailure = max(0, permanentFailure)
         self.retryPending = max(0, retryPending)
         self.unavailableAssets = max(0, unavailableAssets)
-        self.unavailableAssetReasons = unavailableAssetReasons.filter { $0.value > 0 }
         self.generation = generation
     }
 
@@ -450,19 +447,16 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
             var permanent = 0
             var retry = 0
             var total = 0
-            var failureByAsset: [PhotoUID: MLPipelineFailureReason] = [:]
+            var unavailableAssets = Set<PhotoUID>()
             for (storedKey, record) in records
             where storedKey.accountIdentifier == key.accountIdentifier && key.artifacts.contains(record.artifact) {
                 total += 1
                 switch record.state {
                 case .completed: completed += 1
                 case .skipped: skipped += 1
-                case .permanentFailure(let reason):
+                case .permanentFailure:
                     permanent += 1
-                    let current = failureByAsset[record.asset.uid]
-                    if current == nil || reason.rawValue < current!.rawValue {
-                        failureByAsset[record.asset.uid] = reason
-                    }
+                    unavailableAssets.insert(record.asset.uid)
                 case .retry: retry += 1
                 case .pending: break
                 }
@@ -473,11 +467,7 @@ public final class InMemoryMLDerivedPipelineStore: MLDerivedPipelineStore, @unch
                 skipped: skipped,
                 permanentFailure: permanent,
                 retryPending: retry,
-                unavailableAssets: failureByAsset.count,
-                unavailableAssetReasons: Dictionary(
-                    grouping: failureByAsset.values,
-                    by: { $0 }
-                ).mapValues(\.count),
+                unavailableAssets: unavailableAssets.count,
                 generation: generations[generationKey(key)] ?? 0
             )
         }

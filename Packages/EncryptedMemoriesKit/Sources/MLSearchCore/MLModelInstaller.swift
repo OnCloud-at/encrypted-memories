@@ -659,18 +659,25 @@ public actor MLModelInstaller {
         }
         let installedPaths = Set(normalizedSpecs.map(\.relativePath))
         let permittedSidecars = Set(entry.runtimeResourcePaths)
+        // The paths of the plan alone decide these two: a new download of the same entry fails the same way.
         guard
             MLModelInstallLayout.artifactPathsArePermitted(
                 installedPaths, root: modelRootPath, sidecars: permittedSidecars
             ),
-            MLModelInstallLayout.firstMissingSidecar(entry.runtimeResourcePaths, in: installedPaths) == nil,
+            MLModelInstallLayout.firstMissingSidecar(entry.runtimeResourcePaths, in: installedPaths) == nil
+        else {
+            throw MLModelInstallError.ambiguousModelArtifact
+        }
+        // The staging directory on disk is local state that can differ the next time (a read error, a stray file),
+        // so a failure here is not the entry's. It reads like the same check after the record write.
+        guard
             validateInstallTree(
                 at: staging,
                 artifacts: normalizedSpecs,
                 includesInstallRecord: recoveredRecord != nil
             )
         else {
-            throw MLModelInstallError.ambiguousModelArtifact
+            throw MLModelInstallError.installRecordUnreadable
         }
         let record =
             recoveredRecord

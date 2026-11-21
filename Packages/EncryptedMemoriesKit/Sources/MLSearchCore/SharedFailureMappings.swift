@@ -18,9 +18,9 @@ extension MLModelInstallError: FailureClassifiable {
         case .insufficientStorage: .deviceStorage
         case .cancelled: .cancelled
         case .licenseProhibitsDistribution: .unsupported
-        case .notDownloadable, .unsafeArtifactPath, .sizeMismatch, .checksumMismatch, .artifactMissing,
-            .ambiguousModelArtifact, .installRecordUnreadable:
-            .unknown
+        // The catalog entry alone decides these, so a new download repeats them.
+        case .notDownloadable, .unsafeArtifactPath, .ambiguousModelArtifact: .permanent
+        case .sizeMismatch, .checksumMismatch, .artifactMissing, .installRecordUnreadable: .unknown
         }
     }
 }

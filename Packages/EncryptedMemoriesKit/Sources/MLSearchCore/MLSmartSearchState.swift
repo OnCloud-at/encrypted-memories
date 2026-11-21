@@ -75,20 +75,17 @@ public struct MLSmartSearchAggregateProgress: Sendable, Equatable {
     /// Unfinished native work with a scheduled retry, not work in the initial indexing queue.
     public let deferredWorkUnits: Int
     public let permanentlyUnavailableAssets: Int
-    public let unavailableAssetReasons: [MLPipelineFailureReason: Int]
 
     public init(
         totalWorkUnits: Int,
         settledWorkUnits: Int,
         permanentlyUnavailableAssets: Int,
-        unavailableAssetReasons: [MLPipelineFailureReason: Int] = [:],
         deferredWorkUnits: Int = 0
     ) {
         self.totalWorkUnits = max(0, totalWorkUnits)
         self.settledWorkUnits = min(max(0, settledWorkUnits), max(0, totalWorkUnits))
         self.deferredWorkUnits = min(max(0, deferredWorkUnits), self.totalWorkUnits - self.settledWorkUnits)
         self.permanentlyUnavailableAssets = max(0, permanentlyUnavailableAssets)
-        self.unavailableAssetReasons = unavailableAssetReasons.filter { $0.value > 0 }
     }
 
     public var fraction: Double? {
