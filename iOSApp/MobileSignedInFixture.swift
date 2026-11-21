@@ -801,8 +801,40 @@ import os
             }
         }
         private let streamingAttempts = OSAllocatedUnfairLock(initialState: 0)
+        /// One line per read, for the UI test that counts them.
+        private static func append(_ line: String, to file: URL) {
+            guard let data = (line + "\n").data(using: .utf8) else { return }
+            if let handle = try? FileHandle(forWritingTo: file) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: file)
+            }
+        }
         func prefetchEncrypted(for uid: PhotoUID) async throws {}
+        private let infoReads = OSAllocatedUnfairLock(initialState: [String: Int]())
         func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+            if let scenario = MobileUITestLaunch.infoReadScenario {
+                // The count and the log line share one lock: the viewer reads several photos at once.
+                let read = infoReads.withLock { reads in
+                    reads[uid.nodeID, default: 0] += 1
+                    Self.append(uid.nodeID, to: scenario.log)
+                    return reads[uid.nodeID, default: 0]
+                }
+                switch scenario.name {
+                case "slowFirstReadFails":
+                    if read == 1 {
+                        try await Task.sleep(for: .seconds(3))
+                        throw MobileFixtureError.unavailable
+                    }
+                case "firstReadFails":
+                    if read == 1 { throw MobileFixtureError.unavailable }
+                case "firstThreeReadsFail":
+                    if read <= 3 { throw MobileFixtureError.unavailable }
+                default: break
+                }
+            }
             guard uid.nodeID == MobileSignedInFixture.videoNodeID else {
                 return PhotoMetadata(
                     filename: "\(uid.nodeID).jpg", mimeType: "image/jpeg", pixelWidth: 160, pixelHeight: 160)

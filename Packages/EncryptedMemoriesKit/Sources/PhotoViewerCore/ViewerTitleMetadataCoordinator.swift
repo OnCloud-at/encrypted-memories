@@ -5,11 +5,17 @@ public struct ViewerTitleMetadataResolution: Equatable, Sendable {
     public let metadata: PhotoMetadata?
     public let placeName: String?
     public let metadataLoadFailed: Bool
+    /// The cause of the failed read when the provider's error names one; nil for an unclassified error.
+    public let failureCause: FailureCause?
 
-    public init(metadata: PhotoMetadata?, placeName: String?, metadataLoadFailed: Bool = false) {
+    public init(
+        metadata: PhotoMetadata?, placeName: String?, metadataLoadFailed: Bool = false,
+        failureCause: FailureCause? = nil
+    ) {
         self.metadata = metadata
         self.placeName = placeName
         self.metadataLoadFailed = metadataLoadFailed
+        self.failureCause = failureCause
     }
 
     public var metadataLoadState: PhotoMetadataLoadState {
@@ -47,17 +53,25 @@ public final class ViewerTitleMetadataCoordinator {
     private let metadataProvider: (any PhotoMetadataProvider)?
     private let placeNameResolver: (any PlaceNameResolving)?
     private let prefetchRadius: Int
+    private let infoRereadPause: @MainActor (Duration) async -> Void
     private var states: [PhotoUID: ViewerTitleMetadataState] = [:]
     private var tasks: [PhotoUID: ResolutionTask] = [:]
+    /// Photos whose failed read the Info already repeated silently once while they stayed in the window.
+    private var silentlyRereadForInfo: Set<PhotoUID> = []
+
+    /// How long the Info waits before it reads the details of the shown photo a second time.
+    public static let infoRereadDelay: Duration = .seconds(3)
 
     public init(
         metadataProvider: (any PhotoMetadataProvider)?,
         placeNameResolver: (any PlaceNameResolving)?,
-        prefetchRadius: Int = 2
+        prefetchRadius: Int = 2,
+        infoRereadPause: @escaping @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
         self.metadataProvider = metadataProvider
         self.placeNameResolver = placeNameResolver
         self.prefetchRadius = max(0, prefetchRadius)
+        self.infoRereadPause = infoRereadPause
     }
 
     public func state(for uid: PhotoUID) -> ViewerTitleMetadataState {
@@ -78,6 +92,7 @@ public final class ViewerTitleMetadataCoordinator {
             tasks.removeValue(forKey: uid)?.task.cancel()
         }
         states = states.filter { retained.contains($0.key) }
+        silentlyRereadForInfo.formIntersection(retained)
         for item in items[lower...upper] {
             beginResolutionIfNeeded(for: item)
         }
@@ -94,10 +109,52 @@ public final class ViewerTitleMetadataCoordinator {
         return states[item.uid]?.resolution ?? resolution
     }
 
+    /// The details that the Info shows for `item`. A failed read is repeated once after a short pause without a
+    /// message, because the read changes nothing and a new attempt often succeeds. The repeat belongs to the Info and
+    /// the shown photo: `resolve` and the prefetch of the neighbors never repeat a read, and a person's Try again
+    /// reads once more without another silent repeat.
+    ///
+    /// `infoIsOpen` is asked when the first read ends and again when the pause ends, so a title read that fails
+    /// while the Info is closed repeats only if the Info opens before it ends, and an Info that closes during the
+    /// pause ends the repeat. An error that names a cause repeats only when the shared failure policy repeats that
+    /// cause on its own; an error without a cause repeats once, and the failure stays visible after that.
+    public func resolveForInfo(
+        _ item: PhotoItem, infoIsOpen: @MainActor @Sendable () -> Bool = { true }
+    ) async -> ViewerTitleMetadataResolution {
+        let first = await resolve(item)
+        guard !Task.isCancelled, first.metadataLoadFailed, Self.repeatsSilently(first), canRereadForInfo(item.uid),
+            infoIsOpen()
+        else { return first }
+        await infoRereadPause(Self.infoRereadDelay)
+        // The wait is over. The Info may have closed, the viewer may have left the photo, or the task may have ended.
+        guard !Task.isCancelled, infoIsOpen(), canRereadForInfo(item.uid) else { return first }
+        silentlyRereadForInfo.insert(item.uid)
+        invalidate(item.uid)
+        return await resolve(item)
+    }
+
+    /// Whether the Info still has its one silent repeat for `uid`: the read of the photo in the window failed and
+    /// no Info has repeated it yet.
+    public func canRereadForInfo(_ uid: PhotoUID) -> Bool {
+        states[uid]?.resolution?.metadataLoadFailed == true && !silentlyRereadForInfo.contains(uid)
+    }
+
+    /// Whether an Info that opens now reads the details again: the photo's read failed and no Info repeated it yet.
+    /// A read that still runs decides when it ends, and a failure that the Info already repeated stays as it is.
+    public func shouldReadAgainWhenInfoOpens(_ uid: PhotoUID, metadataLoadState: PhotoMetadataLoadState) -> Bool {
+        metadataLoadState == .failed && canRereadForInfo(uid)
+    }
+
+    private static func repeatsSilently(_ resolution: ViewerTitleMetadataResolution) -> Bool {
+        guard let cause = resolution.failureCause else { return true }
+        return FailurePolicy.resolve(cause, situation: .awaitedByPerson, safety: .safeRead).retry == .automatic
+    }
+
     public func cancelAll() {
         for entry in tasks.values { entry.task.cancel() }
         tasks.removeAll(keepingCapacity: false)
         states.removeAll(keepingCapacity: false)
+        silentlyRereadForInfo.removeAll(keepingCapacity: false)
     }
 
     public func invalidate(_ uid: PhotoUID) {
@@ -119,7 +176,13 @@ public final class ViewerTitleMetadataCoordinator {
             do {
                 metadata = try await metadataProvider.metadata(for: item.uid)
             } catch {
-                return .init(metadata: nil, placeName: nil, metadataLoadFailed: !Task.isCancelled)
+                // A read that a cancelled sharer ended is no failure of the photo: it carries the cause that the
+                // policy never repeats.
+                let cause: FailureCause? =
+                    FailureCancellation.isCancellation(error)
+                    ? .cancelled : (error as? any FailureClassifiable)?.failureCause
+                return .init(
+                    metadata: nil, placeName: nil, metadataLoadFailed: !Task.isCancelled, failureCause: cause)
             }
             guard !Task.isCancelled else { return .init(metadata: nil, placeName: nil) }
             guard metadata.hasLocation,

@@ -135,9 +135,8 @@ struct InfoPanelView: View {
             if isLoadingAlbumMemberships {
                 ProgressSpinner(accessibilityLabel: L10n.string("infopanel.albums"))
             } else if albumMembershipsLoadFailed {
-                Label(L10n.string("infopanel.albums_load_failed"), systemImage: "exclamationmark.triangle")
+                ViewerAlbumMembershipsFailedView(onRetry: onRetry)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
             } else if albumTitles.isEmpty {
                 Text(L10n.string("infopanel.no_albums"))
                     .font(.subheadline)

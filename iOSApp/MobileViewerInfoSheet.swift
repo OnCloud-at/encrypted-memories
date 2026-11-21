@@ -185,12 +185,8 @@ struct MobileViewerInfoSheet: View {
                 if isLoadingAlbumMemberships {
                     ProgressSpinner(accessibilityLabel: L10n.string("infopanel.albums"))
                 } else if albumMembershipsLoadFailed {
-                    Label(
-                        L10n.string("infopanel.albums_load_failed"),
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    ViewerAlbumMembershipsFailedView(onRetry: onRetry)
+                        .font(.subheadline)
                 } else if albumTitles.isEmpty {
                     Text(L10n.string("infopanel.no_albums"))
                         .font(.subheadline)

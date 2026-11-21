@@ -46,6 +46,20 @@ import SwiftUI
             return URL(fileURLWithPath: arguments[index + 1])
         }
 
+        /// With `-EncryptedMemoriesInfoReadScenario <scenario> <log file>` the fixture backend fails the reads of the photo
+        /// details as the scenario says and appends the node ID of every read to the log file, so a UI test counts the
+        /// reads of the photo that it opened. `slowFirstReadFails`: the first read of a photo waits three seconds and
+        /// fails. `firstReadFails`: the first read fails at once. `firstThreeReadsFail`: the first three reads fail at
+        /// once. Every later read answers.
+        nonisolated static var infoReadScenario: (name: String, log: URL)? {
+            guard isRequested else { return nil }
+            let arguments = ProcessInfo.processInfo.arguments
+            guard let index = arguments.firstIndex(of: "-EncryptedMemoriesInfoReadScenario"),
+                arguments.indices.contains(index + 2)
+            else { return nil }
+            return (arguments[index + 1], URL(fileURLWithPath: arguments[index + 2]))
+        }
+
         static var libraryLoadScenario: String? {
             let arguments = ProcessInfo.processInfo.arguments
             guard let index = arguments.firstIndex(of: "-EncryptedMemoriesLibraryLoadFixture"),
