@@ -152,6 +152,8 @@ jobs:
           python3 .github/scripts/test_cancel_superseded_queue_run.py
           python3 -B .github/scripts/test_collect_ui_wait_diagnostics.py
           python3 .github/scripts/test_list_retried_tests.py
+          python3 .github/scripts/test_nightly_ui_evidence.py
+          python3 -B .github/scripts/test_create_duo_simulator.py
           python3 .github/scripts/test_ios_test_commands.py
           python3 .github/scripts/test_report_build_storage.py
           python3 .github/scripts/test_remind_llm_key_expiry.py

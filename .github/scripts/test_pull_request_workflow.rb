@@ -684,6 +684,222 @@ class PullRequestWorkflowTests < Minitest::Test
     assert_equal @workflow.fetch("env").fetch("DEVELOPER_DIR"), workflow.fetch("env").fetch("DEVELOPER_DIR")
   end
 
+  # The nightly run is the only hosted UI coverage of main, because the merge queue never runs the UI tests
+  # (#1134, #1197), and it backs the release gate (#1166); it never touches pull requests or the queue.
+  def test_nightly_ui_tests_cover_main_on_both_simulators_and_never_block
+    workflow = YAML.load_file(File.join(WORKFLOWS, "nightly-ui-tests.yml"))
+    events = workflow["on"] || workflow.fetch(true)
+    assert_equal %w[schedule workflow_dispatch], events.keys
+    assert_equal [{"cron" => "30 2 * * *"}], events.fetch("schedule")
+    jobs = workflow.fetch("jobs")
+    assert_equal %w[default-simulator iphone-duo], jobs.keys
+    jobs.each_value do |job|
+      refute job.key?("continue-on-error"), "a failed nightly UI test must fail the job"
+      refute_includes REQUIRED_CHECKS, job.fetch("name")
+      assert_equal "xcode-27", job.fetch("runs-on")
+    end
+    assert_equal 240, jobs.fetch("default-simulator").fetch("timeout-minutes")
+    assert_equal 150, jobs.fetch("iphone-duo").fetch("timeout-minutes")
+    assert_equal({"contents" => "read"}, workflow.fetch("permissions"))
+    assert_equal @workflow.fetch("env").fetch("DEVELOPER_DIR"), workflow.fetch("env").fetch("DEVELOPER_DIR")
+  end
+
+  # A nightly job is green only when UI tests ran (#1134, read by the release gate #1166): the evidence step is the
+  # last judge of each job, whatever happened to the steps before it, and the pull-request Duo job stays as it is.
+  NIGHTLY_EVIDENCE = {
+    "default-simulator" => {"result" => "ios-ui.xcresult", "artifact" => "nightly-ui-evidence-default-simulator"},
+    "iphone-duo" => {"result" => "ios-ui-duo.xcresult", "artifact" => "nightly-ui-evidence-iphone-duo"}
+  }.freeze
+
+  def nightly_job(id)
+    YAML.load_file(File.join(WORKFLOWS, "nightly-ui-tests.yml")).fetch("jobs").fetch(id)
+  end
+
+  def nightly_step(job_id, step_id)
+    nightly_job(job_id).fetch("steps").find { |step| step["id"] == step_id }
+  end
+
+  def test_nightly_jobs_end_with_an_evidence_step_that_decides_the_result_and_an_artifact_upload
+    NIGHTLY_EVIDENCE.each do |job_id, expected|
+      steps = nightly_job(job_id).fetch("steps")
+      evidence = nightly_step(job_id, "evidence")
+      refute_nil evidence, "#{job_id} needs the evidence step"
+      assert_equal "${{ !cancelled() }}", evidence.fetch("if"), "the evidence step runs after every failure and never depends on an earlier outcome"
+      refute evidence.key?("continue-on-error"), "a failed evidence step must fail the job"
+      assert_equal job_id, evidence.fetch("env").fetch("JOB_ID")
+      assert_equal "${{ runner.temp }}/#{expected.fetch("result")}", evidence.fetch("env").fetch("RESULT")
+      assert_includes evidence.fetch("run"), "nightly_ui_evidence.py"
+      assert_operator steps.index(nightly_step(job_id, "ui")), :<, steps.index(evidence)
+      upload = steps.find { |step| step["uses"].to_s.start_with?("actions/upload-artifact") && step.dig("with", "name") == expected.fetch("artifact") }
+      refute_nil upload, "#{job_id} uploads the evidence under a fixed name"
+      assert_equal "${{ !cancelled() }}", upload.fetch("if")
+      assert_equal "${{ runner.temp }}/ui-evidence/ui-evidence.json", upload.fetch("with").fetch("path")
+      assert_equal "error", upload.fetch("with").fetch("if-no-files-found")
+      # A rerun keeps the run id, so the static name exists from the earlier attempt: without `overwrite` the upload
+      # of the new attempt fails with a name conflict; with it the old artifact is deleted and the new one replaces it.
+      assert_equal true, upload.fetch("with")["overwrite"]
+      assert_operator steps.index(evidence), :<, steps.index(upload)
+    end
+  end
+
+  # The only steps of the nightly run that may continue after a failure: diagnostics, the simulator preboot and the
+  # optional retention of result bundles. Every other step decides the result, so a failure of it fails the job.
+  NIGHTLY_CONTINUE_ON_ERROR = {
+    "default-simulator" => [
+      "Record the runner state at the start", "Start the simulator",
+      "Retain the result of the first attempt after a retry", "Record the runner state at the end"
+    ],
+    "iphone-duo" => [
+      "Record the runner state at the start", "Report the retried tests and the free disk",
+      "Retain the UI test result", "Record the runner state at the end"
+    ]
+  }.freeze
+
+  def test_the_nightly_run_continues_on_error_only_in_diagnostics_preboot_and_result_retention
+    workflow = YAML.load_file(File.join(WORKFLOWS, "nightly-ui-tests.yml"))
+    assert_equal NIGHTLY_CONTINUE_ON_ERROR.keys, workflow.fetch("jobs").keys
+    workflow.fetch("jobs").each do |job_id, job|
+      refute job.key?("continue-on-error"), "#{job_id}: no job may continue on error"
+      continuing = job.fetch("steps").select { |step| step.key?("continue-on-error") }
+      continuing.each do |step|
+        assert_equal true, step.fetch("continue-on-error"), "#{job_id}: continue-on-error must be the literal true, never an expression"
+      end
+      assert_equal NIGHTLY_CONTINUE_ON_ERROR.fetch(job_id).sort, continuing.map { |step| step.fetch("name") }.sort
+      # The steps that decide the result never continue: checkout, Duo simulator, prepare, build, UI tests, evidence and its upload.
+      %w[duo prepare test-build ui evidence].each do |id|
+        step = job.fetch("steps").find { |candidate| candidate["id"] == id }
+        next if step.nil?
+        refute step.key?("continue-on-error"), "#{job_id}: step #{id} decides the result"
+      end
+      deciding = job.fetch("steps").select { |step| step["name"] == "Retain the UI test evidence" || step["name"] == "Check out source" }
+      assert_equal 2, deciding.size
+      deciding.each { |step| refute step.key?("continue-on-error"), "#{job_id}: #{step["name"]} decides the result" }
+    end
+  end
+
+  def run_nightly_evidence_step(job_id, summary:, result_bundle: true, sha: nil)
+    root = File.expand_path("../..", WORKFLOWS)
+    head, = Open3.capture2("git", "rev-parse", "HEAD", chdir: root)
+    step = nightly_step(job_id, "evidence")
+    refute_nil step, "#{job_id} needs the evidence step"
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "summary.json"), summary)
+      File.write(File.join(dir, "xcrun"), "#!/usr/bin/env bash\n[[ \"$1 $2 $3 $4\" == 'xcresulttool get test-results summary' ]] || exit 1\ncat \"$STUB_SUMMARY\"\n")
+      FileUtils.chmod(0o755, File.join(dir, "xcrun"))
+      FileUtils.mkdir_p(File.join(dir, "result.xcresult")) if result_bundle
+      env = {
+        "PATH" => "#{dir}:#{ENV.fetch("PATH")}", "STUB_SUMMARY" => File.join(dir, "summary.json"),
+        "JOB_ID" => job_id, "RESULT" => File.join(dir, "result.xcresult"), "EVIDENCE_DIR" => File.join(dir, "ui-evidence"),
+        "GITHUB_SHA" => sha || head.strip, "GITHUB_RUN_ID" => "43090077070", "GITHUB_RUN_ATTEMPT" => "2"
+      }
+      out, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: root)
+      file = File.join(dir, "ui-evidence", "ui-evidence.json")
+      [out, status, File.exist?(file) ? JSON.parse(File.read(file)) : nil, head.strip]
+    end
+  end
+
+  def summary_json(passed:, skipped: 0, failed: 0, expected: 0)
+    JSON.generate(
+      "totalTestCount" => passed + skipped + failed + expected, "passedTests" => passed, "failedTests" => failed,
+      "skippedTests" => skipped, "expectedFailures" => expected,
+      "devicesAndConfigurations" => [{"device" => {"deviceName" => "Simulator", "osVersion" => "27.1"}}]
+    )
+  end
+
+  def test_the_evidence_step_of_each_nightly_job_writes_the_evidence_only_for_a_real_passing_run
+    NIGHTLY_EVIDENCE.each_key do |job_id|
+      out, status, evidence, head = run_nightly_evidence_step(job_id, summary: summary_json(passed: 12, skipped: 2, expected: 1))
+      assert status.success?, out
+      assert_equal({"schema" => 1, "job" => job_id, "run_id" => 43090077070, "run_attempt" => 2, "commit" => head,
+                    "simulator" => {"name" => "Simulator", "os" => "27.1"},
+                    "executed" => 15, "passed" => 12, "failed" => 0, "skipped" => 2, "expected_failures" => 1, "ok" => true}, evidence)
+      # The red cases: all skipped, only expected failures, a failed test, no result bundle, and a checkout that is not the run commit.
+      [
+        {summary: summary_json(passed: 0, skipped: 12)},
+        {summary: summary_json(passed: 0, expected: 3)},
+        {summary: summary_json(passed: 11, failed: 1)},
+        {summary: summary_json(passed: 12), result_bundle: false},
+        {summary: summary_json(passed: 12), sha: "f" * 40}
+      ].each do |arguments|
+        out, status, = run_nightly_evidence_step(job_id, **arguments)
+        refute status.success?, "#{job_id} #{arguments.keys}: #{out}"
+        assert_includes out, "::error::"
+      end
+    end
+  end
+
+  def run_duo_simulator_step(types:, runtimes:, workflow: "nightly-ui-tests.yml", job: "iphone-duo")
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "types.json"), JSON.generate("devicetypes" => types))
+      File.write(File.join(dir, "runtimes.json"), JSON.generate("runtimes" => runtimes))
+      File.write(File.join(dir, "xcrun"), <<~STUB)
+        #!/usr/bin/env bash
+        case "$*" in
+          "simctl list devicetypes -j") cat "$STUB_DIR/types.json" ;;
+          "simctl list runtimes -j") cat "$STUB_DIR/runtimes.json" ;;
+          simctl\\ create*) echo "11111111-2222-3333-4444-555555555555" ;;
+          *) exit 1 ;;
+        esac
+      STUB
+      FileUtils.chmod(0o755, File.join(dir, "xcrun"))
+      env = {"PATH" => "#{dir}:#{ENV.fetch("PATH")}", "STUB_DIR" => dir,
+             "GITHUB_OUTPUT" => File.join(dir, "output"), "GITHUB_STEP_SUMMARY" => File.join(dir, "summary")}
+      root = File.expand_path("../..", WORKFLOWS)
+      step = YAML.load_file(File.join(WORKFLOWS, workflow)).fetch("jobs").fetch(job).fetch("steps").find { |candidate| candidate["id"] == "duo" }
+      out, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: root)
+      output = File.exist?(env["GITHUB_OUTPUT"]) ? File.read(env["GITHUB_OUTPUT"]) : ""
+      [out, status, output]
+    end
+  end
+
+  def test_the_nightly_duo_job_fails_when_no_duo_simulator_can_be_created
+    duo_type = {"name" => "iPhone Duo", "identifier" => "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo"}
+    runtime = lambda do |version|
+      {"isAvailable" => true, "platform" => "iOS", "version" => version, "buildversion" => "24B1",
+       "identifier" => "com.apple.CoreSimulator.SimRuntime.iOS-#{version.tr(".", "-")}", "supportedDeviceTypes" => [{"name" => "iPhone Duo"}]}
+    end
+    out, status, output = run_duo_simulator_step(types: [duo_type], runtimes: [runtime.call("27.1")])
+    assert status.success?, out
+    assert_includes output, "found=true"
+    assert_includes output, "udid=11111111-2222-3333-4444-555555555555"
+    # No Duo device type, no runtime, and a runtime of another major version all fail closed with a message.
+    [[[], [runtime.call("27.1")]], [[duo_type], []], [[duo_type], [runtime.call("26.4")]]].each do |types, runtimes|
+      out, status, output = run_duo_simulator_step(types: types, runtimes: runtimes)
+      refute status.success?, "a missing Duo simulator must not end green: #{out}"
+      assert_includes out, "::error::"
+      refute_includes output, "found=true"
+    end
+  end
+
+  # The pull-request Duo job gives advice: a runner without the Duo runtime skips the tests and nothing fails.
+  def test_the_pull_request_duo_job_skips_without_a_duo_simulator_and_runs_with_one
+    duo_type = {"name" => "iPhone Duo", "identifier" => "com.apple.CoreSimulator.SimDeviceType.iPhone-Duo"}
+    runtime = {"isAvailable" => true, "platform" => "iOS", "version" => "27.1", "buildversion" => "24B1",
+               "identifier" => "com.apple.CoreSimulator.SimRuntime.iOS-27-1", "supportedDeviceTypes" => [{"name" => "iPhone Duo"}]}
+    out, status, output = run_duo_simulator_step(types: [duo_type], runtimes: [runtime], workflow: "duo-ui-tests.yml", job: "duo-ui")
+    assert status.success?, out
+    assert_includes output, "found=true"
+    assert_includes output, "udid=11111111-2222-3333-4444-555555555555"
+    out, status, output = run_duo_simulator_step(types: [duo_type], runtimes: [], workflow: "duo-ui-tests.yml", job: "duo-ui")
+    assert status.success?, "a missing Duo runtime gives advice only: #{out}"
+    refute_includes out, "::error::"
+    assert_includes output, "found=false"
+    refute_includes output, "found=true"
+  end
+
+  # One script chooses the Duo runtime for the pull-request Duo job and for the nightly run (create_duo_simulator.py,
+  # with its own tests); neither workflow carries a copy of the lookup.
+  def test_both_duo_workflows_create_the_simulator_with_the_shared_script
+    [["nightly-ui-tests.yml", "iphone-duo"], ["duo-ui-tests.yml", "duo-ui"]].each do |file, job_id|
+      job = YAML.load_file(File.join(WORKFLOWS, file)).fetch("jobs").fetch(job_id)
+      step = job.fetch("steps").find { |candidate| candidate["id"] == "duo" }
+      assert_includes step.fetch("run"), "create_duo_simulator.py", file
+      refute_includes step.fetch("run"), "simctl", "#{file} must not carry its own simctl lookup"
+    end
+    duo = YAML.load_file(File.join(WORKFLOWS, "duo-ui-tests.yml"))
+    assert_includes (duo["on"] || duo.fetch(true)).fetch("pull_request").fetch("paths"), ".github/scripts/create_duo_simulator.py"
+  end
+
   def test_full_verification_uses_four_mac_runners_without_hygiene_waits
     mac_jobs = @workflow.fetch("jobs").select { |_, job| job["runs-on"] == "xcode-27" }
     assert_equal ["ios-ui-verification", "ios-verification", "macos-verification", "package-verification"], mac_jobs.keys.sort

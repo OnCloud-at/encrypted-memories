@@ -1,0 +1,256 @@
+name: Nightly iOS UI tests
+
+# Runs the full iOS UI test suite on main every night on both the default simulator and the
+# iPhone Duo. The merge queue never runs the iOS UI tests (#1134, #1197), so this run is the only
+# hosted UI coverage of the commits that reach main, and it backs the release gate (#1166). The
+# queue and the pull-request checks stay unchanged: this workflow has no merge_group trigger and
+# creates no required check.
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+
+jobs:
+  default-simulator:
+    name: Nightly iOS UI tests (default simulator)
+    runs-on: xcode-27
+    # The same steps hit the 120-minute limit of the former queue job (runs 43916590168 and 43999299753), so the nightly
+    # run needs more room: nothing waits for it, and a hosted job may run for six hours.
+    timeout-minutes: 240
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Record the runner state at the start
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh start
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          save-cache: "false"
+      # The simulator boots after prepare (#1165): the UI job's prepare step took 12.9, 9.1 and 11.0 minutes while
+      # it started the simulator before prepare, and 2.7 to 3.8 minutes in the job that boots after prepare.
+      # The order is the one difference between those measurements.
+      - name: Start the simulator
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          IOS_TEST_ACTION: boot-simulator
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Build the app and both simulator test bundles once
+        id: test-build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: build-for-testing
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+        run: bash ./scripts/verify-ios-app-tests.sh
+      - name: Run all UI tests without building
+        id: ui
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: test-without-building
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui.xcresult
+          IOS_TEST_BOOT_RECORD: ${{ runner.temp }}/simulator-udid
+        run: bash .github/scripts/run_ui_tests_with_retry.sh bash ./scripts/verify-ios-app-tests.sh ui
+      # The evidence step decides the result of the job (#1134): it fails unless the result bundle exists, shows
+      # at least one passed test and no failed test. A job in which every test was skipped is never green.
+      - name: Write the UI test evidence
+        id: evidence
+        if: ${{ !cancelled() }}
+        env:
+          JOB_ID: default-simulator
+          RESULT: ${{ runner.temp }}/ios-ui.xcresult
+          EVIDENCE_DIR: ${{ runner.temp }}/ui-evidence
+        run: python3 -I .github/scripts/nightly_ui_evidence.py --job "$JOB_ID" --result "$RESULT" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" --checkout-head "$(git rev-parse HEAD)" --out "$EVIDENCE_DIR/ui-evidence.json"
+      - name: Retain the UI test evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-ui-evidence-default-simulator
+          path: ${{ runner.temp }}/ui-evidence/ui-evidence.json
+          if-no-files-found: error
+          # A rerun keeps the run id and so the artifact name; the new attempt replaces the old artifact.
+          overwrite: true
+          retention-days: 90
+      - name: Retain failed UI test results
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-ios-ui-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-ui.xcresult
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Retain the result of the first attempt after a retry
+        if: ${{ always() && steps.ui.outputs.retried == 'true' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-ios-ui-attempt1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ios-ui-attempt1.xcresult
+            ${{ runner.temp }}/ios-ui-attempt1.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Record the runner state at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh end
+      - if: always()
+        run: bash ./scripts/report-build-storage.sh
+
+  iphone-duo:
+    name: Nightly iOS UI tests (iPhone Duo)
+    runs-on: xcode-27
+    # The pull-request Duo job, which runs the same suite, was cancelled at its 75-minute limit in 55 of its last 60 runs,
+    # so the nightly run gets twice that.
+    timeout-minutes: 150
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Print the toolchain, the runtimes, the device types and the disk
+        run: |
+          set -uo pipefail
+          xcodebuild -version
+          xcodebuild -showsdks
+          xcrun simctl list runtimes
+          xcrun simctl list devicetypes
+          xcrun simctl list devices
+          df -h /
+
+      - name: Record the runner state at the start
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh start
+
+      - name: Find the iPhone Duo runtime and create the simulator
+        id: duo
+        run: |
+          set -euo pipefail
+          udid="$(python3 -I .github/scripts/create_duo_simulator.py --name "Nightly iPhone Duo UI tests")"
+          # The nightly run is strict: without a Duo simulator the job fails and never ends green without tests.
+          if [[ -z "$udid" ]]; then
+            {
+              echo "### Nightly iPhone Duo UI tests: no iPhone Duo runtime"
+              echo "This runner image has no iOS 27.1 runtime with the iPhone Duo device type. The runtimes, the device types and the free disk are in the log of the first step. Nothing was tested, so the job fails."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::No iOS 27.1 runtime with the iPhone Duo device type on this runner: no UI test ran on the iPhone Duo."
+            exit 1
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+          echo "Duo simulator $udid"
+
+      - uses: ./.github/actions/prepare-apple-build
+        id: prepare
+        with:
+          build-profile: app
+          save-cache: "false"
+
+      - name: Build the app and both simulator test bundles once
+        id: test-build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: build-for-testing
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_DESTINATION: platform=iOS Simulator,id=${{ steps.duo.outputs.udid }}
+        run: bash ./scripts/verify-ios-app-tests.sh
+
+      - name: Run all UI tests without building on the iPhone Duo
+        id: ui
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        env:
+          IOS_TEST_ACTION: test-without-building
+          IOS_TEST_SCHEME: EncryptedMemoriesMobileCI
+          IOS_TEST_PREPARED: "1"
+          IOS_TEST_DESTINATION: platform=iOS Simulator,id=${{ steps.duo.outputs.udid }}
+          IOS_TEST_RESULT_BUNDLE_PATH: ${{ runner.temp }}/ios-ui-duo.xcresult
+          # The hosted runner sometimes fails to launch the app under load; xcodebuild repeats only a test case that
+          # failed, up to two iterations. A test that fails both iterations still fails the job.
+          IOS_TEST_EXTRA_XCODEBUILD_ARGS: -retry-tests-on-failure -test-iterations 2
+        run: bash .github/scripts/run_ui_tests_with_retry.sh bash ./scripts/verify-ios-app-tests.sh ui
+
+      # The evidence step decides the result of the job (#1134): it fails unless the result bundle exists, shows
+      # at least one passed test and no failed test. A job in which every test was skipped is never green.
+      - name: Write the UI test evidence
+        id: evidence
+        if: ${{ !cancelled() }}
+        env:
+          JOB_ID: iphone-duo
+          RESULT: ${{ runner.temp }}/ios-ui-duo.xcresult
+          EVIDENCE_DIR: ${{ runner.temp }}/ui-evidence
+        run: python3 -I .github/scripts/nightly_ui_evidence.py --job "$JOB_ID" --result "$RESULT" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --commit "$GITHUB_SHA" --checkout-head "$(git rev-parse HEAD)" --out "$EVIDENCE_DIR/ui-evidence.json"
+
+      - name: Retain the UI test evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-ui-evidence-iphone-duo
+          path: ${{ runner.temp }}/ui-evidence/ui-evidence.json
+          if-no-files-found: error
+          # A rerun keeps the run id and so the artifact name; the new attempt replaces the old artifact.
+          overwrite: true
+          retention-days: 90
+
+      - name: Report the retried tests and the free disk
+        if: ${{ always() && steps.duo.outputs.found == 'true' }}
+        continue-on-error: true
+        env:
+          RESULT: ${{ runner.temp }}/ios-ui-duo.xcresult
+        run: |
+          set -uo pipefail
+          {
+            echo "### Nightly iPhone Duo UI tests"
+            if [[ -d "$RESULT" ]]; then
+              # A test that failed once and then passed on its retry appears in the result tree as a passed test case
+              # with a failed repetition below it. The raw log shows the iterations; this collects them in the summary.
+              xcrun xcresulttool get test-results tests --path "$RESULT" 2> /dev/null |
+                python3 .github/scripts/list_retried_tests.py || echo "The retried tests could not be read from the result bundle."
+            else
+              echo "No test result: the tests did not start."
+            fi
+            echo '```'
+            df -h /
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain the UI test result
+        if: ${{ always() && steps.test-build.outcome != 'skipped' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-ios-ui-duo-xcresult-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ios-ui-duo.xcresult
+            ${{ runner.temp }}/ios-ui-duo-attempt1.xcresult
+            ${{ runner.temp }}/ios-ui-attempt1.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Record the runner state at the end
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash .github/scripts/runner_state.sh end
