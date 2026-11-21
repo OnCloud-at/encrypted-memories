@@ -113,8 +113,7 @@ import Testing
 
     @Test func finishedIndexStaysCalmAndKeepsUnanalyzedMediaBehindTheInfo() {
         let progress = MLSmartSearchAggregateProgress(
-            totalWorkUnits: 100, settledWorkUnits: 100, permanentlyUnavailableAssets: 8,
-            unavailableAssetReasons: [.analysisFailed: 8])
+            totalWorkUnits: 100, settledWorkUnits: 100, permanentlyUnavailableAssets: 8)
         let presentation = MLSmartSearchPresentation(
             snapshot: MLSmartSearchSnapshot(
                 isEnabled: true,
@@ -129,9 +128,7 @@ import Testing
         #expect(presentation.presentsAsReady)
         #expect(presentation.detailText == nil)
         #expect(!presentation.canRetry)
-        let note = try? #require(presentation.unavailableNote)
-        #expect(note?.hasPrefix(L10n.string("mlsearch.unavailable_note \(8)")) == true)
-        #expect(note?.contains(L10n.string("mlsearch.failure_analysis")) == true)
+        #expect(presentation.unavailableNote == L10n.string("mlsearch.unavailable_note \(8)"))
     }
 
     @Test func completeIndexHasNoInfo() {

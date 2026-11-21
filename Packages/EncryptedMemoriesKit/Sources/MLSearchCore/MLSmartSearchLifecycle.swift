@@ -1445,25 +1445,27 @@ public actor MLSmartSearchLifecycle {
                 return nil
             }
             let kind: MLSmartSearchFailure.Kind
-            var isRetryable = true
             var requiredBytes: Int64?
             switch error {
             case .insufficientStorage(let required, _):
                 // Retry measures again after the person frees space.
                 kind = .insufficientStorage
                 requiredBytes = required
-            case .checksumMismatch, .sizeMismatch, .unsafeArtifactPath:
+            case .checksumMismatch, .sizeMismatch:
                 kind = .verification
-            case .artifactMissing, .ambiguousModelArtifact, .installRecordUnreadable, .notDownloadable:
+            case .artifactMissing, .ambiguousModelArtifact, .installRecordUnreadable, .notDownloadable,
+                .unsafeArtifactPath, .licenseProhibitsDistribution:
                 kind = .installation
-            case .licenseProhibitsDistribution:
-                // Retrying cannot change the license; this stays blocked until the catalog
-                // ships an entry whose weights are legally distributable.
-                kind = .installation
-                isRetryable = false
             case .cancelled:
                 kind = .download
             }
+            // The shared policy decides whether a new attempt can help. The license, a missing download plan and a
+            // layout that the entry itself makes unsafe or ambiguous stay blocked until the catalog ships a
+            // different entry. A cancellation returned above and never reaches this line.
+            let isRetryable =
+                FailurePolicy.resolve(
+                    error.failureCause, situation: .awaitedByPerson, safety: .safeRead, retriesExhausted: true
+                ).retry != .never
             phase =
                 previousModel == nil
                 ? .failed(
@@ -2068,13 +2070,6 @@ public actor MLSmartSearchLifecycle {
         let nativeUnavailable = nativeSearch == nil ? 0 : (lastNativeProgress?.unavailableAssets ?? 0)
         let unavailableUIDs = (semanticIsActive ? semanticUnavailableAssetUIDs : [])
             .union(nativeSearch == nil ? [] : nativeUnavailableAssetUIDs)
-        var unavailableReasons =
-            nativeSearch == nil
-            ? [:]
-            : (lastNativeProgress?.unavailableAssetReasons ?? [:])
-        if semanticUnavailable > 0 {
-            unavailableReasons[.analysisFailed, default: 0] += semanticUnavailable
-        }
         return MLSmartSearchAggregateProgress(
             totalWorkUnits: semanticTotal + nativeTotal,
             settledWorkUnits: semanticSettled + nativeSettled,
@@ -2082,7 +2077,6 @@ public actor MLSmartSearchLifecycle {
                 unavailableUIDs.count,
                 max(semanticUnavailable, nativeUnavailable)
             ),
-            unavailableAssetReasons: unavailableReasons,
             deferredWorkUnits: nativeSearch == nil ? 0 : (lastNativeProgress?.retryPending ?? 0)
         )
     }

@@ -2252,14 +2252,6 @@
         }
       }
     },
-    "mlsearch.unavailable_reasons %@": {
-      "extractionState": "manual",
-      "comment": "Second paragraph of the info alert; the argument lists the analysis failure reasons.",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "Reason: %@" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Grund: %@" } }
-      }
-    },
     "mlsearch.status_failed_storage": {
       "extractionState": "manual",
       "comment": "Smart Search error: the local index database is unavailable.",
@@ -2274,41 +2266,6 @@
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "%lld%% complete" } },
         "de": { "stringUnit": { "state": "translated", "value": "%lld%% abgeschlossen" } }
-      }
-    },
-    "mlsearch.failure_source_corrupt": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "source cannot be decoded" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Quelle nicht dekodierbar" } }
-      }
-    },
-    "mlsearch.failure_invalid_artifact": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "invalid analysis result" } },
-        "de": { "stringUnit": { "state": "translated", "value": "ungültiges Analyseergebnis" } }
-      }
-    },
-    "mlsearch.failure_invalid_result": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "incomplete analysis result" } },
-        "de": { "stringUnit": { "state": "translated", "value": "unvollständiges Analyseergebnis" } }
-      }
-    },
-    "mlsearch.failure_analysis": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "analysis failed" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Analyse fehlgeschlagen" } }
-      }
-    },
-    "mlsearch.failure_retry_limit": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": { "stringUnit": { "state": "translated", "value": "retry limit reached" } },
-        "de": { "stringUnit": { "state": "translated", "value": "Wiederholungslimit erreicht" } }
       }
     },
     "mlsearch.indexed_count %lld %lld": {

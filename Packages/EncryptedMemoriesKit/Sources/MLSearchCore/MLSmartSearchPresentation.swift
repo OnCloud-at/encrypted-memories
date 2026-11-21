@@ -53,10 +53,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                 indexed = progress.settledWorkUnits
                 total = progress.totalWorkUnits
                 ready = true
-                unavailable = Self.unavailableNote(
-                    count: progress.permanentlyUnavailableAssets,
-                    reasons: Array(progress.unavailableAssetReasons.keys)
-                )
+                unavailable = Self.unavailableNote(count: progress.permanentlyUnavailableAssets)
             case .failed(let failure):
                 aggregateStatus = Self.failureStatus(failure)
                 retry = failure.isRetryable
@@ -116,7 +113,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                     detail = L10n.string("mlsearch.indexed_count \(coverage.indexed) \(coverage.total)")
                     fraction = coverage.accountedFraction
                 }
-                unavailable = Self.unavailableNote(count: coverage.permanentlyUnindexable, reasons: [])
+                unavailable = Self.unavailableNote(count: coverage.permanentlyUnindexable)
             case .ready(let coverage):
                 indexed = coverage.indexed
                 total = coverage.total
@@ -125,7 +122,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                 if total > 0 {
                     detail = L10n.string("mlsearch.ready_count \(coverage.indexed)")
                 }
-                unavailable = Self.unavailableNote(count: coverage.permanentlyUnindexable, reasons: [])
+                unavailable = Self.unavailableNote(count: coverage.permanentlyUnindexable)
             case .switchingModel:
                 status = L10n.string("mlsearch.status_switching")
             case .deleting:
@@ -186,20 +183,11 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
         return L10n.string("mlsearch.work_progress_percent \(Int((fraction * 100).rounded()))")
     }
 
-    private static func unavailableNote(count: Int, reasons: [MLPipelineFailureReason]) -> String? {
+    /// The count and what it means for search. The person cannot act on the internal analysis category of a failure,
+    /// so the note does not name it.
+    private static func unavailableNote(count: Int) -> String? {
         guard count > 0 else { return nil }
-        let note = L10n.string("mlsearch.unavailable_note \(count)")
-        let names = reasons.sorted { $0.rawValue < $1.rawValue }.map {
-            switch $0 {
-            case .sourceCorrupt: L10n.string("mlsearch.failure_source_corrupt")
-            case .invalidArtifactContract: L10n.string("mlsearch.failure_invalid_artifact")
-            case .invalidExecutorResult: L10n.string("mlsearch.failure_invalid_result")
-            case .analysisFailed: L10n.string("mlsearch.failure_analysis")
-            case .retryLimitReached: L10n.string("mlsearch.failure_retry_limit")
-            }
-        }
-        guard !names.isEmpty else { return note }
-        return note + "\n\n" + L10n.string("mlsearch.unavailable_reasons \(names.joined(separator: ", "))")
+        return L10n.string("mlsearch.unavailable_note \(count)")
     }
 
     fileprivate static func failureStatus(_ failure: MLSmartSearchFailure) -> String {

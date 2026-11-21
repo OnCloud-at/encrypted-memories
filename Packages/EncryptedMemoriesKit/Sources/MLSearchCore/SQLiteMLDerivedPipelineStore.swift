@@ -559,9 +559,6 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
                 unavailableAssets: permanentFailure == 0
                     ? 0
                     : try unavailableAssetCountLocked(accountKey: accountKey, artifactIDs: ids),
-                unavailableAssetReasons: permanentFailure == 0
-                    ? [:]
-                    : try unavailableAssetReasonsLocked(accountKey: accountKey, artifactIDs: ids),
                 generation: try generationLocked(for: key, accountKey: accountKey)
             )
         }
@@ -1256,54 +1253,6 @@ public final class SQLiteMLDerivedPipelineStore: MLDerivedPipelineStore, @unchec
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, accountKey)
         return sqlite3_step(stmt) == SQLITE_DONE
-    }
-
-    private func unavailableAssetReasonsLocked(
-        accountKey: Int64,
-        artifactIDs: [Int64]
-    ) throws -> [MLPipelineFailureReason: Int] {
-        guard !artifactIDs.isEmpty else { return [:] }
-        var stmt: OpaquePointer?
-        guard
-            prepare(
-                """
-                SELECT reason, COUNT(*)
-                FROM (
-                  SELECT w.asset_id, MIN(w.terminal_reason) AS reason
-                  FROM ml_derived_work w
-                  WHERE w.account_key=? AND w.state=3
-                    AND w.artifact_id IN (\(Self.placeholders(artifactIDs.count)))
-                    AND w.terminal_reason IS NOT NULL
-                  GROUP BY w.asset_id
-                )
-                GROUP BY reason;
-                """,
-                &stmt
-            )
-        else { throw MLDerivedPipelineStoreError.storageUnavailable }
-        defer { sqlite3_finalize(stmt) }
-        var index: Int32 = 1
-        sqlite3_bind_int64(stmt, index, accountKey)
-        index += 1
-        for id in artifactIDs {
-            sqlite3_bind_int64(stmt, index, id)
-            index += 1
-        }
-
-        var reasons: [MLPipelineFailureReason: Int] = [:]
-        while true {
-            switch sqlite3_step(stmt) {
-            case SQLITE_ROW:
-                guard let reason = MLPipelineFailureReason(rawValue: columnText(stmt, 0)) else {
-                    throw MLDerivedPipelineStoreError.corruptData
-                }
-                reasons[reason] = Int(sqlite3_column_int64(stmt, 1))
-            case SQLITE_DONE:
-                return reasons
-            default:
-                throw MLDerivedPipelineStoreError.storageUnavailable
-            }
-        }
     }
 
     private func unavailableAssetCountLocked(

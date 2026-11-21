@@ -835,7 +835,6 @@ import Testing
         #expect(outcome.progress.completed == 3)
         #expect(outcome.progress.permanentFailure == 3)
         #expect(outcome.progress.unavailableAssets == 1)
-        #expect(outcome.progress.unavailableAssetReasons == [.sourceCorrupt: 1])
         #expect(store.output(for: emptyAsset.uid, artifact: first, accountIdentifier: "account") == nil)
     }
 
