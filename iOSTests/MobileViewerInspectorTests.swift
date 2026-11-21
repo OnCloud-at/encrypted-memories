@@ -40,17 +40,14 @@ final class MobileViewerInspectorTests: XCTestCase {
             into: model, backend: backend, sections: fixture.sections, thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         let router = MobileViewerRouter()
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let root = UIHostingController(rootView: ViewerPresentationHost(router: router, libraryModel: model))
         window.rootViewController = root
         window.makeKeyAndVisible()
         defer {
             root.presentedViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
         }
         let videoIndex = try XCTUnwrap(fixture.items.firstIndex(where: \.isVideo))
         var transaction = Transaction()
@@ -130,8 +127,8 @@ final class MobileViewerInspectorTests: XCTestCase {
             into: model, backend: backend, sections: fixture.sections, thumbnailFeed: fixture.feed,
             thumbnailCache: fixture.cache)
         let router = MobileViewerRouter()
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let originalBounds = scene.coordinateSpace.bounds
         window.frame = originalBounds
         let root = UIHostingController(rootView: ViewerPresentationHost(router: router, libraryModel: model))
@@ -139,9 +136,7 @@ final class MobileViewerInspectorTests: XCTestCase {
         window.makeKeyAndVisible()
         defer {
             root.presentedViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
         }
         let videoIndex = try XCTUnwrap(fixture.items.firstIndex(where: \.isVideo))
         let uid = fixture.items[videoIndex].uid
@@ -287,17 +282,15 @@ final class MobileViewerInspectorTests: XCTestCase {
         fixture.install(into: model)
         let router = MobileViewerRouter()
         let fullBounds = scene.coordinateSpace.bounds
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = fullBounds
         let root = UIHostingController(rootView: ViewerPresentationHost(router: router, libraryModel: model))
         window.rootViewController = root
         window.makeKeyAndVisible()
         defer {
             root.presentedViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         try await Task.sleep(for: .milliseconds(300))
         // Present without animation: see the type comment.

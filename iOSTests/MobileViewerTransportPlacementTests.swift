@@ -41,8 +41,8 @@ final class MobileViewerTransportPlacementTests: XCTestCase {
         let facts = TransportArrangementFacts()
         let transport = ViewerVideoTransport()
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = scene.effectiveGeometry.coordinateSpace.bounds
         let root = UIHostingController(
             rootView: TransportPresentation(router: router, model: model, facts: facts, transport: transport))
@@ -50,9 +50,7 @@ final class MobileViewerTransportPlacementTests: XCTestCase {
         window.makeKeyAndVisible()
         defer {
             root.presentedViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
         }
         let index = try XCTUnwrap(fixture.items.firstIndex(where: \.isVideo))
         let uid = fixture.items[index].uid

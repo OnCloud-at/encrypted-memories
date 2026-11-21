@@ -31,8 +31,8 @@ final class MobileTimelineChromeTests: XCTestCase {
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         fixture.install(into: model)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let originalSize = scene.coordinateSpace.bounds.size
         window.frame = CGRect(origin: .zero, size: originalSize)
         let context = MobileSceneContext()
@@ -47,9 +47,7 @@ final class MobileTimelineChromeTests: XCTestCase {
         defer {
             root.presentedViewController?.dismiss(animated: false)
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
         }
         try await waitUntil("SETUP: the timeline is mounted before the viewer opens") {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.contains { !$0.itemUIDs.isEmpty }
@@ -177,8 +175,8 @@ final class MobileTimelineChromeTests: XCTestCase {
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         fixture.install(into: model)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let originalSize = scene.coordinateSpace.bounds.size
         window.frame = CGRect(origin: .zero, size: originalSize)
         let sceneContext = MobileSceneContext()
@@ -193,9 +191,7 @@ final class MobileTimelineChromeTests: XCTestCase {
         window.makeKeyAndVisible()
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
         }
         try await Task.sleep(for: .milliseconds(200))
         if searching { search.query = "June 2026" }
@@ -293,9 +289,8 @@ final class MobileTimelineChromeTests: XCTestCase {
         defer { fixture.removeCache() }
         let model = MobileLibraryModel()
         fixture.install(into: model)
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let sceneContext = MobileSceneContext()
         sceneContext.attach(window: window)
         let root = UIHostingController(
@@ -308,9 +303,7 @@ final class MobileTimelineChromeTests: XCTestCase {
         window.makeKeyAndVisible()
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
             writeArtifact("timeline-chrome-report.txt", Data(report.joined(separator: "\n").utf8))
         }
 

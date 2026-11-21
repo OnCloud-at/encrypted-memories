@@ -63,11 +63,11 @@ final class MobileViewerReservedRegionTests: XCTestCase {
 
 @MainActor private final class ClearanceSession {
     let fixture: MobileSignedInFixture
-    let window: UIWindow
+    private let hosted: HostedTestWindow
+    var window: UIWindow { hosted.window }
     let root: UIHostingController<ClearancePresentation>
     let router: MobileViewerRouter
     let model: MobileLibraryModel
-    private let previous: UIWindow?
     var viewer: UIViewController {
         get throws { try XCTUnwrap(root.presentedViewController, "The production router must present its viewer") }
     }
@@ -91,15 +91,14 @@ final class MobileViewerReservedRegionTests: XCTestCase {
         let model = MobileLibraryModel()
         fixture.install(into: model)
         let router = MobileViewerRouter()
-        let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let root = UIHostingController(rootView: ClearancePresentation(router: router, model: model))
         self.fixture = fixture
         self.model = model
         self.router = router
-        self.window = window
+        self.hosted = hosted
         self.root = root
-        previous = scene.windows.first(where: \.isKeyWindow)
         window.rootViewController = root
         window.makeKeyAndVisible()
         var transaction = Transaction()
@@ -113,9 +112,7 @@ final class MobileViewerReservedRegionTests: XCTestCase {
 
     func close() {
         root.presentedViewController?.dismiss(animated: false)
-        window.isHidden = true
-        window.rootViewController = nil
-        previous?.makeKey()
+        hosted.close()
         fixture.removeCache()
     }
 

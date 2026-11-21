@@ -40,13 +40,13 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         in size: CGSize, horizontal: UIUserInterfaceSizeClass, vertical: UIUserInterfaceSizeClass
     ) async throws -> (window: CGRect, picker: CGRect) {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let albums = MobileFixtureAlbums()
         let repository = AlbumsRepository(
             catalogBackend: albums, writeBackend: albums, capabilities: MobileFixtureAlbums.capabilities)
         let coordinator = AlbumActionCoordinator(repository: repository)
         let photo = PhotoUID(volumeID: "fixture", nodeID: "landscape-window")
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = CGRect(origin: .zero, size: size)
         window.traitOverrides.horizontalSizeClass = horizontal
         window.traitOverrides.verticalSizeClass = vertical
@@ -59,9 +59,7 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         window.makeKeyAndVisible()
         defer {
             root.presentedViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         await fulfillment(
             of: [
@@ -88,13 +86,13 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
 
     @MainActor func testCompactWindowKeepsAlbumPickerInsideAvailableWidth() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let albums = MobileFixtureAlbums()
         let repository = AlbumsRepository(
             catalogBackend: albums, writeBackend: albums, capabilities: MobileFixtureAlbums.capabilities)
         let coordinator = AlbumActionCoordinator(repository: repository)
         let photo = PhotoUID(volumeID: "fixture", nodeID: "narrow-window")
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = CGRect(x: 0, y: 0, width: 320, height: 700)
         window.traitOverrides.horizontalSizeClass = .compact
         window.traitOverrides.verticalSizeClass = .regular
@@ -106,9 +104,7 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         window.makeKeyAndVisible()
         defer {
             root.presentedViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         await fulfillment(
             of: [
@@ -126,7 +122,8 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
 
         root.presentedViewController?.dismiss(animated: false)
         window.isHidden = true
-        let regularWindow = UIWindow(windowScene: scene)
+        let regularHosted = HostedTestWindow(scene: scene)
+        let regularWindow = regularHosted.window
         regularWindow.frame = CGRect(x: 0, y: 0, width: 400, height: 1000)
         regularWindow.traitOverrides.horizontalSizeClass = .regular
         let regularRoot = UIHostingController(
@@ -137,8 +134,7 @@ final class MobileAlbumNarrowWindowTests: XCTestCase {
         regularWindow.makeKeyAndVisible()
         defer {
             regularRoot.presentedViewController?.dismiss(animated: false)
-            regularWindow.isHidden = true
-            regularWindow.rootViewController = nil
+            regularHosted.close()
         }
         await fulfillment(
             of: [

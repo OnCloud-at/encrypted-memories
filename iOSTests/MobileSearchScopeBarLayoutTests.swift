@@ -67,9 +67,9 @@ final class MobileSearchScopeBarLayoutTests: XCTestCase {
                 mediaType: "image/jpeg")
         }
 
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let state = SearchScopeProbeState()
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIHostingController(
             rootView: SearchScopeProbeShell(
                 items: items, feed: feed, state: state, presentsScopePicker: presentsScopePicker))
@@ -77,9 +77,7 @@ final class MobileSearchScopeBarLayoutTests: XCTestCase {
         window.layoutIfNeeded()
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
 
         // Let the navigation bar and the search field mount first, then enter text so the scope

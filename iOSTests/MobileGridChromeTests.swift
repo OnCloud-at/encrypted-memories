@@ -16,8 +16,8 @@ import XCTest
 final class MobileGridChromeTests: XCTestCase {
     @MainActor func testControllerTabBarIsFoundBehindCrowdedSubtree() throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let tabs = UITabBarController()
         let content = UIViewController()
         content.tabBarItem = UITabBarItem(title: "Library", image: nil, tag: 0)
@@ -27,9 +27,7 @@ final class MobileGridChromeTests: XCTestCase {
         window.makeKeyAndVisible()
         window.layoutIfNeeded()
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
         }
         let bar = tabs.tabBar
         let container = try XCTUnwrap(bar.superview)
@@ -60,11 +58,11 @@ final class MobileGridChromeTests: XCTestCase {
 
     @MainActor func testInsetFollowUpSkipsDetachedInactiveAndDeallocatedHosts() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        defer { hosted.close() }
+        let window = hosted.window
         let controller = UIViewController()
         window.rootViewController = controller
-        window.frame = scene.coordinateSpace.bounds
         window.makeKeyAndVisible()
         let grid = UIKitTimelineGridHostView(frame: controller.view.bounds)
         controller.view.addSubview(grid)
@@ -96,18 +94,15 @@ final class MobileGridChromeTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertNil(released, "A pending follow-up must not retain its host")
         grid.setActive(false)
-        window.isHidden = true
-        window.rootViewController = nil
-        previous?.makeKey()
     }
 
     @MainActor func testInsetFollowUpSkipsAHostOutsideItsClippingAncestor() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        defer { hosted.close() }
+        let window = hosted.window
         let controller = UIViewController()
         window.rootViewController = controller
-        window.frame = scene.coordinateSpace.bounds
         window.makeKeyAndVisible()
         let clipper = UIView(frame: controller.view.bounds)
         clipper.clipsToBounds = true
@@ -155,9 +150,6 @@ final class MobileGridChromeTests: XCTestCase {
                 "A zero-size host inside the clip area must run a follow-up")
         #endif
         grid.setActive(false)
-        window.isHidden = true
-        window.rootViewController = nil
-        previous?.makeKey()
     }
 
     @MainActor func testTabBarTraversalRespectsNodeAndDepthLimits() {
@@ -238,12 +230,11 @@ final class MobileGridChromeTests: XCTestCase {
                 uid: PhotoUID(volumeID: "bottom-bar-probe", nodeID: String($0)),
                 captureTime: Date(timeIntervalSince1970: TimeInterval($0)), mediaType: "image/jpeg")
         }
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let controller = UIViewController()
         controller.additionalSafeAreaInsets.bottom = 72
         window.rootViewController = controller
-        window.frame = scene.coordinateSpace.bounds
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
         let grid = UIKitTimelineGridHostView(frame: controller.view.bounds)
@@ -251,9 +242,7 @@ final class MobileGridChromeTests: XCTestCase {
         controller.view.addSubview(grid)
         defer {
             grid.setActive(false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         grid.configure(items: items, contentRevision: 1, thumbnailFeed: feed)
         let bounds = controller.view.bounds
@@ -313,12 +302,11 @@ final class MobileGridChromeTests: XCTestCase {
                 uid: PhotoUID(volumeID: "bar-change-probe", nodeID: String($0)),
                 captureTime: Date(timeIntervalSince1970: TimeInterval($0)), mediaType: "image/jpeg")
         }
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let controller = UIViewController()
         controller.additionalSafeAreaInsets.bottom = 72
         window.rootViewController = controller
-        window.frame = scene.coordinateSpace.bounds
         window.makeKeyAndVisible()
         let grid = UIKitTimelineGridHostView(frame: controller.view.bounds)
         grid.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -326,9 +314,7 @@ final class MobileGridChromeTests: XCTestCase {
         grid.configure(items: items, contentRevision: 1, thumbnailFeed: feed)
         defer {
             grid.setActive(false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         window.layoutIfNeeded()
         let bounds = controller.view.bounds
@@ -412,18 +398,16 @@ final class MobileGridChromeTests: XCTestCase {
             await cache.store(try XCTUnwrap(bitmap.jpegData(compressionQuality: 1)), for: item.uid)
         }
         _ = await feed.warmDecoded(items.map(\.uid))
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let state = ChromeProbeState()
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.overrideUserInterfaceStyle = .dark
         window.rootViewController = UIHostingController(
             rootView: ChromeProbeShell(items: items, feed: feed, state: state))
         window.makeKeyAndVisible()
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         var originalGrid: UIKitTimelineGridHostView?
         var initialHorizontalSafeBottom: CGFloat?

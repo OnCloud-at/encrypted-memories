@@ -356,19 +356,16 @@ final class MobileSeriesFavoritesTests: XCTestCase {
     let fixture: MobileSignedInFixture
     let libraryModel = MobileLibraryModel()
     let root = UIHostingController(rootView: AnyView(Color.black))
-    private let window: UIWindow
-    private let previousKeyWindow: UIWindow?
+    private let hosted: HostedTestWindow
 
     init() async throws {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let scene = try XCTUnwrap(scenes.first { $0.activationState == .foregroundActive } ?? scenes.first)
         fixture = try await MobileSignedInFixture(itemsPerSection: 6)
         fixture.install(into: libraryModel)
-        previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
-        window.rootViewController = root
-        window.makeKeyAndVisible()
+        hosted = HostedTestWindow(scene: scene)
+        hosted.window.rootViewController = root
+        hosted.window.makeKeyAndVisible()
     }
 
     func install(_ host: some View) async throws {
@@ -378,9 +375,7 @@ final class MobileSeriesFavoritesTests: XCTestCase {
 
     func tearDown() {
         root.presentedViewController?.dismiss(animated: false)
-        window.isHidden = true
-        window.rootViewController = nil
-        previousKeyWindow?.makeKey()
+        hosted.close()
         fixture.removeCache()
     }
 }

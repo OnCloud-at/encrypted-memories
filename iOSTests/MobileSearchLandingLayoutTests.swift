@@ -8,8 +8,8 @@ final class MobileSearchLandingLayoutTests: XCTestCase {
     @MainActor func testSearchClearanceFollowsSizeClassWithoutGrowingWithDynamicType() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let model = MobileLibraryModel()
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let content = MobileSearchLandingContent(
             recents: (0..<5).map {
                 MobileSearchRecentEntry(query: "Recent search \($0)", representativeUID: nil, suggestion: nil)
@@ -18,9 +18,7 @@ final class MobileSearchLandingLayoutTests: XCTestCase {
         window.rootViewController = host
         window.makeKeyAndVisible()
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
 
         // Only regular width and height place the field at the top. Reuse one host to test resizing too.

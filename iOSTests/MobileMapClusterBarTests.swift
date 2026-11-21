@@ -10,15 +10,13 @@ import XCTest
 final class MobileMapClusterBarTests: XCTestCase {
     @MainActor func testPageActionsHaveVerticalTitlesAndKeepTheirPageLimits() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let state = MapPageBarState()
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIHostingController(rootView: MapPageBarProbe(state: state))
         window.makeKeyAndVisible()
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         try await Task.sleep(for: .seconds(1))
         XCTAssertTrue(state.readEdge)

@@ -173,8 +173,7 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
         let backend: MobileFixtureBackend
         let item: PhotoItem
         let root = UIHostingController(rootView: AnyView(Color.black))
-        let window: UIWindow
-        let previous: UIWindow?
+        let hosted: HostedTestWindow
         let directory: URL
 
         init() async throws {
@@ -209,20 +208,16 @@ final class MobileDuplicateCachedThumbnailTests: XCTestCase {
             XCTAssertNil(feed.memoryImage(for: item.uid))
             let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
             let scene = try XCTUnwrap(scenes.first { $0.activationState == .foregroundActive } ?? scenes.first)
-            previous = scene.windows.first { $0.isKeyWindow }
-            window = UIWindow(windowScene: scene)
-            window.frame = scene.coordinateSpace.bounds
-            window.rootViewController = root
-            window.makeKeyAndVisible()
+            hosted = HostedTestWindow(scene: scene)
+            hosted.window.rootViewController = root
+            hosted.window.makeKeyAndVisible()
         }
 
         func show(_ view: some View) { root.rootView = AnyView(view) }
 
         func close() {
             root.rootView = AnyView(Color.black)
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
             seed.removeCache()
             try? FileManager.default.removeItem(at: directory)
         }

@@ -10,26 +10,30 @@ import XCTest
 /// and that the label ends with the host.
 @MainActor
 final class MobileScrollDateLabelHostTests: XCTestCase {
-    private var window: UIWindow?
-    private var previousKeyWindow: UIWindow?
+    private var hosted: HostedTestWindow?
 
     override func tearDown() async throws {
-        window?.isHidden = true
-        window?.rootViewController = nil
-        previousKeyWindow?.makeKey()
-        window = nil
+        hosted?.close()
+        hosted = nil
     }
 
     private func hostInWindow() throws -> UIKitTimelineGridHostView {
-        let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        // A test that builds a second host closes the first window, so it does not stay in the scene.
+        hosted?.close()
+        let hosted = HostedTestWindow(scene: try XCTUnwrap(UIApplication.shared.foregroundWindowScene))
+        self.hosted = hosted
+        let window = hosted.window
         let controller = UIViewController()
         window.rootViewController = controller
-        window.frame = scene.coordinateSpace.bounds
         window.makeKeyAndVisible()
-        self.window = window
-        let grid = UIKitTimelineGridHostView(frame: controller.view.bounds)
+        window.layoutIfNeeded()
+        // The library grid ends at the horizontal safe area, beside the vertical tab bar. On the iPhone Duo outer
+        // display the right inset holds that bar and a reserved region; a grid under it draws its native indicator
+        // there, apart from the label column.
+        let insets = controller.view.safeAreaInsets
+        let grid = UIKitTimelineGridHostView(
+            frame: controller.view.bounds.inset(
+                by: UIEdgeInsets(top: 0, left: insets.left, bottom: 0, right: insets.right)))
         controller.view.addSubview(grid)
         window.layoutIfNeeded()
         return grid
@@ -186,10 +190,16 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         }
     }
 
-    func testNativeThumbGeometryCentersTheLabelAtFiveFractions() throws {
+    func testNativeThumbGeometryPlacesTheLabelBesideTheThumbAtFiveFractions() throws {
         let grid = try hostInWindow()
         try showLabel(on: grid)
         grid.window?.layoutIfNeeded()
+        let columnMinX = TimelineScrollDateLabelMotion.columnMinX(
+            width: grid.bounds.width, trailingInset: grid.safeAreaInsets.right)
+        XCTAssertTrue(
+            TimelineScrollDateLabelGeometry.bands(
+                avoiding: grid.reservedRegionLayout.exclusions, trailingColumnFrom: columnMinX
+            ).isEmpty, "SETUP: no reserved region reaches the label column")
         for fraction in [CGFloat(0), 0.25, 0.5, 0.75, 1] {
             grid.scrollView.contentSize = CGSize(width: grid.bounds.width, height: 10_000)
             let low = -grid.scrollView.contentInset.top
@@ -200,7 +210,19 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
             try showLabel(on: grid)
             grid.scrollDateLabel.layout()
             let thumb = try nativeThumb(on: grid)
-            XCTAssertEqual(grid.scrollDateLabel.view.frame.midY, thumb.midY, accuracy: 0.01)
+            let label = grid.scrollDateLabel.view.frame
+            if abs(label.midY - thumb.midY) <= 0.01 { continue }
+            // Only at a track end may the label leave the thumb centre: where the thumb reaches into a safe-area
+            // inset (the home indicator of iPhone Duo), the label rests at that safe-area edge.
+            let top = grid.safeAreaInsets.top
+            let bottom = grid.bounds.height - grid.safeAreaInsets.bottom
+            if fraction == 0, thumb.midY < label.midY {
+                XCTAssertEqual(label.minY, top, accuracy: 0.01, "fraction 0 rests at the top safe-area edge")
+            } else if fraction == 1, thumb.midY > label.midY {
+                XCTAssertEqual(label.maxY, bottom, accuracy: 0.01, "fraction 1 rests at the bottom safe-area edge")
+            } else {
+                XCTFail("fraction \(fraction): label \(label.midY) is not beside the thumb \(thumb.midY)")
+            }
         }
     }
 

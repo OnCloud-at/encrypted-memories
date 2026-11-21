@@ -92,18 +92,15 @@ final class MobileGridRotationTests: XCTestCase {
                 captureTime: Date(timeIntervalSince1970: TimeInterval($0)), mediaType: "image/jpeg")
         }
 
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let originalOrientation = scene.interfaceOrientation
-        let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIHostingController(
             rootView: RotationProbeShell(items: items, feed: feed, level: level))
         window.makeKeyAndVisible()
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         let rotate: (UIInterfaceOrientation) async throws -> Void = { orientation in
             let mask: UIInterfaceOrientationMask = orientation.isLandscape ? .landscapeRight : .portrait

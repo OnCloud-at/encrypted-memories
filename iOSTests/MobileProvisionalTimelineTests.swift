@@ -387,9 +387,8 @@ import UIKit
     private func mountScreen(model: MobileLibraryModel) throws -> (window: UIWindow, close: @MainActor () -> Void) {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let scene = try #require(scenes.first { $0.activationState == .foregroundActive } ?? scenes.first)
-        let previousKey = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let context = MobileSceneContext()
         context.attach(window: window)
         window.rootViewController = UIHostingController(
@@ -402,9 +401,7 @@ import UIKit
             window,
             {
                 descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-                window.isHidden = true
-                window.rootViewController = nil
-                previousKey?.makeKey()
+                hosted.close()
             }
         )
     }
