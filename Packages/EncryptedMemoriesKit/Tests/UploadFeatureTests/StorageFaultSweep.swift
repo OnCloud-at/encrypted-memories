@@ -145,8 +145,9 @@ struct StorageFaultState: Equatable {
     /// The keys that rule I1 protects, by record kind.
     var records: [String: Set<String>] = [:]
 
-    /// Adds every table of the SQLite file at `url`, every row as text with its SQLite type. The file must not be open
-    /// in a store. This is the shared table dump of the test target.
+    /// Adds every table of the SQLite file at `url`, every row as text with its SQLite type. It reads on its own
+    /// connection, so it sees only committed transactions; a store in WAL mode may keep the file open meanwhile. The
+    /// sweep itself passes a copy that no store has open. This is the shared table dump of the test target.
     mutating func addSQLiteTables(of url: URL) throws {
         try withSQLiteDatabase(at: url) { database in
             let names = "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;"
@@ -679,7 +680,7 @@ func canonicalJSON(_ text: String) -> String {
 
 /// Every row of `sql`, each as its columns joined with " | ", each column as "type:value", or as its text alone when
 /// `typed` is false. JSON text compares by content (`canonicalJSON`).
-private func sqliteRows(_ database: OpaquePointer, _ sql: String, typed: Bool = true) throws -> [String] {
+func sqliteRows(_ database: OpaquePointer, _ sql: String, typed: Bool = true) throws -> [String] {
     var statement: OpaquePointer?
     guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
         throw StorageFaultSweepError("\(sql) does not prepare: \(String(cString: sqlite3_errmsg(database)))")

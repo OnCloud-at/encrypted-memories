@@ -15,7 +15,9 @@ final class StorageFaultSweepTests: XCTestCase {
         "backup.resolveRemoteDeletion.keep": 7, "backup.resolveRemoteDeletion.backUpAgain": 7,
         "backup.replayRemoteDeletion.keep": 9, "backup.replayRemoteDeletion.backUpAgain": 9, "fingerprints.store": 9,
         "fingerprints.advance": 9, "fingerprints.discontinuity": 5, "trashedSeries.record": 12,
-        "trashedSeries.update": 10,
+        "trashedSeries.update": 10, "trashedSeries.finish": 10, "catalog.lateRenderScan": 13,
+        "backup.replaceRemoteDeletion.keep": 10, "backup.replaceRemoteDeletion.backUpAgain": 10,
+        "backup.settleRemoteDeletion.keep": 5, "backup.settleRemoteDeletion.backUpAgain": 5,
     ]
 
     func testEncodedIssueComparisonKeepsAllFieldsValuesAndArrayOrder() {

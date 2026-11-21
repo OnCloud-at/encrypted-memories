@@ -4478,6 +4478,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertNotEqual(kept.state, .alreadyBackedUp)
         XCTAssertGreaterThan(kept.updatedAt, clock.now, "the photo waits")
         XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertNotNil(rows["\(pendingURL.lastPathComponent)/handoff"], "the dump reads the handoff table")
         XCTAssertEqual(rows["\(pendingURL.lastPathComponent)/handoff"] ?? [], [], "no upload record")
     }
 
