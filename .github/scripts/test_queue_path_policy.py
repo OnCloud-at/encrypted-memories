@@ -232,8 +232,7 @@ class UiRuleUnitTests(unittest.TestCase):
                      'scripts/verify-swift-style.sh', 'scripts/another-tool.sh',
                      'Packages/EncryptedMemoriesKit/Sources/AccountStateCore/State.swift',
                      'Packages/EncryptedMemoriesKit/Sources/DeviceRootAppleAdapter/Adapter.swift',
-                     'Packages/EncryptedMemoriesKit/Tests/UploadCoreTests/UploaderTests.swift',
-                     'Shared/AppIntents.xcstrings']:
+                     'Packages/EncryptedMemoriesKit/Tests/UploadCoreTests/UploaderTests.swift']:
             with self.subTest(path=path):
                 self.assertFalse(policy.is_ui_relevant(path))
 
@@ -327,6 +326,27 @@ class UiModulesDriftTests(unittest.TestCase):
             listed, closure,
             'UI_RELEVANT_MODULES drifted from the closure of Package.swift and project.yml:'
             f' add {sorted(closure - listed)}, remove {sorted(listed - closure)}')
+
+
+class UiSourcesDriftTests(unittest.TestCase):
+    """Every source that project.yml compiles into the iOS app or its UI tests belongs to the local UI gate."""
+
+    @staticmethod
+    def target_sources(target):
+        text = (REPO_ROOT / 'project.yml').read_text()
+        block = text[text.index(f'\n  {target}:\n'):]
+        sources = re.search(r'\n    sources:\n((?:      - .+\n)+)', block)
+        return [line.strip()[2:] for line in sources.group(1).splitlines()]
+
+    def test_the_app_and_ui_test_sources_are_ui_relevant(self):
+        for target in ('EncryptedMemoriesMobile', 'EncryptedMemoriesMobileUITests'):
+            sources = self.target_sources(target)
+            self.assertTrue(sources, target)
+            for source in sources:
+                with self.subTest(target=target, source=source):
+                    # A directory source counts through a file below it.
+                    path = source if (REPO_ROOT / source).is_file() else f'{source}/Any.swift'
+                    self.assertTrue(policy.is_ui_relevant(path), f'{source} of {target} is no part of the local UI gate')
 
 
 if __name__ == '__main__':

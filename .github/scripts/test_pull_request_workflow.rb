@@ -148,8 +148,9 @@ class PullRequestWorkflowTests < Minitest::Test
       git.call("add", ".")
       git.call("commit", "-qm", "changed head policy")
       head = git.call("rev-parse", "HEAD")
-      # A missing base ref and a base without the policy script fall back and write both verdicts
-      # as required; the trusted base stub is older-style and writes only its run_macos verdict.
+      # A missing base ref and a base without the policy script fall back to running the macOS jobs and write
+      # run_ui=false, because the queue runs no UI tests; the trusted base stub is older-style and writes only
+      # its run_macos verdict.
       [["", "run_macos=true\nrun_ui=false\n"],
        [missing_base, "run_macos=true\nrun_ui=false\n"],
        [base, "run_macos=true\n"]].each do |ref, expected|
@@ -159,9 +160,11 @@ class PullRequestWorkflowTests < Minitest::Test
         text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
         assert status.success?, text
         assert_equal expected, File.read(output), ref
+        # The fallback names the local UI gate like the policy script does; the base stub prints nothing.
+        assert_equal expected.include?("run_ui=false"), text.include?("local UI gate applies"), ref
       end
       # Only ALLGREEN reaches the base stub, which writes just its run_macos verdict; every other
-      # strategy falls back and requires both the macOS jobs and the UI job.
+      # strategy falls back, runs the macOS jobs and writes run_ui=false.
       [["ALLGREEN", "run_macos=false\n"],
        ["HEADGREEN", "run_macos=true\nrun_ui=false\n"],
        ["", "run_macos=true\nrun_ui=false\n"],
@@ -173,6 +176,7 @@ class PullRequestWorkflowTests < Minitest::Test
         text, status = Open3.capture2e(env, "bash", "-c", step.fetch("run"), chdir: directory)
         assert status.success?, text
         assert_equal expected, File.read(output), strategy
+        assert_equal expected.include?("run_ui=false"), text.include?("local UI gate applies"), strategy
       end
       output = File.join(directory, "output")
       File.write(output, "")
@@ -274,8 +278,9 @@ class PullRequestWorkflowTests < Minitest::Test
       refute_includes REQUIRED_CHECKS, jobs.fetch(watchdog_id).fetch("name"), watchdog_id
     end
     assert_equal "ubuntu-24.04", watchdog.fetch("runs-on")
-    # The longest queue run took 123 minutes, and a late UI run can take longer: the loop ends by itself before
-    # the job limit, which stays below the 360 minute check timeout of the queue.
+    # The longest finished queue run since the UI job left the queue took 146 minutes, because the macOS jobs wait
+    # for a runner: the loop ends by itself before the job limit, which stays below the 360 minute check timeout
+    # of the queue.
     limit = watchdog.fetch("timeout-minutes")
     assert_equal 240, limit, "The failure watchdog must keep its 240 minute job limit"
     deadline = watchdog.fetch("steps").first.fetch("run")[/deadline=\$\(\(SECONDS \+ (\d+)\)\)/, 1].to_i

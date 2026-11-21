@@ -8,9 +8,10 @@ Renames count both the old and new paths.
 The merge queue never runs the iOS UI tests (issues #1134 and #1197): run_ui is always
 false, so the UI job and its gate finish as skipped. A person runs the UI tests locally
 before a pull request when the change touches a path that the UI tests can observe:
-the iOS app, the UI tests, the vendored patches, the workflow files, the project and
-package manifests, the UI test tooling, a Resources bundle of a package, or a package
-module that the iOS app or a UI module reaches (is_ui_relevant). UI_RELEVANT_MODULES
+the iOS app and the files that project.yml compiles into it, the UI tests, the vendored
+patches, the workflow files, the project and package manifests, the UI test tooling, a
+Resources bundle of a package, or a package module that the iOS app or a UI module
+reaches (is_ui_relevant). UI_RELEVANT_MODULES
 pins that module closure; the test suite recomputes it from Package.swift and
 project.yml and fails when it drifted. The log of the policy names the local UI gate
 for such a diff. An empty or unreadable diff and every error name it as well: the
@@ -78,8 +79,10 @@ UI_RELEVANT_MODULES = (
 )
 
 # Exact files outside the iOS app whose change the UI tests observe:
-# the app manifests that a package hygiene test reads, the UI test and build
-# scripts, and the action that prepares the UI build.
+# the app manifests that a package hygiene test reads, the Shared resources that
+# project.yml compiles into the iOS app (its `sources:` list), the UI test and
+# build scripts, and the action that prepares the UI build. A test pins every
+# `sources:` entry of the app and UI test targets to this rule.
 UI_TOOLING = (
     ".github/actions/prepare-apple-build/action.yml",
     ".github/scripts/queue_path_policy.py",
@@ -88,6 +91,7 @@ UI_TOOLING = (
     ".github/scripts/test_queue_path_policy.py",
     ".github/scripts/verify_xcode_toolchain.sh",
     "App/Info.plist",
+    "Shared/AppIntents.xcstrings",
     "Shared/PrivacyInfo.xcprivacy",
     "iOSApp/Info.plist",
     "project.yml",
