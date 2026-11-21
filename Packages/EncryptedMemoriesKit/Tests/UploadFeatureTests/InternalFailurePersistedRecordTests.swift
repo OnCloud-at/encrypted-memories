@@ -18,18 +18,35 @@ final class InternalFailurePersistedRecordTests: XCTestCase {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    /// The text of every case, as the backend error that it replaces wrote it. These texts are stored in the detail of
+    /// a row and shown to a person, so they stay as they are.
+    private static let texts: [UploadError.InternalFailure: String] = [
+        .localStateUnavailable: L10n.string("backup.error_local_state_unavailable"),
+        .sourceRecoveryUnavailable: "Backup source recovery is unavailable",
+        .preflightClassificationIncomplete: "Backup preflight classification was incomplete",
+        .exclusionsUnavailable: "Backup exclusions are unavailable",
+        .stateNotRead: "Backup state could not be read",
+        .stateBatchNotRead: "Backup state batch could not be read",
+        .stateNotSaved: "Backup state could not be saved",
+        .stateNotUpdated: "Backup state could not be updated",
+        .completionStateNotSaved: "Backup completion state could not be saved",
+        .identityManifestNotUpdated: "Upload identity manifest could not be updated",
+        .editJournalNotWritten: "Edit replacement journal could not be written",
+    ]
+
     func testEveryInternalFailureKeepsTheTextOfTheBackendErrorItReplaces() {
-        let message = L10n.string("backup.error_local_state_unavailable")
-        XCTAssertEqual(Set(UploadError.InternalFailure.allCases), [.localStateUnavailable])
+        XCTAssertEqual(
+            Set(UploadError.InternalFailure.allCases), Set(Self.texts.keys), "a new case needs its text here")
         for failure in UploadError.InternalFailure.allCases {
+            let message = Self.texts[failure]
             XCTAssertEqual(failure.message, message, "\(failure)")
             XCTAssertEqual(failure.failureCause, .localState, "\(failure)")
             XCTAssertEqual(UploadError.internalFailure(failure).errorDescription, message, "\(failure)")
             XCTAssertEqual(UploadError.internalFailure(failure).failureCause, .localState, "\(failure)")
+            XCTAssertEqual(
+                UploadError.internalFailure(failure).errorDescription,
+                UploadError.backend(message ?? "").errorDescription, "\(failure)")
         }
-        XCTAssertEqual(
-            UploadError.internalFailure(.localStateUnavailable).errorDescription,
-            UploadError.backend(message).errorDescription)
     }
 
     /// Runs one photo through the runner whose upload fails with `error`, and returns the stored `lastError` and state.
@@ -64,17 +81,19 @@ final class InternalFailurePersistedRecordTests: XCTestCase {
 
     /// The record that the runner stores for an internal failure equals the record of the backend error with the same text.
     func testTheStoredRowOfAnInternalFailureEqualsTheRowOfTheBackendErrorItReplaces() async throws {
-        let oldError = UploadError.backend(L10n.string("backup.error_local_state_unavailable"))
-        let before = try await storedRow(after: oldError)
-        let after = try await storedRow(after: UploadError.internalFailure(.localStateUnavailable))
+        for failure in UploadError.InternalFailure.allCases {
+            let message = try XCTUnwrap(Self.texts[failure], "\(failure)")
+            let before = try await storedRow(after: UploadError.backend(message))
+            let after = try await storedRow(after: UploadError.internalFailure(failure))
 
-        XCTAssertEqual(after.state, before.state, "the item parks the same way")
-        // The encoder writes the keys of the record in no fixed order, so two equal records differ in their bytes.
-        // The record that each row decodes to is the value that the app reads.
-        let record = try XCTUnwrap(BackupIssueRecord.decode(after.lastError))
-        XCTAssertEqual(record, BackupIssueRecord.decode(before.lastError), "the stored record is equal")
-        XCTAssertEqual(record.kind, .remoteService, "the persisted kind of a backend failure")
-        XCTAssertEqual(record.detail, L10n.string("backup.error_local_state_unavailable"))
+            XCTAssertEqual(after.state, before.state, "the item parks the same way: \(failure)")
+            // The encoder writes the keys of the record in no fixed order, so two equal records differ in their bytes.
+            // The record that each row decodes to is the value that the app reads.
+            let record = try XCTUnwrap(BackupIssueRecord.decode(after.lastError), "\(failure)")
+            XCTAssertEqual(record, BackupIssueRecord.decode(before.lastError), "the stored record is equal: \(failure)")
+            XCTAssertEqual(record.kind, .remoteService, "the persisted kind of a backend failure: \(failure)")
+            XCTAssertEqual(record.detail, message, "\(failure)")
+        }
     }
 }
 

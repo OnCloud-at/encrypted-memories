@@ -1376,7 +1376,7 @@ final class RecordingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Senda
 
     /// Discard generation 1 of the modeled queue. Without a ledger, recovery is unavailable, as in the protocol default.
     func missingSourceDiscardGeneration() async throws -> Int64 {
-        guard ledger != nil else { throw UploadError.backend("Backup source recovery is unavailable") }
+        guard ledger != nil else { throw UploadError.internalFailure(.sourceRecoveryUnavailable) }
         return 1
     }
 
@@ -1384,7 +1384,7 @@ final class RecordingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Senda
     /// source with any queue row. The model has no excluded and no backed-up-only sources. Without a ledger, recovery is
     /// unavailable, as in the protocol default.
     func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
-        guard let ledger else { throw UploadError.backend("Backup source recovery is unavailable") }
+        guard let ledger else { throw UploadError.internalFailure(.sourceRecoveryUnavailable) }
         for candidate in candidates {
             guard try !ledger.hasKey(withPrefix: "\(candidate.snapshot.source.identifier)#") else { continue }
             try await enqueue(candidate)
@@ -1405,7 +1405,7 @@ final class RecordingEnqueuer: UploadBackupCandidateEnqueueing, @unchecked Senda
             let key = "\(snapshot.source.identifier)#\(snapshot.revision.rawValue)"
             guard let state = try ledger.value(of: Self.statePrefix + key) else { continue }
             if state == Self.settled, !ledger.set(Self.statePrefix + key, value: "pending") {
-                throw UploadError.backend("Backup state could not be updated")
+                throw UploadError.internalFailure(.stateNotUpdated)
             }
             pending.append(reopening.candidate)
             if try ledger.value(of: key) == Self.settled, !ledger.remove(key) {

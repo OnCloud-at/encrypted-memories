@@ -262,7 +262,7 @@ public struct EditedPhotoReplacement: Sendable {
         // confirmed retired links, so a retry after a failed manifest write forgets them too.
         let trashedLinks = retired.union(gone).union(related).union(journal.entry(for: source).retired)
         guard identities.forgetRemoteLinks(trashedLinks, of: source) else {
-            throw UploadError.backend("Upload identity manifest could not be updated")
+            throw UploadError.internalFailure(.identityManifestNotUpdated)
         }
         try journal.settle(retired, related: related, trashed: true, for: source)
         try journal.settleGone(gone, for: source)

@@ -181,7 +181,7 @@ public actor UploadBackupPreflightIndex {
 
     public func classify(_ snapshot: UploadBackupAssetSnapshot) throws -> UploadBackupCheckDecision {
         guard let lookup = store.lookupBatch([snapshot]).first, lookup.succeeded else {
-            throw UploadError.backend("Backup state could not be read")
+            throw UploadError.internalFailure(.stateNotRead)
         }
         return try classify(snapshot, lookup: lookup)
     }
@@ -190,7 +190,7 @@ public actor UploadBackupPreflightIndex {
         guard !snapshots.isEmpty else { return [] }
         let lookups = store.lookupBatch(snapshots)
         guard lookups.count == snapshots.count, lookups.allSatisfy(\.succeeded) else {
-            throw UploadError.backend("Backup state batch could not be read")
+            throw UploadError.internalFailure(.stateBatchNotRead)
         }
         return try zip(snapshots, lookups).map { snapshot, lookup in
             try classify(snapshot, lookup: lookup)
@@ -236,7 +236,7 @@ public actor UploadBackupPreflightIndex {
                     updatedAt: now()
                 ))
         else {
-            throw UploadError.backend("Backup state could not be saved")
+            throw UploadError.internalFailure(.stateNotSaved)
         }
     }
 
@@ -245,7 +245,7 @@ public actor UploadBackupPreflightIndex {
         guard !snapshots.isEmpty else { return [] }
         let lookups = store.lookupBatch(snapshots)
         guard lookups.count == snapshots.count, lookups.allSatisfy(\.succeeded) else {
-            throw UploadError.backend("Backup state batch could not be read")
+            throw UploadError.internalFailure(.stateBatchNotRead)
         }
         return lookups.map { $0.directRecord?.isComplete == true }
     }
@@ -254,7 +254,7 @@ public actor UploadBackupPreflightIndex {
     /// revision is pending work. A revision without a state keeps the usual classification.
     public func reopen(_ snapshot: UploadBackupAssetSnapshot) throws -> Bool {
         guard let lookup = store.lookupBatch([snapshot]).first, lookup.succeeded else {
-            throw UploadError.backend("Backup state could not be read")
+            throw UploadError.internalFailure(.stateNotRead)
         }
         guard let direct = lookup.directRecord else { return false }
         guard direct.isComplete else { return true }
@@ -268,7 +268,7 @@ public actor UploadBackupPreflightIndex {
         var keeping: Set<UploadBackupRevision> = [snapshot.revision]
         if case .revision(let editRevision) = snapshot.editRevision { keeping.insert(editRevision) }
         guard store.removeRecords(for: snapshot.source, keeping: keeping) else {
-            throw UploadError.backend("Backup state could not be updated")
+            throw UploadError.internalFailure(.stateNotUpdated)
         }
     }
 
@@ -304,7 +304,7 @@ public actor UploadBackupPreflightIndex {
             }
         }
         guard store.upsertBatch(records) else {
-            throw UploadError.backend("Backup completion state could not be saved")
+            throw UploadError.internalFailure(.completionStateNotSaved)
         }
     }
 

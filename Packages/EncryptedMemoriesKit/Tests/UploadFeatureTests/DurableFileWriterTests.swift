@@ -162,9 +162,10 @@ final class DurableFileWriterTests: XCTestCase {
         failWrites([])
 
         XCTAssertThrowsError(try journal.addSuperseded(PhotoUID(volumeID: "vol", nodeID: "c"), for: asset)) { error in
-            XCTAssertEqual(
-                error.localizedDescription,
-                UploadError.backend("Edit replacement journal could not be written").localizedDescription)
+            guard case UploadError.internalFailure(.editJournalNotWritten) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(error.localizedDescription, "Edit replacement journal could not be written")
         }
         XCTAssertEqual(writes, [], "the journal writes nothing after the half line")
         XCTAssertEqual(journal.entry(for: asset).superseded.map(\.nodeID), ["a"])
@@ -219,9 +220,10 @@ final class DurableFileWriterTests: XCTestCase {
         XCTAssertThrowsError(
             try journal.startDeletionCheck(at: Date(timeIntervalSinceReferenceDate: .nan), for: asset)
         ) { error in
-            XCTAssertEqual(
-                error.localizedDescription,
-                UploadError.backend("Edit replacement journal could not be written").localizedDescription)
+            guard case UploadError.internalFailure(.editJournalNotWritten) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(error.localizedDescription, "Edit replacement journal could not be written")
         }
         XCTAssertEqual(writes, [])
     }

@@ -64,10 +64,10 @@ public extension UploadBackupCandidateEnqueueing {
     func enqueueChangedMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {}
 
     func enqueueMissingSources(_ candidates: [UploadBackupAssetCandidate]) async throws {
-        throw UploadError.backend("Backup source recovery is unavailable")
+        throw UploadError.internalFailure(.sourceRecoveryUnavailable)
     }
     func missingSourceDiscardGeneration() async throws -> Int64 {
-        throw UploadError.backend("Backup source recovery is unavailable")
+        throw UploadError.internalFailure(.sourceRecoveryUnavailable)
     }
 
     @discardableResult
@@ -219,7 +219,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         var decisions = try await preflight.classifyBatch(candidates.map(\.snapshot))
         try Task.checkCancellation()
         guard decisions.count == candidates.count else {
-            throw UploadError.backend("Backup preflight classification was incomplete")
+            throw UploadError.internalFailure(.preflightClassificationIncomplete)
         }
 
         // A trusted external identity can prove an existing active remote compound before any
@@ -334,7 +334,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         let decisions = try await preflight.classifyBatch(missing.map(\.snapshot))
         try Task.checkCancellation()
         guard decisions.count == missing.count else {
-            throw UploadError.backend("Backup preflight classification was incomplete")
+            throw UploadError.internalFailure(.preflightClassificationIncomplete)
         }
         let entries = zip(missing, decisions).compactMap { candidate, decision in
             decision == .alreadyBackedUp ? nil : prepare(candidate, decision: decision).entry
@@ -483,7 +483,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         for kind in Set(candidates.map(\.snapshot.source.kind)) {
             let identifiers = candidates.filter { $0.snapshot.source.kind == kind }.map(\.snapshot.source.identifier)
             guard let kindAnswers = exclusions.exclusions(kind: kind, among: identifiers) else {
-                throw UploadError.backend("Backup exclusions are unavailable")
+                throw UploadError.internalFailure(.exclusionsUnavailable)
             }
             answers[kind] = kindAnswers
         }
