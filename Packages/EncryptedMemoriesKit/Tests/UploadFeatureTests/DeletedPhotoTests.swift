@@ -743,6 +743,41 @@ final class DeletedPhotoTests: XCTestCase {
         }
     #endif
 
+    /// The row of the tapped item cannot be read. The person sees the local-state message, and neither the journal nor
+    /// the row changes (#1153).
+    #if DEBUG
+        @MainActor
+        func testAnUnreadableRowOfTheTappedItemRefusesTheDeletionChoiceWithTheLocalStateMessage() async throws {
+            let suite = "deletion-unreadable-row-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let controller = PhotoLibraryBackupController(
+                configuration: .init(
+                    accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults),
+                identityResolver: nil, uploader: MockUploader(), replacementJournal: journal)
+            let queue = try XCTUnwrap(controller.queueStoreForTesting)
+            let row = UploadBackupSyncQueueEntry(
+                source: source, revision: UploadBackupRevision(date: date), originalFilename: "photo.heic",
+                state: .failedPermanent,
+                lastError: BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue,
+                updatedAt: date)
+            XCTAssertTrue(queue.upsert(row))
+            let item = BackupFailedItem(
+                id: "gone", filename: "photo.heic", reason: "gone", isPermanent: true, issue: .deletedElsewhere,
+                source: source, revision: row.revision)
+            let beforeJournal = journal.entry(for: source)
+            let fault = try SQLiteReadInterrupt(in: queue, matching: "SELECT original_filename, byte_count, state")
+            XCTAssertFalse(controller.keepDeleted(item))
+            fault.stop()
+            XCTAssertTrue(fault.fired)
+            XCTAssertEqual(controller.lastMessage, L10n.string("backup.error_local_state_unavailable"))
+            XCTAssertEqual(journal.entry(for: source), beforeJournal)
+            XCTAssertEqual(try queue.entry(for: row.source, revision: row.revision), row)
+
+            await controller.shutdown()
+        }
+    #endif
+
     @MainActor
     func testB1PartialRevisionReadStopsRemoteDeletionDecision() async throws {
         try await assertRemoteDecisionReadFailure(

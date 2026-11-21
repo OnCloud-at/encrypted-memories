@@ -615,9 +615,14 @@ public final class PhotoLibraryBackupController {
                     outcomes[state.key] = remoteOutcome
                     continue
                 }
-                let row = try queueStore.entry(for: context.source, revision: context.revision)
+                let lookup = try queueStore.decisionEntry(for: context.source, revision: context.revision)
+                if case .unknown = lookup {
+                    outcomes[state.key] = .unreadable
+                    continue
+                }
                 guard queueStore.isOperational() else { continue }
-                if admittedRestoreRechecks.contains(state.key), let row, row.state.isTerminalSuccess,
+                if admittedRestoreRechecks.contains(state.key), case .found(let row) = lookup,
+                    row.state.isTerminalSuccess,
                     row.remoteCommitReconciliation == nil
                 {
                     outcomes[state.key] = .completed
@@ -895,12 +900,27 @@ public final class PhotoLibraryBackupController {
         return entries
     }
 
+    /// The row when the read found it. A row that is gone, a read that failed and any other error all refuse the action
+    /// that asks, so no caller acts on a row that it did not see.
+    private static func foundRow(
+        in queueStore: UploadBackupSyncQueueManifestStore, source: UploadSourceIdentity, revision: UploadBackupRevision
+    ) -> UploadBackupSyncQueueEntry? {
+        do {
+            guard case .found(let row) = try queueStore.decisionEntry(for: source, revision: revision) else {
+                return nil
+            }
+            return row
+        } catch {
+            return nil
+        }
+    }
+
     /// Hides a permanent item warning without ever changing the backup-success count.
     public func dismissFailedItem(_ item: BackupFailedItem) {
         guard item.isPermanent, item.issue != .deletedElsewhere,
             let source = item.source,
             let revision = item.revision, let queueStore,
-            let current = try? queueStore.entry(for: source, revision: revision),
+            let current = Self.foundRow(in: queueStore, source: source, revision: revision),
             BackupIssueRecord.decode(current.lastError)?.kind != .deletedElsewhere,
             queueStore.dismissPermanentFailure(
                 source: source,
@@ -967,7 +987,8 @@ public final class PhotoLibraryBackupController {
             item.issue == .deletedElsewhere, let source = item.source, let revision = item.revision,
             source.kind == .photoLibraryAsset, source.resource == .primary,
             pendingReplacementJournal != nil, let queueStore, queueStore.isOperational(),
-            let entry = try? queueStore.entry(for: source, revision: revision), entry.state == .failedPermanent,
+            let entry = Self.foundRow(in: queueStore, source: source, revision: revision),
+            entry.state == .failedPermanent,
             BackupIssueRecord.decode(entry.lastError)?.kind == .deletedElsewhere
         else { return false }
         do {
@@ -1030,18 +1051,24 @@ public final class PhotoLibraryBackupController {
         do {
             let replaced = try DeletionDecisionReplay.prepareLatestChoice(
                 for: source, queue: queueStore, journal: journal)
-            guard
-                let row = try PhotoPerformanceSignposts.database.interval(
-                    "BackupDecisionEntry", { try queueStore.entry(for: source, revision: revision) }),
-                row.state == .failedPermanent,
-                BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
+            let lookup = try PhotoPerformanceSignposts.database.interval(
+                "BackupDecisionEntry", { try queueStore.decisionEntry(for: source, revision: revision) })
+            // A row that cannot be read is no refusal of the tap: it is a failure that the person sees as one.
+            guard case .found(let row) = lookup else {
+                if case .unknown = lookup { throw SQLiteStoreUnknownReadError() }
+                return false
+            }
+            guard row.state == .failedPermanent, BackupIssueRecord.decode(row.lastError)?.kind == .deletedElsewhere
             else { return false }
             let parked = try PhotoPerformanceSignposts.database.interval("BackupDecisionRows") {
                 try queueStore.decisionRows(kind: source.kind, identifiers: [source.identifier]).filter {
                     guard $0.source == source, $0.state == .failedPermanent else { return false }
-                    return BackupIssueRecord.decode(
-                        (try queueStore.entry(for: source, revision: $0.revision))?.lastError)?
-                        .kind == .deletedElsewhere
+                    switch try queueStore.decisionEntry(for: source, revision: $0.revision) {
+                    case .found(let parkedRow):
+                        return BackupIssueRecord.decode(parkedRow.lastError)?.kind == .deletedElsewhere
+                    case .absent: return false
+                    case .unknown: throw SQLiteStoreUnknownReadError()
+                    }
                 }.map(\.revision)
             }
             let newest = parked.max() ?? revision

@@ -174,8 +174,12 @@ public enum DeletionDecisionReplay {
         }
         var updates: [UploadBackupSyncQueueManifestStore.StateUpdate] = []
         for row in rows {
-            guard let current = try queue.entry(for: row.source, revision: .init(rawValue: row.revision)) else {
-                continue
+            let current: UploadBackupSyncQueueEntry
+            switch try queue.decisionEntry(for: row.source, revision: .init(rawValue: row.revision)) {
+            case .found(let found): current = found
+            case .absent: continue
+            // A row that cannot be read keeps the whole intent for a later start.
+            case .unknown: throw SQLiteStoreUnknownReadError()
             }
             guard current.state == .failedPermanent,
                 BackupIssueRecord.decode(current.lastError)?.kind == .deletedElsewhere
