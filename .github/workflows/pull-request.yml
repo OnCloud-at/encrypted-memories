@@ -214,6 +214,7 @@ jobs:
             echo "run_macos=true" >> "$GITHUB_OUTPUT"
             echo "run_ui=false" >> "$GITHUB_OUTPUT"
             echo "Base policy or ALLGREEN unavailable; macOS jobs required."
+            echo "local UI gate applies: the queue does not run the iOS UI tests"
           fi
 
   # swift-format and SwiftLint on Linux give the same verdicts as the macOS runner: a corpus with one deliberate
@@ -408,9 +409,10 @@ jobs:
     # nightly on main (issue #1134); a manual run of this workflow still runs them.
     if: ${{ !cancelled() && github.event_name != 'pull_request' && !(github.event_name == 'merge_group' && needs.queue-path-policy.result == 'success' && needs.queue-path-policy.outputs.run_ui == 'false') }}
     runs-on: xcode-27
-    # The slowest finished queue run took 88 minutes, and another was cancelled at the 90-minute
-    # job limit although no test failed; the merge queue then removed the pull request. 120 minutes
-    # gives a slow runner the same limit as ios-verification. Refs #1197.
+    # A manual run of this workflow runs this job. A queue entry runs it only when the policy job did not
+    # succeed, and the whole run is red then. The last two queue runs that ran it were cancelled at this limit
+    # without a failed test (runs 43916590168 and 43999299753, with 104 and 120 test cases started), so a
+    # manual run can reach it as well. Refs #1197.
     timeout-minutes: 120
     outputs:
       ui: ${{ steps.ui.outcome }}
@@ -567,8 +569,8 @@ jobs:
     name: Cancel a queue run after a failure
     if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-24.04
-    # The longest queue runs took 123 minutes, because the macOS jobs wait for a runner. A late UI run can take
-    # about 215 minutes, so the loop ends by itself after 235 minutes, and the job limit is only the backstop.
+    # The longest finished queue run since the UI job left the queue took 146 minutes, because the macOS jobs
+    # wait for a runner. The loop ends by itself after 235 minutes, and the job limit is only the backstop.
     timeout-minutes: 240
     permissions:
       actions: write

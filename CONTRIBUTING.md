@@ -104,12 +104,13 @@ and `iOS UI tests` stay in the workflow and finish as skipped, which GitHub repo
 checks stay satisfied.
 
 The local UI gate: run `./scripts/verify-ios-app-tests.sh ui` before you submit the pull request, on the iPhone 17
-simulator and on the iPhone Duo (see below), when the change touches `iOSApp`, `iOSUITests`, `VendorPatches`, a
+simulator and on the iPhone Duo (see below), when the change touches `iOSApp`, the `Shared` files that `project.yml` compiles into the app, `iOSUITests`, `VendorPatches`, a
 workflow file, `project.yml`, a package manifest, the UI test tooling, a `Resources` bundle of a package, or a package
 module that the iOS app or a UI module reaches. `is_ui_relevant` and `UI_RELEVANT_MODULES` in
-`.github/scripts/queue_path_policy.py` define these paths once. To check a branch, run
-`BASE_SHA=origin/main HEAD_SHA=HEAD GITHUB_OUTPUT=/dev/null python3 .github/scripts/queue_path_policy.py`;
-the line `local UI gate applies` means that the gate applies. State the UI test run and its result in the pull request.
+`.github/scripts/queue_path_policy.py` define these paths once. To check a branch, fetch first and then run
+`BASE_SHA="$(git merge-base origin/main HEAD)" HEAD_SHA=HEAD GITHUB_OUTPUT=/dev/null python3 .github/scripts/queue_path_policy.py`;
+the merge base keeps newer changes of `main` out of the diff, so the result covers only your own changes.
+The line `local UI gate applies` means that the gate applies. State the UI test run and its result in the pull request.
 
 The hosted safety net is the nightly UI run on `main`, on the default simulator and on the iPhone
 Duo (issue #1134). A release needs a green nightly run for its commit (issue #1166). The nightly run
