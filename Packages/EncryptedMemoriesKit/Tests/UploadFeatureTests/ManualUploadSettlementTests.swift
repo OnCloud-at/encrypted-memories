@@ -1271,6 +1271,44 @@ final class ManualUploadSettlementTests: XCTestCase {
         XCTAssertEqual(uploader.requestCount, 1)
     }
 
+    func testAReplayWithoutAnIdentityResolverFailsWithTheFixedText() async throws {
+        let uploader = SettlementUploader()
+        let firstStore = try store()
+        let firstManager = UploadManager(
+            uploader: uploader,
+            identityResolver: SettlementIdentityResolver(failuresRemaining: 100),
+            settlementStore: firstStore,
+            maxConcurrent: 1
+        )
+        let ids = await firstManager.enqueueFiles([try file()], destination: .library)
+        let id = try XCTUnwrap(ids.first)
+        _ = await waitUntil(firstManager) { items in
+            guard case .failed = items.first?.state else { return false }
+            return true
+        }
+        XCTAssertEqual(firstStore.record(for: id)?.stage, .manifestPending)
+        await firstManager.shutdown()
+
+        let replayManager = UploadManager(
+            uploader: uploader,
+            identityResolver: nil,
+            settlementStore: try store(),
+            maxConcurrent: 1
+        )
+        await replayManager.retry(id)
+        let failed = await waitUntil(replayManager) { items in
+            guard case .failed(let message) = items.first?.state else { return false }
+            return message == "Upload identity resolver is unavailable for settlement."
+        }
+        XCTAssertEqual(failed.first?.id, id)
+        guard case .failed(let message) = failed.first?.state else {
+            return XCTFail("expected the failed state, got \(String(describing: failed.first?.state))")
+        }
+        XCTAssertEqual(message, "Upload identity resolver is unavailable for settlement.")
+        XCTAssertEqual(uploader.requestCount, 1, "the replay never sends the bytes again")
+        await replayManager.shutdown()
+    }
+
     func testRepeatedReplayIsIdempotentAndProducesOneTerminalResult() async throws {
         let uploader = SettlementUploader()
         let firstStore = try store()

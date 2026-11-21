@@ -32,17 +32,68 @@ final class InternalFailurePersistedRecordTests: XCTestCase {
         .completionStateNotSaved: "Backup completion state could not be saved",
         .identityManifestNotUpdated: "Upload identity manifest could not be updated",
         .editJournalNotWritten: "Edit replacement journal could not be written",
+        .pendingHandoffNotSaved: "Pending handoff could not be persisted",
+        .remoteCommitReconciliationNotSaved: "Remote commit reconciliation could not be persisted",
+        .secondaryReconciliationNotSaved: "Secondary reconciliation could not be persisted",
+        .queueNotUploading: "Backup queue could not enter uploading state",
+        .queueNotUpdated: "Backup queue could not be updated",
+        .deletionJournalUnavailable: "Deletion journal is unavailable",
+        .uploadDecisionWithoutTransport: "Scoped upload decision returned without transport",
+        .manualSettlementUnavailable: "Durable manual upload settlement is unavailable.",
+        .identityResolverUnavailable: "Upload identity resolver is unavailable for settlement.",
+        .receiptBacksTheUpload: "Remote upload receipt exists; byte upload is not retryable.",
+        .byteUploadBlocked: "Durable manual upload settlement is unavailable; byte upload is blocked.",
+        .manualReceiptNotPersisted: "Manual upload receipt could not be persisted.",
+        .managerReleased: "Upload manager was released before receipt persistence.",
+        .deletionCheckPending: L10n.string("backup.issue_deletion_check"),
+        .remoteDraftExists: L10n.string("upload.error_remote_draft"),
+        .remoteInconsistent: L10n.string("upload.error_remote_inconsistent"),
+    ]
+
+    /// The class of every case, written out: a failed read or write of a store or file is a local state; a refusal, a
+    /// wait for the remote library, an answer of it that the build cannot use and a defect of the app are unknown.
+    private static let causes: [UploadError.InternalFailure: FailureCause] = [
+        .localStateUnavailable: .localState,
+        .sourceRecoveryUnavailable: .localState,
+        .preflightClassificationIncomplete: .localState,
+        .exclusionsUnavailable: .localState,
+        .stateNotRead: .localState,
+        .stateBatchNotRead: .localState,
+        .stateNotSaved: .localState,
+        .stateNotUpdated: .localState,
+        .completionStateNotSaved: .localState,
+        .identityManifestNotUpdated: .localState,
+        .editJournalNotWritten: .localState,
+        .pendingHandoffNotSaved: .localState,
+        .remoteCommitReconciliationNotSaved: .localState,
+        .secondaryReconciliationNotSaved: .localState,
+        .queueNotUploading: .localState,
+        .queueNotUpdated: .localState,
+        .deletionJournalUnavailable: .unknown,
+        .uploadDecisionWithoutTransport: .unknown,
+        .manualSettlementUnavailable: .localState,
+        .identityResolverUnavailable: .unknown,
+        .receiptBacksTheUpload: .unknown,
+        .byteUploadBlocked: .localState,
+        .manualReceiptNotPersisted: .localState,
+        .managerReleased: .unknown,
+        .deletionCheckPending: .unknown,
+        .remoteDraftExists: .unknown,
+        .remoteInconsistent: .unknown,
     ]
 
     func testEveryInternalFailureKeepsTheTextOfTheBackendErrorItReplaces() {
         XCTAssertEqual(
             Set(UploadError.InternalFailure.allCases), Set(Self.texts.keys), "a new case needs its text here")
+        XCTAssertEqual(
+            Set(UploadError.InternalFailure.allCases), Set(Self.causes.keys), "a new case needs its class here")
         for failure in UploadError.InternalFailure.allCases {
             let message = Self.texts[failure]
             XCTAssertEqual(failure.message, message, "\(failure)")
-            XCTAssertEqual(failure.failureCause, .localState, "\(failure)")
+            let cause = Self.causes[failure]
+            XCTAssertEqual(failure.failureCause, cause, "\(failure)")
             XCTAssertEqual(UploadError.internalFailure(failure).errorDescription, message, "\(failure)")
-            XCTAssertEqual(UploadError.internalFailure(failure).failureCause, .localState, "\(failure)")
+            XCTAssertEqual(UploadError.internalFailure(failure).failureCause, cause, "\(failure)")
             XCTAssertEqual(
                 UploadError.internalFailure(failure).errorDescription,
                 UploadError.backend(message ?? "").errorDescription, "\(failure)")

@@ -309,6 +309,33 @@ final class UploadManagerDedupeTests: XCTestCase {
         XCTAssertEqual(UploadQueuePresentation.rowActions(for: items[0], capabilities: .unavailable), [.retry])
     }
 
+    /// The text that a blocked upload shows for each reason is the localized text of the app (#1159).
+    func testABlockedDuplicateCheckFailsTheItemWithTheTextOfItsReason() async throws {
+        let cases: [(name: String, decision: UploadDuplicateDecision, text: String)] = [
+            ("draft.jpg", .skip(.draftExists, remoteLinkID: "draft-link"), L10n.string("upload.error_remote_draft")),
+            (
+                "inconsistent.jpg", .skip(.inconsistentRemoteState, remoteLinkID: nil),
+                L10n.string("upload.error_remote_inconsistent")
+            ),
+            ("waiting.jpg", .awaitDeletionCheck, L10n.string("backup.issue_deletion_check")),
+        ]
+        for testCase in cases {
+            let urls = try makeTempFiles([testCase.name], in: tempDir)
+            let resolver = FakeIdentityResolver()
+            resolver.decisionsByFilename[testCase.name] = testCase.decision
+            let manager = UploadManager(uploader: MockUploader(), identityResolver: resolver)
+
+            await manager.enqueueFiles(urls, destination: .library)
+            let items = await waitForAllTerminal(manager)
+
+            guard case .failed(let message) = items[0].state else {
+                return XCTFail("expected failed, got \(items[0].state) for \(testCase.name)")
+            }
+            XCTAssertEqual(message, testCase.text, testCase.name)
+            await manager.shutdown()
+        }
+    }
+
     func testRemoteDeletionSkipDoesNotCountAsBackedUpDuplicate() async throws {
         let urls = try makeTempFiles(["deleted.jpg"], in: tempDir)
         let uploader = MockUploader()

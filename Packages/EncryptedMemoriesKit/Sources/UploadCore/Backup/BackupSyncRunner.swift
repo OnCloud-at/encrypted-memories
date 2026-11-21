@@ -1246,7 +1246,7 @@ public actor BackupSyncRunner {
                             kind: .uploaded
                         ) == .failed
                     {
-                        throw UploadError.backend("Pending handoff could not be persisted")
+                        throw UploadError.internalFailure(.pendingHandoffNotSaved)
                     }
                     let reconciliation = UploadRemoteCommitReconciliation(
                         source: resolved.descriptor.source,
@@ -1277,7 +1277,7 @@ public actor BackupSyncRunner {
                         case .unknown: throw SQLiteStoreUnknownReadError()
                         case .found: break
                         }
-                        throw UploadError.backend("Remote commit reconciliation could not be persisted")
+                        throw UploadError.internalFailure(.remoteCommitReconciliationNotSaved)
                     }
                 },
                 operation: { [weak self] preflightResult in
@@ -1394,13 +1394,13 @@ public actor BackupSyncRunner {
                 case .inconsistentRemoteState:
                     retryOrPark(
                         entry, from: persistedState,
-                        error: UploadError.backend(L10n.string("upload.error_remote_inconsistent")))
+                        error: UploadError.internalFailure(.remoteInconsistent))
                 }
             case .upload, .uploadReplacingDraft:
                 retryOrPark(
                     entry,
                     from: persistedState,
-                    error: UploadError.backend("Scoped upload decision returned without transport")
+                    error: UploadError.internalFailure(.uploadDecisionWithoutTransport)
                 )
             }
         }
@@ -1472,7 +1472,7 @@ public actor BackupSyncRunner {
         // The store refuses the record of a photo whose pending row it cannot read; that photo waits (#982).
         let error: Error =
             events?.exclusion(of: entry.source) == .unreadable
-            ? PendingSourceUnreadableError() : UploadError.backend("Pending handoff could not be persisted")
+            ? PendingSourceUnreadableError() : UploadError.internalFailure(.pendingHandoffNotSaved)
         retryOrPark(entry, from: state, error: error)
         return false
     }
@@ -1521,7 +1521,7 @@ public actor BackupSyncRunner {
         let network = try transferNetwork()
         let key = Self.key(entry)
         guard transition(entry, from: state, to: .uploading) != nil else {
-            throw UploadError.backend("Backup queue could not enter uploading state")
+            throw UploadError.internalFailure(.queueNotUploading)
         }
         let token = UUID()
         inFlightTokens[key] = token
@@ -1770,7 +1770,7 @@ public actor BackupSyncRunner {
                 // No remote reference for the primary - cannot pair secondaries safely.
                 retryOrPark(
                     entry, from: persistedState,
-                    error: UploadError.backend(L10n.string("upload.error_remote_inconsistent")))
+                    error: UploadError.internalFailure(.remoteInconsistent))
                 return
             }
             switch await settleSecondaries(
@@ -1856,7 +1856,7 @@ public actor BackupSyncRunner {
                 if replacesEarlierUpload {
                     try await preflight.forgetEarlierStates(of: resolved.candidate.snapshot)
                     guard queue.removeSettledRevisions(of: entry.source, except: entry.revision) else {
-                        throw UploadError.backend("Backup queue could not be updated")
+                        throw UploadError.internalFailure(.queueNotUpdated)
                     }
                 }
                 let outcome = try await editReplacement.replaceSuperseded(
@@ -1934,7 +1934,7 @@ public actor BackupSyncRunner {
         _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState
     ) async {
         guard let journal = editReplacement?.journal else {
-            retryOrPark(entry, from: oldState, error: UploadError.backend("Deletion journal is unavailable"))
+            retryOrPark(entry, from: oldState, error: UploadError.internalFailure(.deletionJournalUnavailable))
             return
         }
         do {
@@ -2033,7 +2033,7 @@ public actor BackupSyncRunner {
                             case .unknown: throw SQLiteStoreUnknownReadError()
                             case .found: break
                             }
-                            throw UploadError.backend("Secondary reconciliation could not be persisted")
+                            throw UploadError.internalFailure(.secondaryReconciliationNotSaved)
                         }
                     },
                     operation: { [weak self] result in
@@ -2104,7 +2104,7 @@ public actor BackupSyncRunner {
                 case .inconsistent:
                     return .failed(
                         remaining: remaining,
-                        error: UploadError.backend(L10n.string("upload.error_remote_inconsistent"))
+                        error: UploadError.internalFailure(.remoteInconsistent)
                     )
                 }
             } catch is SQLiteStoreUnknownReadError {
@@ -2136,7 +2136,7 @@ public actor BackupSyncRunner {
             ? .allSettled
             : .failed(
                 remaining: remaining,
-                error: lastError ?? UploadError.backend(L10n.string("upload.error_remote_inconsistent"))
+                error: lastError ?? UploadError.internalFailure(.remoteInconsistent)
             )
     }
 

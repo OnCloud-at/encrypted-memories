@@ -669,6 +669,24 @@ public enum UploadError: LocalizedError, Equatable {
         case completionStateNotSaved
         case identityManifestNotUpdated
         case editJournalNotWritten
+        case pendingHandoffNotSaved
+        case remoteCommitReconciliationNotSaved
+        case secondaryReconciliationNotSaved
+        case queueNotUploading
+        case queueNotUpdated
+        case deletionJournalUnavailable
+        /// A scoped upload decision that no transport followed: a defect of the app, with no known cause yet.
+        case uploadDecisionWithoutTransport
+        case manualSettlementUnavailable
+        case identityResolverUnavailable
+        case receiptBacksTheUpload
+        case byteUploadBlocked
+        case manualReceiptNotPersisted
+        case managerReleased
+        /// The next three show a localized text of the app, as the backend errors that they replace did.
+        case deletionCheckPending
+        case remoteDraftExists
+        case remoteInconsistent
 
         /// The localized local-state message of the app. The one place that names its key.
         public static var localStateMessage: String { L10n.string("backup.error_local_state_unavailable") }
@@ -687,11 +705,44 @@ public enum UploadError: LocalizedError, Equatable {
             case .completionStateNotSaved: "Backup completion state could not be saved"
             case .identityManifestNotUpdated: "Upload identity manifest could not be updated"
             case .editJournalNotWritten: "Edit replacement journal could not be written"
+            case .pendingHandoffNotSaved: "Pending handoff could not be persisted"
+            case .remoteCommitReconciliationNotSaved: "Remote commit reconciliation could not be persisted"
+            case .secondaryReconciliationNotSaved: "Secondary reconciliation could not be persisted"
+            case .queueNotUploading: "Backup queue could not enter uploading state"
+            case .queueNotUpdated: "Backup queue could not be updated"
+            case .deletionJournalUnavailable: "Deletion journal is unavailable"
+            case .uploadDecisionWithoutTransport: "Scoped upload decision returned without transport"
+            case .manualSettlementUnavailable: "Durable manual upload settlement is unavailable."
+            case .identityResolverUnavailable: "Upload identity resolver is unavailable for settlement."
+            case .receiptBacksTheUpload: "Remote upload receipt exists; byte upload is not retryable."
+            case .byteUploadBlocked: "Durable manual upload settlement is unavailable; byte upload is blocked."
+            case .manualReceiptNotPersisted: "Manual upload receipt could not be persisted."
+            case .managerReleased: "Upload manager was released before receipt persistence."
+            case .deletionCheckPending: L10n.string("backup.issue_deletion_check")
+            case .remoteDraftExists: L10n.string("upload.error_remote_draft")
+            case .remoteInconsistent: L10n.string("upload.error_remote_inconsistent")
             }
         }
 
-        /// Every case is a failure of a store or a file of the app.
-        public var failureCause: FailureCause { .localState }
+        /// What the failure is. A failed read or write of a store or a file of the app is `localState`. A refusal, a
+        /// decision that waits for the remote library, an answer of the remote library that this build cannot use, and
+        /// a defect of the app have no known cause: they are `unknown`. Every case is named, so a new case does not
+        /// compile until it has its class. `FailurePolicy` treats both classes in one branch, so the class changes no
+        /// retry or text.
+        public var failureCause: FailureCause {
+            switch self {
+            case .localStateUnavailable, .sourceRecoveryUnavailable, .preflightClassificationIncomplete,
+                .exclusionsUnavailable, .stateNotRead, .stateBatchNotRead, .stateNotSaved, .stateNotUpdated,
+                .completionStateNotSaved, .identityManifestNotUpdated, .editJournalNotWritten, .pendingHandoffNotSaved,
+                .remoteCommitReconciliationNotSaved, .secondaryReconciliationNotSaved, .queueNotUploading,
+                .queueNotUpdated, .manualSettlementUnavailable, .byteUploadBlocked, .manualReceiptNotPersisted:
+                .localState
+            case .receiptBacksTheUpload, .deletionCheckPending, .remoteDraftExists, .remoteInconsistent,
+                .managerReleased, .identityResolverUnavailable, .deletionJournalUnavailable,
+                .uploadDecisionWithoutTransport:
+                .unknown
+            }
+        }
     }
 
     public var errorDescription: String? {
