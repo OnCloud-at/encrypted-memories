@@ -256,6 +256,40 @@ It uses the `testflight-external` environment.
 `TESTFLIGHT_EXTERNAL_GROUP_NAME` optionally overrides `External Testers`.
 Stable and prerelease release tags can be promoted externally.
 
+## Release nightly gate
+
+The prepare job of the Apple release workflow starts a release only on a commit with a green nightly UI run (issue #1166).
+`.github/scripts/release_nightly_gate.py` reads the newest run of `nightly-ui-tests.yml` whose head commit equals the
+release commit. A run for an older or a newer commit never counts. Any run of that commit that is still open refuses the
+release, and the refusal names it, so an older green run cannot hide it. Of the completed runs the newest one decides,
+ranked by the start of its latest attempt and then by id: a newer red run is not hidden by an older green one, and a
+re-run of an older run counts as the newest run. The job needs the `actions: read` scope for this read.
+
+The newest completed run counts only when all of these hold:
+
+- The event is `schedule` or `workflow_dispatch`. A run of another event is refused, also when an older scheduled run
+  of the same commit is green: the newest completed run decides.
+- The run concluded `success`, and each of the two UI jobs exists once in the latest attempt, concluded `success`
+  and ran in the attempt of the run. A rerun of only the failed jobs leaves a job in an older attempt, so the gate
+  refuses it: re-run all jobs of the nightly run, or start a new run.
+- Each job has one evidence artifact that did not expire and belongs to the release commit. Two artifacts of one name
+  refuse the release, also when one of them expired.
+- The evidence file names that job, run, attempt and commit, its counts add up, at least one test passed and none failed.
+  The gate derives this again and does not trust the `ok` field alone, because `ok` judges only the result bundle.
+  Every number must be a real integer; a boolean or a decimal number is refused.
+
+The age of the run is not limited. The refusal says so when the run is older than 14 days. The refusal names the run,
+the job and every failed condition that the data shows in the job summary, not only the first. The simulator name is not
+checked. The gate tries each GitHub call up to four times, like the release workflow, and reads within one budget of four
+minutes. A call that hangs, an encrypted or corrupt evidence archive and an answer with a missing field end in a refusal
+with its text, never in a timeout of the step or a traceback.
+
+To start a nightly run for a release commit, run `gh workflow run nightly-ui-tests.yml --ref <tag>` with the release
+tag or a branch at the release commit. The workflow has no inputs and tests the head of the chosen ref. That ref must
+contain the workflow file, so a commit older than the workflow needs a newer commit. When both jobs are green, re-run the release.
+The deliberate override of the release gates (see the upgrade verification below) skips this read and records its
+reason in the job summary. The nightly run itself is not a required check.
+
 ## Release upgrade verification
 
 The Apple release workflow finishes both distribution builds before it tests installed upgrades.

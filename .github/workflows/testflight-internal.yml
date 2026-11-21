@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       upgrade_override_tag:
-        description: Confirm the exact release tag to deliberately override upgrade verification
+        description: Confirm the exact release tag to deliberately override the upgrade verification and the nightly UI gate
         required: false
         type: string
       upgrade_override_reason:
@@ -33,6 +33,11 @@ jobs:
     name: Validate GitHub release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # The nightly UI gate reads the runs, jobs and artifacts of the nightly workflow. This job restates contents: read
+    # because a job-level block replaces the workflow-level one.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
@@ -153,6 +158,26 @@ jobs:
             --release "$RUNNER_TEMP/release.json" --history "$RUNNER_TEMP/release-history.json" \
             --output "$RUNNER_TEMP/upgrade-plan.json" --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" \
             --override-tag="$OVERRIDE_TAG" --override-reason="$OVERRIDE_REASON"
+
+      # A release starts only on a commit with a green nightly UI run (#1166). The script comes from the trusted
+      # automation checkout, so it runs before the checkout of the release tag. The deliberate override of the release
+      # gates skips the read and records its reason.
+      - name: Require a green nightly UI run for the release commit
+        id: nightly-gate
+        # The script ends its read in a refusal after 4 minutes at the latest; the step limit is its own backstop.
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.revision.outputs.commit_sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          OVERRIDDEN: ${{ steps.upgrade-plan.outputs.upgrade_overridden }}
+          OVERRIDE_REASON: ${{ inputs.upgrade_override_reason }}
+        run: |
+          set -euo pipefail
+          # The = form keeps a value that starts with a dash from being read as an option, as in the planner step.
+          python3 -I .github/scripts/release_nightly_gate.py --repository="$GITHUB_REPOSITORY" \
+            --commit="$RELEASE_COMMIT" --tag="$RELEASE_TAG" \
+            --overridden="$OVERRIDDEN" --override-reason="$OVERRIDE_REASON"
 
       - name: Check out the exact release tag
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
