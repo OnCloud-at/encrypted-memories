@@ -297,8 +297,6 @@ final class MobileDuplicatesUITests: XCTestCase {
             let tabTitles = language == "de" ? XCUIApplication.germanTabTitles : XCUIApplication.englishTabTitles
             let verticalColumn = try app.verticalTabColumn(titles: tabTitles)
             revealGroup(1)
-            // A vertical bar reserves space beside the list; horizontal bars keep the full-window centre.
-            let contentColumn = group(1).frame
             app.buttons["duplicates.mergeAll"].tap()
             let alert = app.alerts.firstMatch
             XCTAssertTrue(alert.waitForExistence(timeout: 10), "Merge All uses a native alert")
@@ -322,17 +320,22 @@ final class MobileDuplicatesUITests: XCTestCase {
                     : "The copies are identical. One photo of each group stays, with its favorites and albums. 2 photos move to Recently Deleted."
             ]
             XCTAssertTrue(message.exists)
-            let geometry = XCTAttachment(string: app.debugDescription)
-            geometry.name = "Duplicate alert content geometry"
-            geometry.lifetime = .keepAlways
-            add(geometry)
-            print(
-                "[Duplicates content] column=\(contentColumn) window=\(app.windows.firstMatch.frame) alert=\(alert.frame)"
-            )
-            if verticalColumn != nil {
-                XCTAssertEqual(alert.frame.midX, contentColumn.midX, accuracy: 2)
+            // The system places the native alert. Beside a vertical tab bar its centre depends on the simulator
+            // build: on the outer display of iPhone Duo (window 466 wide, tab column at x 394-442), iOS 27.1 build
+            // 24A94401 centres it at 221, between the window edge and the outer edge of the tab column, and build
+            // 24A94425 at 191, on the list column. Beside a vertical bar the test therefore checks that the alert,
+            // with both actions, lies whole in the window and leaves the tab column free; horizontal bars keep the
+            // window centre.
+            let window = app.windows.firstMatch.frame
+            let alertFrame = alert.frame
+            XCTAssertFalse(alertFrame.isEmpty)
+            XCTAssertTrue(window.contains(alertFrame), "the alert \(alertFrame) fits within the window \(window)")
+            XCTAssertTrue(alertFrame.contains(confirm.frame), "the Merge action fits within the alert")
+            XCTAssertTrue(alertFrame.contains(cancel.frame), "the Cancel action fits within the alert")
+            if let column = verticalColumn {
+                XCTAssertFalse(alertFrame.intersects(column), "the alert leaves the tab column \(column) free")
             } else {
-                XCTAssertEqual(alert.frame.midX, app.windows.firstMatch.frame.midX, accuracy: 2)
+                XCTAssertEqual(alertFrame.midX, window.midX, accuracy: 2)
             }
             print(
                 "[Duplicates alert] language=\(language) alert=\(alert.frame) confirm=\(confirm.frame) cancel=\(cancel.frame)"
