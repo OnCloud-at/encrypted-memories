@@ -2,6 +2,7 @@ import AlbumSyncCore
 import Foundation
 import PhotosCore
 import SQLite3
+import SQLiteTestSupport
 import XCTest
 
 @testable import PhotoLibraryBackupAdapter
