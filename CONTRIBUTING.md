@@ -474,6 +474,19 @@ The release workflow uses trusted default-branch automation, so its changes take
 
 A failed upgrade stops both uploads and records its cause in the job summary.
 A maintainer can retry the run after fixing the cause.
+A hosted runner that goes away ends an upgrade job without a failed step, and so does a full runner disk. The job
+`Classify the upgrade failure` reads the jobs of the run and names each failed upgrade job in the summary. A job is
+`lost its runner` only when no step failed, the job ran for less than its time limit (`JOB_TIMEOUT_MINUTES` in
+`.github/scripts/release_upgrade.py` states the 180 minutes of the workflow, with a margin of 5 minutes) and its check-run
+annotations (the `checks: read` scope) say, at the level `failure`, that the hosted runner lost communication with the
+server. The job must also have concluded `failure`: a cancelled job or a job that timed out is never read as a lost
+runner. An annotation about a full disk (`No space left on device`) or the warning of the runner that its disk is nearly
+full (`running out of disk space`) names a full runner disk instead, at every level and also next to the lost-runner text.
+That is a capacity problem and never retried. Any other annotation, no annotation and an annotation that cannot be read
+leave the cause unknown, and the job is not retried. A failed step, a timeout, a failed job outside the upgrade gate and a
+job record with a missing field or an end before its start are never read as a lost runner. The summary also says whether a re-run of the failed jobs is
+safe: only when the run is at attempt 1 and every failed job lost its runner. In that case re-run the failed jobs by hand.
+The job changes no result and starts only when the upgrade result is `failure`.
 To deliberately override the gate, dispatch `Apple release` from `main` with an existing published
 `release_tag`, the same value in `upgrade_override_tag`, and a nonempty `upgrade_override_reason`.
 The summary records the override and its reason. Automatic release events cannot override the gate.

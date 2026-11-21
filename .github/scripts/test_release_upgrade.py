@@ -676,5 +676,338 @@ class ReleaseUpgradeTests(unittest.TestCase):
                     validate_override(event, ref, "v1.1.0", confirmation, reason)
 
 
+RECORDED_JOBS = Path(__file__).resolve().parent / "fixtures" / "upgrade_jobs_run_41064872152.json"
+# Real job records with their check-run annotations: a lost runner (run 38193953552) and a full runner disk (run 38181793360).
+RECORDED_ANNOTATIONS = Path(__file__).resolve().parent / "fixtures" / "upgrade_annotations_runs_38193953552_38181793360.json"
+UPGRADE_JOB = "Test installed upgrades on iOS 27 iPhone (1-of-3)"
+# Synthetic annotation texts, shaped like the real ones.
+LOST_NOTE = {"annotation_level": "failure", "message": "The hosted runner lost communication with the server. (synthetic)"}
+DISK_NOTE = {"annotation_level": "failure", "message": "System.IO.IOException: No space left on device : 'x' (synthetic)"}
+# The warning of the runner itself, shaped like its source text (not a record of a run): it appears at the warning level.
+LOW_DISK_NOTE = {"annotation_level": "warning", "message": "You are running out of disk space. The runner will stop working "
+                 "when the machine runs out of disk space. Free space left: 80 MB (synthetic)"}
+
+
+def synthetic_job(name=UPGRADE_JOB, conclusion="failure", status="completed", minutes=40, steps=None, attempt=1, job_id=1001):
+    """A job in the shape of the GitHub jobs API. The steps of a lost runner stop without a failed step."""
+    if steps is None:
+        steps = [("Check out trusted upgrade automation", "success"), ("Test installed upgrades", "cancelled"),
+                 ("Retain upgrade evidence", "skipped")]
+    return {"id": job_id, "name": name, "status": status, "conclusion": conclusion, "run_attempt": attempt,
+            "started_at": "2026-11-21T10:00:00Z",
+            "completed_at": f"2026-11-21T{10 + minutes // 60:02d}:{minutes % 60:02d}:00Z",
+            "steps": [{"name": step, "status": "completed", "conclusion": result, "number": number}
+                      for number, (step, result) in enumerate(steps, 1)]}
+
+
+def passed_job(name="Build iOS"):
+    return synthetic_job(name=name, conclusion="success", steps=[("Build", "success")], job_id=2002)
+
+
+def annotations_of(notes_by_id):
+    """A reader of annotations for the classifier: the notes of the job id, or a failed read for an id without notes."""
+    def read(job_id):
+        notes = notes_by_id[job_id]
+        if isinstance(notes, Exception):
+            raise notes
+        return notes
+    return read
+
+
+def never_read(job_id):
+    raise AssertionError(f"the annotations of job {job_id} must not be read")
+
+
+def real(key):
+    record = json.loads(RECORDED_ANNOTATIONS.read_text())[key]
+    return record["job"], record["annotations"]
+
+
+class LostRunnerTests(unittest.TestCase):
+    """The classifier of a failed upgrade gate (#1016). Its input is the jobs answer of the GitHub API and, for a job that
+    ended without a failed step, the check-run annotations of the job."""
+
+    def kinds(self, jobs, notes_by_id=None):
+        reader = annotations_of(notes_by_id) if notes_by_id is not None else never_read
+        return {name: kind for name, kind in release_upgrade.classify_failed_jobs(jobs, reader)}
+
+    def decide(self, jobs, attempt, notes_by_id=None):
+        reader = annotations_of(notes_by_id) if notes_by_id is not None else never_read
+        return release_upgrade.retry_decision(release_upgrade.classify_failed_jobs(jobs, reader), attempt)
+
+    def test_the_four_jobs_of_the_recorded_failed_run_failed_in_their_own_step_and_are_not_retried(self):
+        jobs = json.loads(RECORDED_JOBS.read_text())["jobs"]
+        failed = self.kinds(jobs)
+        self.assertEqual(4, len(failed))
+        self.assertEqual({"step-failed"}, set(failed.values()))
+        retry, reason = self.decide(jobs, 1)
+        self.assertFalse(retry)
+        self.assertIn("step failed", reason)
+
+    def test_the_real_lost_runner_is_retried_once(self):
+        job, notes = real("lost_runner")
+        self.assertEqual([], job["steps"])
+        self.assertEqual({job["name"]: "lost-runner"}, self.kinds([job], {job["id"]: notes}))
+        retry, reason = self.decide([job], 1, {job["id"]: notes})
+        self.assertTrue(retry)
+        self.assertIn("lost its runner", reason)
+
+    def test_the_real_job_with_a_full_runner_disk_is_not_a_lost_runner_and_is_never_retried(self):
+        job, notes = real("disk_full")
+        self.assertEqual([], job["steps"])
+        self.assertEqual({job["name"]: "disk-full"}, self.kinds([job], {job["id"]: notes}))
+        retry, reason = self.decide([job], 1, {job["id"]: notes})
+        self.assertFalse(retry)
+        self.assertIn("runner disk", reason)
+        self.assertIn(job["name"], reason)
+
+    def test_a_full_disk_next_to_a_lost_runner_prevents_the_retry(self):
+        lost, lost_notes = real("lost_runner")
+        full, full_notes = real("disk_full")
+        retry, reason = self.decide([lost, full], 1, {lost["id"]: lost_notes, full["id"]: full_notes})
+        self.assertFalse(retry)
+        self.assertIn(full["name"], reason)
+
+    def test_synthetic_job_without_a_failed_step_and_with_a_lost_runner_annotation_is_retried_once(self):
+        jobs = [passed_job(), synthetic_job()]
+        self.assertEqual({UPGRADE_JOB: "lost-runner"}, self.kinds(jobs, {1001: [LOST_NOTE]}))
+        self.assertTrue(self.decide(jobs, 1, {1001: [LOST_NOTE]})[0])
+
+    def test_synthetic_job_that_never_started_a_step_is_a_lost_runner_when_its_annotation_says_so(self):
+        jobs = [synthetic_job(steps=[], minutes=3)]
+        self.assertEqual({UPGRADE_JOB: "lost-runner"}, self.kinds(jobs, {1001: [LOST_NOTE]}))
+
+    def test_a_job_that_did_not_conclude_with_a_failure_is_never_a_lost_runner(self):
+        for conclusion in ("cancelled", "timed_out", "action_required", "stale", None):
+            with self.subTest(conclusion=conclusion):
+                jobs = [synthetic_job(conclusion=conclusion, minutes=40)]
+                self.assertEqual({UPGRADE_JOB: "not-failure"}, self.kinds(jobs))
+                retry, reason = self.decide(jobs, 1)
+                self.assertFalse(retry)
+                self.assertIn("did not conclude with a failure", reason)
+
+    def test_a_job_that_ended_before_it_started_is_unreadable(self):
+        job = {**synthetic_job(), "started_at": "2026-11-21T11:00:00Z", "completed_at": "2026-11-21T10:00:00Z"}
+        self.assertEqual({UPGRADE_JOB: "unreadable"}, self.kinds([job]))
+        self.assertFalse(self.decide([job], 1)[0])
+
+    def test_the_low_disk_warning_of_the_runner_next_to_the_lost_runner_text_is_a_full_disk(self):
+        job, notes = real("lost_runner")
+        self.assertEqual({job["name"]: "disk-full"}, self.kinds([job], {job["id"]: [*notes, LOW_DISK_NOTE]}))
+        self.assertEqual({job["name"]: "disk-full"}, self.kinds([job], {job["id"]: [LOW_DISK_NOTE, *notes]}))
+        retry, reason = self.decide([job], 1, {job["id"]: [*notes, LOW_DISK_NOTE]})
+        self.assertFalse(retry)
+        self.assertIn("runner disk", reason)
+        self.assertEqual({UPGRADE_JOB: "disk-full"}, self.kinds([synthetic_job()], {1001: [LOW_DISK_NOTE]}))
+
+    def test_synthetic_other_annotations_next_to_the_lost_runner_text_do_not_hide_it(self):
+        other = {"annotation_level": "warning", "message": "Node.js 20 actions are deprecated. (synthetic)"}
+        self.assertEqual({UPGRADE_JOB: "lost-runner"}, self.kinds([synthetic_job()], {1001: [other, LOST_NOTE]}))
+
+    def test_synthetic_the_text_of_a_full_disk_wins_over_the_text_of_a_lost_runner(self):
+        self.assertEqual({UPGRADE_JOB: "disk-full"}, self.kinds([synthetic_job()], {1001: [LOST_NOTE, DISK_NOTE]}))
+        self.assertEqual({UPGRADE_JOB: "disk-full"}, self.kinds([synthetic_job()], {1001: [DISK_NOTE, LOST_NOTE]}))
+
+    def test_synthetic_a_full_disk_counts_at_every_annotation_level(self):
+        warning = {"annotation_level": "warning", "message": "No space left on device (synthetic)"}
+        self.assertEqual({UPGRADE_JOB: "disk-full"}, self.kinds([synthetic_job()], {1001: [warning]}))
+
+    def test_synthetic_the_lost_runner_text_counts_only_in_a_failure_annotation(self):
+        for level in ("warning", "notice", None):
+            with self.subTest(level=level):
+                note = {"annotation_level": level, "message": LOST_NOTE["message"]}
+                self.assertEqual({UPGRADE_JOB: "unknown"}, self.kinds([synthetic_job()], {1001: [note]}))
+
+    def test_any_other_or_unreadable_annotation_is_unknown_and_never_retried(self):
+        job = synthetic_job()
+        cases = {"other text": [{"annotation_level": "failure", "message": "Process completed with exit code 1."}],
+                 "no annotation": [], "not a list": "lost communication with the server", "none": None,
+                 "note is not an object": ["lost communication with the server"],
+                 "text is no string": [{"annotation_level": "failure", "message": 5}],
+                 "no text": [{"annotation_level": "failure"}],
+                 "one note unreadable": [LOST_NOTE, 7],
+                 "read failed": release_upgrade.UpgradeError("no access"), "no network": OSError("offline"),
+                 "answer is no json": ValueError("not json"), "read timed out": subprocess.TimeoutExpired("gh", 60)}
+        for name, notes in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual({UPGRADE_JOB: "unknown"}, self.kinds([job], {1001: notes}))
+                retry, reason = self.decide([job], 1, {1001: notes})
+                self.assertFalse(retry)
+                self.assertIn("do not name a lost runner", reason)
+
+    def test_the_annotation_text_is_judged_without_help_from_the_caller(self):
+        self.assertEqual("lost-runner", release_upgrade.annotation_kind([LOST_NOTE]))
+        self.assertEqual("disk-full", release_upgrade.annotation_kind([DISK_NOTE]))
+        self.assertEqual("disk-full", release_upgrade.annotation_kind([LOW_DISK_NOTE]))
+        for notes in (None, "lost communication with the server", {"message": "x"}, [], ["x"], [LOST_NOTE, 7],
+                      [{"annotation_level": "failure", "message": None}], [{"annotation_level": "failure"}]):
+            with self.subTest(notes=notes):
+                self.assertEqual("unknown", release_upgrade.annotation_kind(notes))
+
+    def test_a_job_without_a_usable_id_is_unknown_and_its_annotations_are_not_read(self):
+        for job_id in (None, "1001", True, 1.0):
+            with self.subTest(job_id=job_id):
+                job = {**synthetic_job(), "id": job_id}
+                self.assertEqual({UPGRADE_JOB: "unknown"}, self.kinds([job]))
+        job = {key: value for key, value in synthetic_job().items() if key != "id"}
+        self.assertEqual({UPGRADE_JOB: "unknown"}, self.kinds([job]))
+
+    def test_the_annotations_of_a_job_that_the_record_decides_are_not_read(self):
+        other = synthetic_job(name="Build iOS", steps=[("Build", "cancelled")], job_id=2002)
+        failed_step = synthetic_job(steps=[("Test installed upgrades", "failure")], job_id=2003)
+        slow = synthetic_job(minutes=176, job_id=2004)
+        broken = {**synthetic_job(job_id=2005), "completed_at": None}
+        self.assertEqual({"Build iOS": "other-job", UPGRADE_JOB: "unreadable"}, self.kinds([other, broken]))
+        self.assertEqual({UPGRADE_JOB: "step-failed"}, self.kinds([failed_step]))
+        self.assertEqual({UPGRADE_JOB: "timeout"}, self.kinds([slow]))
+
+    def test_the_annotations_of_a_job_are_read_once_for_the_report_and_the_decision(self):
+        calls = []
+
+        def read(job_id):
+            calls.append(job_id)
+            return [LOST_NOTE]
+        with patch.object(release_upgrade, "report"), patch.dict("os.environ", {"GITHUB_OUTPUT": "/dev/null"}):
+            release_upgrade.report_classification([synthetic_job()], 1, read)
+        self.assertEqual([1001], calls)
+
+    def test_a_second_attempt_is_never_retried(self):
+        retry, reason = self.decide([synthetic_job(attempt=2)], 2, {1001: [LOST_NOTE]})
+        self.assertFalse(retry)
+        self.assertIn("attempt 2", reason)
+
+    def test_one_genuinely_failed_job_prevents_the_retry_of_a_lost_one(self):
+        genuine = synthetic_job(name="Test installed upgrades on macOS 27 host (1-of-1)", job_id=3003,
+                                steps=[("Test installed upgrades", "failure")])
+        retry, reason = self.decide([synthetic_job(), genuine], 1, {1001: [LOST_NOTE]})
+        self.assertFalse(retry)
+        self.assertIn("macOS 27 host", reason)
+
+    def test_a_failed_job_outside_the_upgrade_gate_prevents_the_retry(self):
+        build = synthetic_job(name="Build iOS", steps=[("Build", "cancelled")], job_id=2002)
+        self.assertEqual("other-job", self.kinds([build])["Build iOS"])
+        retry, reason = self.decide([synthetic_job(), build], 1, {1001: [LOST_NOTE]})
+        self.assertFalse(retry)
+        self.assertIn("Build iOS", reason)
+
+    def test_a_job_that_ran_into_its_timeout_is_not_a_lost_runner(self):
+        for minutes in (175, 180):
+            with self.subTest(minutes=minutes):
+                jobs = [synthetic_job(minutes=minutes, conclusion="cancelled")]
+                self.assertEqual({UPGRADE_JOB: "timeout"}, self.kinds(jobs))
+                self.assertFalse(self.decide(jobs, 1)[0])
+        self.assertEqual({UPGRADE_JOB: "lost-runner"}, self.kinds([synthetic_job(minutes=174)], {1001: [LOST_NOTE]}))
+
+    def test_unreadable_job_data_is_never_retried(self):
+        broken = {"missing steps": {k: v for k, v in synthetic_job().items() if k != "steps"},
+                  "missing end": {**synthetic_job(), "completed_at": None},
+                  "bad time": {**synthetic_job(), "started_at": "yesterday"}}
+        for name, job in broken.items():
+            with self.subTest(name=name):
+                self.assertEqual({UPGRADE_JOB: "unreadable"}, self.kinds([job]))
+                self.assertFalse(self.decide([job], 1)[0])
+
+    def test_jobs_that_succeeded_were_skipped_or_still_run_are_no_failures(self):
+        jobs = [passed_job(), synthetic_job(conclusion="skipped"), synthetic_job(conclusion="neutral"),
+                synthetic_job(conclusion=None, status="in_progress")]
+        self.assertEqual({}, self.kinds(jobs))
+        retry, reason = self.decide(jobs, 1)
+        self.assertFalse(retry)
+        self.assertIn("no failed job", reason)
+
+    def test_a_job_that_is_still_running_does_not_hide_a_lost_runner(self):
+        jobs = [synthetic_job(), synthetic_job(name="Classify the upgrade failure", conclusion=None, status="in_progress", job_id=4004)]
+        self.assertTrue(self.decide(jobs, 1, {1001: [LOST_NOTE]})[0])
+
+
+class AnnotationReadTests(unittest.TestCase):
+    """`read_annotations` and the command line: the read goes through `gh` and fails closed."""
+
+    def run_gh(self, answer, **extra):
+        class Done:
+            returncode = extra.get("returncode", 0)
+            stdout = json.dumps(answer)
+        with patch.dict("os.environ", {"GITHUB_REPOSITORY": "example/repository"}), \
+                patch.object(release_upgrade.subprocess, "run", return_value=Done) as run:
+            return release_upgrade.read_annotations(1001), run
+
+    def test_the_annotations_come_from_the_check_run_of_the_job_and_all_pages_are_joined(self):
+        notes, run = self.run_gh([[LOST_NOTE], [DISK_NOTE]])
+        self.assertEqual([LOST_NOTE, DISK_NOTE], notes)
+        command = run.call_args.args[0]
+        self.assertEqual(["gh", "api", "--paginate", "--slurp"], command[:4])
+        self.assertEqual("repos/example/repository/check-runs/1001/annotations?per_page=100", command[4])
+        self.assertEqual(release_upgrade.ANNOTATION_READ_SECONDS, run.call_args.kwargs["timeout"])
+
+    def test_a_failed_read_raises(self):
+        with self.assertRaises(release_upgrade.UpgradeError):
+            self.run_gh([], returncode=1)
+
+    def fake_gh(self, root, answers):
+        """A `gh` that answers with the annotations of the job id in its last argument and fails for an id without an answer."""
+        (root / "bin").mkdir()
+        script = root / "bin" / "gh"
+        script.write_text('#!/usr/bin/env bash\nfor last; do :; done\nid=${last#*check-runs/}\nid=${id%%/*}\n'
+                          '[[ -f "$FAKE_ANSWERS/$id.json" ]] || exit 1\ncat "$FAKE_ANSWERS/$id.json"\n')
+        script.chmod(0o755)
+        (root / "answers").mkdir()
+        for job_id, notes in answers.items():
+            (root / "answers" / f"{job_id}.json").write_text(json.dumps([notes]))
+        return {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "FAKE_ANSWERS": str(root / "answers"),
+                "GITHUB_REPOSITORY": "example/repository", "GITHUB_OUTPUT": str(root / "output"),
+                "GITHUB_STEP_SUMMARY": str(root / "summary")}
+
+    def classify(self, jobs, answers, attempt="1"):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self.fake_gh(root, answers)
+            (root / "jobs.json").write_text(json.dumps([{"total_count": len(jobs), "jobs": jobs}]))
+            completed = subprocess.run([sys.executable, str(Path(release_upgrade.__file__)), "--classify-jobs",
+                                        str(root / "jobs.json"), attempt], capture_output=True, text=True, env=env)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            return (root / "output").read_text().splitlines(), (root / "summary").read_text()
+
+    def test_cli_retries_the_real_lost_runner_and_names_it(self):
+        job, notes = real("lost_runner")
+        output, summary = self.classify([job], {job["id"]: notes})
+        self.assertIn("retry=true", output)
+        self.assertIn("lost its runner", summary)
+
+    def test_cli_names_the_full_disk_of_the_real_job_and_does_not_retry(self):
+        job, notes = real("disk_full")
+        output, summary = self.classify([job], {job["id"]: notes})
+        self.assertIn("retry=false", output)
+        self.assertIn("runner disk", summary)
+        self.assertNotIn("lost its runner", summary)
+
+    def test_cli_does_not_retry_when_the_annotation_read_fails(self):
+        job, _ = real("lost_runner")
+        output, summary = self.classify([job], {})
+        self.assertIn("retry=false", output)
+        self.assertIn("do not name a lost runner", summary)
+
+    def test_cli_reports_the_class_of_each_failed_job_and_the_decision(self):
+        for jobs, answers, retry, text in (([passed_job(), synthetic_job()], {1001: [LOST_NOTE]}, "true", "lost its runner"),
+                                           (json.loads(RECORDED_JOBS.read_text())["jobs"], {}, "false", "step failed")):
+            with self.subTest(retry=retry):
+                output, summary = self.classify(jobs, answers)
+                self.assertIn(f"retry={retry}", output)
+                self.assertIn(text, summary)
+
+    def test_cli_refuses_jobs_that_cannot_be_read(self):
+        script = Path(release_upgrade.__file__)
+        for name, content, attempt in (("not json", "nope", "1"), ("no jobs key", "[{}]", "1"), ("not a list", "{}", "1"), ("job is not an object", '[{"jobs": ["x"]}]', "1"),
+                                       ("attempt", "[]", "first")):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "jobs.json").write_text(content)
+                completed = subprocess.run([sys.executable, str(script), "--classify-jobs", str(root / "jobs.json"), attempt],
+                                           capture_output=True, text=True,
+                                           env={"GITHUB_OUTPUT": str(root / "output"), "GITHUB_STEP_SUMMARY": str(root / "summary")})
+                self.assertEqual(1, completed.returncode)
+                self.assertIn("could not be read", (root / "summary").read_text())
+                self.assertFalse((root / "output").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

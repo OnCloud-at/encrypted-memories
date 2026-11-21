@@ -1042,6 +1042,36 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # A runner that goes away ends an upgrade job without a failed step (#1016). This job names that cause in the summary
+  # of the run, so that it is not read as a failure of the upgrade. It reads the annotations of such a job, because a
+  # full runner disk ends a job the same way. It changes no result: no job waits for it. It starts only when the
+  # upgrade result is `failure`.
+  report-upgrade-failure:
+    name: Classify the upgrade failure
+    needs: [prepare, upgrade]
+    if: always() && needs.upgrade.result == 'failure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - name: Check out trusted upgrade automation
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.automation_sha }}
+          persist-credentials: false
+
+      - name: Report the cause of the failed upgrade jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            > "$RUNNER_TEMP/run-jobs.json"
+          python3 -I .github/scripts/release_upgrade.py --classify-jobs "$RUNNER_TEMP/run-jobs.json" "$GITHUB_RUN_ATTEMPT"
+
   upload:
     name: Upload ${{ matrix.platform }}
     needs: [prepare, build, upgrade]

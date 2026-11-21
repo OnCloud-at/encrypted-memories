@@ -106,7 +106,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     assert_operator steps.index(gate), :<, checkout, "the trusted script runs before the release tag is checked out"
     assert_equal({"contents" => "read", "actions" => "read"}, @jobs.fetch("prepare").fetch("permissions"))
     @jobs.each do |name, job|
-      refute job.fetch("permissions", {}).key?("actions"), "#{name} needs no actions scope" unless name == "prepare"
+      refute job.fetch("permissions", {}).key?("actions"), "#{name} needs no actions scope" unless %w[prepare report-upgrade-failure].include?(name)
     end
     refute gate.key?("continue-on-error"), "a refusal must fail the job"
     assert_equal "${{ steps.revision.outputs.commit_sha }}", gate.fetch("env").fetch("RELEASE_COMMIT")
@@ -161,6 +161,107 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
   def test_the_override_input_says_that_it_skips_the_nightly_gate_too
     inputs = (@workflow["on"] || @workflow.fetch(true)).fetch("workflow_dispatch").fetch("inputs")
     assert_includes inputs.fetch("upgrade_override_tag").fetch("description"), "nightly UI gate"
+  end
+
+  def report_step
+    @jobs.fetch("report-upgrade-failure").fetch("steps").find { |step| step["name"] == "Report the cause of the failed upgrade jobs" }
+  end
+
+  def test_a_failed_upgrade_gate_is_classified_in_a_job_that_changes_no_result
+    job = @jobs.fetch("report-upgrade-failure")
+    assert_equal %w[prepare upgrade], Array(job.fetch("needs"))
+    assert_includes job.fetch("if"), "always()"
+    assert_includes job.fetch("if"), "needs.upgrade.result == 'failure'"
+    refute_includes job.fetch("if"), "cancelled"
+    assert_equal({"contents" => "read", "actions" => "read", "checks" => "read"}, job.fetch("permissions"))
+    @jobs.each do |name, other|
+      refute_includes Array(other["needs"]), "report-upgrade-failure", "#{name} must not wait for the report"
+    end
+    refute job.key?("environment"), "the report needs no release secret"
+    upgrade_timeout = @jobs.fetch("upgrade").fetch("timeout-minutes")
+    limit = IO.popen(["python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import release_upgrade as r; print(r.JOB_TIMEOUT_MINUTES)",
+                      File.expand_path(__dir__)], &:read).to_i
+    assert_equal upgrade_timeout, limit, "the classifier must know the timeout of the upgrade job"
+    assert_equal "${{ needs.prepare.outputs.automation_sha }}", job.fetch("steps").first.dig("with", "ref")
+  end
+
+  # The step runs the real classifier on the recorded jobs of a failed release run through a fake `gh`.
+  def test_the_report_step_names_the_failed_steps_of_the_recorded_run_and_reads_the_current_attempt
+    root = File.expand_path("../..", __dir__)
+    recorded = File.read(File.join(__dir__, "fixtures", "upgrade_jobs_run_41064872152.json"))
+    Dir.mktmpdir do |dir|
+      gh = File.join(dir, "gh")
+      File.write(gh, "#!/usr/bin/env bash\necho \"$*\" >> \"$GH_LOG\"\ncat \"$GH_ANSWER\"\n")
+      File.chmod(0o755, gh)
+      File.write(File.join(dir, "answer.json"), "[#{recorded}]")
+      env = {"PATH" => "#{dir}:#{ENV.fetch("PATH")}", "GH_LOG" => File.join(dir, "calls.log"), "GH_ANSWER" => File.join(dir, "answer.json"),
+             "GITHUB_STEP_SUMMARY" => File.join(dir, "summary"), "GITHUB_OUTPUT" => File.join(dir, "output"),
+             "GITHUB_REPOSITORY" => "example/repository", "GITHUB_RUN_ID" => "4242", "GITHUB_RUN_ATTEMPT" => "2", "RUNNER_TEMP" => dir}
+      assert system(env, "bash", "-c", report_step.fetch("run"), chdir: root, out: File::NULL, err: File::NULL)
+      assert_includes File.read(File.join(dir, "calls.log")), "actions/runs/4242/attempts/2/jobs"
+      assert_includes File.read(File.join(dir, "summary")), "a step failed in this job"
+      assert_includes File.read(File.join(dir, "summary")), "attempt 2"
+      assert_includes File.read(File.join(dir, "output")), "retry=false"
+    end
+  end
+
+  # A fake `gh` for the classifier steps. It logs every call and answers by the last argument: the annotations of a check run
+  # from notes-<id>.json (and fails when there is no such file), the current attempt of a run, and the jobs of a run.
+  FAKE_GH = <<~'BASH'
+    #!/usr/bin/env bash
+    echo "$*" >> "$GH_LOG"
+    for last; do :; done
+    case "$last" in
+      *check-runs/*/annotations*)
+        id=${last#*check-runs/}; id=${id%%/*}
+        if [ -f "$GH_DIR/notes-$id.json" ]; then cat "$GH_DIR/notes-$id.json"; else exit 1; fi ;;
+      .run_attempt) echo "${GH_CURRENT_ATTEMPT:-1}" ;;
+      *) if [ "$1" = api ]; then cat "$GH_DIR/jobs.json"; fi ;;
+    esac
+    exit 0
+  BASH
+
+  def write_fake_gh(dir, jobs: [], annotations: {})
+    gh = File.join(dir, "gh")
+    File.write(gh, FAKE_GH)
+    File.chmod(0o755, gh)
+    File.write(File.join(dir, "jobs.json"), JSON.generate([{"jobs" => jobs}]))
+    annotations.each { |id, notes| File.write(File.join(dir, "notes-#{id}.json"), JSON.generate([notes])) }
+    {"PATH" => "#{dir}:#{ENV.fetch("PATH")}", "GH_LOG" => File.join(dir, "calls.log"), "GH_DIR" => dir,
+     "GITHUB_STEP_SUMMARY" => File.join(dir, "summary"), "GITHUB_OUTPUT" => File.join(dir, "output"),
+     "GITHUB_REPOSITORY" => "example/repository", "RUNNER_TEMP" => dir}
+  end
+
+  def recorded_annotations
+    JSON.parse(File.read(File.join(__dir__, "fixtures", "upgrade_annotations_runs_38193953552_38181793360.json")))
+  end
+
+  # The real job records of a lost runner and of a full runner disk both end without a failed step; only the annotation tells them apart.
+  def test_the_report_step_reads_the_annotations_of_a_job_without_a_failed_step
+    root = File.expand_path("../..", __dir__)
+    {"lost_runner" => ["retry=true", "lost its runner"], "disk_full" => ["retry=false", "runner disk"]}.each do |key, (flag, text)|
+      record = recorded_annotations.fetch(key)
+      id = record.dig("job", "id")
+      Dir.mktmpdir do |dir|
+        env = write_fake_gh(dir, jobs: [record.fetch("job")], annotations: {id => record.fetch("annotations")})
+        env = env.merge("GITHUB_RUN_ID" => "4242", "GITHUB_RUN_ATTEMPT" => "1")
+        assert system(env, "bash", "-c", report_step.fetch("run"), chdir: root, out: File::NULL, err: File::NULL), key
+        assert_includes File.read(File.join(dir, "calls.log")), "repos/example/repository/check-runs/#{id}/annotations"
+        assert_includes File.read(File.join(dir, "output")), flag, key
+        assert_includes File.read(File.join(dir, "summary")), text, key
+      end
+    end
+  end
+
+  def test_the_report_step_does_not_retry_when_the_annotations_cannot_be_read
+    root = File.expand_path("../..", __dir__)
+    record = recorded_annotations.fetch("lost_runner")
+    Dir.mktmpdir do |dir|
+      env = write_fake_gh(dir, jobs: [record.fetch("job")]).merge("GITHUB_RUN_ID" => "4242", "GITHUB_RUN_ATTEMPT" => "1")
+      assert system(env, "bash", "-c", report_step.fetch("run"), chdir: root, out: File::NULL, err: File::NULL)
+      assert_includes File.read(File.join(dir, "output")), "retry=false"
+      assert_includes File.read(File.join(dir, "summary")), "do not name a lost runner"
+    end
   end
 
   def test_the_runner_disk_step_fails_below_the_declared_minimum_and_reads_it_from_the_matrix

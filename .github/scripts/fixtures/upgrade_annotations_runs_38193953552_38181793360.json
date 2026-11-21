@@ -1,0 +1,41 @@
+{
+  "_note": "Real job records and check-run annotations of two failed release runs. The job records keep the fields that the classifier reads. The message of the disk-full annotation is cut before the file path of the runner log and the stack trace that follow it.",
+  "lost_runner": {
+    "job": {
+      "id": 114632451122,
+      "name": "Test installed upgrades on macOS (all)",
+      "run_id": 38193953552,
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-10-12T01:58:31Z",
+      "completed_at": "2026-10-12T02:56:33Z",
+      "steps": []
+    },
+    "annotations": [
+      {
+        "annotation_level": "failure",
+        "message": "The hosted runner lost communication with the server. Anything in your workflow that terminates the runner process, starves it for CPU/Memory, or blocks its network access can cause this error."
+      }
+    ]
+  },
+  "disk_full": {
+    "job": {
+      "id": 114595729225,
+      "name": "Test installed upgrades on iOS (index-thumbnail)",
+      "run_id": 38181793360,
+      "run_attempt": 1,
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-10-11T22:47:18Z",
+      "completed_at": "2026-10-11T23:58:20Z",
+      "steps": []
+    },
+    "annotations": [
+      {
+        "annotation_level": "failure",
+        "message": "System.IO.IOException: No space left on device"
+      }
+    ]
+  }
+}
