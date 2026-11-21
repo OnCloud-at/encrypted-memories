@@ -1905,7 +1905,7 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
         )
     }
 
-    /// Sets an album's cover to an already-uploaded photo (direct REST; SDK 0.31.1 has no album-write API).
+    /// Sets an album's cover to an already-uploaded photo (direct REST; the app does not use the SDK album-write bindings yet).
     /// The photo's `nodeID` is its Drive link id.
     func setAlbumCover(albumID: String, photoUID: PhotoUID) async throws {
         try await withOpenSession(cause: .albums) { bridge in
