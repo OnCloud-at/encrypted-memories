@@ -286,7 +286,16 @@ struct MobilePhotoViewer: View {
             await resolveCurrentTitleMetadata()
         }
         .onChange(of: horizontalSizeClass) { _, _ in followWidthChange() }
-        .onChange(of: showInfo) { _, isShown in followInfoChange(to: isShown) }
+        .onChange(of: showInfo) { _, isShown in
+            followInfoChange(to: isShown)
+            // A read that failed while the Info was closed gets its one silent repeat when the Info opens.
+            if isShown, let uid = currentBaseItem?.uid,
+                titleMetadataCoordinator.shouldReadAgainWhenInfoOpens(uid, metadataLoadState: metadataLoadState)
+            {
+                metadataLoadState = .loading
+                metadataRequestGeneration &+= 1
+            }
+        }
         .onChange(of: mapAndPlacesEnabled) { _, _ in
             titleMetadataCoordinator.cancelAll()
             metadataRequestGeneration &+= 1
@@ -843,10 +852,12 @@ struct MobilePhotoViewer: View {
         let albums = libraryModel.facade?.albums
         isLoadingAlbumMemberships = albums != nil
         let coordinator = titleMetadataCoordinator
+        // Asked by the coordinator when the read ends: only an Info that is open then repeats a failed read.
+        let infoIsOpen: @MainActor @Sendable () -> Bool = { showInfo }
         // A retry, a privacy change or an album change keeps the photo but starts a new run.
         let run = metadataTaskID
         await ViewerInfoPublication.run(
-            metadata: { await coordinator.resolve(item) },
+            metadata: { await coordinator.resolveForInfo(item, infoIsOpen: infoIsOpen) },
             memberships: { await Self.albumTitles(of: uid, in: albums) },
             isCurrent: { metadataTaskID == run },
             publishMetadata: { resolution in

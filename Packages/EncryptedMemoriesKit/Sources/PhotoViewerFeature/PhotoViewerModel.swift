@@ -175,7 +175,8 @@ public final class PhotoViewerModel {
         self.albumMembershipProvider = albumMembershipProvider
         self.titleMetadataCoordinator = ViewerTitleMetadataCoordinator(
             metadataProvider: metadataProvider,
-            placeNameResolver: placeNameResolver
+            placeNameResolver: placeNameResolver,
+            infoRereadPause: { await silentRetryWait($0) }
         )
         self.hasKnownLocation = hasKnownLocation
         self.burstProvider = burstProvider
@@ -219,6 +220,9 @@ public final class PhotoViewerModel {
         if showInfo {
             loadMetadata()
             loadAlbumMemberships()
+        } else {
+            // A silent repeat that waits for a closed Info has no reader.
+            metadataTask?.cancel()
         }
     }
 
@@ -265,15 +269,21 @@ public final class PhotoViewerModel {
         metadataTask?.cancel()
         albumMembershipTask?.cancel()
         let item = current
-        if let resolution = titleMetadataCoordinator.state(for: item.uid).resolution {
+        // A cached failure is final only after the Info repeated the read; until then the Info reads once more.
+        if let resolution = titleMetadataCoordinator.state(for: item.uid).resolution,
+            !(resolution.metadataLoadFailed && titleMetadataCoordinator.canRereadForInfo(item.uid))
+        {
             metadataLoadState = resolution.metadataLoadState
             return
         }
         metadataLoadState = .loading
+        let infoIsOpen: @MainActor @Sendable () -> Bool = { [weak self] in self?.showInfo ?? false }
         metadataTask = Task { [weak self, titleMetadataCoordinator] in
-            let resolution = await titleMetadataCoordinator.resolve(item)
+            let resolution = await titleMetadataCoordinator.resolveForInfo(item, infoIsOpen: infoIsOpen)
             guard !Task.isCancelled, let self, self.isDisplaying(item) else { return }
             self.metadataLoadState = resolution.metadataLoadState
+            // The title reads the same coordinator state: a repeat that succeeded gives it the place name too.
+            self.titleMetadataState = .resolved(resolution)
         }
     }
 

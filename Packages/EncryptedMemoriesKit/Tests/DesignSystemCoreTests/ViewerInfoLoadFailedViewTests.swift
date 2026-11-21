@@ -24,3 +24,19 @@ import Testing
         #expect(full - titleOnly > 100)
     }
 }
+
+@Suite struct ViewerAlbumMembershipsFailedViewTests {
+    @Test func theRowUsesTheAlbumFailureCopyAndSymbol() {
+        #expect(ViewerAlbumMembershipsFailedView.message == L10n.string("infopanel.albums_load_failed"))
+        #expect(ViewerAlbumMembershipsFailedView.message != "infopanel.albums_load_failed")
+        #expect(ViewerAlbumMembershipsFailedView.systemImage == "exclamationmark.triangle")
+    }
+
+    @MainActor @Test func theRowDrawsTheTryAgainButtonBesideTheReason() throws {
+        let reasonOnly = try RenderedInk.pixels(
+            Label(ViewerAlbumMembershipsFailedView.message, systemImage: ViewerAlbumMembershipsFailedView.systemImage))
+        let full = try RenderedInk.pixels(ViewerAlbumMembershipsFailedView(onRetry: {}))
+        // The compact button adds its label and its background to the reason.
+        #expect(full > reasonOnly)
+    }
+}
