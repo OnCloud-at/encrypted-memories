@@ -162,7 +162,8 @@ final class AccountBackupStackTests: XCTestCase {
         fixture.source.failContents = true
         await changeCondition { fixture.clock.count(.seconds(3)) == 1 }
         fixture.clock.release(.seconds(3))
-        await changeCondition { fixture.stack.albumSync.lastMessage == "Album input failed" }
+        // The failing read ends the run; the person sees the short sentence, not the text of the error.
+        await changeCondition { fixture.stack.albumSync.lastMessage == L10n.string("albumsync.sync_failed") }
         XCTAssertEqual(fixture.stack.albumSync.lastMessageStyle, .error)
         await fixture.stack.shutdownUnused()
     }

@@ -95,6 +95,8 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
     var failAttachOf: Set<String> = []
     /// The reason that the fake backend gives for a failed link; "attach failed" otherwise.
     var failureMessageOf: [String: String] = [:]
+    /// Failed links for which the backend names no reason.
+    var failsWithoutReasonOf: Set<String> = []
     var alreadyMemberOf: Set<String> = []
     private var _created: [String] = []
     private var _attached: [[String]] = []
@@ -153,7 +155,9 @@ private final class FakeRemoteOps: AlbumSyncRemoteAlbumOps, @unchecked Sendable 
         var result = AlbumSyncAttachResult()
         for photo in photos {
             if failAttachOf.contains(photo.uid.nodeID) {
-                let message = failureMessageOf[photo.uid.nodeID] ?? "attach failed"
+                let message =
+                    failsWithoutReasonOf.contains(photo.uid.nodeID)
+                    ? nil : (failureMessageOf[photo.uid.nodeID] ?? "attach failed")
                 result.failed += 1
                 result.failedLinkIDs.append(photo.uid.nodeID)
                 result.failureMessages[photo.uid.nodeID] = message
@@ -596,7 +600,7 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         AlbumSyncRemoteLink(uid: PhotoUID(volumeID: "vol1", nodeID: id), sha1Hex: "own-\(id)", isTrashed: false)
     }
 
-    @Test func theMessageNamesAFailureThatRemainsNotOneThatATwinResolved() async throws {
+    @Test func aFailureThatRemainsShowsTheShortSentenceAndNeverTheBackendTextOfAnyPhoto() async throws {
         let remote = FakeRemoteOps()
         remote.failAttachOf = ["la", "lc"]
         remote.failureMessageOf = ["la": "M1", "lc": "M2"]
@@ -607,7 +611,55 @@ private func link(_ id: String, trashed: Bool = false) -> AlbumSyncRemoteLink {
         #expect(remote.attachedBatches == [["la", "lc"], ["lb"]])
         #expect(report.attachFailed == 1)
         #expect(report.problems.map { $0.source?.identifier } == ["c"])
-        #expect(await runner.currentProgress.message == "M2", "photo a is in the album through its twin")
+        // The backend text never reaches the progress: one short sentence names that a failure remains.
+        #expect(
+            await runner.currentProgress.message == AlbumSyncFailureMessage.short,
+            "photo a is in the album through its twin")
+    }
+
+    @Test func aRemainingFailureWithoutAReasonLeavesNoMessageWhenTheResolvedOneHadOne() async throws {
+        let remote = FakeRemoteOps()
+        remote.failAttachOf = ["la", "lc"]
+        remote.failureMessageOf = ["la": "M1"]
+        remote.failsWithoutReasonOf = ["lc"]
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["a", "c", "b"]], links: ["a": sameBytes("la"), "b": sameBytes("lb"), "c": own("lc")],
+            remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 3))
+        #expect(report.attachFailed == 1)
+        #expect(report.problems.map { $0.source?.identifier } == ["c"])
+        // The reason of photo a belonged to a failure that its twin resolved. Photo c names none.
+        #expect(await runner.currentProgress.message == nil)
+    }
+
+    @Test func aStopThatTheBackendReportsAsCancellationPublishesNoFailure() async throws {
+        let errors: [any Error] = [
+            CancellationError(), UploadError.cancelled, URLError(.cancelled),
+            UploadError.transport(code: URLError.cancelled.rawValue, message: "stopped"),
+        ]
+        for failure in errors {
+            let backup = FakeBackupExecutor()
+            backup.proofError = failure
+            let (runner, _, _, _) = makeRunner(
+                contents: ["album": ["known", "missing"]], links: ["known": link("existing")], backup: backup)
+            await #expect(throws: (any Error).self) {
+                try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 2))
+            }
+            let progress = await runner.currentProgress
+            #expect(progress.phase != .needsAttention, "\(failure)")
+            #expect(progress.message == nil, "\(failure)")
+        }
+    }
+
+    @Test func aFailedAttachWithoutATwinShowsTheShortSentenceNotTheBackendText() async throws {
+        let remote = FakeRemoteOps()
+        remote.failAttachOf = ["la"]
+        remote.failureMessageOf = ["la": "HTTP 503 for /drive/v2/albums"]
+        let (runner, _, _, _) = makeRunner(
+            contents: ["album": ["a"]], links: ["a": own("la")], remote: remote)
+        let report = try await runner.sync(album: .init(id: "album", title: "Album", assetCount: 1))
+        #expect(report.attachFailed == 1)
+        #expect(await runner.currentProgress.message == AlbumSyncFailureMessage.short)
     }
 
     @Test func twoPlannedLinksFailInOneRoundAndOnlyTheUnresolvedOnesAreNamed() async throws {
