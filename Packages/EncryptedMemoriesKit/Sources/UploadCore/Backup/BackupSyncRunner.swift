@@ -122,7 +122,7 @@ public actor BackupSyncRunner {
     /// A source with a running item, and the revisions of it that the same claim returned, in claim order.
     private struct RunningSource {
         let source: UploadSourceIdentity
-        var waiting: [UploadBackupSyncQueueEntry] = []
+        var waiting: [UploadBackupClaimedEntry] = []
     }
     /// Keyed by `sourceKey`. A claim never takes rows of these sources: a running item can leave its row runnable
     /// for a moment, for example `needsRemoteReconciliation` while the paired video of its photo uploads.
@@ -131,6 +131,21 @@ public actor BackupSyncRunner {
     private var deferredSources: [String: UploadSourceIdentity] = [:]
     /// At most 128 deferred-source SQL parameters, plus the current upload pool, before the next drain.
     private static let maxDeferredSourcesPerDrain = 64
+    /// Photos whose local read failed in a background pass (#274). Nil: every claim keeps the normal order.
+    private let localReadFailureHints: BackupLocalReadFailureHintStore?
+    /// Keyed by `sourceKey`: sources that this pass deferred after a failed local read. A source defers at most once
+    /// per pass, and the set never reaches SQL, so the deferred-source limit above does not apply.
+    private var localReadFailureDeferrals: Set<String> = []
+    /// True once this pass tried to load the hint file into the queue's list. A failed load is not repeated in the
+    /// pass: the queue then answers `unknown`, and claims keep the normal order.
+    private var localReadFailureListAttempted = false
+    /// Hints checked per pass by the cleanup sweep, and hints per page when the list loads.
+    private static let localReadFailureSweepBatch = 500
+    private static let localReadFailureLoadPage = 1_000
+    /// Rows in these states need no backup work any more, so a hint for a photo with only such rows is stale.
+    private static let settledStates: [UploadBackupSyncQueueState] = [
+        .alreadyBackedUp, .completed, .skippedRemoteDeletion, .failedPermanent, .dismissedFailure,
+    ]
     /// Wakes the scheduling loop when a row is enqueued, an item settles, the runtime changes, or a waiting row
     /// becomes runnable.
     private var schedulerWaiter: CheckedContinuation<Void, Never>?
@@ -206,10 +221,12 @@ public actor BackupSyncRunner {
         markSourceUnavailable: (@Sendable (UploadSourceIdentity) -> Bool)? = nil,
         clock: any BackupSchedulerClock = BackupContinuousClock(),
         events: (any BackupItemEventSink)? = nil,
+        localReadFailureHints: BackupLocalReadFailureHintStore? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.queue = queue
         self.events = events
+        self.localReadFailureHints = localReadFailureHints
         self.preflight = preflight
         self.resolver = resolver
         self.identityResolver = identityResolver
@@ -356,6 +373,8 @@ public actor BackupSyncRunner {
         claimedItemCount = 0
         runningSources = [:]
         deferredSources = [:]
+        localReadFailureDeferrals = []
+        localReadFailureListAttempted = false
         schedulerWakePending = false
         defer {
             remoteIndexPreparationGeneration = nil
@@ -389,6 +408,8 @@ public actor BackupSyncRunner {
         }
         guard isQueueOperational() else { return progress }
         await requeueDueBlockedRows()
+        guard isQueueOperational() else { return progress }
+        sweepLocalReadFailureHints()
         guard isQueueOperational() else { return progress }
 
         // The last known index health stays visible until this pass reads it again.
@@ -562,26 +583,28 @@ public actor BackupSyncRunner {
                     // result shows it; the pass ends as unknown instead of retrying the claim at once (#1004). The pass
                     // count guard would also end the pass; this guard stays so the result of the call itself is never
                     // taken as empty.
-                    guard let claimed = claimEligible(limit: limit - runningSources.count) else {
+                    guard let claimed = claimEligible(limit: limit - runningSources.count, workIntent: workIntent)
+                    else {
                         queueReadUnknown = true
                         storeFailed = true
                         continue
                     }
                     startsSincePrime += claimed.count
-                    for entry in claimed {
+                    for claimedEntry in claimed {
                         claimedItemCount += 1
                         // Two revisions of one photo (a preliminary camera version and the finished one) run one
                         // after the other: both read the current file, and the second then finds it backed up
                         // instead of uploading the same bytes at the same time.
-                        let sourceKey = Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier)
+                        let source = claimedEntry.entry.source
+                        let sourceKey = Self.sourceKey(kind: source.kind, identifier: source.identifier)
                         if runningSources[sourceKey] != nil {
-                            runningSources[sourceKey]?.waiting.append(entry)
+                            runningSources[sourceKey]?.waiting.append(claimedEntry)
                             continue
                         }
-                        runningSources[sourceKey] = RunningSource(source: entry.source)
+                        runningSources[sourceKey] = RunningSource(source: source)
                         group.addTask {
                             await self.processRevisions(
-                                startingWith: entry, sourceKey: sourceKey, workIntent: workIntent)
+                                startingWith: claimedEntry, sourceKey: sourceKey, workIntent: workIntent)
                         }
                     }
                     // A claim can contain several revisions of one source. Fill the remaining photo slots before
@@ -719,26 +742,75 @@ public actor BackupSyncRunner {
         publishActiveExecutionProgress(emit: false)
     }
 
-    private func claimEligible(limit: Int) -> [UploadBackupSyncQueueEntry]? {
+    private func claimEligible(limit: Int, workIntent: LibraryWorkIntent) -> [UploadBackupClaimedEntry]? {
         let claimLimit = min(configuration.batchSize, max(1, limit))
+        let excluded = runningSources.values.map(\.source) + Array(deferredSources.values)
         // Eligibility is persisted in `updatedAt` and enforced inside the same transaction that
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
-        return queue.claimRunnable(
-            limit: claimLimit, claimedAt: now(),
-            excludingSourcesOf: runningSources.values.map(\.source) + Array(deferredSources.values))
+        if ordersLocalReadFailuresLast(workIntent) {
+            if !localReadFailureListAttempted {
+                localReadFailureListAttempted = true
+                loadLocalReadFailureList()
+            }
+            return queue.claimRunnableOrderingLocalReadFailuresLast(
+                limit: claimLimit, claimedAt: now(), excludingSourcesOf: excluded)
+        }
+        return queue.claimRunnable(limit: claimLimit, claimedAt: now(), excludingSourcesOf: excluded)?.map {
+            UploadBackupClaimedEntry(entry: $0, localReadFailure: .unknown)
+        }
+    }
+
+    /// An automatic pass while the app runs only in the background takes the photos on the device first (#274). A pass
+    /// the person started keeps the normal order, also when the device locks.
+    private func ordersLocalReadFailuresLast(_ workIntent: LibraryWorkIntent) -> Bool {
+        localReadFailureHints != nil && workIntent == .automatic && throttleInputs().isAppInBackground
+    }
+
+    /// Copies the hint file into the queue's list page by page. A failure leaves no list: claims then answer `unknown`
+    /// and keep the normal order.
+    private func loadLocalReadFailureList() {
+        guard let localReadFailureHints, queue.loadLocalReadFailureHints([]) else { return }
+        var cursor: Int64 = 0
+        while true {
+            guard let page = localReadFailureHints.page(after: cursor, limit: Self.localReadFailureLoadPage) else {
+                // A partial list would answer `absent` for hinted photos. An unknown answer is safe.
+                queue.dropLocalReadFailureHints()
+                return
+            }
+            guard !page.sources.isEmpty, queue.addLocalReadFailureHints(page.sources),
+                page.sources.count == Self.localReadFailureLoadPage
+            else { return }
+            cursor = page.next
+        }
+    }
+
+    /// Removes the hints of one page whose photos have no row that still needs backup work, then moves the cursor on.
+    /// The hint file is read and released before the queue is read, so the two locks are never held together.
+    private func sweepLocalReadFailureHints() {
+        guard let localReadFailureHints, let cursor = localReadFailureHints.sweepCursor(),
+            let page = localReadFailureHints.page(after: cursor, limit: Self.localReadFailureSweepBatch)
+        else { return }
+        guard !page.sources.isEmpty else {
+            if cursor != 0 { localReadFailureHints.saveSweepCursor(0) }
+            return
+        }
+        guard let withWork = queue.sourcesWithEntries(page.sources, outside: Self.settledStates) else { return }
+        localReadFailureHints.remove(page.sources.filter { !withWork.contains($0) })
+        localReadFailureHints.saveSweepCursor(
+            page.sources.count < Self.localReadFailureSweepBatch ? 0 : page.next)
     }
 
     /// Processes a claimed row, then the other revisions of its source that the same claim returned. Each settled
     /// row wakes the scheduling loop; its source frees one upload slot only after the last revision settles.
     private func processRevisions(
-        startingWith first: UploadBackupSyncQueueEntry,
+        startingWith first: UploadBackupClaimedEntry,
         sourceKey: String,
         workIntent: LibraryWorkIntent
     ) async {
-        var next: UploadBackupSyncQueueEntry? = first
-        while let entry = next {
-            await process(entry, workIntent: workIntent)
+        var next: UploadBackupClaimedEntry? = first
+        while let claimed = next {
+            await process(claimed.entry, localReadFailure: claimed.localReadFailure, workIntent: workIntent)
             claimedItemCount -= 1
             if var running = runningSources[sourceKey], !running.waiting.isEmpty {
                 next = running.waiting.removeFirst()
@@ -936,7 +1008,9 @@ public actor BackupSyncRunner {
 
     // MARK: - Per-entry processing
 
-    private func process(_ queuedEntry: UploadBackupSyncQueueEntry, workIntent: LibraryWorkIntent) async {
+    private func process(
+        _ queuedEntry: UploadBackupSyncQueueEntry, localReadFailure: StoreLookup<Void>, workIntent: LibraryWorkIntent
+    ) async {
         #if ENCRYPTED_MEMORIES_UPGRADE_TEST
             UpgradeTestProbe.checkpoint("backup.claimed")
         #endif
@@ -1001,6 +1075,16 @@ public actor BackupSyncRunner {
             return
         }
 
+        // A background pass takes the photos on the device first (#274). Only a row that the claim checked against the
+        // list and found unlisted (`absent`) can wait; `unknown` reads as today. A source waits at most once per pass,
+        // so another revision from the same claim reads at once instead of waiting again.
+        let sourceKey = Self.sourceKey(kind: checkingEntry.source.kind, identifier: checkingEntry.source.identifier)
+        let claimFoundNoHint: Bool
+        if case .absent = localReadFailure { claimFoundNoHint = true } else { claimFoundNoHint = false }
+        let mayWaitAfterFailedLocalRead =
+            !isSourceRecheck && claimFoundNoHint && !localReadFailureDeferrals.contains(sourceKey)
+            && ordersLocalReadFailuresLast(workIntent)
+
         let resolved: BackupResolvedResource?
         do {
             let resolvingEntry = checkingEntry
@@ -1012,20 +1096,34 @@ public actor BackupSyncRunner {
             let omitsMissingPairedVideo =
                 configuration.leavesOutMissingLivePhotoVideos && !isSourceRecheck
                 && Self.usedReportedMissingChecks(resolvingEntry, now: now())
-            let readAdmission: BackupResourceReadAdmission = {
+            let hints = localReadFailureHints
+            let queue = self.queue
+            let readAdmission: BackupResourceReadAdmission = { read in
                 try Task.checkCancellation()
                 if isSourceRecheck {
                     guard policy.maxConcurrentItems(for: inputs()) > 0 else { throw BackupWorkDeferredError() }
+                }
+                // The row waits only when both lists hold the hint; otherwise its next claim could miss it and wait
+                // again. The app may have come to the foreground since the claim.
+                if read == .afterFailedLocalRead, mayWaitAfterFailedLocalRead, inputs().isAppInBackground,
+                    hints?.insert(resolvingEntry.source) == true,
+                    queue.addLocalReadFailureHints([resolvingEntry.source])
+                {
+                    throw LocalReadFailureDeferral()
                 }
             }
             resolved = try await resourceCoordinator.withHeavyPermit(
                 Self.materializationRequest(workIntent)
             ) { _ in
-                try readAdmission()
+                try readAdmission(.sourceRead)
                 return try await resolver.resolve(
                     resolvingEntry, onPreparationProgress: preparationProgress, readAdmission: readAdmission,
                     omittingMissingPairedVideo: omitsMissingPairedVideo)
             }
+        } catch is LocalReadFailureDeferral {
+            localReadFailureDeferrals.insert(sourceKey)
+            revert(checkingEntry, from: persistedState)
+            return
         } catch is BackupWorkDeferredError {
             putBack(checkingEntry, from: persistedState, isSourceRecheck: isSourceRecheck)
             return
@@ -2358,6 +2456,8 @@ public actor BackupSyncRunner {
 
     /// A policy or source snapshot changed during preparation. Requeue without cancelling the operation.
     private struct BackupWorkDeferredError: Error {}
+    /// A background pass lets a photo whose local read failed wait behind the photos on the device (#274).
+    private struct LocalReadFailureDeferral: Error {}
 
     private func rememberDeferredSource(_ entry: UploadBackupSyncQueueEntry) {
         deferredSources[Self.sourceKey(kind: entry.source.kind, identifier: entry.source.identifier)] = entry.source

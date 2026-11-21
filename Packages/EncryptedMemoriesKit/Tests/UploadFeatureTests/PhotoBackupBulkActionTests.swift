@@ -824,9 +824,9 @@ private struct NetworkChangingBulkResolver: BackupResourceResolving {
         _ entry: UploadBackupSyncQueueEntry, onPreparationProgress: @escaping BackupResourcePreparationHandler,
         readAdmission: @escaping BackupResourceReadAdmission
     ) async throws -> BackupResolvedResource? {
-        try readAdmission()
+        try readAdmission(.sourceRead)
         runtime.update { $0.network = LibraryNetworkState(isReachable: true, isExpensive: true) }
-        try readAdmission()
+        try readAdmission(.sourceRead)
         return try await inner.resolve(entry)
     }
 }

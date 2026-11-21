@@ -59,7 +59,7 @@ final class PhotoLibraryResourceMaterializerTests: XCTestCase {
             staged: .init(nil),
             tempStore: tempStore,
             tracking: .init(),
-            readAdmission: {}
+            readAdmission: { _ in }
         )
         do {
             _ = try await materializer(BackupResourcePreparationReporter { _ in })
