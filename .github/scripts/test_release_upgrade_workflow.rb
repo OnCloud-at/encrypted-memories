@@ -26,7 +26,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     refute @jobs.fetch("upgrade").key?("if"), "Stable releases and betas both require the gate"
     refute @jobs.fetch("upload").key?("if"), "Upload must use the default successful-needs barrier"
     platforms = IO.popen(["python3", "-c", "import sys; sys.path.insert(0, sys.argv[1]); " \
-      "import release_upgrade as r; print(' '.join(r.PLATFORMS))", File.expand_path(__dir__)], &:read).split
+      "import release_upgrade as r; print(' '.join(sorted({k[0] for k in r.CONFIGURATIONS})))", File.expand_path(__dir__)], &:read).split
     assert_equal %w[iOS macOS], platforms.sort
     build = @jobs.fetch("build").fetch("steps").map { |step| step["run"].to_s }.join("\n")
     assert_includes build, "xcodebuild archive"
@@ -44,26 +44,129 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     refute_empty points
     assert_equal points.uniq, points
     matrix = @jobs.fetch("upgrade").dig("strategy", "matrix")
+    assert_includes @jobs.fetch("upgrade").fetch("name"), "${{ matrix.os }}"
+    assert_includes @jobs.fetch("upgrade").fetch("name"), "${{ matrix.device }}"
     assert_equal "${{ fromJSON(needs.prepare.outputs.upgrade_matrix) }}", matrix
     assert_equal "${{ steps.upgrade-plan.outputs.upgrade_matrix }}", @jobs.fetch("prepare").fetch("outputs").fetch("upgrade_matrix")
     plan = @jobs.fetch("prepare").fetch("steps").find { |step| step["id"] == "upgrade-plan" }
     refute_nil plan
     [points, points + (1..5).map { |index| "extra.#{index}" }].each do |listed|
       generated = IO.popen(["python3", "-c", "import json, sys; sys.path.insert(0, sys.argv[1]); " \
-        "import release_upgrade as r; print(json.dumps(r.upgrade_matrix(['a', 'b', 'c'], sys.argv[2].split())))",
+        "import release_upgrade as r, test_release_upgrade as t; print(json.dumps(r.upgrade_matrix(['a', 'b', 'c'], sys.argv[2].split(), t.synthetic_capacity())))",
                             File.expand_path(__dir__), listed.join(" ")], &:read)
       shards = JSON.parse(generated).fetch("include")
-      shards.group_by { |shard| shard.fetch("platform") }.each do |platform, group|
+      shards.group_by { |shard| [shard.fetch("platform"), shard.fetch("os"), shard.fetch("device")] }.each do |configuration, group|
         covered = group.flat_map { |shard| shard.fetch("points").split }
-        assert_equal listed.sort, covered.sort, "#{platform} shards must cover every point exactly once"
+        assert_equal listed.sort, covered.sort, "#{configuration} shards must cover every point exactly once"
       end
-      assert_equal shards.length, shards.map { |shard| [shard.fetch("platform"), shard.fetch("shard")] }.uniq.length
+      assert_equal shards.length, shards.map { |shard| [shard.fetch("platform"), shard.fetch("os"), shard.fetch("device"), shard.fetch("shard")] }.uniq.length
     end
     run = @jobs.fetch("upgrade").fetch("steps").find { |step| step["name"] == "Test installed upgrades" }
     assert_equal "${{ matrix.points }}", run.fetch("env").fetch("UPGRADE_POINTS")
+    assert_equal "${{ matrix.os }}", run.fetch("env")["UPGRADE_OS"]
+    assert_equal "${{ matrix.device }}", run.fetch("env")["UPGRADE_DEVICE"]
+    assert_equal "${{ matrix.runtime_id }}", run.fetch("env")["UPGRADE_RUNTIME_ID"]
+    assert_equal "${{ matrix.runtime_version }}", run.fetch("env")["UPGRADE_RUNTIME_VERSION"]
+    assert_equal "${{ matrix.runtime_build }}", run.fetch("env")["UPGRADE_RUNTIME_BUILD"]
     assert_includes run.fetch("run"), '--points "${points[@]}"'
     artifact = @jobs.fetch("upgrade").fetch("steps").find { |step| step["name"] == "Retain upgrade evidence" }
     assert_includes artifact.dig("with", "name"), "${{ matrix.shard }}"
+    assert_includes artifact.dig("with", "name"), "${{ matrix.os }}"
+    assert_includes artifact.dig("with", "name"), "${{ matrix.device }}"
+  end
+
+  def test_ios_26_runtime_is_provisioned_before_the_journey
+    steps = @jobs.fetch("upgrade").fetch("steps")
+    provision = steps.find { |step| step["id"] == "ios26-runtime" }
+    refute_nil provision, "iOS 26 needs an explicit runtime provisioning step"
+    assert_equal "needs.prepare.outputs.upgrade_overridden != 'true' && matrix.platform == 'iOS' && matrix.os == '26'", provision.fetch("if")
+    assert_equal "${{ matrix.runtime_version }}", provision.fetch("env").fetch("UPGRADE_RUNTIME_VERSION")
+    assert_equal "${{ matrix.runtime_build }}", provision.fetch("env").fetch("UPGRADE_RUNTIME_BUILD")
+    assert_includes provision.fetch("run"), '-buildVersion "$UPGRADE_RUNTIME_VERSION"'
+    assert_includes provision.fetch("run"), 'run_journey.py --check-runtime'
+    assert_operator steps.index(provision), :<, steps.index(steps.find { |step| step["id"] == "journey" })
+  end
+
+  def test_the_optional_provisioning_override_reaches_the_planner_from_the_repository_variable
+    plan = @jobs.fetch("prepare").fetch("steps").find { |step| step["id"] == "upgrade-plan" }
+    assert_equal "${{ vars.RELEASE_UPGRADE_PROVISIONING }}", plan.fetch("env").fetch("UPGRADE_PROVISIONING")
+  end
+
+  def test_the_runner_disk_step_fails_below_the_declared_minimum_and_reads_it_from_the_matrix
+    step = @jobs.fetch("upgrade").fetch("steps").find { |item| item["id"] == "disk" }
+    refute_nil step
+    assert_equal "${{ matrix.available_gib }}", step.fetch("env").fetch("REQUIRED_FREE_GIB")
+    root = File.expand_path("../..", __dir__)
+    Dir.mktmpdir do |dir|
+      env = {"HOME" => dir, "GITHUB_STEP_SUMMARY" => File.join(dir, "summary")}
+      assert system(env.merge("REQUIRED_FREE_GIB" => "0.001"), "bash", "-c", step.fetch("run"), chdir: root, out: File::NULL, err: File::NULL),
+             "enough free disk must pass"
+      refute system(env.merge("REQUIRED_FREE_GIB" => "1000000000"), "bash", "-c", step.fetch("run"), chdir: root, out: File::NULL, err: File::NULL),
+             "a runner below the declared minimum must fail the job"
+    end
+  end
+
+  def test_a_blocked_release_reports_the_disk_and_runtime_outcomes_of_the_failed_job
+    upgrade = @jobs.fetch("upgrade").fetch("steps")
+    report = upgrade.find { |step| step["name"] == "Report blocked release" }
+    assert_equal "${{ steps.disk.outcome }}", report.fetch("env").fetch("DISK_OUTCOME")
+    assert_equal "${{ steps.ios26-runtime.outcome }}", report.fetch("env").fetch("RUNTIME_OUTCOME")
+    assert_includes report.fetch("run"), "$DISK_OUTCOME"
+    assert_includes report.fetch("run"), "$RUNTIME_OUTCOME"
+  end
+
+  def test_runtime_provisioning_rejects_wrong_export_or_unavailable_runtime
+    provision = @jobs.fetch("upgrade").fetch("steps").find { |step| step["id"] == "ios26-runtime" }.fetch("run")
+    Dir.mktmpdir do |dir|
+      bin = File.join(dir, "bin")
+      Dir.mkdir(bin)
+      File.write(File.join(bin, "xcodebuild"), <<~'SH')
+        #!/bin/bash
+        set -eu
+        if [[ "$1" == "-downloadPlatform" ]]; then
+          if [[ "${DOWNLOAD_FAIL:-0}" == 1 ]]; then exit 1; fi
+          while [[ "$1" != "-exportPath" ]]; do shift; done
+          root="$2/fixture.exportedBundle"
+          mkdir -p "$root/Restore"
+          version=26.5
+          build=23F77
+          [[ "${BAD_EXPORT:-0}" == 1 ]] && version=26.4
+          [[ "${BAD_BUILD:-0}" == 1 ]] && build=23F99
+          cat > "$root/ExportedMetadata.plist" <<EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>MobileAssetProperties</key><dict><key>SimulatorVersion</key><string>$version</string><key>Build</key><string>$build</string></dict></dict></plist>
+        EOF
+          touch "$root/Restore/fixture.dmg"
+          [[ "${EXTRA_IMAGE:-0}" == 1 ]] && touch "$root/Restore/other.dmg"
+          [[ "${EXTRA_BUNDLE:-0}" == 1 ]] && mkdir -p "$2/other.exportedBundle"
+          true
+        elif [[ "$1" == "-importPlatform" ]]; then
+          [[ "${IMPORT_FAIL:-0}" != 1 ]]
+        else
+          exit 1
+        fi
+      SH
+      File.write(File.join(bin, "xcrun"), <<~'SH')
+        #!/bin/bash
+        if [[ -f "$(dirname "$0")/bad-runtime" ]]; then
+          echo '{"runtimes": []}'
+        else
+          echo '{"runtimes": [{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-5","version":"26.5","buildversion":"23F77","isAvailable":true}]}'
+        fi
+      SH
+      File.chmod(0755, File.join(bin, "xcodebuild"))
+      File.chmod(0755, File.join(bin, "xcrun"))
+      env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "RUNNER_TEMP" => dir,
+             "UPGRADE_RUNTIME_ID" => "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
+             "UPGRADE_RUNTIME_VERSION" => "26.5", "UPGRADE_RUNTIME_BUILD" => "23F77"}
+      assert system(env, "bash", "-c", provision, out: File::NULL, err: File::NULL), "matching runtime must pass"
+      %w[DOWNLOAD_FAIL BAD_BUILD BAD_EXPORT EXTRA_IMAGE EXTRA_BUNDLE IMPORT_FAIL BAD_RUNTIME].each do |failure|
+        File.write(File.join(bin, "bad-runtime"), "") if failure == "BAD_RUNTIME"
+        refute system(env.merge(failure => "1"), "bash", "-c", provision, out: File::NULL, err: File::NULL),
+               "#{failure} must block the journey"
+      end
+    end
   end
 
   def test_the_journey_keeps_its_full_log_and_prints_its_results_and_disk
@@ -93,7 +196,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
     run = upgrade.fetch("steps").find { |step| step["name"] == "Test installed upgrades" }
     assert_equal "needs.prepare.outputs.upgrade_overridden != 'true'", run.fetch("if")
     assert_includes run.fetch("env").fetch("TARGET_COMMIT"), "needs.prepare.outputs.commit_sha"
-    assert_equal "xcode-27", upgrade.fetch("runs-on")
+    assert_equal "${{ matrix.runner }}", upgrade.fetch("runs-on")
     assert_includes run.fetch("env").fetch("TARGET_RELEASE_TAG"), "needs.prepare.outputs.tag"
     assert_includes run.fetch("run"), '--release-tag "$TARGET_RELEASE_TAG"'
   end

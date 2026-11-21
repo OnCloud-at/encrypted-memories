@@ -1,0 +1,70 @@
+{
+  "configurations": [
+    {
+      "platform": "iOS",
+      "os": "26",
+      "device": "iPhone",
+      "runner": "xcode-27",
+      "runtime_version": "26.5",
+      "runtime_build": "23F77",
+      "capacity": {
+        "provision_minutes": 6,
+        "available_gib": 32,
+        "peak_gib": 20,
+        "case_gib": 1.1,
+        "basis": {
+          "provision_minutes": "measured",
+          "available_gib": "measured",
+          "peak_gib": "estimated",
+          "case_gib": "estimated"
+        },
+        "evidence": "Hosted run 43908282083 (Xcode 27.1): iOS 26.5 export 181 s plus import 55 s = 236 s, free disk fell 8.18 GiB; run 41098205915 (Apple release, 3 sources): free disk 35 to 36 GiB at job start, 25.9 to 26.5 GiB after the builds, 0.52 to 0.91 GiB per iOS case on iOS 27.0. Values add a margin to these numbers; iOS 26 cases were never run."
+      },
+      "newest_runtime": false
+    },
+    {
+      "platform": "iOS",
+      "os": "27",
+      "device": "iPhone",
+      "runner": "xcode-27",
+      "runtime_version": "27.2",
+      "runtime_build": "24B8117",
+      "capacity": {
+        "provision_minutes": 4,
+        "available_gib": 32,
+        "peak_gib": 12,
+        "case_gib": 1.1,
+        "basis": {
+          "provision_minutes": "estimated",
+          "available_gib": "measured",
+          "peak_gib": "estimated",
+          "case_gib": "measured on another runtime"
+        },
+        "evidence": "Hosted run 41098205915 (Apple release, 3 sources, iOS 27.0 runtime): free disk 35 to 36 GiB at job start, 25.9 to 26.5 GiB after the builds, 0.52 to 0.91 GiB per iOS case. Nothing is provisioned; the reserve is an estimate. The per-case disk was measured on the iOS 27.0 runtime; the pin is iOS 27.2, which never ran. The peak disk is the footprint of the three-source builds of that run."
+      },
+      "newest_runtime": true
+    },
+    {
+      "platform": "macOS",
+      "os": "27",
+      "device": null,
+      "runner": "xcode-27",
+      "capacity": {
+        "provision_minutes": 4,
+        "available_gib": 32,
+        "peak_gib": 12,
+        "case_gib": 0.3,
+        "basis": {
+          "provision_minutes": "estimated",
+          "available_gib": "measured",
+          "peak_gib": "estimated",
+          "case_gib": "measured"
+        },
+        "evidence": "Hosted run 41098205915 (Apple release, 3 sources): free disk 35 to 36 GiB at job start, 25.9 to 26.5 GiB after the builds, 0.125 GiB per macOS case over 36 cases. Nothing is provisioned; the reserve is an estimate. The peak disk is the footprint of the three-source builds of that run."
+      }
+    }
+  ],
+  "devices": {
+    "iPhone": "iPhone 17"
+  }
+}

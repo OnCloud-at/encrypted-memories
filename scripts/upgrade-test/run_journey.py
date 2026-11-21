@@ -19,6 +19,9 @@ from build_apps import build_app, clean_environment, command, output, release_me
 from journey import JourneyError, run_cases
 from server import FixtureServer
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
+from release_upgrade import CONFIGURATIONS, DEVICE_NAMES, PINS
+
 BUNDLE = 'at.oncloud.encryptedmemories.upgrade-test'
 POINTS = ['backup.claimed', 'backup.remoteReceipt', 'backup.localRecord',
           'model.partial', 'model.installRecord', 'model.promoted',
@@ -29,11 +32,10 @@ LIMITATION = ('macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau
 CONSENT_LIMITATION = ('The backup journey requires consent already saved on disk. The immediate v1.0.5 '
                      'Enable-to-SIGKILL case is a known historical limit and is not tested here.')
 
-# The exact iOS Simulator runtime that the journey evidence names. Measured on the hosted xcode-27 runner
-# with Xcode 27.0 (27A266a), image 20261006.0244.1. A runner image that changes it must fail visibly until
-# this pin is updated deliberately.
-IOS_RUNTIME = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0',
-               'buildversion': '24A434'}
+# The local default is the configuration that sets `newest_runtime` (exactly one does; the planner module checks it).
+_default_pin = PINS[next(key for key in CONFIGURATIONS if key[0] == 'iOS' and PINS[key]['newest_runtime'])]
+IOS_RUNTIME = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-' + _default_pin['runtime_version'].replace('.', '-'),
+               'version': _default_pin['runtime_version'], 'buildversion': _default_pin['runtime_build']}
 
 # xcodebuild needs its own time to start the UI runner before XCTest starts a test case. On the loaded hosted
 # runner this startup took 160 s, nearly the whole former preparation budget, and the UI test never ran. The
@@ -50,7 +52,7 @@ METADATA_SCOPE = ('The gate requires installed CFBundleShortVersionString and CF
                   'External authentication-header acceptance remains unverified.')
 
 
-def select_ios_runtime(runtimes, expected=IOS_RUNTIME):
+def select_ios_runtime(runtimes, expected=IOS_RUNTIME, require_newest=False):
     """Return the pinned runtime; fail before any device exists when it is missing, ambiguous or different."""
     name = f"{expected['identifier']} ({expected['version']}, build {expected['buildversion']})"
     matches = [r for r in runtimes if r.get('identifier') == expected['identifier']]
@@ -65,13 +67,32 @@ def select_ios_runtime(runtimes, expected=IOS_RUNTIME):
                            + str(len(matches)) + ' times with builds '
                            + ', '.join(str(r.get('buildversion')) for r in matches) + '; expected ' + name)
     runtime = matches[0]
+    if require_newest:
+        available = [r for r in runtimes if r.get('isAvailable') is True and
+                     str(r.get('identifier', '')).startswith('com.apple.CoreSimulator.SimRuntime.iOS-') and
+                     str(r.get('version', '')).split('.')[0] == expected['version'].split('.')[0]]
+        versions = [r.get('version') for r in available]
+        if any(not isinstance(v, str) or not re.fullmatch(r'[0-9]+(?:\.[0-9]+)+', v) for v in versions):
+            raise JourneyError('Cannot establish the newest available iOS runtime')
+        if any(tuple(map(int, v.split('.'))) > tuple(map(int, expected['version'].split('.'))) for v in versions):
+            raise JourneyError('The pinned iOS runtime is not the newest available runtime')
     installed = f"{runtime.get('version')}, build {runtime.get('buildversion')}"
     if runtime.get('version') != expected['version'] or runtime.get('buildversion') != expected['buildversion']:
         raise JourneyError('The installed iOS Simulator runtime differs from the pin: expected ' + name
-                           + ', installed ' + installed + '. Update IOS_RUNTIME in run_journey.py deliberately.')
+                           + ', installed ' + installed + '. Update the runtime pin deliberately.')
     if not runtime.get('isAvailable'):
         raise JourneyError('The pinned iOS Simulator runtime is installed but unavailable: ' + name)
     return runtime
+
+
+def requested_ios_runtime():
+    keys = ('UPGRADE_RUNTIME_ID', 'UPGRADE_RUNTIME_VERSION', 'UPGRADE_RUNTIME_BUILD')
+    supplied = [os.environ.get(key) for key in keys]
+    if any(value is not None for value in supplied):
+        if not all(supplied):
+            raise JourneyError('The Simulator runtime identifier, version and build must all be supplied')
+        return dict(zip(('identifier', 'version', 'buildversion'), supplied))
+    return IOS_RUNTIME
 
 
 def summary(message):
@@ -293,12 +314,23 @@ class InstalledApp:
         self.simulator = None
         self.app_log = None
         if platform == 'iOS':
-            runtime = select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'])
+            expected = requested_ios_runtime()
+            expected_os = os.environ.get('UPGRADE_OS')
+            if expected_os is not None and (expected_os not in {key[1] for key in CONFIGURATIONS if key[0] == 'iOS'} or
+                                             expected['version'].split('.')[0] != expected_os):
+                raise JourneyError('The Simulator runtime does not match the requested OS')
+            device = os.environ.get('UPGRADE_DEVICE', 'iPhone')
+            # Only the configuration that sets `newest_runtime` must run on the newest runtime of its major version.
+            require_newest = bool(PINS.get(('iOS', expected_os, device), {}).get('newest_runtime'))
+            runtime = select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'], expected, require_newest=require_newest)
             types = json.loads(output(['xcrun', 'simctl', 'list', 'devicetypes', '--json']))['devicetypes']
-            phones = [d for d in types if d['name'] == 'iPhone 17']
-            if not phones:
-                raise JourneyError('No iPhone Simulator device type is available')
-            self.simulator = output(['xcrun', 'simctl', 'create', 'EncryptedMemoriesUpgrade-' + self.case_id, phones[-1]['identifier'], runtime['identifier']])
+            names = DEVICE_NAMES
+            if device not in names:
+                raise JourneyError('Unknown upgrade Simulator device: ' + device)
+            matches = [d for d in types if d['name'] == names[device]]
+            if len(matches) != 1:
+                raise JourneyError(f'Expected one Simulator device type {names[device]}, found {len(matches)}')
+            self.simulator = output(['xcrun', 'simctl', 'create', 'EncryptedMemoriesUpgrade-' + self.case_id, matches[0]['identifier'], runtime['identifier']])
             try:
                 (directory / 'simulator.txt').write_text(self.simulator + '\n')
                 (directory / 'simulator-runtime.json').write_text(json.dumps(runtime) + '\n')
@@ -506,7 +538,16 @@ def wait_ui_test_start(process, log, label, reached=None, timeout=UI_STARTUP_SEC
     return elapsed
 
 
+def verify_macos_host(expected_os, actual_os):
+    """The requested macOS must be a configured one, and the host must run it."""
+    if expected_os not in {key[1] for key in CONFIGURATIONS if key[0] == 'macOS'} or actual_os.split('.')[0] != expected_os:
+        raise JourneyError(f'The macOS host {actual_os} does not match the requested OS {expected_os}')
+
+
 def main():
+    if sys.argv[1:] == ['--check-runtime']:
+        select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'], requested_ios_runtime())
+        return
     if sys.argv[1:] == ['--list-points']:
         # The one list of interruption points. The release workflow builds its job matrix from this output.
         print(' '.join(POINTS))
@@ -523,6 +564,9 @@ def main():
     parser.add_argument('--release-tag', default=os.environ.get('UPGRADE_RELEASE_TAG'),
                         help='Published metadata for the candidate; required when its commit has no unique tag')
     args = parser.parse_args()
+    expected_os = os.environ.get('UPGRADE_OS')
+    if args.platform == 'macOS' and expected_os is not None:
+        verify_macos_host(expected_os, output(['sw_vers', '-productVersion']))
     toolchain = output(['xcodebuild', '-version'])
     summary('Xcode toolchain: ' + toolchain.replace('\n', '; '))
     summary('Listen backlog limit kern.ipc.somaxconn: ' + output(['sysctl', '-n', 'kern.ipc.somaxconn']))

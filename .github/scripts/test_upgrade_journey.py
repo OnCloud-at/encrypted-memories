@@ -237,6 +237,17 @@ with SigningIdentity(root) as signer:
                 with self.assertRaisesRegex(JourneyError, 'Saved backup consent changed'):
                     run_journey.verify_saved_backup_consent(preferences, baseline)
 
+    def test_macos_host_mismatch_fails_before_the_journey_starts(self):
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {'UPGRADE_OS': '26'}), \
+                patch.object(sys, 'argv', ['run_journey', '--repo', str(repo), '--automation', str(repo),
+                                          '--root', root, '--target', 'HEAD', '--sources', 'v1.0.5', '--platform', 'macOS']), \
+                patch.object(run_journey, 'output', return_value='27.0'), \
+                patch.object(run_journey, 'command', side_effect=JourneyError('unexpected command')) as command:
+            with self.assertRaises(JourneyError):
+                run_journey.main()
+            command.assert_not_called()
+
     def test_standalone_ui_runner_does_not_inherit_app_hardening(self):
         repo = Path(__file__).resolve().parents[2]
         with _temporary_directory() as root:
@@ -551,6 +562,74 @@ with SigningIdentity(root) as signer:
         error, _, _, _ = self.run_case_on_a_virtual_clock(prepare_startup=1, verify_startup=1, verify_code=1)
         self.assertEqual(str(error), 'v1.0.5 / index.embed: UI verification failed (1)')
 
+    def test_explicit_runtime_selects_the_matching_installed_build(self):
+        selected = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                    'version': '26.5', 'buildversion': '23F77', 'isAvailable': True}
+        replies = [json.dumps({'runtimes': [dict(run_journey.IOS_RUNTIME, isAvailable=True), selected]}),
+                   json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
+        environment = {'UPGRADE_RUNTIME_ID': selected['identifier'], 'UPGRADE_RUNTIME_VERSION': selected['version'],
+                       'UPGRADE_RUNTIME_BUILD': selected['buildversion']}
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, environment), \
+                patch.object(run_journey, 'output', side_effect=replies) as output, patch.object(run_journey, 'command'):
+            app = run_journey.InstalledApp('iOS', Path(root))
+            app.close()
+            create = next(call.args[0] for call in output.call_args_list if call.args[0][2] == 'create')
+            self.assertEqual(create[-1], selected['identifier'])
+
+    def test_partial_runtime_pin_fails_before_query_or_creation(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {'UPGRADE_RUNTIME_ID': 'runtime'}, clear=True), \
+                patch.object(run_journey, 'output') as output, patch.object(run_journey, 'command') as command:
+            with self.assertRaisesRegex(JourneyError, 'identifier, version and build must all be supplied'):
+                run_journey.InstalledApp('iOS', Path(root))
+            output.assert_not_called()
+            command.assert_not_called()
+
+    def test_ios_os_mismatch_fails_before_query_or_creation(self):
+        environment = {'UPGRADE_OS': '26', 'UPGRADE_RUNTIME_ID': run_journey.IOS_RUNTIME['identifier'],
+                       'UPGRADE_RUNTIME_VERSION': run_journey.IOS_RUNTIME['version'],
+                       'UPGRADE_RUNTIME_BUILD': run_journey.IOS_RUNTIME['buildversion']}
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, environment), \
+                patch.object(run_journey, 'output') as output, patch.object(run_journey, 'command') as command:
+            with self.assertRaisesRegex(JourneyError, 'does not match the requested OS'):
+                run_journey.InstalledApp('iOS', Path(root))
+            output.assert_not_called()
+            command.assert_not_called()
+
+    def test_explicit_runtime_with_wrong_build_fails_before_creation(self):
+        environment = {'UPGRADE_RUNTIME_ID': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                       'UPGRADE_RUNTIME_VERSION': '26.5', 'UPGRADE_RUNTIME_BUILD': '23F77'}
+        runtime = {'identifier': environment['UPGRADE_RUNTIME_ID'], 'version': '26.5',
+                   'buildversion': 'OTHER', 'isAvailable': True}
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, environment), \
+                patch.object(run_journey, 'output', return_value=json.dumps({'runtimes': [runtime]})) as output, \
+                patch.object(run_journey, 'command') as command:
+            with self.assertRaisesRegex(JourneyError, 'differs from the pin'):
+                run_journey.InstalledApp('iOS', Path(root))
+            self.assertEqual(output.call_count, 1)
+            command.assert_not_called()
+
+    def test_unknown_device_fails_before_simulator_creation(self):
+        runtime = json.dumps({'runtimes': [dict(run_journey.IOS_RUNTIME, isAvailable=True)]})
+        types = json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]})
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {'UPGRADE_DEVICE': 'unknown'}), \
+                patch.object(run_journey, 'output', side_effect=[runtime, types, 'OWN-DEVICE']) as output, \
+                patch.object(run_journey, 'command'):
+            with self.assertRaises(JourneyError):
+                run_journey.InstalledApp('iOS', Path(root))
+            self.assertFalse(any(call.args[0][2] == 'create' for call in output.call_args_list))
+
+    def test_missing_or_ambiguous_requested_device_fails_before_creation(self):
+        runtime = json.dumps({'runtimes': [dict(run_journey.IOS_RUNTIME, isAvailable=True)]})
+        for devices in ([], [{'name': 'iPhone 17', 'identifier': 'one'},
+                             {'name': 'iPhone 17', 'identifier': 'two'}]):
+            with self.subTest(count=len(devices)), tempfile.TemporaryDirectory() as root, \
+                    patch.dict(os.environ, {'UPGRADE_DEVICE': 'iPhone'}), \
+                    patch.object(run_journey, 'output', side_effect=[runtime, json.dumps({'devicetypes': devices})]) as output, \
+                    patch.object(run_journey, 'command'):
+                with self.assertRaisesRegex(JourneyError, 'Expected one Simulator device type iPhone'):
+                    run_journey.InstalledApp('iOS', Path(root))
+                self.assertEqual(output.call_count, 2)
+
     def test_owned_simulator_journey_preserves_a_foreign_booted_device(self):
         devices = {'FOREIGN-DEVICE': 'Booted'}
         operations = []
@@ -566,7 +645,7 @@ with SigningIdentity(root) as signer:
                 return json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]})
             if operation == 'create':
                 self.assertRegex(args[3], r'^EncryptedMemoriesUpgrade-[a-f0-9]{32}$')
-                self.assertEqual(args[-1], 'com.apple.CoreSimulator.SimRuntime.iOS-27-0')
+                self.assertEqual(args[-1], run_journey.IOS_RUNTIME['identifier'])
                 devices['OWN-DEVICE'] = 'Shutdown'
                 return 'OWN-DEVICE'
             self.assertEqual(args[3], 'OWN-DEVICE') if operation != 'ps' else None
@@ -605,9 +684,9 @@ with SigningIdentity(root) as signer:
                 (bundles[name] / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': 'App'}))
             app = run_journey.InstalledApp('iOS', Path(directory))
             runtime = json.loads((Path(directory) / 'simulator-runtime.json').read_text())
-            self.assertEqual(runtime['identifier'], 'com.apple.CoreSimulator.SimRuntime.iOS-27-0')
-            self.assertEqual(runtime['version'], '27.0')
-            self.assertEqual(runtime['buildversion'], '24A434', 'The pin is the build measured on the hosted runner')
+            self.assertEqual(runtime['identifier'], run_journey.IOS_RUNTIME['identifier'])
+            self.assertEqual((runtime['version'], runtime['buildversion']), ('27.2', '24B8117'),
+                             'The local default is the newest iOS 27 release runtime of the recorded hosted image')
             self.assertEqual(app.destination, 'platform=iOS Simulator,id=OWN-DEVICE')
             app.install(bundles['old'])
             app.launch(type('Server', (), {'url': 'http://127.0.0.1:1234'})(), seed=True)
@@ -624,15 +703,145 @@ with SigningIdentity(root) as signer:
                                     '--predicate', 'process == "App"']])
         self.assertLess(operations.index(['stop-log-stream']), operations.index(next(a for a in operations if a[2:3] == ['shutdown'])))
 
+    def test_older_pinned_runtime_is_rejected_when_newer_available(self):
+        pinned = dict(run_journey.IOS_RUNTIME, isAvailable=True)
+        newer = dict(pinned, identifier='com.apple.CoreSimulator.SimRuntime.iOS-27-3', version='27.3')
+        with self.assertRaisesRegex(JourneyError, 'newest'):
+            run_journey.select_ios_runtime([pinned, newer], require_newest=True)
+
+    # `xcrun simctl list runtimes -j` of the hosted xcode-27 image (Xcode 27.1) lists a second iOS 27.2 entry with its own
+    # identifier and a different build. Only the fields that the selection reads are kept; the values are the real ones.
+    HOSTED_IMAGE_RUNTIMES = [
+        {'isAvailable': True, 'isInternal': False, 'version': '27.0', 'buildversion': '24A434',
+         'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'platform': 'iOS', 'name': 'iOS 27.0'},
+        {'isAvailable': True, 'isInternal': False, 'version': '27.1', 'buildversion': '24A94425',
+         'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-1', 'platform': 'iOS', 'name': 'iOS 27.1'},
+        {'isAvailable': True, 'isInternal': False, 'version': '27.2', 'buildversion': '24B8117',
+         'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-2', 'platform': 'iOS', 'name': 'iOS 27.2'},
+        {'isAvailable': True, 'isInternal': False, 'version': '27.2', 'buildversion': '24B91016s',
+         'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4', 'platform': 'iOS', 'name': 'iOS 27.2'},
+    ]
+    IOS_26_AFTER_IMPORT = {'isAvailable': True, 'isInternal': False, 'version': '26.5', 'buildversion': '23F77',
+                           'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5', 'platform': 'iOS', 'name': 'iOS 26.5'}
+
+    @staticmethod
+    def pinned_runtime(os_version):
+        pin = run_journey.PINS[('iOS', os_version, 'iPhone')]
+        return {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-' + pin['runtime_version'].replace('.', '-'),
+                'version': pin['runtime_version'], 'buildversion': pin['runtime_build']}
+
+    def test_the_second_ios_27_2_entry_of_the_hosted_image_is_never_selected_and_does_not_block_the_pin(self):
+        expected = self.pinned_runtime('27')
+        runtimes = self.HOSTED_IMAGE_RUNTIMES
+        for order in (runtimes, list(reversed(runtimes))):
+            selected = run_journey.select_ios_runtime(order, expected, require_newest=True)
+            self.assertEqual(selected['identifier'], 'com.apple.CoreSimulator.SimRuntime.iOS-27-2')
+            self.assertEqual(selected['buildversion'], '24B8117')
+        # The variant has the same version, so it is not "newer"; a variant of a higher version would be.
+        variant_3 = dict(runtimes[3], version='27.3', identifier='com.apple.CoreSimulator.SimRuntime.iOS-27-3-iPhone19-4')
+        with self.assertRaisesRegex(JourneyError, 'newest'):
+            run_journey.select_ios_runtime(runtimes + [variant_3], expected, require_newest=True)
+        # Pinning the variant's build under the identifier of the release runtime is a different build and fails.
+        with self.assertRaisesRegex(JourneyError, 'differs from the pin'):
+            run_journey.select_ios_runtime(runtimes, dict(expected, buildversion='24B91016s'), require_newest=True)
+        # The iOS 27.0 runtime of the image stays selectable without the newest rule, but not with it.
+        old = {'identifier': runtimes[0]['identifier'], 'version': '27.0', 'buildversion': '24A434'}
+        self.assertEqual(run_journey.select_ios_runtime(runtimes, old)['buildversion'], '24A434')
+        with self.assertRaisesRegex(JourneyError, 'newest'):
+            run_journey.select_ios_runtime(runtimes, old, require_newest=True)
+
+    def test_the_pins_match_the_recorded_hosted_image_and_ios_27_is_its_newest_release_runtime(self):
+        # Recorded: `simctl list runtimes -j` of run 43908282083 (Xcode 27.1 image) and the iOS 26.5 export of the same run.
+        recorded = {(r['identifier'], r['version'], r['buildversion']) for r in self.HOSTED_IMAGE_RUNTIMES}
+        pin_27 = self.pinned_runtime('27')
+        self.assertIn((pin_27['identifier'], pin_27['version'], pin_27['buildversion']), recorded)
+        newest = max(tuple(map(int, r['version'].split('.'))) for r in self.HOSTED_IMAGE_RUNTIMES)
+        self.assertEqual(tuple(map(int, pin_27['version'].split('.'))), newest)
+        pin_26 = self.pinned_runtime('26')
+        self.assertEqual((pin_26['identifier'], pin_26['version'], pin_26['buildversion']),
+                         (self.IOS_26_AFTER_IMPORT['identifier'], '26.5', '23F77'))
+        self.assertEqual({(key[1], key[2]) for key in run_journey.CONFIGURATIONS if key[0] == 'iOS'},
+                         {('26', 'iPhone'), ('27', 'iPhone')})
+
+    def test_only_the_ios_27_job_requires_the_newest_runtime(self):
+        pinned = self.pinned_runtime('27')
+        newer = dict(self.HOSTED_IMAGE_RUNTIMES[2], version='27.3', buildversion='24C1',
+                     identifier='com.apple.CoreSimulator.SimRuntime.iOS-27-3', name='iOS 27.3')
+        runtimes = self.HOSTED_IMAGE_RUNTIMES + [newer]
+        def create(os_version):
+            environment = {'UPGRADE_DEVICE': 'iPhone', 'UPGRADE_RUNTIME_ID': pinned['identifier'],
+                           'UPGRADE_RUNTIME_VERSION': pinned['version'], 'UPGRADE_RUNTIME_BUILD': pinned['buildversion']}
+            if os_version:
+                environment['UPGRADE_OS'] = os_version
+            replies = [json.dumps({'runtimes': runtimes}),
+                       json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
+            with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, environment), \
+                    patch.object(run_journey, 'output', side_effect=replies) as output, patch.object(run_journey, 'command'):
+                os.environ.pop('UPGRADE_OS', None) if not os_version else None
+                try:
+                    run_journey.InstalledApp('iOS', Path(root))
+                finally:
+                    created = [call.args[0] for call in output.call_args_list if call.args[0][2] == 'create']
+            return created
+        # A newer iOS 27.x on the image fails the iOS 27 job before any device exists: the pin is updated deliberately.
+        with self.assertRaisesRegex(JourneyError, 'not the newest'):
+            create('27')
+        # Without the iOS 27 job (local run or the iOS 26 job) the newest rule does not apply.
+        self.assertEqual(len(create(None)), 1)
+
+    def test_the_ios_26_runtime_is_selected_after_the_import_and_a_missing_import_fails_before_a_device_exists(self):
+        expected = self.pinned_runtime('26')
+        selected = run_journey.select_ios_runtime(self.HOSTED_IMAGE_RUNTIMES + [self.IOS_26_AFTER_IMPORT], expected)
+        self.assertEqual((selected['version'], selected['buildversion']), ('26.5', '23F77'))
+        with self.assertRaisesRegex(JourneyError, 'not installed'):
+            run_journey.select_ios_runtime(self.HOSTED_IMAGE_RUNTIMES, expected)
+
+    def test_the_ios_27_job_creates_its_simulator_on_the_release_runtime_of_the_hosted_image(self):
+        expected = self.pinned_runtime('27')
+        environment = {'UPGRADE_OS': '27', 'UPGRADE_DEVICE': 'iPhone', 'UPGRADE_RUNTIME_ID': expected['identifier'],
+                       'UPGRADE_RUNTIME_VERSION': expected['version'], 'UPGRADE_RUNTIME_BUILD': expected['buildversion']}
+        replies = [json.dumps({'runtimes': self.HOSTED_IMAGE_RUNTIMES}),
+                   json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, environment), \
+                patch.object(run_journey, 'output', side_effect=replies) as output, patch.object(run_journey, 'command'):
+            run_journey.InstalledApp('iOS', Path(root))
+            create = next(call.args[0] for call in output.call_args_list if call.args[0][2] == 'create')
+            self.assertEqual(create[-1], 'com.apple.CoreSimulator.SimRuntime.iOS-27-2')
+
+    def test_the_newest_runtime_rule_follows_the_configuration_field_not_a_version_number(self):
+        pinned = self.pinned_runtime('27')
+        newer = dict(self.HOSTED_IMAGE_RUNTIMES[2], version='27.3', buildversion='24C1',
+                     identifier='com.apple.CoreSimulator.SimRuntime.iOS-27-3', name='iOS 27.3')
+        environment = {'UPGRADE_OS': '27', 'UPGRADE_DEVICE': 'iPhone', 'UPGRADE_RUNTIME_ID': pinned['identifier'],
+                       'UPGRADE_RUNTIME_VERSION': pinned['version'], 'UPGRADE_RUNTIME_BUILD': pinned['buildversion']}
+        def attempt(newest):
+            pins = {key: dict(value) for key, value in run_journey.PINS.items()}
+            pins[('iOS', '27', 'iPhone')]['newest_runtime'] = newest
+            replies = [json.dumps({'runtimes': self.HOSTED_IMAGE_RUNTIMES + [newer]}),
+                       json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
+            with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, environment), \
+                    patch.object(run_journey, 'PINS', pins), patch.object(run_journey, 'output', side_effect=replies), \
+                    patch.object(run_journey, 'command'):
+                run_journey.InstalledApp('iOS', Path(root))
+        with self.assertRaisesRegex(JourneyError, 'not the newest'):
+            attempt(True)
+        attempt(False)
+
+    def test_the_requested_macos_must_be_configured_and_run_on_the_host(self):
+        run_journey.verify_macos_host('27', '27.1')
+        for expected, actual in (('26', '26.5'), ('27', '26.5'), ('28', '28.0'), ('27', '270.1')):
+            with self.subTest(expected=expected, actual=actual), self.assertRaisesRegex(JourneyError, 'does not match the requested OS'):
+                run_journey.verify_macos_host(expected, actual)
+
     def test_ambiguous_selected_runtime_fails_before_creating_a_simulator(self):
         runtimes = {'runtimes': [
-            {'isAvailable': True, 'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', 'version': '27.0', 'buildversion': build}
+            {'isAvailable': True, 'identifier': run_journey.IOS_RUNTIME['identifier'], 'version': run_journey.IOS_RUNTIME['version'], 'buildversion': build}
             for build in ['first', 'second']
         ]}
         replies = [json.dumps(runtimes), json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
         with tempfile.TemporaryDirectory() as root, patch.object(run_journey, 'output', side_effect=replies) as output, \
                 patch.object(run_journey, 'command'):
-            with self.assertRaisesRegex(JourneyError, 'Ambiguous Simulator runtime identifier: com.apple.CoreSimulator.SimRuntime.iOS-27-0'):
+            with self.assertRaisesRegex(JourneyError, 'Ambiguous Simulator runtime identifier: ' + re.escape(run_journey.IOS_RUNTIME['identifier'])):
                 run_journey.InstalledApp('iOS', Path(root))
             self.assertFalse(any(call.args[0][2] == 'create' for call in output.call_args_list))
 
@@ -646,7 +855,7 @@ with SigningIdentity(root) as signer:
              'not installed: expected .*build ' + expected + r'\), installed .*iOS-27-1 \(27\.1, build NEWER, available\)'),
             ('other version', [dict(pinned, version='27.0.1')], r'differs from the pin: .*installed 27\.0\.1, build'),
             ('other build', [dict(pinned, buildversion='OTHER')],
-             'differs from the pin: expected .*build ' + expected + r'\), installed 27\.0, build OTHER'),
+             'differs from the pin: expected .*build ' + expected + r'\), installed ' + re.escape(run_journey.IOS_RUNTIME['version']) + ', build OTHER'),
             ('unavailable', [dict(pinned, isAvailable=False)], 'installed but unavailable'),
             ('duplicate', [pinned, dict(pinned, buildversion='OTHER')], 'Ambiguous .* 2 times with builds'),
             ('duplicate with the same build', [pinned, dict(pinned)], 'Ambiguous .* 2 times with builds'),

@@ -324,31 +324,71 @@ so distinct releases on one commit cannot reuse the wrong version or build numbe
 On the hosted runner one iOS case takes seven to eight minutes, so the iOS gate runs in as many jobs as the time model needs.
 The prepare job builds the jobs from the one list of interruption points in `scripts/upgrade-test/run_journey.py`
 (`--list-points`) and the selected sources (`.github/scripts/release_upgrade.py`). Each job tests every source with its
-share of the points; together the jobs of a platform cover every point once, and no job plans more than 165 of its 180 minutes.
-A job plans `12 x sources + case x sources x points` minutes, with 8.0 minutes per iOS case and 1.5 minutes per macOS case.
+share of the points; together the jobs of each device and OS configuration cover every point once.
+The plan includes iPhone on iOS 26 and 27, and the macOS 27 host. The owner decided on 2026-11-16 that this
+gate does not cover iPad; normal UI tests cover iPad.
+The gate deliberately does not cover macOS 26 (owner decision 2026-11-16): no hosted macOS 26 image carries
+the Xcode that builds this project, and installing that Xcode needs credentials. The planner rejects a macOS 26 configuration.
+Each job plans no more than 165 of its 180 minutes, including its explicit provisioning reserve.
+A job plans `provisioning + 12 x sources + case x sources x points` minutes, with 8.0 minutes per iOS case and 1.5 minutes per macOS case.
 These coefficients are estimates from the job means of the releases v1.1.0-rc.1 and v1.1.0; the measured maxima are higher
 (code comment in `release_upgrade.py`: up to 12.8 minutes of builds per source, 9.2 minutes for the slowest iOS point mean,
 10.9 minutes for the slowest single case). The check at 165 minutes keeps a margin against the estimate only; a job that
 concentrates slow points, or a slower runner, can use more of its 180-minute timeout.
 A plan of more than 256 jobs, or a point that no job can hold, fails in the prepare job with its cost. A valid deliberate
 override keeps the normal plan when it fits; when it does not fit, or has more than 256 jobs, the override uses one job per
-platform with every point. The override skips the journey steps; the jobs only acknowledge it. A new interruption point or a
+configuration with every point. The override skips the journey steps; the jobs only acknowledge it. A new interruption point or a
 new source needs no workflow edit.
 Each UI run gets up to 600 seconds to start its first test case. The 180-second preparation budget starts
 when the first test case starts, when the old app reaches its checkpoint on its own, or when the UI run ends, whichever comes first.
 The 240-second verification budget starts with the first test case or the end of the run.
 A slow UI runner start on a loaded runner therefore cannot use up either budget.
-The iOS gate runs in at least two jobs (`MIN_IOS_JOBS` in `release_upgrade.py`), but never in more jobs than points. With one
-source the generator plans two iOS jobs of six points (about 60 planned minutes each) and one macOS job: about one more
-build (12 minutes) of runner time than one job of twelve points (about 108 planned minutes), and about half the wall-clock
-time. With three sources it plans three iOS jobs of four points (about 132 minutes each) and one macOS job; a fourth source
-makes it plan four iOS jobs. The macOS gate keeps one job as long as it fits.
+Each iOS configuration runs in at least two jobs (`MIN_IOS_JOBS`), but never more jobs than points.
+`.github/scripts/release_upgrade_config.json` holds the capacity of each configuration: `provision_minutes`,
+`available_gib`, `peak_gib`, `case_gib`, one basis for each number (`measured`, `measured on another runtime`, or
+`estimated`), and the evidence. Each iOS configuration also states `newest_runtime`; exactly one sets it. That one is the
+local default pin and the only job that must run on the newest runtime of its major version.
+A job plans `provision_minutes` extra minutes and `peak_gib + case_gib x sources x points` GiB, and its free disk at
+the start must reach `available_gib`. The prepare job adds jobs until both limits hold. With three sources and twelve
+points the checked-in values plan 8 jobs, 958 estimated runner-minutes and a longest job of 136 minutes. iOS 26 needs
+four jobs of three points, because 20 GiB plus 1.1 GiB per case would not fit 32 GiB.
+Measured: iOS 26 provisioning (run 43908282083: export 181 s, import 55 s, 8.18 GiB of disk), free disk at the job start
+(35 to 36.8 GiB), and the per-case disk of macOS (0.125 GiB, run 41098205915). Measured on another runtime: the per-case
+disk of iOS 27 (0.52 to 0.91 GiB on the iOS 27.0 runtime of run 41098205915; the pin is iOS 27.2). Estimated: the reserve of
+the iOS 27 and macOS jobs, the per-case disk of iOS 26, and every `peak_gib`. `peak_gib` rests on the three-source builds of
+run 41098205915 (25.9 to 26.5 GiB free after the builds, from 35 to 36 GiB), and the iOS 26 value adds the runtime. The
+planner reuses it for every source count, so a plan with more than three sources can underestimate the build footprint.
+Each checked-in number adds a margin to its measurement. The 8.0 minutes per iOS case have not been measured on iOS 26 or
+iOS 27.2.
+The repository variable `RELEASE_UPGRADE_PROVISIONING` is an optional override. It holds a JSON array of objects with
+`platform`, `os`, `device`, `provision_minutes`, `available_gib`, `peak_gib`, `case_gib`, and `evidence`. `os` is a JSON
+string (`"26"`, not `26`), and `device` is `null` for macOS. The planner names the field of a wrong value. An object replaces the
+checked-in capacity of the configuration that it names, with the same validation. It cannot change a runner or a runtime pin:
+the planner refuses the other keys. The job summary names the source of each plan: `release_upgrade_config.json` with the
+basis of each number, or `RELEASE_UPGRADE_PROVISIONING`. The planner refuses a missing capacity.
+The planner rejects iOS 26 values below the measured floors (236 seconds and 8.18 GiB); the checked-in values add a margin.
+This single sample did not measure runner variation or prove app execution.
+A prior hosted journey lost 10.9 GiB over 12 cases (about 0.91 GiB per case); the checked-in values budget that growth in
+addition to the runtime.
+The job does not delete the exported runtime after the import. Run 43908282083 kept its export until its last disk sample,
+so the 8.18 GiB include the export and the import.
+The iOS 26 job exports the pinned build, checks its metadata, imports the one image and checks the registered runtime.
+`xcodebuild -downloadPlatform -buildVersion` takes the OS version (26.5), not a build number. The metadata check compares the
+exported build (23F77) afterwards, so the job fails when Apple serves another 26.5 build.
+The job fails when its available disk is below the declared minimum, and the summary of a blocked release names the disk
+and runtime step outcomes.
+The first prerelease that runs this gate is its hosted rehearsal: no iOS 26 case and no iOS 27.2 case has run on a hosted
+runner. A failed rehearsal blocks both uploads. The override from `main` stays the escape.
+The gate pins iPhone on iOS 26.5 (build 23F77, exported and imported by the job) and on iOS 27.2 (build 24B8117), the newest
+iOS 27 release runtime of the hosted image. The image also lists iOS 27.0, iOS 27.1 and a second iOS 27.2 entry with another
+identifier (build 24B91016s). The selection compares the identifier exactly, so that entry is never selected. When a newer iOS 27
+runtime appears on the image, the iOS 27 job fails before it creates a device. Update the pin deliberately in the configuration file.
 Each case ends with `simctl delete` of its simulator. macOS moves that device's data into `Deleting-<uuid>` directories
 of TMPDIR, which a system process empties asynchronously (#1008). The journey keeps nothing in TMPDIR and must not remove
 these directories, because the system owns them. A hosted runner under load emptied them too slowly: in run 41098205915
-a shard grew TMPDIR from 0 to 8.6 GiB and lost 10.9 GiB of free disk over its 24 cases (about 0.5 GiB per case; #498
+a shard grew TMPDIR from 0 to 8.6 GiB and lost 10.9 GiB of free disk over its 12 cases (about 0.91 GiB per case; #498
 measured up to 0.9 GiB per case), starting from 26.0 to 26.5 GiB free after the builds. About 28 cases therefore fill the
-runner disk; the time model stays below that with at most 19, 16, 15 or 12 cases per job for one to four sources. An idle
+runner disk. An idle
 local host empties the directories within minutes, so a rehearsal cannot show the hosted growth.
 A failing case keeps the app's system log. The evidence also holds the runner load, the free disk and the size of
 the large build and Simulator directories, and each case's timing and free disk.
@@ -358,7 +398,8 @@ A historical source keeps only its published app; its build scratch is deleted a
 
 The iOS journey installs the new app with `simctl install` over the existing app.
 It never removes the app or resets its data between the old and new phases.
-It runs on the Simulator runtime pinned in `IOS_RUNTIME` of `scripts/upgrade-test/run_journey.py` (iOS 27.0, build 24A434).
+The release matrix supplies an exact Simulator runtime identifier, version and build for each iOS configuration.
+Without a supplied pin, a local journey uses `IOS_RUNTIME` in `run_journey.py`, the iOS 27 pin of the configuration file (iOS 27.2, build 24B8117).
 A missing, ambiguous, unavailable, or different runtime fails before a device exists; the message names the expected and the installed build.
 The new phase does not seed a session: loss of the real simulator Keychain entry fails the journey.
 The seed marker records both the loopback server URL and the case-specific account UID.

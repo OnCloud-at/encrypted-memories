@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -24,7 +25,28 @@ PREVIOUS_BETA_WITHOUT_ENTRY = frozenset({"v1.1.0-beta.2"})
 
 # A hosted job stops after 180 minutes. A job may plan at most this long, which keeps a margin for a slow runner.
 JOB_BUDGET_MINUTES = 165
-PLATFORMS = ("iOS", "macOS")
+# One hosted cold export/import sample, run 43908282083. These are floors, not variance margins.
+IOS_26_PROVISION_MINUTES = 236 / 60
+IOS_26_PROVISION_GIB = 8573672 / 1048576
+CONFIG = json.loads(Path(__file__).with_name("release_upgrade_config.json").read_text())
+PINS = {(item["platform"], item["os"], item["device"]): item for item in CONFIG["configurations"]}
+
+
+def validate_pins(pins):
+    """Every iOS configuration states `newest_runtime`; exactly one sets it. That one is the local default pin and the
+    only job that must run on the newest runtime of its major version. A new configuration without the field fails
+    when this module loads."""
+    ios = [key for key in pins if key[0] == "iOS"]
+    for key in ios:
+        if not isinstance(pins[key].get("newest_runtime"), bool):
+            raise UpgradeError(f"newest_runtime must be true or false for {key} in release_upgrade_config.json")
+    if sum(pins[key]["newest_runtime"] for key in ios) != 1:
+        raise UpgradeError("Exactly one iOS configuration must set newest_runtime in release_upgrade_config.json")
+
+
+validate_pins(PINS)
+CONFIGURATIONS = tuple(PINS)
+DEVICE_NAMES = CONFIG["devices"]
 # A job needs: builds + cases = BUILD_MINUTES_PER_SOURCE x sources + CASE_MINUTES x sources x points of the job.
 # Measured on the hosted runner (v1.1.0-rc.1, run 38202469938, two sources, and v1.1.0, run 38307297868, one source):
 #   iOS case: mean 6.6 to 7.6 minutes per job (slowest job mean 454 s), slowest single case 653 s (10.9 minutes).
@@ -131,33 +153,67 @@ def job_minutes(platform, source_count, point_count):
     return BUILD_MINUTES_PER_SOURCE[platform] * source_count + CASE_MINUTES[platform] * source_count * point_count
 
 
-def shard_count(platform, source_count, point_count):
-    """The fewest jobs of one platform so that each job, with every source, fits the job budget.
+def shard_count(platform, source_count, point_count, provisioning):
+    """The fewest jobs of one configuration so that each job, with every source, fits the time budget and the disk limit.
 
     The iOS gate never runs in fewer than MIN_IOS_JOBS jobs, but never in more jobs than points, so every job holds at
     least one point: with one point a single job is planned."""
+    if not provisioning:
+        raise UpgradeError("Provisioning capacity is required for each job")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+           for value in (source_count, point_count)):
+        raise UpgradeError("Source and interruption point counts must be positive integers")
+    key = validate_configuration(provisioning)
+    if key[0] != platform:
+        raise UpgradeError("Provisioning platform does not match the requested platform")
     minimum = max(1, min(MIN_IOS_JOBS, point_count)) if platform == "iOS" else 1
     for count in range(minimum, point_count + 1):
-        if job_minutes(platform, source_count, math.ceil(point_count / count)) <= JOB_BUDGET_MINUTES:
+        largest = math.ceil(point_count / count)
+        minutes = job_minutes(platform, source_count, largest) + provisioning["provision_minutes"]
+        disk_fits = (provisioning["peak_gib"] + provisioning["case_gib"] * source_count * largest
+                     <= provisioning["available_gib"])
+        if minutes <= JOB_BUDGET_MINUTES and disk_fits:
             return count
-    raise UpgradeError(
-        f"One interruption point of {source_count} sources needs {job_minutes(platform, source_count, 1):.0f} "
-        f"minutes on {platform}, more than the {JOB_BUDGET_MINUTES} minutes that a job may plan")
+    minimum_minutes = job_minutes(platform, source_count, 1) + provisioning["provision_minutes"]
+    if minimum_minutes > JOB_BUDGET_MINUTES:
+        raise UpgradeError(f"One interruption point of {source_count} sources needs {minimum_minutes:.0f} minutes on {platform}, more than the {JOB_BUDGET_MINUTES} minutes that a job may plan")
+    raise UpgradeError(f"One interruption point of {source_count} sources exceeds the disk budget on {platform}")
 
 
-def upgrade_matrix(sources, points):
-    """The jobs of the upgrade gate: each platform tests every source, and together its jobs cover every point once."""
+def upgrade_matrix(sources, points, override=None):
+    """Each device and OS configuration tests every source and covers every point once.
+
+    The capacity of each configuration comes from release_upgrade_config.json; `override` is the optional list of
+    RELEASE_UPGRADE_PROVISIONING objects that replace it for the configurations they name."""
     if not points:
         raise UpgradeError("There is no interruption point to plan")
+    for name, values in (("source", sources), ("interruption point", points)):
+        if (not isinstance(values, (list, tuple)) or
+                any(not isinstance(value, str) or not value.strip() or value != value.strip() or
+                    any(character.isspace() for character in value) for value in values) or
+                len(set(values)) != len(values)):
+            raise UpgradeError(f"Invalid or duplicate {name}")
+    provisioning = validate_provisioning(override)
     include = []
-    for platform in PLATFORMS:
-        count = shard_count(platform, max(1, len(sources)), len(points))
+    for platform, os_version, device in CONFIGURATIONS:
+        config = provisioning[(platform, os_version, device)]
+        count = shard_count(platform, max(1, len(sources)), len(points), config)
         size, extra = divmod(len(points), count)
         start = 0
         for index in range(count):
             end = start + size + (1 if index < extra else 0)
-            include.append({"platform": platform, "shard": f"{index + 1}-of-{count}",
-                            "points": " ".join(points[start:end])})
+            job = {"platform": platform, "os": os_version, "device": device,
+                   "shard": f"{index + 1}-of-{count}", "points": " ".join(points[start:end])}
+            pin = PINS[(platform, os_version, device)]
+            job.update({key: pin.get(key, "") for key in ("runner", "runtime_version", "runtime_build")})
+            job["runtime_id"] = ("com.apple.CoreSimulator.SimRuntime.iOS-" + pin["runtime_version"].replace(".", "-")) if platform == "iOS" else ""
+            job["available_gib"] = config["available_gib"]
+            cases = max(1, len(sources)) * (end - start)
+            job["planned_minutes"] = job_minutes(platform, max(1, len(sources)), end - start) + config["provision_minutes"]
+            job["planned_peak_gib"] = config["peak_gib"] + config["case_gib"] * cases
+            job["capacity_evidence"] = config["evidence"]
+            job["capacity_source"] = config["source"]
+            include.append(job)
             start = end
     if len(include) > MAX_MATRIX_JOBS:
         raise UpgradeError(f"The plan needs {len(include)} jobs, more than the {MAX_MATRIX_JOBS} that GitHub accepts")
@@ -165,20 +221,90 @@ def upgrade_matrix(sources, points):
 
 
 def unbudgeted_matrix(points):
-    """One job per platform with every point, for a deliberate override that no time budget can plan."""
-    return {"include": [{"platform": platform, "shard": "1-of-1", "points": " ".join(points)}
-                        for platform in PLATFORMS]}
+    """One job per configuration when a deliberate override cannot plan the journey."""
+    return {"include": [{"platform": platform, "os": os_version, "device": device, "runner": PINS[(platform, os_version, device)]["runner"],
+                         "shard": "1-of-1", "points": " ".join(points)}
+                        for platform, os_version, device in CONFIGURATIONS]}
 
 
-def plan_matrix(sources, points, overridden):
+def validate_configuration(item):
+    if not isinstance(item, dict):
+        raise UpgradeError("Invalid provisioning configuration")
+    if item.get("platform") not in ("iOS", "macOS"):
+        raise UpgradeError("The provisioning field platform must be \"iOS\" or \"macOS\"")
+    if not isinstance(item.get("os"), str):
+        raise UpgradeError("The provisioning field os must be a JSON string, for example \"26\"")
+    if (item["platform"] == "macOS") != (item.get("device") is None):
+        raise UpgradeError("The provisioning field device must be null for macOS and a device name for iOS")
+    key = (item["platform"], item["os"], item["device"])
+    if key not in CONFIGURATIONS:
+        raise UpgradeError("Unknown provisioning configuration")
+    for field in ("provision_minutes", "available_gib", "peak_gib", "case_gib"):
+        value = item.get(field)
+        try:
+            valid = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise UpgradeError(f"Invalid or unknown provisioning {field} for {key}")
+    if key[0:2] == ("iOS", "26") and (item["provision_minutes"] < IOS_26_PROVISION_MINUTES or
+                                       item["peak_gib"] < IOS_26_PROVISION_GIB):
+        raise UpgradeError(f"Provisioning capacity for {key} is below the measured iOS 26 sample")
+    permitted = {"platform", "os", "device", "provision_minutes", "available_gib", "peak_gib", "case_gib", "evidence",
+                 "source"}
+    if set(item) - permitted:
+        raise UpgradeError(f"Capacity inputs cannot override a checked-in pin for {key}")
+    if not isinstance(item.get("evidence"), str) or not item["evidence"].strip():
+        raise UpgradeError(f"Invalid or unknown provisioning evidence for {key}")
+    return key
+
+
+CAPACITY_FIELDS = ("provision_minutes", "available_gib", "peak_gib", "case_gib")
+# "measured": measured on this configuration. "measured on another runtime": measured on a runtime that the pin replaced.
+BASES = frozenset({"measured", "measured on another runtime", "estimated"})
+PINNED_SOURCE = "release_upgrade_config.json"
+OVERRIDE_SOURCE = "RELEASE_UPGRADE_PROVISIONING"
+
+
+def pinned_capacity(key):
+    """The checked-in capacity of one configuration, with the basis of each number (see BASES)."""
+    capacity = PINS[key].get("capacity")
+    if (not isinstance(capacity, dict) or not isinstance(capacity.get("basis"), dict) or
+            set(capacity["basis"]) != set(CAPACITY_FIELDS) or
+            not set(capacity["basis"].values()) <= BASES):
+        raise UpgradeError(f"Provisioning capacity is required for {key} in release_upgrade_config.json")
+    item = {"platform": key[0], "os": key[1], "device": key[2], "evidence": capacity.get("evidence")}
+    item.update({field: capacity.get(field) for field in CAPACITY_FIELDS})
+    validate_configuration(item)
+    item["source"] = PINNED_SOURCE + " (" + ", ".join(f"{field} {capacity['basis'][field]}" for field in CAPACITY_FIELDS) + ")"
+    return item
+
+
+def validate_provisioning(override=None):
+    """The capacity of every configuration: the checked-in values, replaced by the optional override objects."""
+    if override is not None and not isinstance(override, list):
+        raise UpgradeError("The provisioning override must be a JSON array")
+    supplied = {}
+    for item in override or []:
+        if isinstance(item, dict) and "source" in item:
+            raise UpgradeError("The provisioning override cannot set its own source")
+        key = validate_configuration(item)
+        if key in supplied:
+            raise UpgradeError("Duplicate provisioning configuration")
+        supplied[key] = dict(item, source=OVERRIDE_SOURCE + " (all numbers supplied)")
+    return {key: supplied.get(key) or pinned_capacity(key) for key in CONFIGURATIONS}
+
+
+def plan_matrix(sources, points, overridden, provisioning=None):
+    # `provisioning` is the optional RELEASE_UPGRADE_PROVISIONING override; None uses the checked-in capacity.
     """The matrix and a note. A deliberate override keeps its escape path: a plan that does not fit falls back."""
     try:
-        return upgrade_matrix(sources, points), None
+        return upgrade_matrix(sources, points, provisioning), None
     except UpgradeError as error:
         if not overridden:
             raise
         return unbudgeted_matrix(points), (
-            f"Override: {error}. The plan falls back to one job per platform with every point; the journey steps "
+            f"Override: {error}. The plan falls back to one job per configuration with every point; the journey steps "
             "are skipped by the override, so the jobs only acknowledge it.")
 
 
@@ -202,6 +328,18 @@ def report(message):
 
 
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--check-free-disk":
+        try:
+            minimum = float(sys.argv[3])
+        except ValueError as error:
+            raise UpgradeError("The free-disk minimum must be a positive number") from error
+        if not math.isfinite(minimum) or minimum <= 0:
+            raise UpgradeError("The free-disk minimum must be a positive number")
+        available = shutil.disk_usage(sys.argv[2]).free / (1024 ** 3)
+        if available < minimum:
+            raise UpgradeError(f"Insufficient free disk: {available:.1f} GiB available, {minimum:.1f} GiB required")
+        report(f"Free disk: {available:.1f} GiB; required minimum {minimum:.1f} GiB")
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release", type=Path, required=True)
     parser.add_argument("--history", type=Path, required=True)
@@ -226,7 +364,15 @@ def main():
         report(f"Override: {error}. The journey steps are skipped by the override, so the jobs only acknowledge it.")
         matrix, note = unbudgeted_matrix([]), None
     else:
-        matrix, note = plan_matrix(selection["sources"], points, overridden)
+        raw_provisioning = os.environ.get("UPGRADE_PROVISIONING")
+        try:
+            provisioning = json.loads(raw_provisioning) if raw_provisioning else None
+        except json.JSONDecodeError as error:
+            if not overridden:
+                raise UpgradeError(f"Invalid provisioning JSON: {error}") from error
+            report(f"Override: invalid provisioning JSON: {error}")
+            provisioning = None
+        matrix, note = plan_matrix(selection["sources"], points, overridden, provisioning)
     plan = {"target": target["tag_name"], **selection, "matrix": matrix,
             "overridden": overridden, "override_reason": args.override_reason}
     args.output.write_text(json.dumps(plan, indent=2) + "\n")
@@ -238,13 +384,21 @@ def main():
     report("Upgrade sources: " + ", ".join(selection["sources"]))
     if note:
         report(note)
-    report("Upgrade jobs: " + ", ".join(f"{job['platform']} {job['shard']} ({len(job['points'].split())} points)"
+    report("Upgrade jobs: " + ", ".join(f"{job['platform']} {job['os']} {job['device'] or 'host'} {job['shard']} ({len(job['points'].split())} points)"
                                          for job in matrix["include"]))
+    for job in matrix["include"]:
+        if "planned_minutes" in job:
+            report(f"Estimated {job['platform']} {job['os']} {job['device'] or 'host'} {job['shard']}: "
+                   f"{job['planned_minutes']:.1f} minutes, {job['planned_peak_gib']:.1f} GiB peak, "
+                   f"{job['available_gib']:.1f} GiB minimum free. Capacity source: {html.escape(job['capacity_source'])}. "
+                   f"Evidence: {html.escape(job['capacity_evidence'])}")
     for tag in selection["untested"]:
         report(f"nicht getestet: {tag} (kein Prüfeinstieg)")
     if overridden:
         report("**Upgrade check deliberately overridden for " + target["tag_name"] + ":** "
                + html.escape(args.override_reason))
+        report("**The upgrade gate is off for this release:** no installed-upgrade journey runs, and the upgrade jobs "
+               "only acknowledge the override.")
 
 
 if __name__ == "__main__":

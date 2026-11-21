@@ -143,6 +143,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OVERRIDE_TAG: ${{ inputs.upgrade_override_tag }}
           OVERRIDE_REASON: ${{ inputs.upgrade_override_reason }}
+          UPGRADE_PROVISIONING: ${{ vars.RELEASE_UPGRADE_PROVISIONING }}
         run: |
           set -euo pipefail
           gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/release-pages.json"
@@ -835,15 +836,16 @@ jobs:
         run: bash ./scripts/report-build-storage.sh
 
   upgrade:
-    name: Test installed upgrades on ${{ matrix.platform }} (${{ matrix.shard }})
+    name: Test installed upgrades on ${{ matrix.platform }} ${{ matrix.os }} ${{ matrix.device }} (${{ matrix.shard }})
     needs: [prepare, build]
-    runs-on: xcode-27
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
       # The prepare job builds the jobs from the one list of interruption points and the selected sources
-      # (.github/scripts/release_upgrade.py): each platform tests every source, together its jobs cover every
-      # point once, and each job fits its time budget. A new point or source needs no edit here.
+      # (.github/scripts/release_upgrade.py): each device and OS configuration tests every source, together its jobs
+      # cover every point once, and each job fits its time budget and its disk limit. A new point, source or
+      # configuration needs no edit here.
       matrix: ${{ fromJSON(needs.prepare.outputs.upgrade_matrix) }}
     env:
       # The lines that tell each case's result, timing and free disk. GitHub cuts a step log at about 10 MB, so the
@@ -898,10 +900,44 @@ jobs:
           echo "key=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)-$(uname -m)" >> "$GITHUB_OUTPUT"
 
       - name: Report runner disk
+        id: disk
         if: needs.prepare.outputs.upgrade_overridden != 'true'
+        env:
+          REQUIRED_FREE_GIB: ${{ matrix.available_gib }}
         run: |
           # An iOS shard ran out of disk (rehearsal 38181793360). The free space at the start bounds every case.
           { echo '### Runner disk at job start'; echo '```'; df -h "$HOME"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 .github/scripts/release_upgrade.py --check-free-disk "$HOME" "$REQUIRED_FREE_GIB"
+
+      - name: Provision the pinned iOS 26 runtime
+        id: ios26-runtime
+        if: needs.prepare.outputs.upgrade_overridden != 'true' && matrix.platform == 'iOS' && matrix.os == '26'
+        env:
+          UPGRADE_RUNTIME_ID: ${{ matrix.runtime_id }}
+          UPGRADE_RUNTIME_VERSION: ${{ matrix.runtime_version }}
+          UPGRADE_RUNTIME_BUILD: ${{ matrix.runtime_build }}
+        run: |
+          set -euo pipefail
+          runtime_dir="$(mktemp -d "$RUNNER_TEMP/upgrade-runtime.XXXXXX")"
+          xcodebuild -downloadPlatform iOS -exportPath "$runtime_dir" -buildVersion "$UPGRADE_RUNTIME_VERSION" -architectureVariant arm64
+          image="$(python3 - "$runtime_dir" <<'PYTHON'
+          import os, pathlib, plistlib, sys
+          root = pathlib.Path(sys.argv[1])
+          bundles = list(root.glob('*.exportedBundle'))
+          if len(bundles) != 1:
+              sys.exit('Expected exactly one exported Simulator runtime bundle')
+          with (bundles[0] / 'ExportedMetadata.plist').open('rb') as stream:
+              metadata = plistlib.load(stream)['MobileAssetProperties']
+          if metadata.get('SimulatorVersion') != os.environ['UPGRADE_RUNTIME_VERSION'] or metadata.get('Build') != os.environ['UPGRADE_RUNTIME_BUILD']:
+              sys.exit('Exported Simulator runtime differs from the selected pin')
+          images = list((bundles[0] / 'Restore').glob('*.dmg'))
+          if len(images) != 1:
+              sys.exit('Expected exactly one Simulator runtime image')
+          print(images[0])
+          PYTHON
+          )"
+          xcodebuild -importPlatform "$image"
+          python3 scripts/upgrade-test/run_journey.py --check-runtime
 
       - name: Restore completed predecessor builds
         id: cache
@@ -923,6 +959,11 @@ jobs:
           UPGRADE_SOURCES: ${{ needs.prepare.outputs.upgrade_sources }}
           UPGRADE_PLATFORM: ${{ matrix.platform }}
           UPGRADE_POINTS: ${{ matrix.points }}
+          UPGRADE_OS: ${{ matrix.os }}
+          UPGRADE_DEVICE: ${{ matrix.device }}
+          UPGRADE_RUNTIME_ID: ${{ matrix.runtime_id }}
+          UPGRADE_RUNTIME_VERSION: ${{ matrix.runtime_version }}
+          UPGRADE_RUNTIME_BUILD: ${{ matrix.runtime_build }}
         run: |
           set -euo pipefail
           mapfile_path="$RUNNER_TEMP/upgrade-sources.txt"
@@ -950,12 +991,14 @@ jobs:
           PYTHON_OUTCOME: ${{ steps.python.outcome }}
           XCODEGEN_OUTCOME: ${{ steps.xcodegen.outcome }}
           TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
+          DISK_OUTCOME: ${{ steps.disk.outcome }}
+          RUNTIME_OUTCOME: ${{ steps.ios26-runtime.outcome }}
           CACHE_OUTCOME: ${{ steps.cache.outcome }}
           JOURNEY_OUTCOME: ${{ steps.journey.outcome }}
         run: |
           {
             echo 'Both Apple uploads remain blocked. Correct the failed step and re-run, or use the explicit main-branch override.'
-            echo "Checkout: $CHECKOUT_OUTCOME; Python: $PYTHON_OUTCOME; XcodeGen: $XCODEGEN_OUTCOME; toolchain: $TOOLCHAIN_OUTCOME; cache: $CACHE_OUTCOME; journey: $JOURNEY_OUTCOME."
+            echo "Checkout: $CHECKOUT_OUTCOME; Python: $PYTHON_OUTCOME; XcodeGen: $XCODEGEN_OUTCOME; toolchain: $TOOLCHAIN_OUTCOME; free disk: $DISK_OUTCOME; iOS 26 runtime: $RUNTIME_OUTCOME; cache: $CACHE_OUTCOME; journey: $JOURNEY_OUTCOME."
             echo 'The journey log reports the failing source, task boundary, and cause. Retained evidence contains the UI logs and result bundles.'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -967,7 +1010,7 @@ jobs:
         if: always() && needs.prepare.outputs.upgrade_overridden != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-upgrade-${{ matrix.platform }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: release-upgrade-${{ matrix.platform }}-${{ matrix.os }}-${{ matrix.device }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ~/Developer/xcode/EncryptedMemories/UpgradeCheck/evidence
             ${{ runner.temp }}/release-upgrade.log
