@@ -2753,7 +2753,8 @@ public actor BackupSyncRunner {
             return .permission
         case UploadError.transport:
             return .network
-        case UploadError.retryableBackend, UploadError.backend, UploadError.serviceRejected, UploadError.albumStep:
+        case UploadError.retryableBackend, UploadError.backend, UploadError.internalFailure,
+            UploadError.serviceRejected, UploadError.albumStep:
             return .remoteService
         case UploadError.tagAdderUnavailable:
             return .localState

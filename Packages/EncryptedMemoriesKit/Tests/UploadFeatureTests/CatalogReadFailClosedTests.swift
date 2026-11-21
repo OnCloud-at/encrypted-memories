@@ -194,6 +194,93 @@ final class CatalogReadFailClosedTests: XCTestCase {
             scan: fullScan([photo("a")]))
     }
 
+    // MARK: - Typed failure of each catalog replay guard
+
+    /// Runs the replay with a fault installed by `install`. The fault must fire, and the replay must stop with the
+    /// internal local-state failure. `seed` prepares the catalog and the queue.
+    private func assertReplayStops(
+        seed: (PhotoLibraryCatalogManifestStore, UploadBackupSyncQueueManifestStore) -> Void,
+        install: (PhotoLibraryCatalogManifestStore, UploadBackupSyncQueueManifestStore) throws -> InstalledFault,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let store = try makeCatalog()
+        XCTAssertTrue(store.upsertBatch([entry(photo("a"))]), file: file, line: line)
+        let (queue, engine) = try await makeReplayQueue()
+        seed(store, queue)
+        let fault = try install(store, queue)
+        defer { fault.stop() }
+        do {
+            try await PhotoLibraryBackupController.replayCatalogIfQueueNeedsRecovery(
+                catalogStore: store, queueStore: queue, engine: engine, retryRows: PhotoLibraryCatalogRetryRows())
+            XCTFail("a failed read or write must stop the replay", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? UploadError, .internalFailure(.localStateUnavailable), file: file, line: line)
+        }
+        XCTAssertTrue(fault.fired(), file: file, line: line)
+    }
+
+    private func queuedRow() -> UploadBackupSyncQueueEntry {
+        UploadBackupSyncQueueEntry(
+            source: .init(kind: .photoLibraryAsset, identifier: "queued"), revision: .init(rawValue: 1),
+            originalFilename: "queued.heic", state: .discovered, updatedAt: Date(timeIntervalSince1970: 100))
+    }
+
+    private func readFault(_ store: Any, _ sql: String) throws -> InstalledFault {
+        let fault = try SQLiteReadInterrupt(in: store, matching: sql)
+        return ({ fault.stop() }, { fault.fired })
+    }
+
+    private typealias InstalledFault = (stop: () -> Void, fired: () -> Bool)
+
+    private func writeFault(_ store: Any, _ matches: @escaping (String) -> Bool) throws -> InstalledFault {
+        let fault = try SQLiteStatementFaults(in: store, failures: 1, matches: matches)
+        return ({ fault.stop() }, { fault.firedCount > 0 })
+    }
+
+    private func replayStateWrite(_ sql: String) -> Bool {
+        sql.contains("INSERT INTO backup_sync_queue_info") && sql.contains("catalog_replay_state")
+    }
+
+    func testAnUnreadQueueCountStopsTheReplay() async throws {
+        try await assertReplayStops(
+            seed: { _, _ in },
+            install: { _, queue in try self.readFault(queue, "SELECT COUNT(*) FROM backup_sync_queue") })
+    }
+
+    func testAnUnreadCatalogSnapshotStopsTheReplay() async throws {
+        try await assertReplayStops(
+            seed: { _, _ in }, install: { store, _ in try self.readFault(store, "FROM photo_catalog") })
+    }
+
+    func testAnUnreadReplayStateStopsTheReplay() async throws {
+        try await assertReplayStops(
+            seed: { _, _ in },
+            install: { _, queue in try self.readFault(queue, "SELECT value FROM backup_sync_queue_info WHERE key=") })
+    }
+
+    func testAFailedCompletionMarkOfAnEmptyCatalogStopsTheReplay() async throws {
+        try await assertReplayStops(
+            seed: { _, queue in XCTAssertTrue(queue.upsert(self.queuedRow())) },
+            install: { _, queue in try self.writeFault(queue, self.replayStateWrite) })
+    }
+
+    func testAFailedStartMarkStopsTheReplay() async throws {
+        try await assertReplayStops(
+            seed: { _, _ in }, install: { _, queue in try self.writeFault(queue, self.replayStateWrite) })
+    }
+
+    func testAnUnreadCatalogPageStopsTheReplay() async throws {
+        try await assertReplayStops(
+            seed: { _, queue in XCTAssertTrue(queue.setCatalogReplayState(.inProgress)) },
+            install: { store, _ in try self.readFault(store, "SELECT local_id, cloud_id") })
+    }
+
+    func testAFailedFinishMarkStopsTheReplay() async throws {
+        try await assertReplayStops(
+            seed: { _, queue in XCTAssertTrue(queue.setCatalogReplayState(.inProgress)) },
+            install: { _, queue in try self.writeFault(queue, self.replayStateWrite) })
+    }
+
     // MARK: - Typed failure of each remaining site
 
     /// Matches the write of one info value, not the read of the same key.

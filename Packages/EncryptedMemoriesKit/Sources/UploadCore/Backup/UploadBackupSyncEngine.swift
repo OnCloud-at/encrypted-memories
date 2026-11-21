@@ -533,7 +533,7 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
     private static func localStateError(_ diagnostic: StaticString) -> UploadError {
         PhotoDiagnostics.shared.increment("backup.queue.localStateUnavailable")
         PhotoDiagnostics.shared.emitDebug("BackupSync", ["error": String(describing: diagnostic)])
-        return .backend(L10n.string("backup.error_local_state_unavailable"))
+        return .internalFailure(.localStateUnavailable)
     }
 
     public func summary() -> UploadBackupSyncQueueSummary {

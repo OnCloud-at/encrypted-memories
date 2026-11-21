@@ -600,6 +600,9 @@ public enum UploadError: LocalizedError, Equatable {
     /// rejection, this must not consume an item's finite retry budget and strand valid media.
     case retryableBackend(code: Int?, message: String)
     case backend(String)
+    /// A failure of the app's own state, with a fixed text and a cause (#1159). It stores as the same issue kind as
+    /// `backend` and shows the same text, so a stored row does not change.
+    case internalFailure(InternalFailure)
     /// Proton refused the request itself (an API answer with a 4xx status that a repeat cannot change). It carries
     /// only the status: the server's own text is logged where the failure happens and never reaches a person.
     case serviceRejected(code: Int)
@@ -650,6 +653,28 @@ public enum UploadError: LocalizedError, Equatable {
         try Task.checkCancellation()
     }
 
+    /// The internal failures that carry a fixed text instead of a free string.
+    public enum InternalFailure: Equatable, Sendable, CaseIterable {
+        /// A store of the app cannot answer. The person sees the localized local-state message.
+        case localStateUnavailable
+
+        /// The localized local-state message of the app. The one place that names its key.
+        public static var localStateMessage: String { L10n.string("backup.error_local_state_unavailable") }
+
+        /// The text that the failure shows and that the diagnostics keep.
+        public var message: String {
+            switch self {
+            case .localStateUnavailable: Self.localStateMessage
+            }
+        }
+
+        public var failureCause: FailureCause {
+            switch self {
+            case .localStateUnavailable: .localState
+            }
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .unsupportedFile(let name): L10n.string("error.upload_unsupported_file \(name)")
@@ -658,12 +683,13 @@ public enum UploadError: LocalizedError, Equatable {
         case .transport(_, let message): message
         case .retryableBackend(_, let message): message
         case .backend(let message): message
+        case .internalFailure(let failure): failure.message
         case .serviceRejected: L10n.string("backup.fail_reason_generic")
         case .albumStep(let message): L10n.string("error.upload_album_step \(message)")
         case .cancelled: L10n.string("error.upload_cancelled")
         case .sourceNotReady(let name, _): L10n.string("error.upload_source_not_ready \(name)")
         case .sourceUnavailable, .sourceReportedMissing: L10n.string("backup.issue_source_unavailable")
-        case .tagAdderUnavailable: L10n.string("backup.error_local_state_unavailable")
+        case .tagAdderUnavailable: InternalFailure.localStateMessage
         case .accountStorageFull(let name, let required, let available):
             L10n.string(
                 "error.upload_account_storage_full \(name) \(L10n.fileSize(required)) \(L10n.fileSize(available))")

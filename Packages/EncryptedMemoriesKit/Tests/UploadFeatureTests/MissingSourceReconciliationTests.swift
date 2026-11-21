@@ -658,7 +658,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
             try await engine().enqueueChangedMissingSources([offered])
             XCTFail("A failed recovered-source write must keep the change retryable")
         } catch {
-            guard case UploadError.backend = error else { return XCTFail("Unexpected write error: \(error)") }
+            guard case UploadError.internalFailure = error else { return XCTFail("Unexpected write error: \(error)") }
         }
         XCTAssertEqual(availability.calls, 0)
         XCTAssertEqual(availability.cleanups, 0)

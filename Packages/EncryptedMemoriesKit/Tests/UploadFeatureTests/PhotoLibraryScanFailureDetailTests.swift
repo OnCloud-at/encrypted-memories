@@ -24,6 +24,14 @@ final class PhotoLibraryScanFailureDetailTests: XCTestCase {
         XCTAssertFalse(detail.contains("private-name"), detail)
     }
 
+    func testAnInternalFailureKeepsItsFixedText() {
+        for failure in UploadError.InternalFailure.allCases {
+            XCTAssertEqual(
+                PhotoLibraryBackupController.scanFailureDetail(UploadError.internalFailure(failure)), failure.message,
+                "\(failure)")
+        }
+    }
+
     func testEveryCatalogSyncFailureKeepsItsTechnicalWording() {
         for error in PhotoLibraryCatalogSyncError.allCases {
             XCTAssertEqual(PhotoLibraryBackupController.scanFailureDetail(error), error.diagnosticText, "\(error)")

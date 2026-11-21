@@ -47,6 +47,14 @@ private struct EarlierBuildLine: Codable {
 }
 
 final class DeletionDecisionReplayTests: XCTestCase {
+    /// The replay reports a local state that it cannot read or write as the internal failure (#1159).
+    private func assertLocalStateFailure(
+        _ error: any Error, _ message: String = "", file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(
+            error as? UploadError, .internalFailure(.localStateUnavailable), message, file: file, line: line)
+    }
+
     @MainActor
     private func withWorld(_ body: (DeletionReplayWorld) async throws -> Void) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -187,6 +195,11 @@ final class DeletionDecisionReplayTests: XCTestCase {
             try world.journal.recordDeletionDecision(.keptDeleted, revisions: world.revisions, for: world.source)
             let rows = try world.rows()
             let lines = RecordedLogLines()
+            XCTAssertThrowsError(
+                try DeletionDecisionReplay.apply(
+                    world.journal.pendingDeletionDecision(for: world.source), queue: world.queue,
+                    journal: world.journal, at: world.date)
+            ) { assertLocalStateFailure($0, "a store with a recorded failure refuses the apply") }
 
             let done = await DeletionDecisionReplay.run(
                 queue: world.queue, journal: world.journal, at: world.date, log: BackgroundWorkLog { lines.append($1) })
@@ -282,7 +295,8 @@ final class DeletionDecisionReplayTests: XCTestCase {
             XCTAssertThrowsError(
                 try DeletionDecisionReplay.apply(
                     world.journal.pendingDeletionDecision(for: world.source), queue: world.queue,
-                    journal: world.journal, at: world.date))
+                    journal: world.journal, at: world.date)
+            ) { assertLocalStateFailure($0, "a failed transaction") }
             XCTAssertTrue(fault.fired)
             fault.stop()
             XCTAssertEqual(try world.rows(), before)
@@ -687,7 +701,8 @@ final class DeletionDecisionReplayTests: XCTestCase {
                     // settles nothing; its reads would still find the parked rows here and call the choice unapplied.
                     XCTAssertThrowsError(
                         try DeletionDecisionReplay.prepareLatestChoice(
-                            for: world.source, queue: store, journal: world.journal))
+                            for: world.source, queue: store, journal: world.journal)
+                    ) { assertLocalStateFailure($0, "a store with a recorded failure refuses the preparation") }
                     XCTAssertEqual(world.journal.entry(for: world.source).deletionDecision, stuck)
 
                     XCTAssertFalse(controller.keepDeleted(BackupFailedItem(entry: world.entry(world.revisions[1]))))
@@ -757,11 +772,14 @@ final class DeletionDecisionReplayTests: XCTestCase {
             .init(keptDeleted: true, backUpAgainRevision: .init(rawValue: 1), deletionDecision: intent),
             .init(backUpAgainRevision: .init(rawValue: 2), deletionDecision: intent),
         ] {
-            XCTAssertThrowsError(try DeletionDecisionRow.rows(key: "photoLibraryAsset|photo|primary", entry: entry))
+            XCTAssertThrowsError(try DeletionDecisionRow.rows(key: "photoLibraryAsset|photo|primary", entry: entry)) {
+                assertLocalStateFailure($0, "\(entry)")
+            }
         }
         for key in ["photoLibraryAsset|primary", "futureKind|photo|primary", "photoLibraryAsset|photo|"] {
             XCTAssertThrowsError(
-                try DeletionDecisionRow.rows(key: key, entry: .init(keptDeleted: true, deletionDecision: intent)))
+                try DeletionDecisionRow.rows(key: key, entry: .init(keptDeleted: true, deletionDecision: intent))
+            ) { assertLocalStateFailure($0, key) }
         }
     }
 
@@ -878,9 +896,8 @@ final class DeletionDecisionReplayTests: XCTestCase {
                     .keptDeleted, revisions: world.revisions, for: world.source,
                     queue: world.queue, journal: journal, at: world.date)
             ) { error in
-                XCTAssertEqual(
-                    error as? UploadError, .backend(L10n.string("backup.error_local_state_unavailable")),
-                    "the caller gets the local-state error, not the error of the failed read")
+                assertLocalStateFailure(
+                    error, "the caller gets the local-state error, not the error of the failed read")
             }
             XCTAssertEqual(try world.rows(), rows)
             XCTAssertEqual(world.journal.entry(for: world.source), previous)
