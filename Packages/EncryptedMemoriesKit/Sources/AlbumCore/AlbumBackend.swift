@@ -3,7 +3,7 @@ import PhotosCore
 
 /// App-facing album operations. Reads and writes are deliberately split below at the transport
 /// boundary: the SDK owns catalog/sharing/membership reads, while direct Photos HTTP remains only
-/// for the write contracts the SDK does not expose.
+/// for the write contracts the app does not yet send through the SDK.
 public protocol PhotoAlbumMembershipProviding: Sendable {
     func albumMembershipTitles(for photoUID: PhotoUID) async throws -> [String]
 }

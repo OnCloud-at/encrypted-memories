@@ -8,28 +8,28 @@ index b8d0022..2754016 100644
 @@ -29,0 +30 @@ final class EventEnumerationCancellationState: @unchecked Sendable {
 +        await requestCancellation.waitForDispatch()
 diff --git a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-index d460df7..268f943 100644
+index 9cc8032..9f5ea6d 100644
 --- a/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
 +++ b/Sources/Client/ProtonDriveClient/ProtonDriveClient.swift
-@@ -81 +81 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+@@ -83 +83 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
 -    private var activeEventEnumerations: [OperationIdentifier: EventEnumerationCancellationState] = [:]
 +    private var activeEnumerations: [OperationIdentifier: EventEnumerationCancellationState] = [:]
-@@ -189 +189 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+@@ -191 +191 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
 -        let eventEnumerations = Array(activeEventEnumerations.values)
 +        let enumerations = Array(activeEnumerations.values)
-@@ -191 +191 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+@@ -193 +193 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
 -            for enumeration in eventEnumerations {
 +            for enumeration in enumerations {
-@@ -221 +221 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+@@ -223 +223 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
 -    private func releaseEventEnumeration(
 +    private func releaseEnumeration(
-@@ -226 +226 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+@@ -228 +228 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
 -        let ownsRegistration = activeEventEnumerations[identifier] === state
 +        let ownsRegistration = activeEnumerations[identifier] === state
-@@ -228 +228 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+@@ -230 +230 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
 -            activeEventEnumerations[identifier] = nil
 +            activeEnumerations[identifier] = nil
-@@ -236,0 +237,39 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
+@@ -238,0 +239,39 @@ public actor ProtonDriveClient: Sendable, ProtonSDKClient {
 +    private func runCancellableRequest<Request: Message, Response: Sendable, State: Sendable>(
 +        identifier: OperationIdentifier,
 +        makeRequest: (ObjectHandle) -> Request,
@@ -69,7 +69,7 @@ index d460df7..268f943 100644
 +        await state.cancelAndRelease()
 +    }
 +
-@@ -474,16 +513,11 @@ extension ProtonDriveClient {
+@@ -476,16 +515,11 @@ extension ProtonDriveClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.createFolder(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .createFolder(cancellationToken))
@@ -97,10 +97,10 @@ index d460df7..268f943 100644
 +                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
 +                }
 +            }, state: ())
-@@ -497 +531 @@ extension ProtonDriveClient {
+@@ -499 +533 @@ extension ProtonDriveClient {
 -        try await cancelOperation(identifier: .createFolder(cancellationToken))
 +        try await cancelCancellableRequest(identifier: .createFolder(cancellationToken))
-@@ -531,11 +565,8 @@ extension ProtonDriveClient {
+@@ -533,11 +567,8 @@ extension ProtonDriveClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.getMyFilesRootFolder(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .getMyFilesRootFolder(cancellationToken))
@@ -120,10 +120,10 @@ index d460df7..268f943 100644
 +                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
 +                }
 +            }, state: ())
-@@ -549 +580 @@ extension ProtonDriveClient {
+@@ -551 +582 @@ extension ProtonDriveClient {
 -        try await cancelOperation(identifier: .getMyFilesRootFolder(cancellationToken))
 +        try await cancelCancellableRequest(identifier: .getMyFilesRootFolder(cancellationToken))
-@@ -553,12 +584,9 @@ extension ProtonDriveClient {
+@@ -555,12 +586,9 @@ extension ProtonDriveClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.getNode(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .getNode(cancellationToken))
@@ -145,16 +145,16 @@ index d460df7..268f943 100644
 +                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
 +                }
 +            }, state: ())
-@@ -570 +598 @@ extension ProtonDriveClient {
+@@ -572 +600 @@ extension ProtonDriveClient {
 -        try await cancelOperation(identifier: .getNode(cancellationToken))
 +        try await cancelCancellableRequest(identifier: .getNode(cancellationToken))
-@@ -578,5 +605,0 @@ extension ProtonDriveClient {
+@@ -613,5 +640,0 @@ extension ProtonDriveClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateFolderChildren(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .enumerateFolderChildren(cancellationToken))
 -        }
 -
-@@ -584,14 +607,10 @@ extension ProtonDriveClient {
+@@ -619,14 +642,10 @@ extension ProtonDriveClient {
 -        let request = Proton_Drive_Sdk_DriveClientEnumerateFolderChildrenRequest.with {
 -            $0.clientHandle = Int64(clientHandle)
 -            $0.folderUid = folderUid.sdkCompatibleIdentifier
@@ -179,31 +179,31 @@ index d460df7..268f943 100644
 +                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
 +                }
 +            }, state: WeakReference(value: callbackState), scope: .ownerManaged, owner: callbackState)
-@@ -601 +620 @@ extension ProtonDriveClient {
+@@ -636 +655 @@ extension ProtonDriveClient {
 -        try await cancelOperation(identifier: .enumerateFolderChildren(cancellationToken))
 +        try await cancelCancellableRequest(identifier: .enumerateFolderChildren(cancellationToken))
-@@ -621 +640 @@ extension ProtonDriveClient {
+@@ -656 +675 @@ extension ProtonDriveClient {
 -        activeEventEnumerations[identifier] = cancellationState
 +        activeEnumerations[identifier] = cancellationState
-@@ -643 +662 @@ extension ProtonDriveClient {
+@@ -678 +697 @@ extension ProtonDriveClient {
 -            await releaseEventEnumeration(
 +            await releaseEnumeration(
-@@ -649 +668 @@ extension ProtonDriveClient {
+@@ -684 +703 @@ extension ProtonDriveClient {
 -            await releaseEventEnumeration(
 +            await releaseEnumeration(
-@@ -656 +675 @@ extension ProtonDriveClient {
+@@ -691 +710 @@ extension ProtonDriveClient {
 -            await releaseEventEnumeration(
 +            await releaseEnumeration(
-@@ -667 +686 @@ extension ProtonDriveClient {
+@@ -702 +721 @@ extension ProtonDriveClient {
 -        guard let state = activeEventEnumerations.removeValue(forKey: identifier) else {
 +        guard let state = activeEnumerations.removeValue(forKey: identifier) else {
-@@ -973,5 +991,0 @@ extension ProtonDriveClient {
+@@ -1008,5 +1026,0 @@ extension ProtonDriveClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateDevices(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .enumerateDevices(cancellationToken))
 -        }
 -
-@@ -979,13 +993,9 @@ extension ProtonDriveClient {
+@@ -1014,13 +1028,9 @@ extension ProtonDriveClient {
 -        let request = Proton_Drive_Sdk_DriveClientEnumerateDevicesRequest.with {
 -            $0.clientHandle = Int64(clientHandle)
 -            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
@@ -226,10 +226,10 @@ index d460df7..268f943 100644
 +                    $0.yieldAction = Int64(ObjectHandle(callback: cDeviceEnumerationCallback))
 +                }
 +            }, state: WeakReference(value: callbackState), scope: .ownerManaged, owner: callbackState)
-@@ -995 +1005 @@ extension ProtonDriveClient {
+@@ -1030 +1040 @@ extension ProtonDriveClient {
 -        try await cancelOperation(identifier: .enumerateDevices(cancellationToken))
 +        try await cancelCancellableRequest(identifier: .enumerateDevices(cancellationToken))
-@@ -999,14 +1009,10 @@ extension ProtonDriveClient {
+@@ -1034,14 +1044,10 @@ extension ProtonDriveClient {
 -        let cancellationTokenSource = try await createCancellationTokenSource(.createDevice(cancellationToken), logger)
 -        defer {
 -            freeCancellationTokenSourceIfNeeded(identifier: .createDevice(cancellationToken))
@@ -254,7 +254,7 @@ index d460df7..268f943 100644
 +                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
 +                }
 +            }, state: ())
-@@ -1017 +1023 @@ extension ProtonDriveClient {
+@@ -1052 +1058 @@ extension ProtonDriveClient {
 -        try await cancelOperation(identifier: .createDevice(cancellationToken))
 +        try await cancelCancellableRequest(identifier: .createDevice(cancellationToken))
 diff --git a/Sources/Plumbing/InternalTypes.swift b/Sources/Plumbing/InternalTypes.swift
