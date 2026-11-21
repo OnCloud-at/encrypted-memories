@@ -1,5 +1,5 @@
 diff --git a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
-index e22b354..028975b 100644
+index e22b354..bca89d8 100644
 --- a/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 +++ b/Sources/Client/EncryptedMemoriesClient/EncryptedMemoriesClient.swift
 @@ -242,0 +243,39 @@ public actor EncryptedMemoriesClient: Sendable, ProtonSDKClient {
@@ -203,6 +203,40 @@ index e22b354..028975b 100644
 @@ -559 +573 @@ extension EncryptedMemoriesClient {
 -        try await cancelOperation(identifier: .removePhotosFromAlbum(cancellationToken))
 +        try await cancelCancellableRequest(identifier: .removePhotosFromAlbum(cancellationToken))
+@@ -596,5 +609,0 @@ extension EncryptedMemoriesClient {
+-        let cancellationTokenSource = try await createCancellationTokenSource(.enumerateNodes(cancellationToken), logger)
+-        defer {
+-            freeCancellationTokenSourceIfNeeded(identifier: .enumerateNodes(cancellationToken))
+-        }
+-
+@@ -602,14 +611,10 @@ extension EncryptedMemoriesClient {
+-        let request = Proton_Drive_Sdk_DrivePhotosClientEnumerateNodesRequest.with {
+-            $0.clientHandle = Int64(clientHandle)
+-            $0.nodeUids = nodeUids.map(\.sdkCompatibleIdentifier)
+-            $0.yieldAction = Int64(ObjectHandle(callback: cNodeEnumerationCallback))
+-            $0.cancellationTokenSourceHandle = Int64(cancellationTokenSource.handle)
+-        }
+-
+-        let _: Void = try await SDKRequestHandler.send(
+-            request,
+-            state: WeakReference(value: callbackState),
+-            scope: .ownerManaged,
+-            owner: callbackState,
+-            logger: logger
+-        )
++        let _: Void = try await runCancellableRequest(
++            identifier: .enumerateNodes(cancellationToken),
++            makeRequest: { tokenHandle in
++                Proton_Drive_Sdk_DrivePhotosClientEnumerateNodesRequest.with {
++                    $0.clientHandle = Int64(clientHandle)
++                    $0.nodeUids = nodeUids.map(\.sdkCompatibleIdentifier)
++                    $0.yieldAction = Int64(ObjectHandle(callback: cNodeEnumerationCallback))
++                    $0.cancellationTokenSourceHandle = Int64(tokenHandle)
++                }
++            }, state: WeakReference(value: callbackState), scope: .ownerManaged, owner: callbackState)
+@@ -619 +624 @@ extension EncryptedMemoriesClient {
+-        try await cancelOperation(identifier: .enumerateNodes(cancellationToken))
++        try await cancelCancellableRequest(identifier: .enumerateNodes(cancellationToken))
 diff --git a/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift b/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift
 index b8d0022..2754016 100644
 --- a/Sources/Client/ProtonDriveClient/EventEnumerationCancellationState.swift
