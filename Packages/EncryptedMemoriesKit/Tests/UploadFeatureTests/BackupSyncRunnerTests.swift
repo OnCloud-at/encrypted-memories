@@ -541,6 +541,9 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private var readFailed = false
     private var unknownEntryReads: Int
     var refusesMissingRemoval = false
+    /// When set, the first keyed read after a refused receipt write answers unknown: the read that tells a removed row
+    /// from a failed write.
+    var unknownReadAfterRefusedMark = false
     private var unknownEntryReadCount = 0
     /// An error other than a failed read, which the keyed read throws once it is set.
     var entryReadFailure: (any Error)? {
@@ -670,7 +673,10 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         lastError: String?,
         updatedAt: Date
     ) -> Bool {
-        guard beforeReconciliationMark?(reconciliation) ?? true else { return false }
+        guard beforeReconciliationMark?(reconciliation) ?? true else {
+            if unknownReadAfterRefusedMark { lock.withLock { unknownEntryReads += 1 } }
+            return false
+        }
         return inner.markNeedsRemoteReconciliation(
             source: source, revision: revision, reconciliation: reconciliation,
             lastError: lastError, updatedAt: updatedAt)
@@ -2336,6 +2342,25 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(kept.state, .uploading, "Unknown presence is not proof that the row was removed")
         XCTAssertEqual(kept.attempts, row.attempts)
         XCTAssertEqual(kept.lastError, row.lastError)
+    }
+
+    /// The receipt write was refused and the row cannot be read to tell a removed row from a failed write: the pass
+    /// stops as a store failure. The photo is not cancelled as if it were removed (#1153).
+    func testAnUnreadableRowAfterARefusedReceiptWriteIsAStoreFailureNotARemoval() async throws {
+        let row = seedEntry("unknown-after-refused.jpg")
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog())
+        queue.beforeReconciliationMark = { _ in false }
+        queue.unknownReadAfterRefusedMark = true
+        let runner = makeRunner(queue: queue)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        do { try await runner.checkCancellation() } catch {
+            XCTFail("An unreadable row must not become a removal cancellation: \(error)")
+        }
+        XCTAssertEqual(queue.failedEntryReads, 1)
+        let kept = try XCTUnwrap(inner.entry(for: row.source, revision: row.revision))
+        XCTAssertEqual(kept.state, .uploading, "an unreadable row is no proof of a removal")
+        XCTAssertEqual(kept.attempts, row.attempts)
     }
 
     func testB1UnknownDeferredStateDoesNotRevertTheRow() async throws {
