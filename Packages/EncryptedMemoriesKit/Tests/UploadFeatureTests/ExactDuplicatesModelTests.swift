@@ -3955,6 +3955,52 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertTrue(model.possibleCheckFailed)
     }
 
+    func testAnOpenScreenChecksThePossibleDuplicatesAfterTheIdenticalCopies() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.possible = threeFiles
+        let model = ExactDuplicatesModel(finder: finder, possibleDuplicatePolicy: shape)
+
+        await model.load()
+
+        XCTAssertEqual(finder.possibleRequests, [], "a load without the screen checks nothing")
+
+        await model.load(checkAllGroups: true)
+
+        XCTAssertEqual(finder.possibleRequests, [.init(sameBytes: ["A"], policy: shape)])
+        XCTAssertEqual(finder.rankCallsBeforePossibleChecks, [finder.rankCalls], "the identical copies come first")
+        XCTAssertEqual(model.possibleGroups, threeFiles.groups)
+    }
+
+    func testWithoutAPolicyTheScreenChecksNoPossibleDuplicates() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+
+        await model.load(checkAllGroups: true)
+
+        XCTAssertEqual(finder.possibleRequests, [])
+        XCTAssertEqual(model.possibleGroups, [])
+    }
+
+    func testACancelledCheckKeepsTheLastPossibleGroups() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+        finder.possible = PossibleDuplicateScan()
+        finder.possibleGate.close()
+        let check = Task { await model.checkPossibleDuplicates(policy: shape) }
+        await assertEventually({ finder.possibleGate.hasWaiters }, "the second check reads")
+
+        check.cancel()
+        finder.possibleGate.open()
+        await check.value
+
+        XCTAssertEqual(model.possibleGroups, threeFiles.groups, "a cancelled check may have read only a part")
+        XCTAssertFalse(model.possibleCheckFailed)
+        XCTAssertFalse(model.isCheckingPossibleDuplicates)
+    }
+
     func testACopyThatAMergeMovedToRecentlyDeletedLeavesThePossibleGroups() async {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         let scanned = PossibleDuplicateScan(
@@ -4041,13 +4087,19 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var possible: PossibleDuplicateScan?
     private var _possibleRequests: [PossibleRequest] = []
     var possibleRequests: [PossibleRequest] { lock.withLock { _possibleRequests } }
+    private var _rankCallsBeforePossibleChecks: [Int] = []
+    /// The rankings that ran before each check of possibly identical photos.
+    var rankCallsBeforePossibleChecks: [Int] { lock.withLock { _rankCallsBeforePossibleChecks } }
     /// Holds the check of possibly identical photos while it is closed.
     let possibleGate = BuildGate()
 
     func possibleDuplicates(
         excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
     ) async -> PossibleDuplicateScan? {
-        lock.withLock { _possibleRequests.append(PossibleRequest(sameBytes: sameBytes.map(\.id), policy: policy)) }
+        lock.withLock {
+            _possibleRequests.append(PossibleRequest(sameBytes: sameBytes.map(\.id), policy: policy))
+            _rankCallsBeforePossibleChecks.append(_rankCalls)
+        }
         await possibleGate.pass()
         return lock.withLock { possible }
     }

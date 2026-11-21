@@ -591,10 +591,15 @@ public final class ExactDuplicatesModel {
     /// Called with the photos that a merge moved to Recently Deleted, so the library stops showing them.
     @ObservationIgnored private let didTrash: @MainActor ([PhotoUID]) async -> Void
 
+    /// The rule of the check of possibly identical photos that an open screen runs. Nil: no such check runs.
+    @ObservationIgnored private let possibleDuplicatePolicy: PossibleDuplicatePolicy?
+
     public init(
-        finder: any ExactDuplicateMerging, didTrash: @escaping @MainActor ([PhotoUID]) async -> Void = { _ in }
+        finder: any ExactDuplicateMerging, possibleDuplicatePolicy: PossibleDuplicatePolicy? = nil,
+        didTrash: @escaping @MainActor ([PhotoUID]) async -> Void = { _ in }
     ) {
         self.finder = finder
+        self.possibleDuplicatePolicy = possibleDuplicatePolicy
         self.didTrash = didTrash
     }
 
@@ -939,7 +944,8 @@ public final class ExactDuplicatesModel {
 
     /// Checks the library for different files that are possibly the same photo, by `policy`. The copies of the
     /// groups of the last scan after their first copy count as one file. A check that cannot read the library keeps
-    /// the last groups and sets `possibleCheckFailed`. A copy that leaves the library during the check is not listed.
+    /// the last groups and sets `possibleCheckFailed`; a cancelled check keeps them, too. A copy that leaves the library
+    /// during the check is not listed.
     public func checkPossibleDuplicates(policy: PossibleDuplicatePolicy) async {
         guard !isRetired, !isCheckingPossibleDuplicates else { return }
         isCheckingPossibleDuplicates = true
@@ -948,7 +954,10 @@ public final class ExactDuplicatesModel {
             isCheckingPossibleDuplicates = false
             trashedDuringPossibleCheck = []
         }
-        guard let scan = await finder.possibleDuplicates(excluding: scannedGroups, policy: policy) else {
+        let scan = await finder.possibleDuplicates(excluding: scannedGroups, policy: policy)
+        // A cancelled check may have read only a part of the candidates.
+        guard !Task.isCancelled else { return }
+        guard let scan else {
             possibleCheckFailed = true
             return
         }
@@ -984,6 +993,10 @@ public final class ExactDuplicatesModel {
         async let ranked: Void = rank(around: 0)
         async let built: Void = buildAndRescan(generation: generation)
         _ = await (ranked, built)
+        // An open screen checks for possibly identical photos once the identical copies are known.
+        if checksAllGroups, let possibleDuplicatePolicy, generation == loadGeneration, !Task.isCancelled {
+            await checkPossibleDuplicates(policy: possibleDuplicatePolicy)
+        }
     }
 
     /// The screen shows the group. After a short pause without another group shown, ranks the pages of the first and
