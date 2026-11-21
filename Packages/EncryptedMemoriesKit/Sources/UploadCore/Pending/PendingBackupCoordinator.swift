@@ -847,7 +847,11 @@ public actor PendingBackupCoordinator {
     private func certifiedInventory(
         of kind: UploadSourceIdentity.Kind, from queue: any UploadBackupSyncQueueObserving
     ) -> [UploadBackupQueueRowState]? {
-        guard let inventory = try? queue.decisionUnsettledRows() else {
+        let inventory: [UploadBackupQueueRowState]
+        switch queue.decisionUnsettledRowSet() {
+        case .found(let rows): inventory = rows
+        case .absent: inventory = []
+        case .unknown:
             inventoryOwed.insert(kind)
             return nil
         }
@@ -1025,7 +1029,11 @@ public actor PendingBackupCoordinator {
         for (kind, kindKeys) in grouped {
             guard let queue = queues[kind] else { continue }
             // An unknown answer is not an absent row: the cached row and its state stay until a later read answers.
-            guard let fetched = try? queue.decisionRows(kind: kind, identifiers: Set(kindKeys.map(\.identifier))) else {
+            let fetched: [UploadBackupQueueRowState]
+            switch queue.decisionRowSet(kind: kind, identifiers: Set(kindKeys.map(\.identifier))) {
+            case .found(let rows): fetched = rows
+            case .absent: fetched = []
+            case .unknown:
                 reloadOwed.formUnion(kindKeys)
                 continue
             }
@@ -1082,7 +1090,11 @@ public actor PendingBackupCoordinator {
         guard !unchecked.isEmpty, unchecked.count <= configuration.uncheckedAdmissionLimit else { return }
         for (kind, keys) in Dictionary(grouping: unchecked, by: \.kind) {
             guard let queue = queues[kind] else { continue }
-            guard let fetched = try? queue.decisionRows(kind: kind, identifiers: Set(keys.map(\.identifier))) else {
+            let fetched: [UploadBackupQueueRowState]
+            switch queue.decisionRowSet(kind: kind, identifiers: Set(keys.map(\.identifier))) {
+            case .found(let rows): fetched = rows
+            case .absent: fetched = []
+            case .unknown:
                 earlierRevisionsUnknown.formUnion(keys)
                 continue
             }

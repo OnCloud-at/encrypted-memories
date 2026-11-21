@@ -453,8 +453,8 @@ private struct SessionEffects: PendingBackupEffects {
                 await files.returnToBackup([state.key.identifier]).contains(state.key.identifier),
                 queue.isOperational()
             else { continue }
-            guard let rows = try? queue.decisionRows(kind: .fileURL, identifiers: [state.key.identifier]),
-                queue.isOperational(), !rows.isEmpty
+            guard case .found(let rows) = queue.decisionRowSet(kind: .fileURL, identifiers: [state.key.identifier]),
+                queue.isOperational()
             else { continue }
             outcomes[state.key] =
                 rows.allSatisfy { $0.state.isTerminalSuccess }
