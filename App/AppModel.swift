@@ -284,8 +284,8 @@ final class AppModel {
             url: url,
             presentationContextProvider: webAuthenticationPresentationContext
         ) { [weak self] in
-            guard let self, case .authenticating = self.auth else { return }
-            self.apply(self.authController.cancelSignIn(), prepareBackendOnSignedIn: false)
+            guard let self, let state = self.authController.cancelSignInIfAuthenticating() else { return }
+            self.apply(state, prepareBackendOnSignedIn: false)
         }
     }
 

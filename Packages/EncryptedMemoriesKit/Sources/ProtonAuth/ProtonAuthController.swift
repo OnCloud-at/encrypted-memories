@@ -180,6 +180,14 @@ public final class ProtonAuthController {
         return setState(.signedOut(error: nil))
     }
 
+    /// Ends a sign-in while it is in progress, for the moment the person closes the browser sheet.
+    /// Returns the new state, or `nil` when no sign-in is in progress, so a late callback of a completed or failed
+    /// sign-in changes nothing.
+    public func cancelSignInIfAuthenticating() -> ProtonAuthState? {
+        guard case .authenticating = state else { return nil }
+        return cancelSignIn()
+    }
+
     @discardableResult
     public func signOut() -> ProtonAuthState {
         signInTask?.cancel()
