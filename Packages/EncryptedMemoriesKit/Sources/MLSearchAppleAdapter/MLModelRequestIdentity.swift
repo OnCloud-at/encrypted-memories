@@ -24,10 +24,12 @@ enum MLModelRequestIdentity {
     }
 }
 
-final class MLModelNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+/// Declines every HTTP redirect, so a request that carries the app identity never reaches a host that the caller's
+/// endpoint check did not validate. The model download delegate inherits this rule.
+class MLModelNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     static let shared = MLModelNoRedirectDelegate()
 
-    func urlSession(
+    final func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
         willPerformHTTPRedirection response: HTTPURLResponse,

@@ -261,7 +261,9 @@ private final class RangeDownloadClient: @unchecked Sendable {
     }
 }
 
-private final class RangeDownloadSessionDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+private final class RangeDownloadSessionDelegate: MLModelNoRedirectDelegate, URLSessionDownloadDelegate,
+    @unchecked Sendable
+{
     private final class PendingDownload: @unchecked Sendable {
         let continuation: CheckedContinuation<(URL, URLResponse), any Error>
         let reporter: RangeProgressReporter
@@ -279,16 +281,6 @@ private final class RangeDownloadSessionDelegate: NSObject, URLSessionDownloadDe
 
     private let lock = NSLock()
     private var pending: [Int: PendingDownload] = [:]
-
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        completionHandler(nil)
-    }
 
     func register(
         task: URLSessionDownloadTask,
