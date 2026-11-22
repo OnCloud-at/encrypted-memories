@@ -108,6 +108,100 @@ final class DurableFileWriterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testTheLocalSyncFlushesAFileAndADirectoryAndReportsAPathItCannotOpen() throws {
+        try Data("a\n".utf8).write(to: url)
+        let local = LocalDurableFileSystem()
+
+        try local.synchronize(url, isDirectory: false)
+        try local.synchronize(directory, isDirectory: true)
+        let missing = directory.appendingPathComponent("missing")
+        XCTAssertThrowsError(try local.synchronize(missing, isDirectory: false)) {
+            XCTAssertEqual(($0 as NSError).domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(($0 as NSError).code, Int(ENOENT))
+        }
+    }
+
+    func testASyncGoesThroughTheSeamAndAFailedOneThrows() throws {
+        try Data("a\n".utf8).write(to: url)
+        failWrites([1])
+        XCTAssertThrowsError(try files.synchronize(url, isDirectory: false))
+        failWrites([])
+        try files.synchronize(url, isDirectory: false)
+        try files.synchronize(directory, isDirectory: true)
+        XCTAssertEqual(writes, ["sync log.jsonl", "sync directory"])
+    }
+
+    func testTheLocalSyncNeverFollowsASymbolicLink() throws {
+        try Data("a\n".utf8).write(to: url)
+        let link = directory.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: url)
+
+        XCTAssertThrowsError(try LocalDurableFileSystem().synchronize(link, isDirectory: false)) {
+            XCTAssertEqual(($0 as NSError).domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(($0 as NSError).code, Int(ELOOP))
+        }
+    }
+
+    func testTheLocalDirectorySyncRejectsARegularFile() throws {
+        try Data("a\n".utf8).write(to: url)
+
+        XCTAssertThrowsError(try LocalDurableFileSystem().synchronize(url, isDirectory: true)) {
+            XCTAssertEqual(($0 as NSError).domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(($0 as NSError).code, Int(ENOTDIR))
+        }
+    }
+
+    func testTheLocalFullSyncPropagatesADeviceError() throws {
+        let device = URL(fileURLWithPath: "/dev/null")
+        let file: FileHandle
+        do {
+            file = try FileHandle(forReadingFrom: device)
+        } catch {
+            throw XCTSkip("cannot open the /dev/null fixture: error code \((error as NSError).code)")
+        }
+        defer { try? file.close() }
+        let syncResult = fsync(file.fileDescriptor)
+        let syncError = errno
+        guard syncResult == 0 else {
+            throw XCTSkip("/dev/null fsync returned \(syncResult), errno \(syncError); expected 0")
+        }
+        let fullSyncResult = fcntl(file.fileDescriptor, F_FULLFSYNC)
+        let fullSyncError = errno
+        guard fullSyncResult == -1, fullSyncError == ENODEV else {
+            throw XCTSkip(
+                "/dev/null F_FULLFSYNC returned \(fullSyncResult), errno \(fullSyncError); expected -1 and ENODEV")
+        }
+
+        XCTAssertThrowsError(try LocalDurableFileSystem().synchronize(device, isDirectory: false)) {
+            XCTAssertEqual(($0 as NSError).domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(($0 as NSError).code, Int(ENODEV))
+        }
+    }
+
+    /// A caller supplies a volume that accepts fsync but rejects a full sync, for example an SMB volume.
+    func testTheLocalFullSyncRejectsAVolumeThatAcceptsFSync() throws {
+        guard let root = ProcessInfo.processInfo.environment["ENCRYPTED_MEMORIES_SYNC_UNSUPPORTED_VOLUME"] else {
+            throw XCTSkip("set ENCRYPTED_MEMORIES_SYNC_UNSUPPORTED_VOLUME to a volume that rejects a full sync")
+        }
+        let probe = URL(fileURLWithPath: root).appendingPathComponent("sync-probe-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: probe, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: probe) }
+        let file = probe.appendingPathComponent("file")
+        try Data("probe".utf8).write(to: file)
+
+        for (path, isDirectory) in [(file, false), (probe, true)] {
+            let descriptor = open(path.path, O_RDONLY)
+            XCTAssertGreaterThanOrEqual(descriptor, 0)
+            guard descriptor >= 0 else { return }
+            defer { _ = close(descriptor) }
+            XCTAssertEqual(fsync(descriptor), 0)
+            XCTAssertThrowsError(try LocalDurableFileSystem().synchronize(path, isDirectory: isDirectory)) {
+                XCTAssertEqual(($0 as NSError).domain, NSPOSIXErrorDomain)
+                XCTAssertEqual(($0 as NSError).code, Int(ENOTSUP))
+            }
+        }
+    }
+
     func testTheLocalRemovalDeletesTheFile() throws {
         try Data("a\n".utf8).write(to: url)
         try LocalDurableFileSystem().remove(url)

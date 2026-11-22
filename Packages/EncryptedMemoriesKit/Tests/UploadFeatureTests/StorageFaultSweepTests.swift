@@ -21,6 +21,7 @@ final class StorageFaultSweepTests: XCTestCase {
         "backup.settleRemoteDeletion.keep": 5, "backup.settleRemoteDeletion.backUpAgain": 5,
         "localReadFailureHints.insert": 4, "localReadFailureHints.remove": 4,
         "localReadFailureHints.saveSweepCursor": 3,
+        "deviceRoot.beginCreate": 3, "deviceRoot.markDispatchAttempted": 3, "deviceRoot.finishCreate": 3,
     ]
 
     func testEncodedIssueComparisonKeepsAllFieldsValuesAndArrayOrder() {
@@ -94,6 +95,28 @@ final class StorageFaultSweepTests: XCTestCase {
 
     func testACorrectOperationKeepsEveryRule() async throws {
         try await assertSweep(of: .correct, violates: [:])
+    }
+
+    func testTheDeviceRootCaseDeclaresItsPendingIntentAndSelectedRoot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let faultCase = DeviceRootEnrollmentCase(id: "deviceRoot.finishCreate", step: .finishCreate)
+        let remote = StorageFaultRemote()
+        XCTAssertEqual(try faultCase.state(in: directory).records["device root intent"], Set<String>())
+
+        try await faultCase.seed(in: directory, remote: remote)
+        XCTAssertEqual(
+            try faultCase.state(in: directory).records["device root intent"],
+            Set(["pending:claim", "selected:computer#device#folder#claim"]))
+
+        let world = try faultCase.open(directory, remote: remote)
+        let succeeded = await faultCase.run(world)
+        faultCase.close(world)
+
+        XCTAssertTrue(succeeded)
+        XCTAssertEqual(
+            try faultCase.state(in: directory).records["device root intent"],
+            Set(["selected:computer#device#folder#claim"]))
     }
 
     func testTwoTransactionsForOneChangeBreakAllOrNothing() async throws {

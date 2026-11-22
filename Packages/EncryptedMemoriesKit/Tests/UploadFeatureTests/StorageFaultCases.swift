@@ -1,7 +1,9 @@
+import DeviceRootCore
 import Foundation
 import PhotosCore
 import XCTest
 
+@testable import DeviceRootAppleAdapter
 @testable import PhotoLibraryBackupAdapter
 @testable import ProtonDriveBackend
 @testable import UploadCore
@@ -42,6 +44,9 @@ let storageFaultCases: [any StorageFaultCase] = [
     LocalReadFailureHintCase(id: "localReadFailureHints.insert", step: .insert),
     LocalReadFailureHintCase(id: "localReadFailureHints.remove", step: .remove),
     LocalReadFailureHintCase(id: "localReadFailureHints.saveSweepCursor", step: .saveSweepCursor),
+    DeviceRootEnrollmentCase(id: "deviceRoot.beginCreate", step: .beginCreate),
+    DeviceRootEnrollmentCase(id: "deviceRoot.markDispatchAttempted", step: .markDispatchAttempted),
+    DeviceRootEnrollmentCase(id: "deviceRoot.finishCreate", step: .finishCreate),
 ]
 
 /// A deletion decision on the real queue and journal, by its production operations. By `start`:
@@ -731,6 +736,93 @@ struct ExactDuplicateMergeJournalCase: StorageFaultCase {
         ExactDuplicateMergeIntent(
             volumeID: "volume", kept: kept, contentHash: "main-hash", hashKeyEpoch: "epoch",
             members: [.init(link: "duplicate-of-\(kept)", moves: [])], trashedAt: 1_720_000_000)
+    }
+}
+
+/// One step of the device root enrollment journal through the file-system seam (#1149). Each step replaces the journal
+/// file, then syncs the file and its directory. A failed sync throws after the replacement, so the failed step leaves
+/// its record written, as the journal does today; a restart must reach the state of the fault-free run.
+struct DeviceRootEnrollmentCase: StorageFaultCase {
+    enum Step: Sendable {
+        case beginCreate
+        case markDispatchAttempted
+        case finishCreate
+    }
+
+    struct World {
+        let journal: DeviceRootEnrollmentFileJournal
+        let files: StorageFaultFiles
+    }
+
+    let id: String
+    let step: Step
+    let atomicity = StorageFaultAtomicity.convergesAfterRestart
+    private static let identity = DeviceRootIdentity(deviceUID: "device", rootFolderUID: "folder", incarnation: "claim")
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let journal = DeviceRootEnrollmentFileJournal(accountDataDirectory: directory)
+        switch step {
+        case .beginCreate:
+            break
+        case .markDispatchAttempted:
+            _ = try await journal.beginCreateIfAbsent(incarnation: "claim")
+        case .finishCreate:
+            _ = try await journal.beginCreateIfAbsent(incarnation: "claim")
+            _ = try await journal.markCreateDispatchAttempted(location: .computer, incarnation: "claim")
+            try await journal.recordCreatedDevice(.init(deviceUID: "device", rootFolderUID: "folder"))
+            try await journal.select(Self.identity)
+        }
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        let files = StorageFaultFiles()
+        return World(
+            journal: DeviceRootEnrollmentFileJournal(
+                accountDataDirectory: directory, onBeforeFileLock: nil, fileSystem: files),
+            files: files)
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.files] }
+
+    func run(_ world: World) async -> Bool {
+        do {
+            switch step {
+            case .beginCreate: _ = try await world.journal.beginCreateIfAbsent(incarnation: "claim")
+            case .markDispatchAttempted:
+                _ = try await world.journal.markCreateDispatchAttempted(location: .computer, incarnation: "claim")
+            case .finishCreate: try await world.journal.finishCreate()
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func close(_ world: World) {}
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        let file = directory.appendingPathComponent("device-root-enrollment.json")
+        var state = StorageFaultState()
+        var records: Set<String> = []
+        if FileManager.default.fileExists(atPath: file.path) {
+            let data = try Data(contentsOf: file)
+            state.tables["device root journal"] = [canonicalJSON(String(decoding: data, as: UTF8.self))]
+            let record = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            if let pending = record["pendingIncarnation"] as? String {
+                records.insert("pending:\(pending)")
+            }
+            if let device = record["selectedDeviceUID"] as? String,
+                let folder = record["selectedRootFolderUID"] as? String,
+                let incarnation = record["selectedIncarnation"] as? String
+            {
+                let location = record["selectedLocation"] as? String ?? DeviceRootLocation.computer.rawValue
+                records.insert("selected:\(location)#\(device)#\(folder)#\(incarnation)")
+            }
+        } else {
+            state.tables["device root journal"] = ["absent"]
+        }
+        state.records["device root intent"] = records
+        return state
     }
 }
 
