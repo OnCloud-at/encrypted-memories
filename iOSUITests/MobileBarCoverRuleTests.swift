@@ -18,6 +18,41 @@ final class MobileBarCoverRuleTests: XCTestCase {
         XCTAssertTrue(barCoversContent(CGRect(x: 0, y: 791, width: 402, height: 83), in: window))
     }
 
+    /// An alert, a sheet, a popover and a menu cover what lies behind them. A page sheet of an iPhone nearly fills the
+    /// window; it is a presentation, not a window-sized toolbar container, so it still covers.
+    func testEveryPresentationCoversContent() {
+        let window = CGRect(x: 0, y: 0, width: 402, height: 874)
+        let presentations = [
+            ("alert", CGRect(x: 66, y: 340, width: 270, height: 190)),
+            ("sheet", CGRect(x: 0, y: 74, width: 402, height: 800)),
+            ("popover", CGRect(x: 41, y: 120, width: 320, height: 400)),
+            ("menu", CGRect(x: 120, y: 110, width: 250, height: 180)),
+        ]
+        for (kind, frame) in presentations {
+            let covering = framesCoveringContent(window: window, bars: [], presentations: [frame])
+            XCTAssertEqual(covering, [frame], "a \(kind) covers content")
+        }
+        XCTAssertEqual(
+            framesCoveringContent(window: window, bars: [window], presentations: [.zero]), [],
+            "a window-sized toolbar container and an empty frame cover nothing")
+    }
+
+    /// Tabs that share one column form the vertical bar of iPhone Duo; tabs side by side do not.
+    func testTheTabColumnIsTheUnionOfTabsThatShareOneColumn() {
+        let column = [
+            CGRect(x: 8, y: 100, width: 60, height: 60), CGRect(x: 8, y: 170, width: 60, height: 60),
+            CGRect(x: 9, y: 240, width: 60, height: 60),
+        ]
+        XCTAssertEqual(tabColumn(of: column), column[0].union(column[1]).union(column[2]))
+        let row = [
+            CGRect(x: 10, y: 800, width: 80, height: 50), CGRect(x: 110, y: 800, width: 80, height: 50),
+            CGRect(x: 210, y: 800, width: 80, height: 50),
+        ]
+        XCTAssertNil(tabColumn(of: row), "tabs side by side share no column")
+        XCTAssertNil(tabColumn(of: []))
+        XCTAssertNil(tabColumn(of: [column[0], .zero]), "a tab without a frame is no column")
+    }
+
     /// The vertical tab bar of iPhone Duo is as tall as the window but narrow. It covers the content beside it, so a
     /// row under it is not tapped, and a row beside it is.
     func testTheVerticalBarOfIPhoneDuoCoversContent() throws {

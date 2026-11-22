@@ -122,43 +122,50 @@ final class MobileViewerShareWiringTests: XCTestCase {
     }
 
     func testShareAfterAFailedReadShowsTheBurstFailureAndSharesNothing() async throws {
-        struct ReadFailure: Error {}
-        let fixture = try await Fixture(
-            items: [ViewerShareSample.lead, ViewerShareSample.second],
-            burstLoader: { _ in throw ReadFailure() })
-        defer { fixture.close() }
+        let held = try await fixtureWithHeldFailingReads()
+        defer { held.fixture.close() }
+        let fixture = held.fixture
 
-        // The read fails shortly after the viewer mounts. Until then Share is dimmed and takes no
-        // activation, so pressing continues until the failed read enables Share again and the
-        // press shows the burst failure.
+        // The press reads the burst again, and that read fails when its gate opens.
+        try await waitUntil { held.pressRead.arrivals >= 1 }
+        XCTAssertEqual(held.reads.count, 2, "the press reads the burst again")
+        held.pressRead.open()
+        try await waitUntil { !fixture.probe.events.isEmpty }
+
         let failure = String(localized: "viewer.share_burst_load_failed")
-        let start = ContinuousClock.now
-        while start.duration(to: .now) < .seconds(15) {
-            // The raw-control fallback reports an accepted press also while Share is still
-            // committed dimmed, and such a press reads nothing. Press only an enabled control.
-            guard fixture.shareIsEnabled() == true, fixture.tryActivatingShare() else {
-                try await Task.sleep(for: .milliseconds(100))
-                continue
-            }
-            // The accepted press reads the burst again. A next press can arrive before
-            // Share renders dimmed, reach the running read, and record burstUnsettled.
-            // The failing fixture records the read's outcome at once, so a short wait
-            // settles it before another press.
-            let settled = ContinuousClock.now
-            while settled.duration(to: .now) < .seconds(2),
-                !fixture.probe.events.contains(where: \.isBurstReadFailed)
-            {
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            if fixture.probe.events.contains(where: \.isBurstReadFailed) { break }
-        }
-
         XCTAssertEqual(
             fixture.probe.events,
             [.burstReadFailed(message: failure)],
             "a failed burst read must produce the burst failure, not a share of the partial filmstrip")
         let failureShown = try await fixture.waitForAlert(containing: failure)
         XCTAssertTrue(failureShown, "the burst failure must become visible to the person")
+    }
+
+    /// A press that reaches the running read, before Share renders dimmed, is refused without an alert and shares
+    /// nothing. The running read goes on, and its end shows the burst failure for the first press.
+    func testASecondSharePressWhileTheReadRunsIsRefusedWithoutAnAlert() async throws {
+        let held = try await fixtureWithHeldFailingReads()
+        defer { held.fixture.close() }
+        let (fixture, reads, pressRead) = (held.fixture, held.reads, held.pressRead)
+
+        // The press queued the task that starts the read on the main actor. One yield lets that task run, so the
+        // viewer knows that the read is in flight. The update that dims Share is queued behind this test, so the
+        // second press reaches the running read while Share is still enabled.
+        await Task.yield()
+        XCTAssertEqual(fixture.shareIsEnabled(), true, "Share is not rendered dimmed yet")
+        XCTAssertTrue(fixture.tryActivatingShare())
+        XCTAssertEqual(fixture.probe.events, [.burstUnsettled], "the press at the running read is refused")
+        XCTAssertTrue(fixture.alertControllers().isEmpty, "the refusal is silent")
+        try await waitUntil { pressRead.arrivals >= 1 }
+        XCTAssertEqual(reads.count, 2, "the first press reads the burst again, and the refused press starts no read")
+
+        pressRead.open()
+        try await waitUntil { fixture.probe.events.count == 2 }
+        let failure = String(localized: "viewer.share_burst_load_failed")
+        XCTAssertEqual(
+            fixture.probe.events, [.burstUnsettled, .burstReadFailed(message: failure)],
+            "the first press still ends with the burst failure, and nothing is shared")
+        XCTAssertTrue(fixture.probe.events.filter(\.isShared).isEmpty)
     }
 
     func testShareAfterAFailedReadReadsTheBurstAgainAndSharesTheWholeSeries() async throws {
@@ -428,6 +435,49 @@ final class MobileViewerShareWiringTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(100))
         }
         return false
+    }
+
+    /// A viewer whose burst reads fail, each when its gate opens, with the gates and the read counter.
+    private struct HeldFailingReads {
+        let fixture: Fixture
+        let reads: ReadCounter
+        let firstRead: AsyncGate
+        let pressRead: AsyncGate
+    }
+
+    /// Opens a viewer whose first burst read fails when `firstRead` opens, and presses Share once after that failed
+    /// read. The press starts a second read, which fails when `pressRead` opens. A held read shows the dimmed control
+    /// and its end shows the enabled control again, so the press comes only after the failed read and a test waits
+    /// for the outcome of the press on the read itself, not on a time limit. It returns right after the press, with
+    /// no suspension in between.
+    private func fixtureWithHeldFailingReads() async throws -> HeldFailingReads {
+        struct ReadFailure: Error {}
+        let reads = ReadCounter()
+        let firstRead = AsyncGate()
+        let pressRead = AsyncGate()
+        let fixture = try await Fixture(
+            items: [ViewerShareSample.lead, ViewerShareSample.second],
+            burstLoader: { _ in
+                await (reads.next() == 1 ? firstRead : pressRead).arriveAndWait()
+                throw ReadFailure()
+            },
+            releaseOnClose: {
+                firstRead.open()
+                pressRead.open()
+            })
+        do {
+            try await waitUntil { firstRead.arrivals >= 1 }
+            let dimmedWhileReading = try await fixture.waitForShareEnabledState(false)
+            XCTAssertTrue(dimmedWhileReading, "Share is dimmed while the viewer reads the burst")
+            firstRead.open()
+            let enabledAfterFailure = try await fixture.waitForShareEnabledState(true)
+            XCTAssertTrue(enabledAfterFailure, "Share is available after the failed read")
+            XCTAssertTrue(fixture.tryActivatingShare())
+        } catch {
+            fixture.close()
+            throw error
+        }
+        return HeldFailingReads(fixture: fixture, reads: reads, firstRead: firstRead, pressRead: pressRead)
     }
 
     /// Hosts the viewer in its own window over the fixture account, through the production
