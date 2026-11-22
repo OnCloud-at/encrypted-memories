@@ -517,9 +517,9 @@ public struct ExactDuplicateFinder: Sendable {
 
     /// Different files of the library that are possibly the same photo, by `policy`. The candidates come from the
     /// stored timeline without a request, and only their nodes are read, one candidate group at a time and
-    /// `rankingConcurrency` groups at once. The copies of `sameBytes` after their first copy are no candidates. A
-    /// failed read leaves out only its candidate group. Nil while the stored timeline cannot be read, because then
-    /// nothing is known about the candidates.
+    /// `rankingConcurrency` groups at once. The copies of `sameBytes` after their first copy are no candidates. When
+    /// the read of a candidate group fails, the copies of that group that needed a read are left out of the result. Nil
+    /// while the stored timeline cannot be read, because then nothing is known about the candidates.
     public func possibleDuplicates(
         excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
     ) async -> PossibleDuplicateScan? {
@@ -550,8 +550,12 @@ public struct ExactDuplicateFinder: Sendable {
         let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) {
             (members: [PhotoUID]) -> [PhotoUID: ExactDuplicateNodeFacts]? in
             // A saved row without size information, such as one from before sizes were saved, is read again. A row of
-            // a node that states no size holds zero and is not read again.
-            let unsaved = members.filter { saved[$0]?.byteSize == nil }
+            // a node that states no size holds zero, and a node without photo details matches no other copy; neither
+            // is read again.
+            let unsaved = members.filter { member in
+                guard let row = saved[member] else { return true }
+                return row.byteSize == nil && !row.fingerprint.matchesOnlyItsNode
+            }
             guard !unsaved.isEmpty else { return [PhotoUID: ExactDuplicateNodeFacts]() }
             guard let read = try? await remote.nodeFacts(of: unsaved) else { return nil }
             // Each group saves at once, so a pass that stops keeps what it read. Only while the index still stands at
@@ -566,7 +570,7 @@ public struct ExactDuplicateFinder: Sendable {
             return read
         }
         var fingerprints = saved.mapValues(\.fingerprint)
-        var sizes = saved.compactMapValues { $0.byteSize.flatMap { $0 > 0 ? $0 : nil } }
+        var sizes = saved.compactMapValues { Self.shownSize($0.byteSize) }
         var readCount = 0
         for case let read?? in reads {
             readCount += read.count
@@ -583,9 +587,14 @@ public struct ExactDuplicateFinder: Sendable {
             fingerprints: fingerprints.filter { members.contains($0.key) })
     }
 
+    /// A size above zero; zero and no size are never shown.
+    private static func shownSize(_ size: Int64?) -> Int64? {
+        size.flatMap { $0 > 0 ? $0 : nil }
+    }
+
     /// The size that a node states, when it states one above zero.
     private static func positiveSize(_ facts: ExactDuplicateNodeFacts) -> Int64? {
-        facts.byteSize.flatMap { $0 > 0 ? $0 : nil }
+        shownSize(facts.byteSize)
     }
 
     /// The size to save for a node that was read: its size above zero, or zero for a node that states none, so the

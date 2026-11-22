@@ -166,7 +166,7 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
         let time = Date(timeIntervalSince1970: 1_700_000_000)
         for (uid, type) in [(own, "image/jpeg"), (shared, "image/heic")] {
             server.setFingerprint(.possiblePhoto(type: type, width: 100, height: 100), of: uid)
-            // A size, so the saved row is complete and the test checks only the volume.
+            // A size, so the saved row holds size information and the test checks only the volume.
             server.setNodeSize(100, of: uid)
         }
         server.setLibraryItems([own, shared].map { PhotoItem(uid: $0, captureTime: time, mediaType: "image/jpeg") })
@@ -228,6 +228,25 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
 
         XCTAssertEqual(nodeReads, 2, "the node was read once; its missing size is saved as known")
         XCTAssertEqual(again?.byteSizes, [pair[0]: 300], "a size of zero is never shown")
+    }
+
+    func testANodeWithoutPhotoDetailsIsNotReadAgain() async throws {
+        let pair = seedPossiblePair("one")
+        let plain = server.seedLink(digest: digest("plain"))
+        server.setFingerprint(.matchingOnly(plain), of: plain)
+        server.setLibraryItems(
+            (pair + [plain]).map {
+                PhotoItem(uid: $0, captureTime: Date(timeIntervalSince1970: 1_700_000_000), mediaType: "image/jpeg")
+            })
+        publishIndex(eventID: "event-1")
+        let cache = try openCache()
+        let first = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+        XCTAssertEqual(nodeReads, 3)
+
+        let again = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(again, first)
+        XCTAssertEqual(nodeReads, 3, "a file without photo details is read once; it never matches another copy")
     }
 
     func testASizeOfZeroIsNoSize() async throws {

@@ -364,16 +364,17 @@ public final class TimelineMetadataStore {
         return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
     }
 
-    /// Ordered timeline load. The hot path is one indexed scan of `photos`; tags and burst
-    /// membership are reconstructed from their feature tables with one full pass each (dictionary
-    /// join in memory - no per-row queries, no blob decoding).
-    /// Throws when photos, tags, or series cannot prepare, finish, or decode every selected identity.
     /// The stored photos with the moment within the second that `order` has published, as the timeline shows them.
+    /// Throws when `load()` throws.
     public func loadWithMoments(from order: TimelineOrderMetadataStore?) throws -> [PhotoItem] {
         let items = try load()
         return order?.enrich(items) ?? items
     }
 
+    /// Ordered timeline load. The hot path is one indexed scan of `photos`; tags and burst
+    /// membership are reconstructed from their feature tables with one full pass each (dictionary
+    /// join in memory - no per-row queries, no blob decoding).
+    /// Throws when photos, tags, or series cannot prepare, finish, or decode every selected identity.
     public func load() throws -> [PhotoItem] {
         try PhotoPerformanceSignposts.database.interval("db.load") {
             try loadInstrumented()
