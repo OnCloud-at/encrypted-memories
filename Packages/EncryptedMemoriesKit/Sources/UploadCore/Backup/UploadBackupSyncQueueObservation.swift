@@ -41,11 +41,6 @@ public struct UploadBackupQueueRowState: Sendable, Equatable {
     }
 }
 
-private extension Array {
-    /// The array, or nil when it is empty: a complete read without rows is absent.
-    var nonEmpty: [Element]? { isEmpty ? nil : self }
-}
-
 /// Queue reads and change notifications for the pending grid. Only the SQLite store implements it.
 public protocol UploadBackupSyncQueueObserving: Sendable {
     /// Replaces the observer. The store calls it after each committed write, outside its lock.
@@ -69,12 +64,12 @@ public extension UploadBackupSyncQueueObserving {
     func decisionRowSet(
         kind: UploadSourceIdentity.Kind, identifiers: Set<String>
     ) -> StoreLookup<[UploadBackupQueueRowState]> {
-        StoreLookup(catching: { try decisionRows(kind: kind, identifiers: identifiers).nonEmpty })
+        StoreLookup(catchingRows: { try decisionRows(kind: kind, identifiers: identifiers) })
     }
 
     /// The unsettled rows as a typed answer, with the same three cases as `decisionRowSet`.
     func decisionUnsettledRowSet() -> StoreLookup<[UploadBackupQueueRowState]> {
-        StoreLookup(catching: { try decisionUnsettledRows().nonEmpty })
+        StoreLookup(catchingRows: { try decisionUnsettledRows() })
     }
 
     /// True only when a complete read finds no row of these sources. A removal proves itself with this read: a later

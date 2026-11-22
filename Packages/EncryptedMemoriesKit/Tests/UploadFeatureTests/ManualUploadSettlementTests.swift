@@ -95,9 +95,9 @@ private final class ReadCountingSettlementStore: UploadManualSettlementStoreProt
         operational ? .absent : .unknown
     }
 
-    func readAllOutcome() -> UploadManualSettlementListReadOutcome {
+    func readAllOutcome() -> StoreLookup<[UploadManualSettlementRecord]> {
         lock.withLock { reads += 1 }
-        return operational ? .records(rows) : .unreadable
+        return operational ? StoreLookup(catchingRows: { rows }) : .unknown
     }
 }
 
@@ -340,8 +340,8 @@ private final class FailingSettlementStore: UploadManualSettlementStoreProtocol,
         }
     }
 
-    func readAllOutcome() -> UploadManualSettlementListReadOutcome {
-        lock.withLock { failed ? .unreadable : .records(Array(records.values)) }
+    func readAllOutcome() -> StoreLookup<[UploadManualSettlementRecord]> {
+        lock.withLock { failed ? .unknown : StoreLookup(catchingRows: { Array(records.values) }) }
     }
 
     @discardableResult
@@ -389,8 +389,8 @@ private final class EnqueueGateStore: UploadManualSettlementStoreProtocol, @unch
         }
     }
 
-    func readAllOutcome() -> UploadManualSettlementListReadOutcome {
-        lock.withLock { .records(Array(records.values)) }
+    func readAllOutcome() -> StoreLookup<[UploadManualSettlementRecord]> {
+        lock.withLock { StoreLookup(catchingRows: { Array(records.values) }) }
     }
 
     @discardableResult
@@ -436,7 +436,7 @@ private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unc
         lock.withLock { readsFail = fail }
     }
 
-    /// While set, every sweep of the whole table answers `.unreadable`.
+    /// While set, every sweep of the whole table answers `.unknown`.
     func setSweepsFail(_ fail: Bool) {
         lock.withLock { sweepsFail = fail }
     }
@@ -466,8 +466,8 @@ private final class ScriptedReadStore: UploadManualSettlementStoreProtocol, @unc
         }
     }
 
-    func readAllOutcome() -> UploadManualSettlementListReadOutcome {
-        lock.withLock { sweepsFail ? .unreadable : .records(Array(records.values)) }
+    func readAllOutcome() -> StoreLookup<[UploadManualSettlementRecord]> {
+        lock.withLock { sweepsFail ? .unknown : StoreLookup(catchingRows: { Array(records.values) }) }
     }
 
     @discardableResult
@@ -684,6 +684,18 @@ final class ManualUploadSettlementTests: XCTestCase {
         XCTAssertFalse(durableStore.upsert(record))
         XCTAssertFalse(durableStore.remove(queueItemID: id))
         XCTAssertFalse(durableStore.isOperational())
+    }
+
+    /// A row that does not decode makes the whole sweep unknown: the sweep never leaves it out of a complete answer.
+    func testASweepWithARowThatDoesNotDecodeIsUnknown() async throws {
+        _ = try await seedCompletedRow()
+        let durableStore = try store()
+        defer { durableStore.close() }
+        try runSQL(
+            "UPDATE manual_upload_settlement SET payload='{';",
+            inStoreAt: tempDir.appendingPathComponent(UploadManualSettlementStore.databaseFileName))
+
+        XCTAssertEqual(durableStore.readAllOutcome(), .unknown)
     }
 
     func testManualVersionMarkersKeepTheirReadRulesAndRefuseUnknownVersions() async throws {

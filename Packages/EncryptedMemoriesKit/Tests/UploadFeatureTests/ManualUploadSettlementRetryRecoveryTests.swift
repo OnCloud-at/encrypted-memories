@@ -873,8 +873,8 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
             return XCTFail("A failed read must surface unknown, never absence")
         }
         XCTAssertTrue(store.allRecords().isEmpty, "A failed sweep must never look like absence")
-        guard case .unreadable = store.readAllOutcome() else {
-            return XCTFail("A failed sweep must surface unreadable, never absence")
+        guard case .unknown = store.readAllOutcome() else {
+            return XCTFail("A failed sweep must surface unknown, never absence")
         }
         XCTAssertFalse(store.upsert(saved), "The lasting latch keeps refusing writes")
     }
@@ -972,11 +972,21 @@ final class ManualUploadSettlementRetryRecoveryTests: XCTestCase {
 
         settlementConnection(of: store).markFailed(resultCode: SQLITE_IOERR)
         XCTAssertFalse(store.isOperational())
-        guard case .records(let rows) = store.readAllOutcome() else {
+        guard case .found(let rows) = store.readAllOutcome() else {
             return XCTFail("The next sweep heals a recorded transient SQLITE_IOERR latch")
         }
         XCTAssertEqual(rows.map(\.queueItemID), [saved.queueItemID])
         XCTAssertTrue(store.isOperational(), "The successful sweep proved the latch healed")
+    }
+
+    /// A complete sweep of an empty table proves that no row is stored: it reads as absent, never as unknown (#1140).
+    func testReadAllOfAnEmptyTableIsAbsent() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".sqlite")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try XCTUnwrap(UploadManualSettlementStore(url: url))
+        defer { store.close() }
+        XCTAssertEqual(store.readAllOutcome(), .absent)
+        XCTAssertTrue(store.isOperational())
     }
 
     /// While a transaction holds the store's own handle, reads and deletes must refuse the

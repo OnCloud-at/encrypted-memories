@@ -51,3 +51,39 @@ func forbidden() async throws {
     // expect: no_default_for_store_read_in_decision_code
     _ = catalogStore.presentEntries(for: [key(of: item(at: 0))]) ?? [:]
 }
+
+// Decision protocols (#1148): a declaration that names a concrete decision store.
+final class ForbiddenStoreHolder {
+    // expect: decision_code_receives_store_protocol
+    let queue: UploadBackupSyncQueueManifestStore
+    // expect: decision_code_receives_store_protocol
+    var catalog: PhotoLibraryCatalogManifestStore?
+    // expect: decision_code_receives_store_protocol
+    init(pending: PendingBackupManifestStore) {}
+    // expect: decision_code_receives_store_protocol
+    func open() -> UploadManualSettlementStore? { nil }
+    // expect: decision_code_receives_store_protocol
+    func check(_ store: Any) -> Bool { store is UploadBackupSyncQueueManifestStore }
+    // expect: decision_code_receives_store_protocol
+    func narrow(_ store: Any) { _ = store as? PendingBackupManifestStore }
+    // expect: decision_code_receives_store_protocol
+    func all(_ stores: [UploadBackupSyncQueueManifestStore]) {}
+    // expect: decision_code_receives_store_protocol
+    func later(_ make: () -> Optional<PhotoLibraryCatalogManifestStore>) {}
+    // expect: decision_code_receives_store_protocol
+    func pass(_ use: (inout UploadManualSettlementStore) -> Void) {}
+    // expect: decision_code_receives_store_protocol
+    var pair: (Int, PendingBackupManifestStore)?
+    // expect: decision_code_receives_store_protocol
+    var byKey: [String: UploadBackupSyncQueueManifestStore] = [:]
+    // expect: decision_code_receives_store_protocol
+    let both: Result<Int, PhotoLibraryCatalogManifestStore>? = nil
+    // expect: decision_code_receives_store_protocol
+    func second(_ use: (Int, UploadManualSettlementStore) -> Void) {}
+    // expect: decision_code_receives_store_protocol
+    let qualified: UploadCore.PendingBackupManifestStore?
+    // expect: decision_code_receives_store_protocol
+    /* let blocked: UploadManualSettlementStore */
+    // expect: decision_code_receives_store_protocol
+    func pass() { use(queue, PendingBackupManifestStore.self) }
+}

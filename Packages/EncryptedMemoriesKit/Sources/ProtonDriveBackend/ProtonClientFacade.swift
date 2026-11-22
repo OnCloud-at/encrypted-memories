@@ -114,7 +114,7 @@ public final class ProtonClientFacade {
         bridge: DriveSDKBridge,
         librarySources: LibrarySourceCoordinator,
         identityComposition: UploadIdentityResolverComposition,
-        settlementStore: UploadManualSettlementStore?
+        settlementStore: (any UploadManualSettlementStoreProtocol)?
     ) -> ProtonClientFacade {
         // Albums: SDK 0.33.1 is the catalog/sharing/membership reader and sends the five album writes
         // (create, cover, delete, add, remove). Direct Photos HTTP remains for two uses: Album Sync creates albums and

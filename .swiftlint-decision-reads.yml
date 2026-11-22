@@ -62,6 +62,25 @@
 # reported: the rules check no syntax kinds, because SwiftLint checks them over the whole match, so a string or
 # comment inside a matched range would hide a site.
 #
+# Decision protocols (#1148): decision code receives a decision store only through its protocol, so the compiler
+# offers it only what the protocol declares. The decision stores are the backup queue, the photo library catalog, the
+# pending backup store and the manual upload settlement. `decision_code_receives_store_protocol` checks every core
+# module source and reports a concrete store type that a declaration names: a stored property, a parameter, a
+# function result, a cast (`as`, `as?`, `as!`, `is`), a generic argument, a collection element, a tuple element or a
+# closure parameter, also behind `any`, `some`, `inout`, `Optional<` or a module name (`UploadCore.Store`), and also
+# after a comma. A metatype (`Store.self`) in these places is reported too. The stores' own files name their type
+# only in their declaration and through `Self`, which the rule does not report. A constructor call (`Store(url:)`), a
+# nested type or static member (`Store.StateUpdate`) and a `//` comment, also `///`, stay allowed; a `/* … */` comment
+# is reported. The pattern names the four types twice, in the match and in its lookbehinds: a renamed store must be
+# renamed there, and the canary fails until it is.
+# The rule does not see a type alias of a concrete store, a same-type requirement (`where Wrapped == Store`), a type
+# that a closure or a local variable infers, a store passed as `Any`, a metatype after `=`, or a declaration after a
+# `//` inside a string earlier on the same line.
+# The baseline lists the sites that exist and can only shrink. A queue, catalog or settlement site moves to the
+# protocol of its store. The pending backup store has no decision protocol yet (#1154): its sites stay until it has
+# one, and the rule keeps new ones out. Sites that create, own or test a store stay as exceptions that the baseline
+# names.
+#
 # Each rule starts at fixed text (`StoreLookup`, `try?`, a read method) and checks what precedes it with bounded
 # lookbehinds; identifier runs are bounded to 64 characters. This keeps the pass linear. Each rule reports the
 # position of `try?` or `??` (capture group 1).
@@ -89,6 +108,13 @@ custom_rules:
     regex: '\b(?:entry|entries|decision[A-Z]\w{0,64}|containsAny|count|problemEntries|runnableDate|summary|earliest[A-Z]\w{0,64}|nextRunnable[A-Z]\w{0,64}|runtimeIssue|present[A-Z]\w{0,64}|sourceStates?|handoffs?|read|readOutcome|readAllOutcome|load|rows)(?<!//[^\n]{0,400})(?:(?<=(?:\b\w{0,64}[a-z0-9](?:Queue|Store|Catalog|Journal|Repository|Manifest|Ledger)|\b(?:queue|store|catalog|journal|repository|manifest|ledger))\??\s{0,40}\.\s{0,40}\w{1,64})|(?<!\.\s{0,40}\w{1,64})|(?<=\bself\s{0,40}\.\s{0,40}\w{1,64}))\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)(?:\s*\??\s*\.\s*\b\w{1,64}(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?)*\s*(\?\?)'
     capture_group: 1
     message: "A decision read must not replace a failed read with a default; use StoreLookup or handle the nil."
+    severity: error
+  decision_code_receives_store_protocol:
+    name: Store protocol in decision code
+    included: *core_sources
+    regex: '\b(UploadBackupSyncQueueManifestStore|PhotoLibraryCatalogManifestStore|PendingBackupManifestStore|UploadManualSettlementStore)\b(?<!//[^\n]{0,300}(?:UploadBackupSyncQueueManifestStore|PhotoLibraryCatalogManifestStore|PendingBackupManifestStore|UploadManualSettlementStore))(?<=(?::|->|\bas[?!]?|\bis|<|\[|\(|,)\s{0,40}(?:(?:any|some|inout)\s{1,9})?(?:(?:\[|\(|Optional<)\s{0,9}){0,3}(?:\w{1,64}\.)?(?:UploadBackupSyncQueueManifestStore|PhotoLibraryCatalogManifestStore|PendingBackupManifestStore|UploadManualSettlementStore))(?!\s*(?:\(|\.(?!\s*self\b)))'
+    capture_group: 1
+    message: "Decision code receives a decision store through its protocol, never through the concrete store type."
     severity: error
   no_domain_error_decision_in_host:
     name: Host decision from an error type
