@@ -2509,7 +2509,6 @@ struct ThumbnailFeedCoreTests {
         let result = await feed.warmDecoded([ThumbnailRequest(uid: uid)], priority: .visibleNow, limit: 1)
         #expect(result.decodedFromDisk == 1)
         #expect(result.queuedNetwork == 0)
-        #expect(result.mainThreadDecodeCount == 0)
         #expect(await loader.requestCount() == 0)
         #expect(feed.memoryDecoded(for: uid) != nil)
         #expect(
@@ -2676,7 +2675,7 @@ struct ThumbnailFeedCoreTests {
             configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
         )
         let wakes = Counter()
-        let registration = await feed.setOnImagesAvailable { wakes.increment() }
+        let registration = feed.setOnImagesAvailableWake { wakes.increment() }
 
         feed.noteVisibleDemand()  // A live viewport must wake when data arrives.
         await feed.requestPriority(uid, priority: .visibleNow)  // enqueue the disk-miss for the crawl worker
@@ -2697,8 +2696,8 @@ struct ThumbnailFeedCoreTests {
         )
         let firstWakes = Counter()
         let secondWakes = Counter()
-        let firstRegistration = await feed.setOnImagesAvailable { firstWakes.increment() }
-        let secondRegistration = await feed.setOnImagesAvailable { secondWakes.increment() }
+        let firstRegistration = feed.setOnImagesAvailableWake { firstWakes.increment() }
+        let secondRegistration = feed.setOnImagesAvailableWake { secondWakes.increment() }
 
         feed.noteVisibleDemand()
         await feed.requestPriority(uid, priority: .visibleNow)
@@ -2722,8 +2721,8 @@ struct ThumbnailFeedCoreTests {
         )
         let firstWakes = Counter()
         let secondWakes = Counter()
-        let firstRegistration = await feed.setOnImagesAvailable { firstWakes.increment() }
-        let secondRegistration = await feed.setOnImagesAvailable { secondWakes.increment() }
+        let firstRegistration = feed.setOnImagesAvailableWake { firstWakes.increment() }
+        let secondRegistration = feed.setOnImagesAvailableWake { secondWakes.increment() }
         firstRegistration.end()
 
         feed.noteVisibleDemand()
@@ -2748,7 +2747,7 @@ struct ThumbnailFeedCoreTests {
             configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1)
         )
         let wakes = Counter()
-        let registration = await feed.setOnImagesAvailable { wakes.increment() }
+        let registration = feed.setOnImagesAvailableWake { wakes.increment() }
 
         await feed.startPrefetch([uid])  // crawl only; never sets visible demand
         try await Self.waitUntil { await loader.fetched(uid) }

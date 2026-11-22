@@ -91,22 +91,19 @@ public struct WarmDecodedResult: Equatable, Sendable {
     public let decodedFromDisk: Int
     public let queuedNetwork: Int
     public let missing: Int
-    public let mainThreadDecodeCount: Int
 
     public init(
         requested: Int,
         alreadyDecoded: Int,
         decodedFromDisk: Int,
         queuedNetwork: Int,
-        missing: Int,
-        mainThreadDecodeCount: Int = 0
+        missing: Int
     ) {
         self.requested = requested
         self.alreadyDecoded = alreadyDecoded
         self.decodedFromDisk = decodedFromDisk
         self.queuedNetwork = queuedNetwork
         self.missing = missing
-        self.mainThreadDecodeCount = mainThreadDecodeCount
     }
 }
 
