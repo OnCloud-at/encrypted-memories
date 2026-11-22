@@ -62,7 +62,7 @@ class ReleaseUpgradeTests(unittest.TestCase):
         with self.assertRaisesRegex(UpgradeError, "pin"):
             release_upgrade.validate_provisioning(capacity)
 
-    def test_owner_scope_has_three_configurations_and_rejects_ipad_and_macos_26(self):
+    def test_the_gate_has_three_configurations_and_rejects_ipad_and_macos_26(self):
         self.assertEqual(set(release_upgrade.CONFIGURATIONS), {
             ("iOS", "26", "iPhone"), ("iOS", "27", "iPhone"), ("macOS", "27", None),
         })

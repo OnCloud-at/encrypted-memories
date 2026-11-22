@@ -359,10 +359,10 @@ On the hosted runner one iOS case takes seven to eight minutes, so the iOS gate 
 The prepare job builds the jobs from the one list of interruption points in `scripts/upgrade-test/run_journey.py`
 (`--list-points`) and the selected sources (`.github/scripts/release_upgrade.py`). Each job tests every source with its
 share of the points; together the jobs of each device and OS configuration cover every point once.
-The plan includes iPhone on iOS 26 and 27, and the macOS 27 host. The owner decided on 2026-11-16 that this
-gate does not cover iPad; normal UI tests cover iPad.
-The gate deliberately does not cover macOS 26 (owner decision 2026-11-16): no hosted macOS 26 image carries
-the Xcode that builds this project, and installing that Xcode needs credentials. The planner rejects a macOS 26 configuration.
+The plan includes iPhone on iOS 26 and 27, and the macOS 27 host. The gate does not cover iPad; the normal UI tests
+cover iPad.
+The gate does not cover macOS 26: no hosted macOS 26 image carries the Xcode that builds this project. The planner
+rejects a macOS 26 configuration.
 Each job plans no more than 165 of its 180 minutes, including its explicit provisioning reserve.
 A job plans `provisioning + 12 x sources + case x sources x points` minutes, with 8.0 minutes per iOS case and 1.5 minutes per macOS case.
 These coefficients are estimates from the job means of the releases v1.1.0-rc.1 and v1.1.0; the measured maxima are higher
