@@ -180,6 +180,18 @@ final class BackupProblemSheetSourceTests: XCTestCase {
     }
 
     #if DEBUG
+        /// A photo that is not backed up without anything the person can fix still makes an empty list read again:
+        /// the controller and the sheet expect a row for calm photos too.
+        func testCalmPhotosAloneMakeAnEmptyListReadAgain() async throws {
+            let controller = try makeBackupController()
+            XCTAssertFalse(controller.summaryCountsProblemItems)
+            XCTAssertTrue(controller.installFailedItemsFixtureForTesting(kinds: [.remoteService]))
+            try await pollUntilOrFail { controller.status.notBackedUpCount == 1 }
+            XCTAssertEqual(controller.status.needsAttentionCount, 0)
+            XCTAssertTrue(controller.summaryCountsProblemItems)
+            XCTAssertTrue(BackupProblemSheetSource.backup(controller).expectsItems)
+        }
+
         func testTheBackupSourceFollowsItsListAndItsKeyChangesWithTheBackupStatus() async throws {
             let controller = try makeBackupController()
             let source = BackupProblemSheetSource.backup(controller)

@@ -851,7 +851,7 @@ public final class PhotoLibraryBackupController {
     static let problemListRereadDelays: [TimeInterval] = [0.25, 0.5, 1, 2, 4]
 
     /// Whether the summary counts photos that are not backed up, so the list must show some.
-    private var summaryCountsProblemItems: Bool {
+    var summaryCountsProblemItems: Bool {
         #if DEBUG
             if let override = problemListExpectationForTesting { return override() }
         #endif
