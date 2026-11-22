@@ -10,6 +10,25 @@ enum UITestApplication {
         app.launchEnvironment["OS_ACTIVITY_DT_MODE"] = "NO"
         return app
     }
+
+    /// True on the iPhone Duo simulator. Its model identifier is `iPhone19,4` (`simctl list devicetypes`).
+    static var runsOnIPhoneDuo: Bool {
+        ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] == "iPhone19,4"
+    }
+}
+
+extension XCUIApplication {
+    /// Turns the device and waits up to `timeout` seconds until the window has the shape of `orientation`: wider than
+    /// tall for a landscape orientation, otherwise taller. The window decides, not the device: a display that keeps
+    /// its portrait window has no landscape layout. Returns whether the window turned.
+    func turnWindow(to orientation: UIDeviceOrientation, timeout: TimeInterval = 5) -> Bool {
+        XCUIDevice.shared.orientation = orientation
+        let window = windows.firstMatch
+        let landscape = orientation.isLandscape
+        let turned = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in (window.frame.width > window.frame.height) == landscape }, object: nil)
+        return XCTWaiter.wait(for: [turned], timeout: timeout) == .completed
+    }
 }
 
 extension XCUIElement {

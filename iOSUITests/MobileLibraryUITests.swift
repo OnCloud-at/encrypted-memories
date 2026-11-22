@@ -340,12 +340,7 @@ final class MobileLibraryUITests: XCTestCase {
         let column = try app.verticalTabColumn()
         app.barButton(titled: "Select").tap()
         try app.visiblePhoto(beside: column).tap()
-        XCUIDevice.shared.orientation = .landscapeLeft
-        let window = app.windows.firstMatch
-        let turned = XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in window.frame.width > window.frame.height }, object: nil)
-        // The window, not the device, decides: a display that keeps its portrait window has no landscape layout.
-        try XCTSkipUnless(XCTWaiter.wait(for: [turned], timeout: 5) == .completed, "The window stays in portrait")
+        try XCTSkipUnless(app.turnWindow(to: .landscapeLeft), "The window stays in portrait")
         let addToAlbum = app.barButton(titled: "Add to Album")
         XCTAssertTrue(addToAlbum.waitForExistence(timeout: 10))
         addToAlbum.tap()
