@@ -196,10 +196,16 @@ final class MobileScrollDateLabelHostTests: XCTestCase {
         grid.window?.layoutIfNeeded()
         let columnMinX = TimelineScrollDateLabelMotion.columnMinX(
             width: grid.bounds.width, trailingInset: grid.safeAreaInsets.right)
-        XCTAssertTrue(
-            TimelineScrollDateLabelGeometry.bands(
-                avoiding: grid.reservedRegionLayout.exclusions, trailingColumnFrom: columnMinX
-            ).isEmpty, "SETUP: no reserved region reaches the label column")
+        let bands = TimelineScrollDateLabelGeometry.bands(
+            avoiding: grid.reservedRegionLayout.exclusions, trailingColumnFrom: columnMinX)
+        // A reserved region inside a safe-area inset (the camera of an iPhone with iOS 27.1 or later) does not move
+        // the label, which stays inside the safe area anyway. Only a band across the safe area would.
+        let safeTop = grid.safeAreaInsets.top
+        let safeBottom = grid.bounds.height - grid.safeAreaInsets.bottom
+        XCTAssertFalse(
+            bands.contains { $0.upperBound > safeTop && $0.lowerBound < safeBottom },
+            "SETUP: no reserved region reaches the label column inside the safe area; bands \(bands), "
+                + "safe area \(safeTop)...\(safeBottom)")
         for fraction in [CGFloat(0), 0.25, 0.5, 0.75, 1] {
             grid.scrollView.contentSize = CGSize(width: grid.bounds.width, height: 10_000)
             let low = -grid.scrollView.contentInset.top
