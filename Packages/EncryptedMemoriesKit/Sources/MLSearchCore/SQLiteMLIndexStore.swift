@@ -305,54 +305,51 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
     public func recordFailures(_ records: [MLIndexFailureRecord]) -> Bool {
         guard !records.isEmpty else { return true }
         return lock.withLock {
-            guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
             var stmt: OpaquePointer?
-            guard
-                sqlite3_prepare_v2(
-                    db,
-                    """
-                    INSERT INTO ml_failures(
-                      volume_id, node_id, model_identifier, model_version,
-                      kind, reason, attempts, updated_at
-                    )
-                    SELECT ?,?,?,?,?,?,?,?
-                    WHERE NOT EXISTS(
-                      SELECT 1 FROM ml_embeddings
-                      WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?
-                    )
-                    ON CONFLICT(model_identifier, model_version, volume_id, node_id) DO UPDATE SET
-                      kind=excluded.kind,
-                      reason=excluded.reason,
-                      attempts=excluded.attempts,
-                      updated_at=excluded.updated_at;
-                    """,
-                    -1, &stmt, nil
-                ) == SQLITE_OK
-            else {
-                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                return false
-            }
+            // The statement ends after the transaction; one that did not prepare finalizes as a no-op.
             defer { sqlite3_finalize(stmt) }
+            // SQLite can keep a transaction open after a failed COMMIT; the shared frame then rolls it back.
+            return SQLiteTransaction.immediate(db) {
+                guard
+                    sqlite3_prepare_v2(
+                        db,
+                        """
+                        INSERT INTO ml_failures(
+                          volume_id, node_id, model_identifier, model_version,
+                          kind, reason, attempts, updated_at
+                        )
+                        SELECT ?,?,?,?,?,?,?,?
+                        WHERE NOT EXISTS(
+                          SELECT 1 FROM ml_embeddings
+                          WHERE model_identifier=? AND model_version=? AND volume_id=? AND node_id=?
+                        )
+                        ON CONFLICT(model_identifier, model_version, volume_id, node_id) DO UPDATE SET
+                          kind=excluded.kind,
+                          reason=excluded.reason,
+                          attempts=excluded.attempts,
+                          updated_at=excluded.updated_at;
+                        """,
+                        -1, &stmt, nil
+                    ) == SQLITE_OK
+                else { return false }
 
-            for record in records {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                sqlite3_bind_int64(stmt, 4, Int64(record.descriptor.version))
-                sqlite3_bind_int64(stmt, 7, Int64(record.attempts))
-                sqlite3_bind_double(stmt, 8, record.updatedAt.timeIntervalSince1970)
-                sqlite3_bind_int64(stmt, 10, Int64(record.descriptor.version))
-                // A failed bind leaves its parameter NULL; the write must not run (#1194).
-                guard bindUID(stmt, 1, record.uid), SQLiteBinding.bindText(stmt, 3, record.descriptor.identifier),
-                    SQLiteBinding.bindText(stmt, 5, record.kind.rawValue),
-                    SQLiteBinding.bindText(stmt, 6, record.reason),
-                    SQLiteBinding.bindText(stmt, 9, record.descriptor.identifier), bindUID(stmt, 11, record.uid),
-                    sqlite3_step(stmt) == SQLITE_DONE
-                else {
-                    sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
-                    return false
+                for record in records {
+                    sqlite3_reset(stmt)
+                    sqlite3_clear_bindings(stmt)
+                    sqlite3_bind_int64(stmt, 4, Int64(record.descriptor.version))
+                    sqlite3_bind_int64(stmt, 7, Int64(record.attempts))
+                    sqlite3_bind_double(stmt, 8, record.updatedAt.timeIntervalSince1970)
+                    sqlite3_bind_int64(stmt, 10, Int64(record.descriptor.version))
+                    // A failed bind leaves its parameter NULL; the write must not run (#1194).
+                    guard bindUID(stmt, 1, record.uid), SQLiteBinding.bindText(stmt, 3, record.descriptor.identifier),
+                        SQLiteBinding.bindText(stmt, 5, record.kind.rawValue),
+                        SQLiteBinding.bindText(stmt, 6, record.reason),
+                        SQLiteBinding.bindText(stmt, 9, record.descriptor.identifier), bindUID(stmt, 11, record.uid),
+                        sqlite3_step(stmt) == SQLITE_DONE
+                    else { return false }
                 }
+                return true
             }
-            return sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
         }
     }
 

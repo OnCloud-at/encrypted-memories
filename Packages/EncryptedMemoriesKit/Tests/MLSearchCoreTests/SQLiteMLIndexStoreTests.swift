@@ -1,6 +1,7 @@
 import Foundation
 import PhotosCore
 import SQLite3
+import SQLiteTestSupport
 import Testing
 
 @testable import MLSearchCore
@@ -491,6 +492,47 @@ struct TestMLVectorCipher: MLVectorCipher {
             #expect(report.transientFailure == 2)
             let storedA = try store.contains(uid: uid("a"), descriptor: descriptorV1)
             #expect(!storedA, "the failed transaction stored nothing")
+        }
+    }
+
+    /// SQLite can keep a transaction open after a COMMIT that fails, for example on a deferred constraint. Recording
+    /// failure records must then roll back, or every later write of the store fails to begin.
+    @Test func aFailedCommitOfFailureRecordsRollsBackAndTheStoreWritesAgain() throws {
+        try withStore { store, url in
+            let storeHandle = try #require(storeDatabaseHandle(store))
+            #expect(sqlite3_exec(storeHandle, "PRAGMA foreign_keys=ON;", nil, nil, nil) == SQLITE_OK)
+            var handle: OpaquePointer?
+            #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+            // Every failure record also writes a row whose deferred foreign key fails at COMMIT.
+            #expect(
+                sqlite3_exec(
+                    handle,
+                    """
+                    CREATE TABLE commit_guard_parent(id INTEGER PRIMARY KEY);
+                    CREATE TABLE commit_guard(
+                      parent INTEGER REFERENCES commit_guard_parent(id) DEFERRABLE INITIALLY DEFERRED
+                    );
+                    CREATE TRIGGER fail_commit AFTER INSERT ON ml_failures
+                    BEGIN
+                      INSERT INTO commit_guard VALUES(1);
+                    END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            let first = uid("first")
+            let second = uid("second")
+            let failure: (PhotoUID) -> MLIndexFailureRecord = {
+                MLIndexFailureRecord(
+                    uid: $0, descriptor: descriptorV1, kind: .permanent, reason: "unsupported", attempts: 1)
+            }
+
+            #expect(!store.recordFailures([failure(first)]), "a commit that fails is no success")
+            #expect(sqlite3_get_autocommit(storeHandle) == 1, "the failed transaction is rolled back")
+            #expect(sqlite3_exec(handle, "DROP TRIGGER fail_commit;", nil, nil, nil) == SQLITE_OK)
+            sqlite3_close(handle)
+
+            #expect(store.recordFailures([failure(second)]), "the next write of the store begins and commits")
+            let records = try store.failureRecords(for: descriptorV1, from: [first, second])
+            #expect(records[first] == nil, "the failed write left no record")
+            #expect(records[second] != nil)
         }
     }
 

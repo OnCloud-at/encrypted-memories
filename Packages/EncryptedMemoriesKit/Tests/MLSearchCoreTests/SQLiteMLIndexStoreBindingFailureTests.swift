@@ -170,6 +170,20 @@ final class SQLiteMLIndexStoreBindingFailureTests: XCTestCase {
         XCTAssertNil(fault.failedBeforeStepProblem)
     }
 
+    /// A failure record that does not bind rolls back the records before it in the same call. The limit stays lowered
+    /// for the whole call, so the first record, with a short reason, binds and steps, and only the second one fails.
+    func testRecordFailuresWhoseLaterReasonDoesNotBindStoresNoRecord() throws {
+        let handle = try XCTUnwrap(storeDatabaseHandle(store!))
+        let otherUID = PhotoUID(volumeID: "volume", nodeID: "other")
+        _ = sqlite3_limit(handle, SQLITE_LIMIT_LENGTH, Self.limit)
+        defer { _ = sqlite3_limit(handle, SQLITE_LIMIT_LENGTH, 1_000_000_000) }
+        XCTAssertFalse(
+            store.recordFailures([failure(shortUID, reason: "short"), failure(otherUID, reason: Self.long)]),
+            "A later reason that does not bind fails the call")
+        _ = sqlite3_limit(handle, SQLITE_LIMIT_LENGTH, 1_000_000_000)
+        XCTAssertEqual(try store.failureRecords(for: descriptor, from: [shortUID, otherUID]).count, 0)
+    }
+
     // MARK: Reads
 
     func testIndexedUIDsWithAKeyThatDoesNotBindIsAReadFailure() throws {

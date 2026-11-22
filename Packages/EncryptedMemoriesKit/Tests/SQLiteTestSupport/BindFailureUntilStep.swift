@@ -103,6 +103,6 @@ public final class BindFailureUntilStep {
 }
 
 /// The open `db` handle of a store that owns its database without `SQLiteStoreConnection`, read through reflection.
-func storeDatabaseHandle(_ store: Any) -> OpaquePointer? {
+public func storeDatabaseHandle(_ store: Any) -> OpaquePointer? {
     Mirror(reflecting: store).children.first(where: { $0.label == "db" })?.value as? OpaquePointer
 }
