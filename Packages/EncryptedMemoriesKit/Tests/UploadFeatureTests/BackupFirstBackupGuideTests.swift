@@ -41,6 +41,37 @@ final class BackupFirstBackupGuideTests: XCTestCase {
 
     private let threshold = BackupFirstBackupGuide.largeBackupThreshold
 
+    // MARK: - Photos that are not backed up
+
+    /// A first backup that ends with photos that are not backed up is no plain completion, also when nothing asks the
+    /// person: the calm photos make it end quietly, without the completion headline.
+    func testACompletionWithCalmPhotosEndsTheGuideQuietly() {
+        var calm = status(.completed, total: 2_000, uploaded: 1_997, guide: .running, totalKnown: true)
+        calm.failed = 3
+        XCTAssertEqual(calm.needsAttentionCount, 0)
+        XCTAssertTrue(calm.hasOmissions)
+        XCTAssertEqual(BackupFirstBackupGuide.next(.running, after: calm), .done)
+        XCTAssertNotEqual(BackupStatusPresentation(calm).headlineKey, "backup.phase_first_completed")
+    }
+
+    /// A status that asks the person shows no hint about speed: photos that need the person, or a full Proton storage.
+    func testAStatusThatAsksThePersonShowsNoHint() {
+        var attention = status(.needsAttention, total: 2_000, uploaded: 500, guide: .running, totalKnown: true)
+        attention.failed = 1
+        attention.needsAttentionCount = 1
+        XCTAssertEqual(BackupStatusPresentation(attention).accessory, .attention)
+        XCTAssertFalse(BackupStatusPresentation(attention).showsLargeBackupHint)
+
+        var storage = status(.waiting, total: 2_000, uploaded: 500, remaining: 1_500, guide: .running, totalKnown: true)
+        storage.outstandingIssue = .accountStorage
+        storage.outstandingCount = 1_500
+        XCTAssertEqual(BackupStatusPresentation(storage).accessory, .attention)
+        XCTAssertFalse(BackupStatusPresentation(storage).showsLargeBackupHint)
+
+        storage.outstandingIssue = .network
+        XCTAssertTrue(BackupStatusPresentation(storage).showsLargeBackupHint, "a calm wait keeps the hint")
+    }
+
     // MARK: - Steps
 
     /// The first status decides whether this can be a first backup at all.
@@ -265,7 +296,8 @@ final class BackupFirstBackupGuideTests: XCTestCase {
                 isTotalKnown: false, isChecking: false, fraction: nil)
             let display = BackupStatusPresentation(held)
             XCTAssertEqual(display.headlineKey, headlineKey, "\(phase)")
-            XCTAssertTrue(display.showsLargeBackupHint, "\(phase)")
+            // A status that asks the person shows no hint about speed.
+            XCTAssertEqual(display.showsLargeBackupHint, phase != .needsAttention, "\(phase)")
             XCTAssertNil(display.localizedSubtitle, "\(phase)")
         }
     }

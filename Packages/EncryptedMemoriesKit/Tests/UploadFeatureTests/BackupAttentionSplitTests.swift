@@ -119,6 +119,16 @@ final class BackupAttentionSplitTests: XCTestCase {
         XCTAssertEqual(BackupStatusPresentation(empty).accessory, .attention)
     }
 
+    /// A pass that checks photos while their total is unknown reads "Checking" and shows no calm line yet.
+    func testAStatusThatChecksPhotosShowsNoCalmLine() {
+        var status = BackupStatus(progress: progress(total: 10, uploaded: 7, failed: 2), isScanning: false)
+        XCTAssertEqual(status.phase, .completed)
+        status.photoDisplayProgress = BackupPhotoDisplayProgress(isTotalKnown: false, isChecking: true, fraction: nil)
+        let display = BackupStatusPresentation(status)
+        XCTAssertTrue(display.isActive)
+        XCTAssertNil(display.localizedNotBackedUp)
+    }
+
     func testAPausedStatusShowsNoCalmLine() {
         var raw = progress(total: 10, uploaded: 5, waiting: 3, failed: 2)
         raw.isRunning = true

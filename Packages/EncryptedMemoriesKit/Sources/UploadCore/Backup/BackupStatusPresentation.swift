@@ -213,10 +213,6 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         }
         executionOpportunityIssue = status.executionOpportunityIssue
         remainingCount = status.remainingCount
-        // A running pass changes the parked counts before the summary sorts them, so only a resting status shows them.
-        if !isActive && status.phase != .paused {
-            notBackedUpCount = status.notBackedUpCount
-        }
         // A speed belongs to a sending phase only; a stale value never shows while paused or waiting.
         if status.phase == .checking || status.phase == .uploading {
             uploadSpeedBytesPerSecond = status.uploadSpeedBytesPerSecond
@@ -241,9 +237,16 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 }
             }
         }
+        // A running pass changes the parked counts before the summary sorts them, so only a resting status shows them.
+        // This follows the photo progress, which can make the status active.
+        if !isActive && status.phase != .paused {
+            notBackedUpCount = status.notBackedUpCount
+        }
         // The large first backup guide (#275): its hint while it runs, its headline once after a plain completion.
         let guide = status.firstBackupGuide
-        showsLargeBackupHint = guide == .running && status.phase != .completed && status.phase != .idle
+        // A status that asks the person (for example a full Proton storage) shows no hint about speed.
+        showsLargeBackupHint =
+            guide == .running && status.phase != .completed && status.phase != .idle && accessory != .attention
         if guide == .completedUnseen, headlineKey == "backup.phase_completed" {
             headlineKey = "backup.phase_first_completed"
         }

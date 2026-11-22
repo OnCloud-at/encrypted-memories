@@ -52,7 +52,7 @@ public enum BackupFirstBackupGuide {
             guard status.photoDisplayProgress?.isTotalKnown != false else { return .running }
             // Only a completion without omissions or respected deletions that uploaded something is a completed
             // first backup. A library that was already in Proton (for example after a reinstall) ends quietly.
-            let plain = status.dismissedFailures == 0 && status.skippedRemoteDeletions == 0
+            let plain = !status.hasOmissions && status.skippedRemoteDeletions == 0
             return plain && status.uploaded > 0 ? .completedUnseen : .done
         case .completedUnseen:
             return status.isActive && status.remainingCount > 0 ? .done : .completedUnseen
