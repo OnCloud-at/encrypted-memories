@@ -415,11 +415,14 @@ struct MainView: View {
                         mapEmptyState
                     } else {
                         LibraryMapScreen(
-                            index: locationIndex,
-                            thumbnail: { feed.memoryImage(for: $0) },
-                            loadThumbnail: { await feed.cachedImage(for: $0) },
-                            onSelectPhoto: { openPhotoByUID($0) },
-                            onSelectCluster: { uids, coordinate in showMapCluster(uids: uids, coordinate: coordinate) })
+                            LibraryMapView(
+                                index: locationIndex,
+                                thumbnail: { feed.memoryImage(for: $0) },
+                                loadThumbnail: { await feed.cachedImage(for: $0) },
+                                onSelectPhoto: { openPhotoByUID($0) },
+                                onSelectCluster: { uids, coordinate in
+                                    showMapCluster(uids: uids, coordinate: coordinate)
+                                }))
                     }
                 }
                 .padding(.leading, leadingObstructionInset)
