@@ -468,6 +468,7 @@ public struct ExactDuplicateFinder: Sendable {
             var pageFacts: [String: [PhotoUID: ExactDuplicateKeepFacts]] = [:]
             var memberSizes: [String: [PhotoUID: Int64]] = [:]
             var fingerprints: [String: [PhotoUID: ExactDuplicateFingerprint]] = [:]
+            var savedSizes: [String: [PhotoUID: Int64]] = [:]
             for group in page {
                 guard let read = facts[group.id] else {
                     failed += 1
@@ -485,6 +486,7 @@ public struct ExactDuplicateFinder: Sendable {
                     memberSizes[group.id] = Dictionary(known, uniquingKeysWith: { first, _ in first })
                 }
                 fingerprints[group.id] = read.mapValues(\.fingerprint)
+                savedSizes[group.id] = read.mapValues(Self.savedSize)
                 var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
                 for member in group.members {
                     memberFacts[member] = Self.keepFacts(
@@ -499,7 +501,7 @@ public struct ExactDuplicateFinder: Sendable {
             if let cache = fingerprintCache, let epoch = page.first?.hashKeyEpoch {
                 cache.record(
                     fingerprints.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } },
-                    byteSizes: memberSizes.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } },
+                    byteSizes: savedSizes.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } },
                     for: snapshot, currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
             }
             await ranked(
@@ -547,7 +549,8 @@ public struct ExactDuplicateFinder: Sendable {
         let index = index
         let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) {
             (members: [PhotoUID]) -> [PhotoUID: ExactDuplicateNodeFacts]? in
-            // A saved row without a size, such as one from before sizes were saved, is read again for its size.
+            // A saved row without size information, such as one from before sizes were saved, is read again. A row of
+            // a node that states no size holds zero and is not read again.
             let unsaved = members.filter { saved[$0]?.byteSize == nil }
             guard !unsaved.isEmpty else { return [PhotoUID: ExactDuplicateNodeFacts]() }
             guard let read = try? await remote.nodeFacts(of: unsaved) else { return nil }
@@ -556,7 +559,7 @@ public struct ExactDuplicateFinder: Sendable {
             if let cache, let snapshot {
                 let own = read.filter { $0.key.volumeID == snapshot.scope.volumeID }
                 cache.record(
-                    own.mapValues(\.fingerprint), byteSizes: own.compactMapValues(Self.positiveSize), for: snapshot,
+                    own.mapValues(\.fingerprint), byteSizes: own.mapValues(Self.savedSize), for: snapshot,
                     currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: snapshot.scope.hashKeyEpoch)?
                         .eventID)
             }
@@ -583,6 +586,12 @@ public struct ExactDuplicateFinder: Sendable {
     /// The size that a node states, when it states one above zero.
     private static func positiveSize(_ facts: ExactDuplicateNodeFacts) -> Int64? {
         facts.byteSize.flatMap { $0 > 0 ? $0 : nil }
+    }
+
+    /// The size to save for a node that was read: its size above zero, or zero for a node that states none, so the
+    /// next check knows that the node was read and does not read it again. Zero is never shown.
+    private static func savedSize(_ facts: ExactDuplicateNodeFacts) -> Int64 {
+        positiveSize(facts) ?? 0
     }
 
     /// The snapshot of the latest scan, or a new one at the current cursor of the content index. Nil without a cache

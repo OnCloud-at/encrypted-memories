@@ -216,6 +216,20 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
         XCTAssertEqual(saved.mapValues(\.byteSize), [pair[0]: 5_000, pair[1]: 5_000])
     }
 
+    func testAPhotoWhoseNodeStatesNoSizeIsNotReadAgain() async throws {
+        let pair = seedPossiblePair("one")
+        server.setNodeSize(0, of: pair[1])
+        setLibrary([pair])
+        publishIndex(eventID: "event-1")
+        let cache = try openCache()
+        _ = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        let again = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(nodeReads, 2, "the node was read once; its missing size is saved as known")
+        XCTAssertEqual(again?.byteSizes, [pair[0]: 300], "a size of zero is never shown")
+    }
+
     func testASizeOfZeroIsNoSize() async throws {
         let pair = seedPossiblePair("one")
         server.setNodeSize(0, of: pair[1])
