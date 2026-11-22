@@ -7672,11 +7672,11 @@ extension BackupSyncRunnerTests {
         let control = await makeRunner().runUntilDrained(mode: .eligibleOnly)
         XCTAssertTrue(control.leavesNoUploadWork, "fixture control: an empty queue leaves no upload work")
 
-        let mark = try SQLiteRecordedFailure(
+        let mark = try SQLiteStatementStartAction.recordedFailure(
             in: queueStore!, matching: "SELECT 1 FROM backup_sync_queue WHERE state IN")
         defer { mark.stop() }
         let progress = await makeRunner().runUntilDrained(mode: .eligibleOnly)
-        XCTAssertTrue(mark.recorded, "the failure was recorded while the last read ran")
+        XCTAssertTrue(mark.fired, "the failure was recorded while the last read ran")
         XCTAssertTrue(queueStore.isOperational(), "the health check forgot it, because the database answers")
         XCTAssertFalse(progress.leavesNoUploadWork, "a pass with a recorded failure proves no empty queue")
     }

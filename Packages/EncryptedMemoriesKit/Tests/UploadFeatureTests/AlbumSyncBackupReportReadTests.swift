@@ -38,47 +38,18 @@ final class AlbumSyncBackupReportReadTests: XCTestCase {
     }
 
     func testADeletionRowThatLeavesTheQueueAfterTheStateReadRefusesTheReport() throws {
-        let removal = try RowRemovalBeforeStatement(
-            in: queue!, matching: "SELECT original_filename, byte_count, state", databaseURL: url)
+        // Another connection deletes every queue row when the read starts, so the read finds the queue without its rows.
+        var other: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &other, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        defer { sqlite3_close(other) }
+        let removal = try SQLiteStatementStartAction(
+            in: queue!, matching: "SELECT original_filename, byte_count, state"
+        ) { _ in sqlite3_exec(other, "DELETE FROM backup_sync_queue;", nil, nil, nil) == SQLITE_OK }
         defer { removal.stop() }
         XCTAssertThrowsError(try AlbumSyncBackupReport.read(from: queue, localIdentifiers: ["photo"])) {
             XCTAssertEqual($0 as? AlbumSyncError, .mappingStoreUnavailable)
         }
-        XCTAssertTrue(removal.removed)
+        XCTAssertTrue(removal.fired)
         XCTAssertTrue(queue.isOperational(), "the row is absent, not unreadable")
-    }
-}
-
-/// Deletes every queue row through a second connection when the store starts the first statement whose SQL contains
-/// `matching`, so that statement reads the queue without its rows.
-private final class RowRemovalBeforeStatement {
-    private let connection: SQLiteStoreConnection
-    private let matching: String
-    private var other: OpaquePointer?
-    private(set) var removed = false
-
-    init(in store: Any, matching: String, databaseURL: URL) throws {
-        connection = try storeConnection(store)
-        self.matching = matching
-        XCTAssertEqual(sqlite3_open_v2(databaseURL.path, &other, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
-        connection.withLock {
-            sqlite3_trace_v2(
-                connection.database, UInt32(SQLITE_TRACE_STMT),
-                { _, context, statement, _ in
-                    guard let context, let statement else { return 0 }
-                    let removal = Unmanaged<RowRemovalBeforeStatement>.fromOpaque(context).takeUnretainedValue()
-                    guard !removal.removed, let sql = sqlite3_sql(OpaquePointer(statement)),
-                        String(cString: sql).contains(removal.matching)
-                    else { return 0 }
-                    removal.removed =
-                        sqlite3_exec(removal.other, "DELETE FROM backup_sync_queue;", nil, nil, nil) == SQLITE_OK
-                    return 0
-                }, Unmanaged.passUnretained(self).toOpaque())
-        }
-    }
-
-    func stop() {
-        connection.withLock { sqlite3_trace_v2(connection.database, 0, nil, nil) }
-        sqlite3_close(other)
     }
 }

@@ -73,35 +73,48 @@ extension SQLiteStatementFaults {
     }
 }
 
-/// Records one transient failure on the store's connection while the first statement whose SQL contains `matching`
-/// runs, without failing that statement. The failure stands for another reader of the same connection; the store's
-/// health check forgets it at once, because the database answers.
-final class SQLiteRecordedFailure {
+/// Runs `action` once, under the store's connection lock, when the store starts the first statement whose SQL contains
+/// `matching`. The statement itself runs normally. `fired` tells whether the action ran and returned true.
+final class SQLiteStatementStartAction {
     private let connection: SQLiteStoreConnection
     private let matching: String
-    private var marked = false
+    private let action: (SQLiteStoreConnection) -> Bool
+    private var ran = false
+    private var succeeded = false
 
-    init(in store: Any, matching: String) throws {
+    init(in store: Any, matching: String, action: @escaping (SQLiteStoreConnection) -> Bool) throws {
         connection = try storeConnection(store)
         self.matching = matching
+        self.action = action
         connection.withLock {
             sqlite3_trace_v2(
                 connection.database, UInt32(SQLITE_TRACE_STMT),
                 { _, context, statement, _ in
                     guard let context, let statement else { return 0 }
-                    let mark = Unmanaged<SQLiteRecordedFailure>.fromOpaque(context).takeUnretainedValue()
-                    guard !mark.marked, let sql = sqlite3_sql(OpaquePointer(statement)),
-                        String(cString: sql).contains(mark.matching)
+                    let start = Unmanaged<SQLiteStatementStartAction>.fromOpaque(context).takeUnretainedValue()
+                    guard !start.ran, let sql = sqlite3_sql(OpaquePointer(statement)),
+                        String(cString: sql).contains(start.matching)
                     else { return 0 }
-                    // The trace runs while the store holds its connection lock, as `markFailed` requires.
-                    mark.marked = true
-                    mark.connection.markFailed(resultCode: SQLITE_INTERRUPT)
+                    // The trace runs while the store holds its connection lock.
+                    start.ran = true
+                    start.succeeded = start.action(start.connection)
                     return 0
                 }, Unmanaged.passUnretained(self).toOpaque())
         }
     }
 
-    var recorded: Bool { connection.withLock { marked } }
+    /// Records one transient failure on the store's connection while the first matching statement runs, without
+    /// failing that statement. The failure stands for another reader of the same connection; the store's health check
+    /// forgets it at once, because the database answers.
+    static func recordedFailure(in store: Any, matching: String) throws -> SQLiteStatementStartAction {
+        try SQLiteStatementStartAction(in: store, matching: matching) { connection in
+            // `markFailed` requires the connection lock, which the trace holds.
+            connection.markFailed(resultCode: SQLITE_INTERRUPT)
+            return true
+        }
+    }
+
+    var fired: Bool { connection.withLock { succeeded } }
 
     func stop() {
         connection.withLock {

@@ -362,12 +362,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         let (fixture, queue, entry) = try await makeRetryFailureFixture(prefix: "backup-retry-probe-count")
         defer { fixture.cleanup() }
         let controllerQueue = try photoBackupQueueStore(fixture.controller)
-        let fault = try SQLiteRecordedFailure(in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;")
+        let fault = try SQLiteStatementStartAction.recordedFailure(
+            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;")
         defer { fault.stop() }
 
         await fixture.controller.retryUserResolvableWork()
 
-        XCTAssertTrue(fault.recorded, "The health probe recorded the unrelated transient failure")
+        XCTAssertTrue(fault.fired, "The health probe recorded the unrelated transient failure")
         XCTAssertTrue(controllerQueue.isOperational())
         XCTAssertNil(fixture.controller.lastMessage, "The reopen succeeded before the health probe ran")
         let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
