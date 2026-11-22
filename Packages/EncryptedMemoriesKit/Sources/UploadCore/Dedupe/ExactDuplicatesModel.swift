@@ -809,9 +809,13 @@ public final class ExactDuplicatesModel {
         reviewGroups(list).first { $0.id == id }
     }
 
-    /// The spoken label of a copy of a review list: its position among the copies of its group.
-    public func accessibilityLabel(of member: PhotoUID, in group: ExactDuplicateReviewGroup) -> String {
-        Self.positionLabel(of: member, in: group.members)
+    /// The spoken label of a copy of a review list: its position among the copies of its group, and its size.
+    public func accessibilityLabel(
+        of member: PhotoUID, in group: ExactDuplicateReviewGroup, of list: ExactDuplicateReviewList
+    ) -> String {
+        let position = Self.positionLabel(of: member, in: group.members)
+        guard let size = byteSize(of: member, in: list) else { return position }
+        return "\(position), \(Self.byteText(size))"
     }
 
     /// "Copy 2 of 3" for `member` of `members`.

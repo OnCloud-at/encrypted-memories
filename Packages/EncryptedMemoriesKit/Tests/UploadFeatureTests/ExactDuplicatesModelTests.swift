@@ -3532,7 +3532,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertNil(model.reviewGroup(.differing, id: "A"))
         let group = try XCTUnwrap(model.reviewGroups(.differing).first)
         XCTAssertEqual(
-            group.members.map { model.accessibilityLabel(of: $0, in: group) },
+            group.members.map { model.accessibilityLabel(of: $0, in: group, of: .differing) },
             [L10n.string("duplicates.member_label \(1) \(2)"), L10n.string("duplicates.member_label \(2) \(2)")])
     }
 
@@ -4072,6 +4072,32 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
         XCTAssertNil(route.opened, "the list closes when its last group left")
         XCTAssertTrue(route.offersMergeAll(of: model))
+    }
+
+    func testTheAccountModelChecksPossibleDuplicatesWithTheRuleOfTheApps() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.possible = threeFiles
+        let lifetime = ExactDuplicatesAccountLifetime()
+        let model = try XCTUnwrap(lifetime.replace(with: finder))
+
+        await model.load(checkAllGroups: true)
+
+        XCTAssertEqual(finder.possibleRequests, [.init(sameBytes: ["A"], policy: .standard)])
+        XCTAssertEqual(
+            PossibleDuplicatePolicy.standard, PossibleDuplicatePolicy(rule: .sameShape, includesVideos: true))
+        lifetime.retire()
+    }
+
+    func testTheSpokenLabelOfAReviewCopyNamesItsPositionAndSize() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+        let group = try XCTUnwrap(model.reviewGroups(.possible).first)
+
+        XCTAssertEqual(
+            model.accessibilityLabel(of: x2, in: group, of: .possible),
+            "\(L10n.string("duplicates.member_label \(2) \(3)")), \(ExactDuplicatesModel.byteText(2))")
     }
 
     func testACopyThatAMergeMovedToRecentlyDeletedLeavesThePossibleGroups() async {

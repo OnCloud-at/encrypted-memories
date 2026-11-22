@@ -36,7 +36,7 @@ public final class ExactDuplicatesAccountLifetime {
         retire()
         guard let finder else { return nil }
         let token = self.token
-        let next = ExactDuplicatesModel(finder: finder) { [weak self] trashed in
+        let next = ExactDuplicatesModel(finder: finder, possibleDuplicatePolicy: .standard) { [weak self] trashed in
             guard let self, self.isCurrent(token) else { return }
             await didTrash(trashed, token)
         }

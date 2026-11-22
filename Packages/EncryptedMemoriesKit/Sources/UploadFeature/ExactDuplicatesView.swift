@@ -463,7 +463,8 @@ public struct ExactDuplicatesReviewView<Cover: View>: View {
         let model = model
         let members = ExactDuplicateReviewMembers(
             group: group, groupIndex: index, identifier: list.identifier, item: item,
-            label: { model.accessibilityLabel(of: $0, in: group) }, open: onOpen, cover: cover)
+            size: { [list] in model.byteSize(of: $0, in: list) },
+            label: { [list] in model.accessibilityLabel(of: $0, in: group, of: list) }, open: onOpen, cover: cover)
         if DuplicatesLayout.cards {
             VStack(alignment: .leading, spacing: 8) {
                 line.padding(.horizontal, margin)
@@ -491,6 +492,8 @@ private struct ExactDuplicateReviewMembers<Cover: View>: View {
     /// The identifier of the list, which the identifiers of the copies and the group extend.
     let identifier: String
     let item: (PhotoUID) -> PhotoItem?
+    /// The file size of a copy, shown on its tile.
+    let size: (PhotoUID) -> Int64?
     /// The spoken label of a copy.
     let label: (PhotoUID) -> String
     let open: (PhotoUID, String) -> Void
@@ -503,9 +506,13 @@ private struct ExactDuplicateReviewMembers<Cover: View>: View {
                 Button {
                     if found != nil { open(uid, group.id) }
                 } label: {
-                    cover(uid).overlay {
-                        if found == nil { ProgressView().controlSize(.small) }
-                    }
+                    cover(uid)
+                        .overlay {
+                            if found == nil { ProgressView().controlSize(.small) }
+                        }
+                        .overlay(alignment: .bottomTrailing) {
+                            if let size = size(uid) { ExactDuplicateSizeBadge(size: size) }
+                        }
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(label(uid))
@@ -840,13 +847,7 @@ private struct ExactDuplicateTile<Cover: View>: View {
             }
             .overlay(alignment: .bottomLeading) { badges }
             .overlay(alignment: .bottomTrailing) {
-                if let size = group.byteSize(of: member) {
-                    Text(ExactDuplicatesModel.byteText(size))
-                        .font(.caption2.weight(.semibold))
-                        .monospacedDigit()
-                        .lineLimit(1)
-                        .modifier(ThumbnailText())
-                }
+                if let size = group.byteSize(of: member) { ExactDuplicateSizeBadge(size: size) }
             }
             .overlay(alignment: .topTrailing) {
                 if isKept {
@@ -895,6 +896,19 @@ private struct ExactDuplicateTile<Cover: View>: View {
                 return "iphone"
             #endif
         }
+    }
+}
+
+/// The file size at the bottom right of a tile, in every list of the Duplicates route.
+private struct ExactDuplicateSizeBadge: View {
+    let size: Int64
+
+    var body: some View {
+        Text(ExactDuplicatesModel.byteText(size))
+            .font(.caption2.weight(.semibold))
+            .monospacedDigit()
+            .lineLimit(1)
+            .modifier(ThumbnailText())
     }
 }
 

@@ -157,7 +157,12 @@ import os
                             : ProcessInfo.processInfo.arguments.contains(
                                 "-EncryptedMemoriesDuplicatesMergeFailure") ? .timedOut : nil,
                         fingerprints: Dictionary(
-                            uniqueKeysWithValues: differing.map { ($0[1], ExactDuplicateFingerprint(pixelWidth: 1)) })))
+                            uniqueKeysWithValues: differing.map { ($0[1], ExactDuplicateFingerprint(pixelWidth: 1)) }),
+                        possible: ProcessInfo.processInfo.arguments.contains(
+                            "-EncryptedMemoriesDuplicatesPossibleDetails")
+                            ? MobileFixtureDuplicates.possibleFixture(
+                                sections.dropFirst(2).first.map { Array($0.items.prefix(2)) } ?? [])
+                            : nil))
             } else if ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDuplicatesWideFixture") {
                 // One group with more copies than fit on the screen, and one whose two copies fit.
                 let wide = Array(sections[0].items.prefix(12))
@@ -512,6 +517,8 @@ import os
         private var mergeFailure: URLError.Code?
         /// The details of copies that differ from the others. Every other copy has a fingerprint without values.
         private let fingerprints: [PhotoUID: ExactDuplicateFingerprint]
+        /// The result of the check of possibly identical photos. Nil reads as a library that cannot be read.
+        private let possible: PossibleDuplicateScan?
 
         init(
             groups members: [[PhotoUID]], checking: Bool = false, captureDates: [PhotoUID: Date] = [:],
@@ -520,7 +527,7 @@ import os
             confirmsNoPendingMerges: Bool = true, onConfirmNoPendingMerges: (@Sendable () -> Void)? = nil,
             beforeMerge: (@Sendable () async -> Void)? = nil, invalidatingMergeReloadFails: Bool = false,
             buildInterruptions: Int = 0, mergeFailure: URLError.Code? = nil,
-            fingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
+            fingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:], possible: PossibleDuplicateScan? = nil
         ) {
             groups = members.enumerated().map { index, members in
                 ExactDuplicateGroup(contentHash: "fixture-copies-\(index)", hashKeyEpoch: "fixture", members: members)
@@ -538,6 +545,27 @@ import os
             self.buildInterruptions = buildInterruptions
             self.mergeFailure = mergeFailure
             self.fingerprints = fingerprints
+            self.possible = possible
+        }
+
+        /// Two photos of the same moment and camera as a JPEG and a smaller HEIC: possibly the same photo.
+        static func possibleFixture(_ items: [PhotoItem]) -> PossibleDuplicateScan? {
+            guard items.count == 2 else { return nil }
+            let details = { (type: String) in
+                ExactDuplicateFingerprint(
+                    captureTime: items[0].captureTime, device: "Fixture Camera", pixelWidth: 4000, pixelHeight: 3000,
+                    mimeType: type)
+            }
+            return PossibleDuplicateScan(
+                groups: [PossibleDuplicateGroup(members: items.map(\.uid), differences: [.fileType])],
+                byteSizes: [items[0].uid: 3_400_000, items[1].uid: 1_200_000],
+                fingerprints: [items[0].uid: details("image/jpeg"), items[1].uid: details("image/heic")])
+        }
+
+        func possibleDuplicates(
+            excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
+        ) async -> PossibleDuplicateScan? {
+            possible
         }
 
         func confirmNoPendingMerges() async -> Bool {
