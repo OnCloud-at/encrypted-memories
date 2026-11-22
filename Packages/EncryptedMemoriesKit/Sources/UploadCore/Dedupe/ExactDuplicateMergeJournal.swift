@@ -75,11 +75,7 @@ public final class ExactDuplicateMergeJournalFileStore: ExactDuplicateMergeJourn
     /// Writes and removes the file. Reads and the move aside of a damaged file use the file manager.
     private let fileSystem: any DurableFileSystem
 
-    public convenience init(accountDataDirectory: URL) {
-        self.init(accountDataDirectory: accountDataDirectory, fileSystem: LocalDurableFileSystem())
-    }
-
-    init(accountDataDirectory: URL, fileSystem: any DurableFileSystem) {
+    public init(accountDataDirectory: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem()) {
         url = accountDataDirectory.appendingPathComponent(Self.fileName)
         self.fileSystem = fileSystem
     }

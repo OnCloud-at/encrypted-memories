@@ -13,7 +13,7 @@ public enum RecentlyDeletedEmptying {
         _ trash: any TrashProvider, checkingMergesWith duplicates: (any ExactDuplicateMerging)?,
         accountDataDirectory: URL?, beforeEmpty: @MainActor () async throws -> Void = {}
     ) async throws {
-        let journal = accountDataDirectory.map(ExactDuplicateMergeJournalFileStore.init(accountDataDirectory:))
+        let journal = accountDataDirectory.map { ExactDuplicateMergeJournalFileStore(accountDataDirectory: $0) }
         func blocked() -> PendingMergeCheck {
             guard let journal else { return PendingMergeCheck() }
             if journal.cannotBeRead() { return PendingMergeCheck(reason: .journalUnreadable) }

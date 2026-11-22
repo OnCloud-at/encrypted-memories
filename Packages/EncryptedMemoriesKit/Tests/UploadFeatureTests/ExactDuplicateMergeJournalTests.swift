@@ -87,10 +87,9 @@ final class ExactDuplicateMergeJournalTests: XCTestCase {
             try FileManager.default.contentsOfDirectory(atPath: directory.path),
             [ExactDuplicateMergeJournalFileStore.fileName],
             "one file", file: file, line: line)
-        let url = directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName)
-        let text = String(decoding: try Data(contentsOf: url), as: UTF8.self)
-        XCTAssertEqual(text.utf8.count, expected.utf8.count, "exact length", file: file, line: line)
-        XCTAssertEqual(canonicalJSON(text), expected, "exact content", file: file, line: line)
+        try assertJSONFile(
+            directory.appendingPathComponent(ExactDuplicateMergeJournalFileStore.fileName), holds: expected,
+            file: file, line: line)
     }
 
     func testTheJournalIsOneFileThatHoldsExactlyItsEncodedIntentsInOrder() throws {
