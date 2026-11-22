@@ -32,7 +32,7 @@ public enum BackupProblemSheetSource {
     /// Whether the summary counts photos that are not backed up, so an empty list is no answer yet.
     var expectsItems: Bool {
         switch self {
-        case .backup(let controller): controller.status.needsAttentionCount + controller.status.notBackedUpCount > 0
+        case .backup(let controller): controller.status.hasPhotosNotBackedUp
         case .album(let controller, let albumID):
             controller.selectedAlbums.first { $0.id == albumID }?.hasNeedsAttention == true
         }

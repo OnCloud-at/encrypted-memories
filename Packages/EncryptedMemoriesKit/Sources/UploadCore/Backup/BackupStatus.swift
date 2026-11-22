@@ -139,6 +139,8 @@ public struct BackupStatus: Sendable, Equatable {
     public var needsAttentionCount = 0
     /// Rows that are not backed up although nothing the person can fix is known. They show in a calm line.
     public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) }
+    /// Whether the summary counts any photo that is not backed up, orange or calm: the problem list must show one.
+    public var hasPhotosNotBackedUp: Bool { needsAttentionCount + notBackedUpCount > 0 }
     /// The failed and final part of `notBackedUpCount`, for a host that lists missing photos in their own line.
     public var notBackedUpFailedCount: Int { max(0, notBackedUpCount - sourceMissing) }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
@@ -170,8 +172,10 @@ public struct BackupStatus: Sendable, Equatable {
     public func afterFolderEnumerationFailure() -> BackupStatus {
         var status = self
         status.phase = .needsAttention
-        status.failed = max(1, status.failed)
-        status.needsAttentionCount = max(1, status.needsAttentionCount)
+        // One item that asks the person, added only once: the calm rows keep their count.
+        let added = max(0, 1 - status.needsAttentionCount)
+        status.failed += added
+        status.needsAttentionCount += added
         status.fractionCompleted = nil
         status.currentItemName = nil
         return status

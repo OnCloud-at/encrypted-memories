@@ -107,7 +107,7 @@ public enum PhotoLibraryContinuedBackupEnd: String, Sendable, BackgroundLogName 
     ) -> Self {
         // Every row that is not backed up keeps the system card from reporting success, also a calm one.
         if goal.isReached(by: settled) {
-            return settled.needsAttentionCount + settled.notBackedUpCount > 0 ? .needsAttention : .completed
+            return settled.hasPhotosNotBackedUp ? .needsAttention : .completed
         }
         if didExpire { return .stopped }
         return backupRuns ? .waiting : .turnedOff

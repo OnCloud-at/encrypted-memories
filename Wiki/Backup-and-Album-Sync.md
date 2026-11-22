@@ -47,7 +47,7 @@ The Backup page shows how many photos are not backed up yet. The orange line **N
 - **Continues by itself**: the backup tries again later, at the latest after the next start of the app. Examples: **Not enough space on this device.**, **Connection interrupted.**, or **Not backed up after several tries.**
 - **No further attempts**: the backup does not try this photo again. Examples: **This file type cannot be backed up.** or **Proton did not accept this photo.** A photo that Proton refused again and again over several days stops here; it is backed up again when you change it, and tried once more after an app update.
 
-**Try again** appears only while the list shows a photo that you can fix. Select it to retry these photos. When nothing is left, the list shows **Nothing needs attention.**
+**Try again** appears while a retry can help a photo in the list. Select it to retry these photos. When nothing is left, the list shows **Nothing needs attention.**
 
 If the backup of a photo was removed from Proton Drive, select the photo in the list and choose what to do. **Back Up Again** uploads the photo again. **Keep Deleted** leaves it out of the backup.
 

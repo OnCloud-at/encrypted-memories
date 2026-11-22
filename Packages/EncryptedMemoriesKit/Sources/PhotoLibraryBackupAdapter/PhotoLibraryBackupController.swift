@@ -855,7 +855,7 @@ public final class PhotoLibraryBackupController {
         #if DEBUG
             if let override = problemListExpectationForTesting { return override() }
         #endif
-        return status.needsAttentionCount + status.notBackedUpCount > 0
+        return status.hasPhotosNotBackedUp
     }
 
     /// Re-reads an empty list while the summary still counts problems, up to the bounded retry budget.
