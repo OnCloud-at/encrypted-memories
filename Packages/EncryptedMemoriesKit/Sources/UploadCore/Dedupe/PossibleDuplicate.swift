@@ -149,7 +149,8 @@ public enum PossibleDuplicateCandidates {
     /// Groups of two or more library items with the same capture second and the same kind, in the order of `items`.
     /// Leaves out burst photos, the paired videos of Live Photos, videos unless `includesVideos`, and every copy of
     /// `sameBytes` after its first one, because the lists of identical copies already hold those pairs. Every member
-    /// of a group has the same known moment within the second, or none.
+    /// of a group has the same known moment within the second; a second with two or more known moments leaves out its
+    /// items without a moment.
     public static func groups(of items: [PhotoItem], sameBytes: [[PhotoUID]], includesVideos: Bool) -> [[PhotoUID]] {
         let pairedVideos = Set(items.compactMap(\.relatedVideoUID))
         let laterCopies = Set(sameBytes.flatMap { $0.dropFirst() })
@@ -172,27 +173,24 @@ public enum PossibleDuplicateCandidates {
         let isVideo: Bool
     }
 
-    /// Splits the items of one second into groups whose members have the same known moment or none.
+    /// Splits the items of one second by their known moment to the millisecond. With one known moment or none, every
+    /// item of the second is one group. With two or more, an item without a moment could belong to either, so it is
+    /// left out; the result never depends on the order of the items.
     private static func moments(of items: [PhotoItem]) -> [[PhotoUID]] {
-        var rest = items
-        var groups: [[PhotoUID]] = []
-        while let first = rest.first {
-            var group = [first]
-            var left: [PhotoItem] = []
-            for item in rest.dropFirst() {
-                if group.allSatisfy({ sameMoment($0, item) }) { group.append(item) } else { left.append(item) }
-            }
-            groups.append(group.map(\.uid))
-            rest = left
+        let known = Set(items.compactMap(millisecond))
+        guard known.count > 1 else { return [items.map(\.uid)] }
+        var keys: [Int64] = []
+        var groups: [Int64: [PhotoUID]] = [:]
+        for item in items {
+            guard let key = millisecond(of: item) else { continue }
+            if groups[key] == nil { keys.append(key) }
+            groups[key, default: []].append(item.uid)
         }
-        return groups
+        return keys.compactMap { groups[$0] }
     }
 
-    /// The moments within the second agree to the millisecond, or one item has none.
-    private static func sameMoment(_ first: PhotoItem, _ other: PhotoItem) -> Bool {
-        guard let moment = first.timelineOrder?.exactCaptureTime,
-            let otherMoment = other.timelineOrder?.exactCaptureTime
-        else { return true }
-        return abs(moment.timeIntervalSince(otherMoment)) < 0.001
+    /// The known moment of `item` in whole milliseconds, nil without one.
+    private static func millisecond(of item: PhotoItem) -> Int64? {
+        item.timelineOrder?.exactCaptureTime.map { Int64(($0.timeIntervalSince1970 * 1_000).rounded()) }
     }
 }

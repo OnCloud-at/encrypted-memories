@@ -42,7 +42,7 @@ final class PossibleDuplicateTests: XCTestCase {
             [[uid("a"), uid("b")]], "without videos only the photos stay candidates")
     }
 
-    func testCandidatesLeaveOutBurstsPairedVideosAndOtherExactMoments() {
+    func testCandidatesLeaveOutBurstsPairedVideosAndKeepKnownMomentsApart() {
         let items = [
             photo("live", relatedVideo: "paired"), photo("paired", type: "video/quicktime"),
             photo("other-video", type: "video/quicktime"),
@@ -51,9 +51,21 @@ final class PossibleDuplicateTests: XCTestCase {
             photo("unknown-moment"),
         ]
         XCTAssertEqual(
-            PossibleDuplicateCandidates.groups(of: items, sameBytes: [], includesVideos: true),
-            [[uid("live"), uid("early"), uid("unknown-moment")]],
-            "every member of a group has the same known moment or none; the photo of another moment stays alone")
+            PossibleDuplicateCandidates.groups(of: items, sameBytes: [], includesVideos: true), [],
+            "two known moments keep their photos apart and leave out the photos without a moment")
+        let oneMoment = [photo("a", exact: 1_700_000_000.2), photo("b"), photo("c", exact: 1_700_000_000.2)]
+        XCTAssertEqual(
+            PossibleDuplicateCandidates.groups(of: oneMoment, sameBytes: [], includesVideos: true),
+            [[uid("a"), uid("b"), uid("c")]], "one known moment takes the photos without a moment")
+        let twoMoments = [
+            photo("x", exact: 1_700_000_000.1), photo("y", exact: 1_700_000_000.6), photo("z"),
+            photo("w", exact: 1_700_000_000.6),
+        ]
+        for order in [twoMoments, twoMoments.reversed()] {
+            XCTAssertEqual(
+                Set(PossibleDuplicateCandidates.groups(of: order, sameBytes: [], includesVideos: true).map(Set.init)),
+                [[uid("y"), uid("w")]], "the order of the photos changes nothing")
+        }
     }
 
     func testCopiesWithTheSameBytesCountOnceAndAGroupNeedsTwoFiles() {

@@ -7,8 +7,9 @@ import PhotosCore
 /// asks the store for the details of exactly that cursor: when the index applied any event since, the store discards
 /// all of them. A ranking stores details only while the index still stands at the cursor of the scan.
 ///
-/// The details only split groups on the screen. They never join groups and never decide a merge or a trash: a merge
-/// reads the server state of its group again.
+/// The details split groups of identical copies on the screen and group possibly identical photos for review. They
+/// never decide a merge or a trash: a merge reads the server state of its group again, and a possibly identical photo
+/// leaves the library only when the person moves it to the trash in the viewer.
 public final class ExactDuplicateFingerprintCache: @unchecked Sendable {
     let store: ExactDuplicateFingerprintStore
     private let accountID: String

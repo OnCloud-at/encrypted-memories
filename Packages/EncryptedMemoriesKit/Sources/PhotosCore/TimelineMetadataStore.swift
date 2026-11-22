@@ -368,6 +368,12 @@ public final class TimelineMetadataStore {
     /// membership are reconstructed from their feature tables with one full pass each (dictionary
     /// join in memory - no per-row queries, no blob decoding).
     /// Throws when photos, tags, or series cannot prepare, finish, or decode every selected identity.
+    /// The stored photos with the moment within the second that `order` has published, as the timeline shows them.
+    public func loadWithMoments(from order: TimelineOrderMetadataStore?) throws -> [PhotoItem] {
+        let items = try load()
+        return order?.enrich(items) ?? items
+    }
+
     public func load() throws -> [PhotoItem] {
         try PhotoPerformanceSignposts.database.interval("db.load") {
             try loadInstrumented()

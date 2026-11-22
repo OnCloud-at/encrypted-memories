@@ -3128,7 +3128,9 @@ extension DriveSDKBridge: ExactDuplicateRemote {
 
     /// Reads the stored timeline, so finding the candidates of possibly identical photos costs no request.
     func libraryItems() async -> [PhotoItem]? {
-        try? await withOpenSession(cause: .local) { bridge in try bridge.timelineStore?.load() }
+        try? await withOpenSession(cause: .local) { bridge in
+            try bridge.timelineStore?.loadWithMoments(from: bridge.timelineOrderStore)
+        }
     }
 
     /// Reads the node of each photo, so only the members of the groups that the screen ranks or merges cost a read.

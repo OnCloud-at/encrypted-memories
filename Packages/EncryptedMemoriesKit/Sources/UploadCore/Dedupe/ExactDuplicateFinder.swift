@@ -498,8 +498,9 @@ public struct ExactDuplicateFinder: Sendable {
             // Details of a successful read only, and only while the index still stands at the cursor of the scan.
             if let cache = fingerprintCache, let epoch = page.first?.hashKeyEpoch {
                 cache.record(
-                    fingerprints.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } }, for: snapshot,
-                    currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
+                    fingerprints.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } },
+                    byteSizes: memberSizes.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } },
+                    for: snapshot, currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
             }
             await ranked(
                 ExactDuplicateRankingPage(
@@ -533,7 +534,8 @@ public struct ExactDuplicateFinder: Sendable {
         let index = index
         let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) {
             (members: [PhotoUID]) -> [PhotoUID: ExactDuplicateNodeFacts]? in
-            let unsaved = members.filter { saved[$0] == nil }
+            // A saved row without a size, such as one from before sizes were saved, is read again for its size.
+            let unsaved = members.filter { saved[$0]?.byteSize == nil }
             guard !unsaved.isEmpty else { return [PhotoUID: ExactDuplicateNodeFacts]() }
             guard let read = try? await remote.nodeFacts(of: unsaved) else { return nil }
             // Each group saves at once, so a pass that stops keeps what it read. Only while the index still stands at
@@ -541,19 +543,19 @@ public struct ExactDuplicateFinder: Sendable {
             if let cache, let snapshot {
                 let own = read.filter { $0.key.volumeID == snapshot.scope.volumeID }
                 cache.record(
-                    own.mapValues(\.fingerprint), byteSizes: own.compactMapValues(\.byteSize), for: snapshot,
+                    own.mapValues(\.fingerprint), byteSizes: own.compactMapValues(Self.positiveSize), for: snapshot,
                     currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: snapshot.scope.hashKeyEpoch)?
                         .eventID)
             }
             return read
         }
         var fingerprints = saved.mapValues(\.fingerprint)
-        var sizes = saved.compactMapValues(\.byteSize)
+        var sizes = saved.compactMapValues { $0.byteSize.flatMap { $0 > 0 ? $0 : nil } }
         var readCount = 0
         for case let read?? in reads {
             readCount += read.count
             fingerprints.merge(read.mapValues(\.fingerprint)) { _, read in read }
-            sizes.merge(read.compactMapValues(\.byteSize)) { _, read in read }
+            sizes.merge(read.compactMapValues(Self.positiveSize)) { _, read in read }
         }
         let groups = policy.groups(of: candidates, fingerprints: fingerprints)
         let members = Set(groups.flatMap(\.members))
@@ -563,6 +565,11 @@ public struct ExactDuplicateFinder: Sendable {
         return PossibleDuplicateScan(
             groups: groups, byteSizes: sizes.filter { members.contains($0.key) },
             fingerprints: fingerprints.filter { members.contains($0.key) })
+    }
+
+    /// The size that a node states, when it states one above zero.
+    private static func positiveSize(_ facts: ExactDuplicateNodeFacts) -> Int64? {
+        facts.byteSize.flatMap { $0 > 0 ? $0 : nil }
     }
 
     /// The snapshot of the latest scan, or a new one at the current cursor of the content index. Nil without a cache

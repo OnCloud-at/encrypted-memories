@@ -182,6 +182,58 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
         XCTAssertEqual(nodeReads, 3, "the photo of the own volume was saved; only the other one is read again")
     }
 
+    func testASavedRowWithoutASizeIsReadAgainForItsSize() async throws {
+        let pair = seedPossiblePair("one")
+        setLibrary([pair])
+        publishIndex(eventID: "event-1")
+        let cache = try openCache()
+        let snapshot = try XCTUnwrap(
+            cache.currentSnapshot(orBeginAt: "vol", hashKeyEpoch: epoch, eventID: "event-1"))
+        // Rows as a ranking saved them before it saved sizes.
+        let details = zip(pair, ["image/jpeg", "image/heic"]).map { uid, type in
+            (
+                uid,
+                ExactDuplicateFingerprint(
+                    captureTime: Date(timeIntervalSince1970: 1_700_000_000), device: "camera", pixelWidth: 100,
+                    pixelHeight: 100, mimeType: type)
+            )
+        }
+        XCTAssertTrue(cache.store.store(Dictionary(uniqueKeysWithValues: details), for: snapshot))
+
+        let scan = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(scan?.byteSizes, [pair[0]: 300, pair[1]: 200])
+        XCTAssertEqual(nodeReads, 2)
+        _ = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+        XCTAssertEqual(nodeReads, 2, "the sizes are saved now")
+    }
+
+    func testTheRankingSavesTheSizesItReads() async throws {
+        let pair = seedPair("same", devices: ("camera", "camera"))
+        server.setNodeSize(5_000, of: pair[0])
+        server.setNodeSize(5_000, of: pair[1])
+        publishIndex(eventID: "event-1")
+        let cache = try openCache()
+        let finder = finder(cache: cache)
+        let scan = try await finder.duplicateGroups()
+        _ = await finder.rankedMembers(of: scan.groups)
+
+        let saved = cache.facts(of: pair, in: cache.currentSnapshot())
+
+        XCTAssertEqual(saved.mapValues(\.byteSize), [pair[0]: 5_000, pair[1]: 5_000])
+    }
+
+    func testASizeOfZeroIsNoSize() async throws {
+        let pair = seedPossiblePair("one")
+        server.setNodeSize(0, of: pair[1])
+        setLibrary([pair])
+        publishIndex(eventID: "event-1")
+
+        let scan = await finder(cache: try openCache()).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertEqual(scan?.byteSizes, [pair[0]: 300])
+    }
+
     func testAPassThatStopsKeepsTheFactsOfItsFinishedGroups() async throws {
         let done = seedPossiblePair("done")
         let failing = seedPossiblePair("failing", second: 60)

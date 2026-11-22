@@ -103,6 +103,33 @@ final class TimelineOrderMetadataStoreTests: XCTestCase {
         XCTAssertTrue(try store.nextPage().isEmpty)
     }
 
+    func testTheStoredPhotosCarryThePublishedMomentWithinTheirSecond() throws {
+        let folder = try directory()
+        let timeline = try XCTUnwrap(TimelineMetadataStore(url: folder.appendingPathComponent("timeline.sqlite")))
+        let order = try XCTUnwrap(TimelineOrderMetadataStore(url: folder.appendingPathComponent("order.sqlite")))
+        defer {
+            timeline.close()
+            order.close()
+        }
+        let (first, second) = (photo("a"), photo("b"))
+        timeline.save([first, second])
+        XCTAssertTrue(order.synchronize([first, second], classifiedUIDs: [first.uid, second.uid]))
+        let moments = [
+            first.uid: Date(timeIntervalSince1970: 500.8), second.uid: Date(timeIntervalSince1970: 500.1),
+        ]
+        XCTAssertTrue(order.record(moments.mapValues { TimelineOrderMetadata(exactCaptureTime: $0) }))
+        XCTAssertTrue(try order.publishCompletedSeconds())
+
+        let loaded = try timeline.loadWithMoments(from: order)
+
+        XCTAssertEqual(
+            Dictionary(
+                uniqueKeysWithValues: loaded.compactMap { item in
+                    item.timelineOrder?.exactCaptureTime.map { (item.uid, $0) }
+                }), moments)
+        XCTAssertEqual(try timeline.loadWithMoments(from: nil).compactMap(\.timelineOrder), [])
+    }
+
     func testOnlyUnknownCollisionsAreReadAndASecondIsPublishedTogether() throws {
         let store = try XCTUnwrap(TimelineOrderMetadataStore(url: directory().appendingPathComponent("order.sqlite")))
         defer { store.close() }
