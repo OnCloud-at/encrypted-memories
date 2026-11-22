@@ -1,7 +1,8 @@
 import Foundation
 import PhotosCore
 import Testing
-import UploadCore
+
+@testable import UploadCore
 
 /// Pins what a person sees for every stored queue row: section category, reason, and whether a retry can help.
 @Suite
@@ -119,6 +120,27 @@ struct BackupItemOutcomeTests {
                 Self.placement(state: state, lastError: reason.lastError)
                     == Self.placement(state: .discovered, lastError: reason.lastError), "\(reason.label)")
         }
+    }
+
+    /// The runner stores these details in the queue, and the outcome reads them back: their values are a stored format.
+    /// The original-wait check also knows the two sentences that builds before the key stored.
+    @Test func theStoredWaitDetailsKeepTheirValues() {
+        #expect(BackupItemOutcome.sourceUnavailableDetail == "backup.issue_source_unavailable")
+        #expect(BackupItemOutcome.sourceReportedMissingDetail == "backup.issue_source_unavailable.reported_missing")
+        #expect(BackupItemOutcome.sourceNotReadyDetail == "error.upload_source_not_ready")
+        #expect(BackupItemOutcome.isWaitingForPhotos("backup.issue_source_unavailable"))
+        #expect(BackupItemOutcome.isWaitingForPhotos("backup.issue_source_unavailable.reported_missing"))
+        #expect(!BackupItemOutcome.isWaitingForPhotos("error.upload_source_not_ready"))
+        #expect(!BackupItemOutcome.isWaitingForPhotos(nil))
+        for stored in [
+            "backup.issue_waiting_original",
+            "The edited photo is waiting for its original resources. Backup will retry automatically.",
+            "Das bearbeitete Foto wartet auf seine Originalressourcen. Das Backup versucht es automatisch erneut.",
+        ] {
+            #expect(BackupItemOutcome.isWaitingForOriginal(stored), "\(stored)")
+        }
+        #expect(!BackupItemOutcome.isWaitingForOriginal("backup.issue_source_unavailable"))
+        #expect(!BackupItemOutcome.isWaitingForOriginal(nil))
     }
 
     /// Album Sync rows and the album last-run file carry a reason without a queue row.
