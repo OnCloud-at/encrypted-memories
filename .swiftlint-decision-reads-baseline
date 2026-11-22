@@ -5,19 +5,15 @@
 # (#1153, #1154); the style check prints a notice for a linted file below its count.
 # Exception: `try load() ?? default` throws a failed read into its catch; nil means that no state file exists.
 1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/MLSearchCore/MLSmartSearchLifecycle.swift
-1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/PhotoLibraryBackupAdapter/PhotoLibraryBackupController.swift
 # Exception: `records()` feeds only the support snapshot. The writes read the file again and stop on a failed read.
 1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/PhotosCore/BackgroundWindowLedger.swift
 # Exception: the Recently Deleted listing state is a local cache of the server's listing. Until the next listing, a
 # failed read loses only local state: the offline listing, the marks of photos trashed here and the cached thumbnails
 # of trashed photos. No remote change follows from it.
 1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/DriveSDKBridge.swift
-1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupStatusProjector.swift
 1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupSyncRunner.swift
 # Exception: `(try? containsAny(...)) == false` is false for a failed read, so the failure never reads as no work.
 1 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/BackupSyncRunner.swift
-1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/UploadBackupSyncEngine.swift
-5 no_try_optional_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Backup/UploadBackupSyncQueueStore.swift
 1 no_default_for_store_read_in_decision_code Packages/EncryptedMemoriesKit/Sources/UploadCore/Pending/PendingBackupEventRecorder.swift
 # Declarations that name a concrete decision store instead of its protocol (#1148). Lower a count, or remove a
 # line, when a declaration moves to the protocol of its store. The pending backup store has no decision protocol yet

@@ -570,6 +570,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     var refusesMissingRemoval = false
     /// True: the removal of the settled earlier revisions of a replaced photo fails, as a failed write does.
     var refusesSettledRevisionRemoval = false
+    /// The bounded row reads of these states answer unknown, as a failed statement does.
+    var unknownRowReadStates: Set<UploadBackupSyncQueueState> = []
     /// When set, the first keyed read after a refused receipt write answers unknown: the read that tells a removed row
     /// from a failed write.
     var unknownReadAfterRefusedMark = false
@@ -640,14 +642,27 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         try inner.containsAny(in: states)
     }
 
-    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? { inner.earliestRunnableEntry() }
+    /// A read of the spy proves its result by the health of the spy after the read, as the store does.
+    private func healthy<Value>(_ read: () throws -> Value) throws -> Value {
+        let value = try read()
+        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
+        return value
+    }
 
-    func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
+    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
+        try healthy { try inner.decisionEarliestRunnableEntry() }
+    }
+
+    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
+        try healthy { try inner.decisionEarliestEntry(in: state) }
+    }
+
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
         if failsRunnableDateRead {
             lock.withLock { readFailed = true }
-            return nil
+            throw SQLiteStoreUnknownReadError()
         }
-        return inner.nextRunnableDate(excludingSourcesOf: excludedSources)
+        return try healthy { try inner.decisionNextRunnableDate(excludingSourcesOf: excludedSources) }
     }
 
     func claimRunnable(
@@ -659,9 +674,11 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
 
     func addLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool { acceptsLocalReadFailureHints }
 
-    func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
-    {
-        inner.entries(in: state, updatedBefore: updatedBefore, limit: limit)
+    func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry] {
+        if unknownRowReadStates.contains(state) { throw SQLiteStoreUnknownReadError() }
+        return try healthy { try inner.decisionEntries(in: state, updatedBefore: updatedBefore, limit: limit) }
     }
 
     @discardableResult
@@ -763,18 +780,24 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
         try inner.containsAny(in: states)
     }
 
-    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry? { inner.earliestRunnableEntry() }
-    func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date? {
-        inner.nextRunnableDate(excludingSourcesOf: excludedSources)
+    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
+        try inner.decisionEarliestRunnableEntry()
+    }
+    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
+        try inner.decisionEarliestEntry(in: state)
+    }
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
+        try inner.decisionNextRunnableDate(excludingSourcesOf: excludedSources)
     }
     func claimRunnable(
         limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
     ) -> [UploadBackupSyncQueueEntry]? {
         inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
     }
-    func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
-    {
-        inner.entries(in: state, updatedBefore: updatedBefore, limit: limit)
+    func decisionEntries(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
+    ) throws -> [UploadBackupSyncQueueEntry] {
+        try inner.decisionEntries(in: state, updatedBefore: updatedBefore, limit: limit)
     }
     func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int? {
         inner.requeueStaleActive(before: cutoff, updatedAt: updatedAt)
@@ -3917,6 +3940,23 @@ final class BackupSyncRunnerTests: XCTestCase {
         queueEntryForTesting(in: queueStore, source: entry.source, revision: entry.revision)?.state
     }
 
+    /// The index issue that the queue stores is part of the progress that the pass reports once it has read the queue
+    /// (#1154).
+    func testAStoredIndexIssueIsReportedInTheProgressOfThePass() async throws {
+        let issue = BackupIssueRecord(kind: .remoteService, detail: "stored")
+        XCTAssertTrue(queueStore.setRuntimeIssue(issue, for: .remoteIndexPreparation))
+        _ = seedEntry("waiting.jpg")
+        let runner = makeRunner()
+        let recorder = BackupProgressRecorder()
+        await runner.setOnProgress { recorder.append($0) }
+
+        _ = await runner.runUntilDrained()
+
+        XCTAssertTrue(
+            recorder.snapshots.contains { $0.remoteIndexPreparationIssue == issue && $0.remoteIndexPreparationFailed },
+            "a pass reports the stored issue before it prepares the index")
+    }
+
     func testRemoteIndexPreparationFailureLeavesQueueRunnableAndFailsClosed() async throws {
         let entry = seedEntry("waiting.jpg")
         let runner = makeRunner(identityResolver: PreparationFailingIdentityResolver(inner: makePipeline()))
@@ -3928,7 +3968,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(progress.remoteIndexPreparation?.completed, 10)
         // A backend error proves no temporary Proton failure, so the status never says "Waiting for Proton".
         XCTAssertEqual(progress.remoteIndexPreparationIssue?.kind, .unknown)
-        var persistedIssue = try XCTUnwrap(queueStore.runtimeIssue(for: .remoteIndexPreparation))
+        var persistedIssue = try XCTUnwrap(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation))
         XCTAssertEqual(persistedIssue.kind, .unknown)
         XCTAssertEqual(persistedIssue.automaticRetryAttempt, 1)
         XCTAssertEqual(persistedIssue.nextAttemptAt, clock.now.addingTimeInterval(1))
@@ -3936,13 +3976,13 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         let secondFailure = makeRunner(identityResolver: PreparationFailingIdentityResolver(inner: makePipeline()))
         _ = await secondFailure.runUntilDrained()
-        persistedIssue = try XCTUnwrap(queueStore.runtimeIssue(for: .remoteIndexPreparation))
+        persistedIssue = try XCTUnwrap(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation))
         XCTAssertEqual(persistedIssue.automaticRetryAttempt, 2)
         XCTAssertEqual(persistedIssue.nextAttemptAt, clock.now.addingTimeInterval(2))
 
         let retry = makeRunner()
         let recovered = await retry.runUntilDrained()
-        XCTAssertNil(queueStore.runtimeIssue(for: .remoteIndexPreparation))
+        XCTAssertNil(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation))
         XCTAssertEqual(recovered.uploaded, 1)
     }
 
@@ -3977,7 +4017,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let changed = await makeRunner().makeRetryableWorkEligibleNow()
 
         XCTAssertEqual(changed, 1)
-        XCTAssertNil(queueStore.runtimeIssue(for: .remoteIndexPreparation))
+        XCTAssertNil(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation))
     }
 
     func testRunRequeuesStaleActiveRowsAndProcessesThem() async throws {
@@ -4103,7 +4143,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let drain = Task { await runner.runUntilDrained() }
         await stalledUploader.uploadStarted.wait()
 
-        let removal = Task { await runner.removePhotoLibraryAssets([source.identifier]) }
+        let removal = Task { await runner.removeSources(kind: .photoLibraryAsset, identifiers: [source.identifier]) }
         await stalledUploader.cancelStarted.wait()
 
         XCTAssertNil(
@@ -4623,7 +4663,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         let beforeRemoval = await runner.currentProgress()
 
         // The removal refreshes the progress from the queue before it waits for native cancellation.
-        let removal = Task { await runner.removePhotoLibraryAssets([source.identifier]) }
+        let removal = Task { await runner.removeSources(kind: .photoLibraryAsset, identifiers: [source.identifier]) }
         let cancelStarted = await pollUntil { stalledUploader.cancellations == 1 }
         let afterRemoval = await runner.currentProgress()
 
@@ -4815,6 +4855,21 @@ final class BackupSyncRunnerTests: XCTestCase {
         let issue = try storedIssue(of: entry)
         XCTAssertEqual(issue.kind, .remoteService)
         XCTAssertEqual(issue.detail, "Pending handoff could not be persisted")
+    }
+
+    /// The look-ahead warms the duplicate cache from the rows about to run. A read of those rows that fails warms
+    /// nothing, and the per-item check still runs and uploads the photo (#1154).
+    func testAFailedLookAheadReadWarmsNothingAndTheItemStillUploads() async throws {
+        let entry = seedEntry("ahead.jpg")
+        let spy = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        spy.unknownRowReadStates = [.discovered, .queuedForUpload]
+        let fake = FakeIdentityResolver()
+
+        _ = await makeRunner(identityResolver: fake, queue: spy).runUntilDrained()
+
+        XCTAssertTrue(fake.primedFilenames.isEmpty, "no row was read, so none is primed")
+        XCTAssertEqual(uploader.requests.map(\.name), ["corrected-ahead.jpg"])
+        XCTAssertEqual(state(of: entry), .completed)
     }
 
     func testDraftBlocksWithBackoffAndNeverCountsAsBackedUp() async throws {
@@ -7647,7 +7702,7 @@ extension BackupSyncRunnerTests {
         _ = await makeRunner(identityResolver: PreparationFailingIdentityResolver(inner: makePipeline()))
             .runUntilDrained()
         XCTAssertTrue(fault.fired)
-        XCTAssertEqual(try XCTUnwrap(queueStore.runtimeIssue(for: .remoteIndexPreparation)), stored)
+        XCTAssertEqual(try XCTUnwrap(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation)), stored)
     }
 
     /// The person's retry clears the stored backoff also when the read of that backoff fails.
@@ -7663,7 +7718,8 @@ extension BackupSyncRunnerTests {
         defer { fault.stop() }
         _ = await makeRunner().makeRetryableWorkEligibleNow()
         XCTAssertTrue(fault.fired)
-        XCTAssertNil(queueStore.runtimeIssue(for: .remoteIndexPreparation), "the retry runs without the old backoff")
+        XCTAssertNil(
+            queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation), "the retry runs without the old backoff")
     }
 }
 
