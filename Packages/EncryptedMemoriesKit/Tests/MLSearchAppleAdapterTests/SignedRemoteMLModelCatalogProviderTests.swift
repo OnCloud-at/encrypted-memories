@@ -87,6 +87,33 @@ private struct TestActivePointerPayload: Codable {
         #expect(cached.entry(for: MLModelCatalogEntry.tinyCLIPVit40M.id)?.downloadPlan?.totalByteCount == 123)
     }
 
+    @Test func neverFollowsARedirectOfTheCatalogRequest() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("signed-model-catalog-redirect-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalogURL = URL(string: "https://catalog.test/catalog-v1.json")!
+        let signatureURL = URL(string: "https://catalog.test/catalog-v1.sig")!
+        let otherURL = URL(string: "https://other.test/catalog-v1.json")!
+        StubProtocol.configure(
+            responses: [catalogURL: Data("{}".utf8), signatureURL: Data("sig".utf8), otherURL: Data("{}".utf8)],
+            redirects: [catalogURL: otherURL])
+        let provider = SignedRemoteMLModelCatalogProvider(
+            trustedCatalog: .builtIn,
+            cacheDirectory: root,
+            session: catalogStubSession(for: StubProtocol.self),
+            catalogURL: catalogURL,
+            signatureURL: signatureURL,
+            artifactBaseURL: URL(string: "https://catalog.test/models/")!,
+            publicKey: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+        )
+
+        _ = try? await provider.catalog()
+
+        let requests = StubProtocol.recordedRequests
+        #expect(requests.contains { $0.url == catalogURL }, "the catalog URL itself was requested")
+        #expect(!requests.contains { $0.url?.host == "other.test" }, "the redirect was followed")
+    }
+
     @Test func v2PersistsASequenceFloorAndRejectsRollback() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("signed-model-v2-\(UUID().uuidString)", isDirectory: true)

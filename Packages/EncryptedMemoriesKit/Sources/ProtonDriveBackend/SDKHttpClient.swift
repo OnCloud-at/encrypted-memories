@@ -345,21 +345,6 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
     }
 }
 
-/// Declines every HTTP redirect so an authenticated request body is never replayed to a host that
-/// the caller's trust check did not validate. `URLSession` then delivers the 3xx response as is.
-private final class RedirectRefusingTaskDelegate: NSObject, URLSessionTaskDelegate, Sendable {
-    static let shared = RedirectRefusingTaskDelegate()
-
-    func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest
-    ) async -> URLRequest? {
-        nil
-    }
-}
-
 /// Thread-safe one-shot holder for a stream-side upload error.
 private final class ErrorBox: @unchecked Sendable {
     private let lock = NSLock()

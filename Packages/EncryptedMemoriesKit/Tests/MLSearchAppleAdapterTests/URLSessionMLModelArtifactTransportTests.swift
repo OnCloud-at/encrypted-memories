@@ -53,12 +53,13 @@ import Testing
                     url: request.url!, statusCode: 302, httpVersion: nil,
                     headerFields: ["Location": target.absoluteString])!
                 client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: target), redirectResponse: redirect)
-                // The task delegate decides after this call. A refused redirect leaves this load to finish; a
-                // followed one stops it first, which cancels the finish.
+                // The task delegate decides after this call. A refused redirect leaves this load to answer with the
+                // redirect itself, as a real HTTP stack does; a followed one stops it first, which cancels the answer.
                 let delivery = ChunkDelivery(owner: self, body: Data(), chunkSize: 0)
                 loadingTask = Task { [delivery] in
                     try? await Task.sleep(for: .milliseconds(100))
                     guard !Task.isCancelled, let owner = delivery.owner else { return }
+                    owner.client?.urlProtocol(owner, didReceive: redirect, cacheStoragePolicy: .notAllowed)
                     owner.client?.urlProtocolDidFinishLoading(owner)
                 }
                 return
@@ -147,8 +148,10 @@ import Testing
                 progress: { _, _ in }
             )
             Issue.record("A redirected answer must not complete the download")
+        } catch let error as MLArtifactTransportError {
+            #expect(error == .httpStatus(302), "the refused redirect reaches the transport as its own answer")
         } catch {
-            // The refused redirect ends the transfer; the kind of failure is the transport's retry decision.
+            Issue.record("Expected the status of the refused redirect, received \(error)")
         }
 
         #expect(RangeProtocol.requests.map { $0.url?.host } == ["models.oncloud.at"], "the redirect was followed")
