@@ -3839,13 +3839,13 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
             XCTAssertTrue(ended)
             XCTAssertEqual(probe.results, [true], "nothing is owed and nothing needs attention")
-            try await Task.sleep(for: .milliseconds(50))
+            // The session reports no card after its run returns, so the last card is final then.
+            await probe.task?.value
             let final = try XCTUnwrap(probe.cards.last)
             XCTAssertEqual(
                 final, "\(BackupStatusPresentation(controller.status).localizedHeadline) 1000000",
                 "the last card is the app's own headline with a full ring, also for a respected deletion; no running card "
                     + "follows it")
-            await probe.task?.value
             await controller.shutdown()
         }
 
@@ -4315,6 +4315,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 accountDataDirectory: directory, databasePolicy: databasePolicy, defaults: defaults,
                 runtimeSignals: source, firstNetworkPathWait: .seconds(60))
             configuration.currentAccessState = { .full }
+            configuration.makeChangeMonitor = { .withoutPhotoLibrary(tokenURL: $0) }
             let controller = PhotoLibraryBackupController(
                 configuration: configuration, identityResolver: FakeIdentityResolver(), uploader: MockUploader())
             // Installed before the first await, so the resume at launch cannot pass the gate unseen.

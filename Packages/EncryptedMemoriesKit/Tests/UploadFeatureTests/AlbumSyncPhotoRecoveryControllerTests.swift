@@ -1169,12 +1169,7 @@ private struct RecoveryControllerFixture {
         configuration.localSource = localSource
         let library = device.library
         configuration.recoveryCatalog = { _ in library }
-        configuration.makeChangeMonitor = { url in
-            PhotoLibraryChangeMonitor(
-                tokenURL: url,
-                operations: .init(
-                    fetch: { PHFetchResult<PHAsset>() }, register: { _ in }, unregister: { _ in }))
-        }
+        configuration.makeChangeMonitor = { .withoutPhotoLibrary(tokenURL: $0) }
         configuration.recoveryResourceResolver = RecoveryScenarioResolver(
             library: device.library, now: device.clock.now)
         configuration.changeSleep = { _ in

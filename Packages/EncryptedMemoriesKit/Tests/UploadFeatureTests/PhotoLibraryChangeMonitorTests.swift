@@ -215,6 +215,16 @@ final class ChangeCallCounter: @unchecked Sendable {
     func value(_ key: String) -> Int { lock.withLock { counts[key, default: 0] } }
 }
 
+extension PhotoLibraryChangeMonitor {
+    /// A monitor that never reads the photo library of the test host. `xctest` has no photo library usage
+    /// description, so a real fetch makes the system end the whole test process.
+    static func withoutPhotoLibrary(tokenURL: URL) -> PhotoLibraryChangeMonitor {
+        PhotoLibraryChangeMonitor(
+            tokenURL: tokenURL,
+            operations: .init(fetch: { PHFetchResult<PHAsset>() }, register: { _ in }, unregister: { _ in }))
+    }
+}
+
 final class PhotoChangeOperationsProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var observers: [ObjectIdentifier: any PHPhotoLibraryChangeObserver] = [:]
