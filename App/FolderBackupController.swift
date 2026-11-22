@@ -59,6 +59,10 @@ final class FolderBackupController {
     /// A scan failure is not a queue item. Keep it as run-local state so a drained prefix cannot
     /// be presented as a complete backup, without polluting the durable queue with a fake row.
     private var hasFolderEnumerationFailure = false
+    /// The skipped-file count of the run that scans now, and the count of the last finished scan, which the status
+    /// shows. A file with a type that the app does not back up never enters the queue.
+    private var scanSkippedFiles: FolderBackupSkippedFiles?
+    private var skippedCount = FolderBackupSkippedCount()
 
     private static let foldersDefaultsKey = "backup.folderBookmarks.v1"
 
@@ -140,10 +144,8 @@ final class FolderBackupController {
             projection.revision >= lastAppliedStatusProjectionRevision
         else { return }
         lastAppliedStatusProjectionRevision = projection.revision
-        status =
-            hasFolderEnumerationFailure
-            ? projection.status.afterFolderEnumerationFailure()
-            : projection.status
+        let projected = skippedCount.applied(to: projection.status)
+        status = hasFolderEnumerationFailure ? projected.afterFolderEnumerationFailure() : projected
     }
 
     // MARK: - Folder registry (bookmarks are the App-side boundary)
@@ -282,6 +284,8 @@ final class FolderBackupController {
         isScanning = true
         hasFolderEnumerationFailure = false
         lastMessage = nil
+        let skippedFiles = FolderBackupSkippedFiles()
+        scanSkippedFiles = skippedFiles
         refreshFromQueue()
         let snapshotFolders = folders
         let statusSetupTask = self.statusSetupTask
@@ -296,7 +300,7 @@ final class FolderBackupController {
             // Scan every reachable folder first (cheap, no bytes), then drain the shared queue.
             for folder in snapshotFolders {
                 guard !Task.isCancelled else {
-                    self?.finishScanPhase()
+                    self?.finishScanPhase(stopped: true)
                     await self?.finishSync(runID: runID)
                     return
                 }
@@ -320,21 +324,21 @@ final class FolderBackupController {
                 }
                 accessedURLs.append(url)
                 do {
-                    _ = try await engine.scan(FolderBackupCatalog(folder: url))
+                    _ = try await engine.scan(FolderBackupCatalog(folder: url, skippedFiles: skippedFiles))
                 } catch is CancellationError {
-                    self?.finishScanPhase()
+                    self?.finishScanPhase(stopped: true)
                     await self?.finishSync(runID: runID)
                     return
                 } catch let error as FolderEnumerationError {
                     guard !Task.isCancelled else {
-                        self?.finishScanPhase()
+                        self?.finishScanPhase(stopped: true)
                         await self?.finishSync(runID: runID)
                         return
                     }
                     self?.reportFolderEnumerationError(error, folder: folder, root: url)
                 } catch {
                     guard !Task.isCancelled else {
-                        self?.finishScanPhase()
+                        self?.finishScanPhase(stopped: true)
                         await self?.finishSync(runID: runID)
                         return
                     }
@@ -423,13 +427,17 @@ final class FolderBackupController {
     }
 
     private func recordFolderEnumerationFailure(_ message: String) {
+        // A scan with a folder that it could not read keeps the skipped count of the last complete scan.
+        scanSkippedFiles?.markIncomplete()
         hasFolderEnumerationFailure = true
         status = status.afterFolderEnumerationFailure()
         reportSyncMessage(message)
     }
 
-    private func finishScanPhase() {
+    private func finishScanPhase(stopped: Bool = false) {
         isScanning = false
+        if let scanSkippedFiles { skippedCount.finish(scanSkippedFiles, stopped: stopped) }
+        scanSkippedFiles = nil
         refreshFromQueue()
     }
 

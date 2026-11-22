@@ -139,6 +139,15 @@ public struct BackupStatus: Sendable, Equatable {
     public var needsAttentionCount = 0
     /// Rows that are not backed up although nothing the person can fix is known. They show in a calm line.
     public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) }
+    /// Files that the last folder scan skipped because the app does not back up their file type. Only a folder backup
+    /// sets it; they never enter the queue.
+    public var skippedUnsupportedFiles = 0
+    /// A calm line for the skipped files. It names the file type, never Proton: the app's own list of supported types
+    /// decides. Nil when the scan skipped nothing.
+    public var localizedSkippedUnsupportedFiles: String? {
+        guard skippedUnsupportedFiles > 0 else { return nil }
+        return L10n.string("backup.folder_skipped_unsupported \(skippedUnsupportedFiles)")
+    }
     /// Whether the summary counts any photo that is not backed up, orange or calm: the problem list must show one.
     public var hasPhotosNotBackedUp: Bool { needsAttentionCount + notBackedUpCount > 0 }
     /// The failed and final part of `notBackedUpCount`, for a host that lists missing photos in their own line.

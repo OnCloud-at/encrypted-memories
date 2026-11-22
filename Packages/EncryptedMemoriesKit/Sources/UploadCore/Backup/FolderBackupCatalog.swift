@@ -1,35 +1,96 @@
 import Foundation
 
+/// Counts the files of one folder backup run that the backup skips because the app does not back up their file type.
+/// Hidden files, packages and symbolic links are not files the person chose to back up, so they do not count. A file
+/// counts once per run, also when two registered folders contain it.
+public final class FolderBackupSkippedFiles: @unchecked Sendable {
+    private let lock = NSLock()
+    private var paths: Set<String> = []
+    private var isComplete = true
+
+    public init() {}
+
+    public var count: Int { lock.withLock { paths.count } }
+
+    /// The folder listing names each file by its resolved path, so a folder named through a link in its path counts its
+    /// files once. A volume that ignores letter case can still name one file in two spellings; it then counts twice.
+    func add(_ file: URL) { lock.withLock { _ = paths.insert(file.standardizedFileURL.path) } }
+
+    /// The scan did not read every folder to its end: it stopped, or a folder failed.
+    public func markIncomplete() { lock.withLock { isComplete = false } }
+
+    /// This scan's count when it read every folder to its end, otherwise `earlier`.
+    func count(replacing earlier: Int) -> Int {
+        lock.withLock { isComplete ? paths.count : earlier }
+    }
+}
+
+/// The skipped-file count that the folder backup shows: the count of its last complete scan.
+public struct FolderBackupSkippedCount: Sendable, Equatable {
+    public private(set) var shown = 0
+
+    public init() {}
+
+    /// Ends one scan. A scan that read every folder to its end replaces the shown count. A stopped scan, or one that
+    /// met a folder that it could not read, keeps it: a partial count would hide files that are still there.
+    public mutating func finish(_ scan: FolderBackupSkippedFiles, stopped: Bool) {
+        if stopped { scan.markIncomplete() }
+        shown = scan.count(replacing: shown)
+    }
+
+    /// `status` with the shown count.
+    public func applied(to status: BackupStatus) -> BackupStatus {
+        var status = status
+        status.skippedUnsupportedFiles = shown
+        return status
+    }
+}
+
 /// Streams supported files as backup candidates. The platform layer owns sandbox access for the
 /// complete scan. A changed file modification date requires another content check.
 public struct FolderBackupCatalog: UploadBackupAssetCatalog {
     public let folder: URL
     public let includeHidden: Bool
+    /// Counts the files with a type that the app does not back up. A scan that includes hidden files counts none: the
+    /// hidden filter is what keeps hidden files out of the count.
+    public let skippedFiles: FolderBackupSkippedFiles?
     let readAttributes: AttributeReader
 
     /// Reads the file attributes of one path.
     typealias AttributeReader = @Sendable (String) throws -> [FileAttributeKey: Any]
 
-    public init(folder: URL, includeHidden: Bool = false) {
-        self.init(folder: folder, includeHidden: includeHidden, readAttributes: Self.readAttributes(atPath:))
+    public init(folder: URL, includeHidden: Bool = false, skippedFiles: FolderBackupSkippedFiles? = nil) {
+        self.init(
+            folder: folder, includeHidden: includeHidden, skippedFiles: skippedFiles,
+            readAttributes: Self.readAttributes(atPath:))
     }
 
-    init(folder: URL, includeHidden: Bool, readAttributes: @escaping AttributeReader) {
+    init(
+        folder: URL, includeHidden: Bool, skippedFiles: FolderBackupSkippedFiles? = nil,
+        readAttributes: @escaping AttributeReader
+    ) {
         self.folder = folder
         self.includeHidden = includeHidden
+        self.skippedFiles = skippedFiles
         self.readAttributes = readAttributes
     }
 
     public func candidates() -> AsyncThrowingStream<UploadBackupAssetCandidate, any Error> {
         let readAttributes = readAttributes
+        let skippedFiles = includeHidden ? nil : skippedFiles
+        let incompleteScan = self.skippedFiles
         let iterator = FolderEnumerator.stream(
             folder,
             includeHidden: includeHidden
         ).makeAsyncIterator()
         return AsyncThrowingStream(unfolding: {
-            while let entry = try await iterator.next() {
-                try Task.checkCancellation()
-                if entry.isSupported {
+            do {
+                while let entry = try await iterator.next() {
+                    try Task.checkCancellation()
+                    guard entry.isSupported else {
+                        skippedFiles?.add(entry.url)
+                        continue
+                    }
                     do {
                         return try Self.candidate(for: entry.url, readAttributes: readAttributes)
                     } catch {
@@ -37,8 +98,12 @@ public struct FolderBackupCatalog: UploadBackupAssetCatalog {
                         throw error
                     }
                 }
+                return nil
+            } catch {
+                // A folder that ends early has an unknown number of skipped files.
+                incompleteScan?.markIncomplete()
+                throw error
             }
-            return nil
         })
     }
 

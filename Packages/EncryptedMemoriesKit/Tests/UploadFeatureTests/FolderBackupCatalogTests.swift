@@ -48,6 +48,119 @@ final class FolderBackupCatalogTests: XCTestCase {
         }
     }
 
+    /// A file with a type that the app does not back up is skipped and counted; a hidden file is not counted, and the
+    /// candidates stay the same.
+    func testSkippedFileTypesAreCountedButHiddenFilesAreNot() async throws {
+        let sub = tempDir.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try Data("b".utf8).write(to: tempDir.appendingPathComponent("b.jpg"))
+        try Data("no".utf8).write(to: tempDir.appendingPathComponent("notes.txt"))
+        try Data("r".utf8).write(to: sub.appendingPathComponent("raw.cr2"))
+        try Data("h".utf8).write(to: tempDir.appendingPathComponent(".hidden.txt"))
+        let skipped = FolderBackupSkippedFiles()
+
+        let candidates = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: skipped))
+
+        XCTAssertEqual(candidates.map(\.originalFilename), ["b.jpg"])
+        XCTAssertEqual(skipped.count, 2, "notes.txt and raw.cr2 are skipped; the hidden file is not counted")
+    }
+
+    func testAScanThatIncludesHiddenFilesCountsNone() async throws {
+        try Data("r".utf8).write(to: tempDir.appendingPathComponent("raw.cr2"))
+        try Data("h".utf8).write(to: tempDir.appendingPathComponent(".hidden.txt"))
+        let skipped = FolderBackupSkippedFiles()
+
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, includeHidden: true, skippedFiles: skipped))
+
+        XCTAssertEqual(skipped.count, 0, "the hidden filter is what keeps hidden files out of the count")
+    }
+
+    func testOnlyACompleteScanReplacesTheShownCount() async throws {
+        try Data("r".utf8).write(to: tempDir.appendingPathComponent("raw.cr2"))
+        var shown = FolderBackupSkippedCount()
+
+        let first = FolderBackupSkippedFiles()
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: first))
+        shown.finish(first, stopped: false)
+        XCTAssertEqual(shown.shown, 1, "a complete scan shows its own count")
+
+        try Data("m".utf8).write(to: tempDir.appendingPathComponent("clip.mkv"))
+        let stopped = FolderBackupSkippedFiles()
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: stopped))
+        shown.finish(stopped, stopped: true)
+        XCTAssertEqual(shown.shown, 1, "a stopped scan keeps the count of the last complete scan")
+
+        let failed = FolderBackupSkippedFiles()
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: failed))
+        do {
+            let gone = tempDir.appendingPathComponent("gone", isDirectory: true)
+            _ = try await collect(FolderBackupCatalog(folder: gone, skippedFiles: failed))
+            XCTFail("a folder that does not exist ends its scan")
+        } catch {}
+        shown.finish(failed, stopped: false)
+        XCTAssertEqual(shown.shown, 1, "a scan with a folder that failed keeps the count of the last complete scan")
+
+        let complete = FolderBackupSkippedFiles()
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: complete))
+        shown.finish(complete, stopped: false)
+        XCTAssertEqual(shown.shown, 2, "the next complete scan replaces it")
+
+        var status = BackupStatus()
+        status.skippedUnsupportedFiles = 9
+        XCTAssertEqual(shown.applied(to: status).skippedUnsupportedFiles, 2, "the status shows the kept count")
+
+        try FileManager.default.removeItem(at: tempDir.appendingPathComponent("raw.cr2"))
+        try FileManager.default.removeItem(at: tempDir.appendingPathComponent("clip.mkv"))
+        let none = FolderBackupSkippedFiles()
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: none))
+        shown.finish(none, stopped: false)
+        XCTAssertEqual(shown.shown, 0, "a complete scan without skipped files clears the line")
+    }
+
+    func testAFileInTwoNestedFoldersCountsOnce() async throws {
+        let sub = tempDir.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try Data("r".utf8).write(to: sub.appendingPathComponent("raw.cr2"))
+        let skipped = FolderBackupSkippedFiles()
+
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: skipped))
+        _ = try await collect(FolderBackupCatalog(folder: sub, skippedFiles: skipped))
+
+        XCTAssertEqual(skipped.count, 1, "the parent and the child folder both contain raw.cr2")
+    }
+
+    func testAFolderNamedThroughALinkInItsPathCountsItsFilesOnce() async throws {
+        let real = tempDir.appendingPathComponent("real", isDirectory: true)
+        let sub = real.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try Data("r".utf8).write(to: sub.appendingPathComponent("raw.cr2"))
+        let link = tempDir.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        // One folder, two spellings: real/sub and link/sub.
+        let throughLink = link.appendingPathComponent("sub", isDirectory: true)
+        let skipped = FolderBackupSkippedFiles()
+
+        _ = try await collect(FolderBackupCatalog(folder: sub, skippedFiles: skipped))
+        _ = try await collect(FolderBackupCatalog(folder: throughLink, skippedFiles: skipped))
+
+        XCTAssertEqual(skipped.count, 1, "real/sub and link/sub are one folder")
+    }
+
+    func testPackagesAndSymbolicLinksDoNotCount() async throws {
+        try Data("r".utf8).write(to: tempDir.appendingPathComponent("raw.cr2"))
+        let package = tempDir.appendingPathComponent("Archive.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try Data("p".utf8).write(to: package.appendingPathComponent("inside.cr2"))
+        try FileManager.default.createSymbolicLink(
+            at: tempDir.appendingPathComponent("link.cr2"),
+            withDestinationURL: tempDir.appendingPathComponent("raw.cr2"))
+        let skipped = FolderBackupSkippedFiles()
+
+        _ = try await collect(FolderBackupCatalog(folder: tempDir, skippedFiles: skipped))
+
+        XCTAssertEqual(skipped.count, 1, "only raw.cr2 counts; the package content and the link do not")
+    }
+
     func testRevisionTracksModificationTime() async throws {
         let file = tempDir.appendingPathComponent("shot.heic")
         try Data("x".utf8).write(to: file)

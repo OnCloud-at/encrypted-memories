@@ -297,6 +297,9 @@ private struct BackupSettingsTab: View {
                 if status.skippedRemoteDeletions > 0 {
                     Text("settings.backup_row_skipped_deleted \(status.skippedRemoteDeletions)")
                 }
+                if let skipped = status.localizedSkippedUnsupportedFiles {
+                    Text(skipped)
+                }
                 if status.sourceMissing > 0 {
                     Text("settings.backup_row_source_missing \(status.sourceMissing)")
                 }
