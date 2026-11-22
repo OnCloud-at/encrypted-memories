@@ -1623,13 +1623,26 @@ final class PendingBackupCoordinatorTests: XCTestCase {
 
     func testCheckmarkShowsOnlyBriefly() async throws {
         await coordinator.close()
-        coordinator = makeCoordinator(checkmarkDuration: .milliseconds(30))
+        // The checkmark wait ends when the test opens the gate: a poll on a loaded runner cannot miss a wall-clock window.
+        let checkmarkDuration = Duration.seconds(30)
+        let gate = OpenGate()
+        defer { gate.open() }
+        coordinator = makeCoordinator(
+            checkmarkDuration: checkmarkDuration,
+            sleep: { duration in
+                if duration == checkmarkDuration {
+                    await gate.wait()
+                } else {
+                    try await Task.sleep(for: duration)
+                }
+            })
         enqueue("done", state: .uploading)
         await coordinator.start()
         recorder.recordHandoff(
             source: source("done"), revision: revision, remote: PhotoUID(volumeID: "vol", nodeID: "l"), kind: .uploaded)
         setState("done", .completed)
         await waitForSnapshot("the checkmark shows") { $0.tiles.first?.badge == .done }
+        gate.open()
         let later = await waitForSnapshot("then the tile shows no badge") { $0.tiles.first?.badge == .backedUp }
         XCTAssertEqual(tileIDs(later), ["done"], "the tile stays until its Proton photo takes over")
     }
