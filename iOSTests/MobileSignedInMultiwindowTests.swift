@@ -414,7 +414,7 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         let clock = ContinuousClock()
         let deadline = clock.now + .seconds(15)
         while clock.now < deadline {
-            if let element = accessibilityElement(labelled: label, in: window), element.accessibilityActivate() {
+            if let element = visibleAccessibilityElement(labelled: label, in: window), element.accessibilityActivate() {
                 note("activated '\(label)' through accessibility")
                 try await Task.sleep(for: .milliseconds(600))
                 return
@@ -441,7 +441,7 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
     /// check that the tab is selected before they return.
     @MainActor private func selectTab(_ tab: MobileTab, in window: UIWindow) async throws {
         let controller = viewControllers(in: window).compactMap { $0 as? UITabBarController }.first
-        if let element = accessibilityElement(labelled: tab.title, in: window), element.accessibilityActivate() {
+        if let element = visibleAccessibilityElement(labelled: tab.title, in: window), element.accessibilityActivate() {
             note("selected tab '\(tab.title)' through accessibility")
             try await Task.sleep(for: .milliseconds(800))
             if let controller { try await waitUntilSelected(tab, in: controller) }
@@ -564,38 +564,6 @@ final class MobileSignedInMultiwindowTests: XCTestCase {
         let labels = descendants(window).compactMap { $0.accessibilityLabel }.filter { !$0.isEmpty }
         lines.append("view labels: " + Array(Set(labels)).sorted().prefix(30).joined(separator: " | "))
         return lines.joined(separator: "\n  ")
-    }
-
-    @MainActor private func accessibilityElement(labelled label: String, in root: NSObject) -> NSObject? {
-        if let view = root as? UIView {
-            if view.isHidden || view.alpha < 0.01 { return nil }
-            if view.accessibilityElementsHidden { return nil }
-        }
-        if root.isAccessibilityElement, root.accessibilityLabel == label {
-            return root
-        }
-        if let container = root as? UIView {
-            for element in container.accessibilityElements ?? [] {
-                if let object = element as? NSObject, let match = accessibilityElement(labelled: label, in: object) {
-                    return match
-                }
-            }
-            for subview in container.subviews {
-                if let match = accessibilityElement(labelled: label, in: subview) { return match }
-            }
-        } else {
-            let count = root.accessibilityElementCount()
-            if count != NSNotFound, count > 0 {
-                for index in 0..<count {
-                    if let object = root.accessibilityElement(at: index) as? NSObject,
-                        let match = accessibilityElement(labelled: label, in: object)
-                    {
-                        return match
-                    }
-                }
-            }
-        }
-        return nil
     }
 
     private func writeReport() {
