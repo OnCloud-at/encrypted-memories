@@ -244,6 +244,7 @@ private final class RangeDownloadClient: @unchecked Sendable {
         progress: @escaping @Sendable (Int64, Int64?) async -> Void
     ) async throws -> (URL, URLResponse) {
         let task = session.downloadTask(with: request)
+        task.delegate = RedirectRefusingTaskDelegate.shared
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 delegate.register(
@@ -261,9 +262,7 @@ private final class RangeDownloadClient: @unchecked Sendable {
     }
 }
 
-private final class RangeDownloadSessionDelegate: MLModelNoRedirectDelegate, URLSessionDownloadDelegate,
-    @unchecked Sendable
-{
+private final class RangeDownloadSessionDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private final class PendingDownload: @unchecked Sendable {
         let continuation: CheckedContinuation<(URL, URLResponse), any Error>
         let reporter: RangeProgressReporter

@@ -527,7 +527,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         MLModelRequestIdentity.apply(to: &request)
         let (data, response) = try await session.data(
             for: request,
-            delegate: MLModelNoRedirectDelegate.shared
+            delegate: RedirectRefusingTaskDelegate.shared
         )
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard MLModelRequestIdentity.isExactEndpoint(http.url, expected: url) else {

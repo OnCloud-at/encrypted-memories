@@ -26,15 +26,24 @@ struct EmptyImageSource: CoreMLImageSource {
 class CatalogStubProtocol: URLProtocol, @unchecked Sendable {
     private struct State {
         var responses: [URL: Data] = [:]
+        /// URLs that answer with a 302 redirect to the mapped URL instead of their response.
+        var redirects: [URL: URL] = [:]
         var requests: [URLRequest] = []
     }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var states: [ObjectIdentifier: State] = [:]
+    private var finishRedirectedLoad: Task<Void, Never>?
 
-    class func configure(responses: [URL: Data]) {
+    /// Hands the protocol instance to the task that finishes a refused redirect, without holding it strongly.
+    private final class LoadingProtocol: @unchecked Sendable {
+        weak var owner: URLProtocol?
+        init(_ owner: URLProtocol) { self.owner = owner }
+    }
+
+    class func configure(responses: [URL: Data], redirects: [URL: URL] = [:]) {
         CatalogStubProtocol.lock.withLock {
-            CatalogStubProtocol.states[ObjectIdentifier(self)] = State(responses: responses)
+            CatalogStubProtocol.states[ObjectIdentifier(self)] = State(responses: responses, redirects: redirects)
         }
     }
 
@@ -52,11 +61,26 @@ class CatalogStubProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        let data = CatalogStubProtocol.lock.withLock { () -> Data? in
+        let (data, redirectTarget) = CatalogStubProtocol.lock.withLock { () -> (Data?, URL?) in
             let key = ObjectIdentifier(type(of: self))
             CatalogStubProtocol.states[key, default: State()].requests.append(request)
-            guard let url = request.url else { return nil }
-            return CatalogStubProtocol.states[key]?.responses[url]
+            guard let url = request.url else { return (nil, nil) }
+            return (CatalogStubProtocol.states[key]?.responses[url], CatalogStubProtocol.states[key]?.redirects[url])
+        }
+        if let redirectTarget, let url = request.url {
+            let redirect = HTTPURLResponse(
+                url: url, statusCode: 302, httpVersion: nil, headerFields: ["Location": redirectTarget.absoluteString])!
+            client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: redirectTarget), redirectResponse: redirect)
+            // The task delegate decides after this call. A refused redirect leaves this load to answer with the
+            // redirect itself, as a real HTTP stack does; a followed one stops it first, which cancels the answer.
+            let loading = LoadingProtocol(self)
+            finishRedirectedLoad = Task { [loading] in
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, let owner = loading.owner else { return }
+                owner.client?.urlProtocol(owner, didReceive: redirect, cacheStoragePolicy: .notAllowed)
+                owner.client?.urlProtocolDidFinishLoading(owner)
+            }
+            return
         }
         guard let data, let url = request.url else {
             client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
@@ -70,7 +94,7 @@ class CatalogStubProtocol: URLProtocol, @unchecked Sendable {
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() { finishRedirectedLoad?.cancel() }
 }
 
 func catalogStubSession(for protocolClass: CatalogStubProtocol.Type) -> URLSession {
