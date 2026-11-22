@@ -842,7 +842,7 @@ final class BackupStatusProjectorTests: XCTestCase {
         let display = BackupStatusPresentation(projection.status)
         XCTAssertEqual(projection.status.outstandingCount, 1)
         XCTAssertEqual(display.headlineKey, "backup.phase_waiting_proton")
-        XCTAssertNotNil(display.localizedSystemIssue)
+        XCTAssertNil(display.localizedSystemIssue)
         XCTAssertNil(display.localizedWaitingDetail)
         XCTAssertNil(display.localizedAttention)
         await projector.stop()
@@ -875,7 +875,7 @@ final class BackupStatusProjectorTests: XCTestCase {
         progress.remoteIndexPreparationFailed = true
         let failed = BackupStatusPresentation(BackupStatus(progress: progress, isScanning: false))
         XCTAssertEqual(failed.headlineKey, "backup.phase_waiting")
-        XCTAssertNotNil(failed.localizedSystemIssue)
+        XCTAssertNil(failed.localizedSystemIssue)
         progress.remoteIndexPreparationFailed = false
         progress.remoteIndexPreparationIssue = .init(kind: .remoteService, detail: "service unavailable")
         let issue = BackupStatusPresentation(BackupStatus(progress: progress, isScanning: false))

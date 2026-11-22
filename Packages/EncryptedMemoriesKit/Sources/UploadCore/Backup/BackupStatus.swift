@@ -388,9 +388,6 @@ public struct BackupStatus: Sendable, Equatable {
             guard alreadyBackedUp > 0 else { return nil }
             return L10n.string("backup.detail_already_backed_up \(alreadyBackedUp)")
         case .needsAttention:
-            if remoteIndexPreparationFailed {
-                return L10n.string("backup.detail_preparing_index_failed")
-            }
             return L10n.string("backup.detail_attention \(needsAttentionCount)")
         }
     }

@@ -309,7 +309,7 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertEqual(s.backedUp, 0)
         XCTAssertEqual(p.attentionCount, 0, "unfinished work must not be labeled as failed media")
         XCTAssertNil(p.localizedAttention)
-        XCTAssertNotNil(p.localizedSystemIssue)
+        XCTAssertNil(p.localizedSystemIssue, "a retry is scheduled: the headline and the next attempt say so")
         XCTAssertEqual(p.nextAttemptAt, Date(timeIntervalSince1970: 1_000))
     }
 
@@ -325,7 +325,42 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.accessory, .waiting)
         XCTAssertEqual(presentation.headlineKey, "backup.phase_waiting")
         XCTAssertNil(presentation.localizedAttention, "scheduler failures do not belong in the per-photo sheet")
-        XCTAssertFalse(try XCTUnwrap(presentation.localizedSystemIssue).isEmpty)
+        XCTAssertEqual(
+            try XCTUnwrap(presentation.localizedSystemIssue),
+            PhotosCore.L10n.string("backup.background_unavailable_action"))
+    }
+
+    /// Only an issue that the person can act on shows a line: the two permission cases share one text, a failed
+    /// registration keeps its restart text, and the scheduling issues that iOS and the app retry on their own show
+    /// nothing.
+    func testEveryBackgroundIssueShowsItsLineOrNone() {
+        let expectations: [(BackupExecutionOpportunityIssue, String?)] = [
+            (.backgroundRefreshUnavailable, "backup.background_unavailable_action"),
+            (.backgroundLaunchNotPermitted, "backup.background_unavailable_action"),
+            (.registrationFailed, "backup.error_background_registration"),
+            (.schedulerCapacity, nil),
+            (.immediateRunIneligible, nil),
+            (.unknown, nil),
+        ]
+        for (issue, key) in expectations {
+            let presentation = BackupStatusPresentation(
+                BackupStatus(
+                    progress: progress(total: 10, waiting: 1, alreadyBackedUp: 9), isScanning: false,
+                    executionOpportunityIssue: issue))
+            XCTAssertEqual(
+                presentation.localizedSystemIssue, key.map { PhotosCore.L10n.string(dynamicKey: $0) }, "\(issue)")
+        }
+    }
+
+    /// An index failure with a scheduled retry shows no extra line, and a needs-attention detail counts the files.
+    func testAFailedIndexPreparationNamesNoDetailOfItsOwn() {
+        var raw = progress(total: 10, alreadyBackedUp: 8, failed: 2, attention: 2)
+        raw.remoteIndexPreparationFailed = true
+        let status = BackupStatus(progress: raw, isScanning: false)
+
+        XCTAssertEqual(status.phase, .needsAttention)
+        XCTAssertEqual(status.localizedDetail, PhotosCore.L10n.string("backup.detail_attention \(2)"))
+        XCTAssertNil(BackupStatusPresentation(status).localizedSystemIssue)
     }
 
     func testPausedKeepsProgressButIsNotActive() {
@@ -366,7 +401,7 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertFalse(presentation.localizedHeadline.isEmpty)
     }
 
-    func testSystemIssuesWithoutRowsKeepIdleAndExplainTheIssue() {
+    func testSilentSystemIssuesWithoutRowsKeepIdleAndShowNoLine() {
         var raw = progress()
         raw.remoteIndexPreparationFailed = true
         let presentation = BackupStatusPresentation(
@@ -374,11 +409,11 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.headlineKey, "backup.phase_idle")
         XCTAssertEqual(presentation.accessory, .idle)
         XCTAssertEqual(presentation.attentionCount, 0)
-        XCTAssertNotNil(presentation.localizedSystemIssue)
+        XCTAssertNil(presentation.localizedSystemIssue)
         let schedulerOnly = BackupStatusPresentation(
             BackupStatus(progress: progress(), isScanning: false, executionOpportunityIssue: .schedulerCapacity))
         XCTAssertEqual(schedulerOnly.headlineKey, "backup.phase_idle")
-        XCTAssertNotNil(schedulerOnly.localizedSystemIssue)
+        XCTAssertNil(schedulerOnly.localizedSystemIssue)
     }
 
     func testFailedHeadlineStatesTheCountAndOffersReasons() {
