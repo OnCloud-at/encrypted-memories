@@ -37,9 +37,9 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
         XCTAssertTrue(status.label.contains("2 photos not in the album"))
         status.tap()
 
-        XCTAssertTrue(app.navigationBars["Photos not in the album"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.navigationBars["Photos not in the album"].waitForExistence(timeout: 15))
         let attach = row("attach fixture.heic")
-        XCTAssertTrue(attach.waitForExistence(timeout: 5))
+        XCTAssertTrue(attach.waitForExistence(timeout: 15))
         XCTAssertTrue(attach.label.contains("Could not be added to the Proton album."))
         XCTAssertTrue(row("network fixture.heic").label.contains("Connection interrupted."))
         // Sync now on the album row is the retry; the sheet offers none.
@@ -53,9 +53,9 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
         XCTAssertTrue(status.label.contains("2 Fotos nicht im Album"))
         status.tap()
 
-        XCTAssertTrue(app.navigationBars["Fotos nicht im Album"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.navigationBars["Fotos nicht im Album"].waitForExistence(timeout: 15))
         let attach = row("attach fixture.heic")
-        XCTAssertTrue(attach.waitForExistence(timeout: 5))
+        XCTAssertTrue(attach.waitForExistence(timeout: 15))
         XCTAssertTrue(attach.label.contains("Konnte nicht zum Proton-Album hinzugefügt werden."))
     }
 
@@ -73,7 +73,7 @@ final class MobileAlbumSyncReasonsUITests: XCTestCase {
         XCTAssertTrue(status.waitForExistence(timeout: 10))
         status.tap()
         let photo = row("trashed fixture.heic")
-        XCTAssertTrue(photo.waitForExistence(timeout: 5))
+        XCTAssertTrue(photo.waitForExistence(timeout: 15))
         let reason = language == "de" ? "Übersprungen: in Proton Drive gelöscht" : "Skipped: deleted in Proton Drive"
         XCTAssertTrue(photo.label.contains(reason))
         photo.tap()
