@@ -36,6 +36,8 @@ import Testing
         nonisolated(unsafe) static var responseChunkSize: Int?
         nonisolated(unsafe) static var statusCode = 206
         nonisolated(unsafe) static var contentRangeStartDelta = 0
+        /// When set, the first answer is a 302 redirect to this URL instead of the payload.
+        nonisolated(unsafe) static var redirectTarget: URL?
         private var loadingTask: Task<Void, Never>?
 
         override class func canInit(with request: URLRequest) -> Bool { true }
@@ -43,6 +45,24 @@ import Testing
 
         override func startLoading() {
             Self.requests.append(request)
+            // Only the original host redirects. A followed redirect asks the target host without a Range header, so
+            // this stub answers it with a bad server response. The list of requested hosts tells a followed
+            // redirect from a refused one.
+            if let target = Self.redirectTarget, request.url?.host != target.host {
+                let redirect = HTTPURLResponse(
+                    url: request.url!, statusCode: 302, httpVersion: nil,
+                    headerFields: ["Location": target.absoluteString])!
+                client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: target), redirectResponse: redirect)
+                // The task delegate decides after this call. A refused redirect leaves this load to finish; a
+                // followed one stops it first, which cancels the finish.
+                let delivery = ChunkDelivery(owner: self, body: Data(), chunkSize: 0)
+                loadingTask = Task { [delivery] in
+                    try? await Task.sleep(for: .milliseconds(100))
+                    guard !Task.isCancelled, let owner = delivery.owner else { return }
+                    owner.client?.urlProtocolDidFinishLoading(owner)
+                }
+                return
+            }
             let range = request.value(forHTTPHeaderField: "Range") ?? ""
             let bounds =
                 range
@@ -103,6 +123,36 @@ import Testing
         RangeProtocol.responseChunkSize = chunkSize
         RangeProtocol.statusCode = 206
         RangeProtocol.contentRangeStartDelta = 0
+        RangeProtocol.redirectTarget = nil
+    }
+
+    @Test func refusesAnHTTPRedirectInsteadOfFollowingIt() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("model-redirect-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let destination = root.appendingPathComponent("weights.partial")
+        let payload = Data((0..<251).map(UInt8.init))
+        configureProtocol(payload: payload)
+        RangeProtocol.redirectTarget = URL(string: "https://other.example/models/test/weights.bin")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RangeProtocol.self]
+        let transport = URLSessionMLModelArtifactTransport(session: URLSession(configuration: configuration))
+
+        do {
+            try await transport.download(
+                from: URL(string: "https://models.oncloud.at/models/test/weights.bin")!,
+                to: destination,
+                expectedByteCount: Int64(payload.count),
+                progress: { _, _ in }
+            )
+            Issue.record("A redirected answer must not complete the download")
+        } catch {
+            // The refused redirect ends the transfer; the kind of failure is the transport's retry decision.
+        }
+
+        #expect(RangeProtocol.requests.map { $0.url?.host } == ["models.oncloud.at"], "the redirect was followed")
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
     }
 
     @Test func resumesFromPartialFileAndIdentifiesTheApp() async throws {
