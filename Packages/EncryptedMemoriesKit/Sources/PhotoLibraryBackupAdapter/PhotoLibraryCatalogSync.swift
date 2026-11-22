@@ -7,10 +7,11 @@ import UploadCore
 /// without retaining the full library in memory.
 public protocol PhotoLibraryAssetEnumerator: Sendable {
     /// `identifiers == nil` enumerates the whole library newest-first; otherwise it fetches exactly
-    /// those identifiers. `startOffset` skips that many assets from the newest-first start so an
-    /// interrupted full scan can resume instead of restarting (ignored for a targeted fetch). Each
-    /// yielded chunk is at most `chunkSize` assets so transient PhotoKit objects and catalog writes stay
-    /// bounded for large libraries.
+    /// those identifiers. `startOffset` skips that many assets from the start of the fetch, which is
+    /// newest-first for the whole library and PhotoKit's order for a targeted fetch, so an interrupted scan
+    /// can resume instead of restarting; an offset beyond the fetch yields nothing. Each yielded chunk is at
+    /// most `chunkSize` assets so transient PhotoKit objects and catalog writes stay bounded for large
+    /// libraries.
     func infoChunks(
         identifiers: [String]?, startOffset: Int, chunkSize: Int
     ) -> AsyncThrowingStream<[PhotoBackupAssetInfo], any Error>
@@ -71,33 +72,16 @@ public struct PhotoKitAssetEnumerator: PhotoLibraryAssetEnumerator {
                     identifiers: identifiers, startOffset: startOffset, chunkSize: chunkSize)
             }
         #endif
-        let chunkSize = max(1, chunkSize)
-        return AsyncThrowingStream { continuation in
-            let task = Task.detached(priority: .utility) {
-                let fetchResult = PhotoKitAssetMapper.fetchAssets(identifiers: identifiers)
-
-                let total = fetchResult.count
-                // Resume point: skip assets already observed by an earlier run of this scan epoch.
-                // Clamped so a shrunk library (deletions since the cursor was saved) can't index past
-                // the end; it just yields nothing and the epoch completes.
-                var index = min(max(0, startOffset), total)
-                while index < total {
-                    if Task.isCancelled {
-                        continuation.finish(throwing: CancellationError())
-                        return
-                    }
-                    let upperBound = min(index + chunkSize, total)
-                    autoreleasepool {
-                        let assets = (index..<upperBound).map { fetchResult.object(at: $0) }
-                        let chunk = PhotoKitAssetMapper.infos(for: assets)
-                        continuation.yield(chunk)
-                    }
-                    index = upperBound
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
+        // The start offset skips assets that an earlier run of this scan epoch already observed.
+        return ChunkedAssetStream.make(
+            startOffset: startOffset,
+            chunkSize: chunkSize,
+            open: { PhotoKitAssetMapper.fetchAssets(identifiers: identifiers) },
+            count: { $0.count },
+            emit: { fetchResult, range, continuation in
+                let assets = range.map { fetchResult.object(at: $0) }
+                continuation.yield(PhotoKitAssetMapper.infos(for: assets))
+            })
     }
 
     public func identifierChunks(chunkSize: Int) -> AsyncThrowingStream<PhotoLibraryIdentifierChunk, any Error> {
@@ -106,31 +90,17 @@ public struct PhotoKitAssetEnumerator: PhotoLibraryAssetEnumerator {
                 return UpgradeTestPhotoLibrary.identifierChunks(chunkSize: chunkSize)
             }
         #endif
-        let chunkSize = max(1, chunkSize)
-        return AsyncThrowingStream { continuation in
-            let task = Task.detached(priority: .utility) {
-                let result = PhotoKitAssetMapper.fetchAssets()
-                var index = 0
-                while index < result.count {
-                    if Task.isCancelled {
-                        continuation.finish(throwing: CancellationError())
-                        return
-                    }
-                    let upperBound = min(index + chunkSize, result.count)
-                    let identifiers = autoreleasepool {
-                        (index..<upperBound).map { result.object(at: $0).localIdentifier }
-                    }
-                    continuation.yield(
-                        PhotoLibraryIdentifierChunk(
-                            identifiers: identifiers,
-                            totalCount: result.count
-                        ))
-                    index = upperBound
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
+        return ChunkedAssetStream.make(
+            chunkSize: chunkSize,
+            open: { PhotoKitAssetMapper.fetchAssets() },
+            count: { $0.count },
+            emit: { result, range, continuation in
+                continuation.yield(
+                    PhotoLibraryIdentifierChunk(
+                        identifiers: range.map { result.object(at: $0).localIdentifier },
+                        totalCount: result.count
+                    ))
+            })
     }
 }
 
