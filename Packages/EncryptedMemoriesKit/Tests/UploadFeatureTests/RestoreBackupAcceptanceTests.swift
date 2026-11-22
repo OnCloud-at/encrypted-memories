@@ -441,6 +441,7 @@ import XCTest
                     var configuration = PhotoLibraryBackupController.Configuration(
                         accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults)
                     configuration.currentAccessState = { .full }
+                    configuration.makeChangeMonitor = { .withoutPhotoLibrary(tokenURL: $0) }
                     controller = PhotoLibraryBackupController(
                         configuration: configuration, identityResolver: pipeline, uploader: server,
                         tagAdder: tagAdder,

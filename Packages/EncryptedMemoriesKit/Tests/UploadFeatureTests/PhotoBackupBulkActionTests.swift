@@ -776,6 +776,7 @@ final class PhotoBackupBulkActionTests: XCTestCase {
             accountDataDirectory: directory, databasePolicy: .conservative, defaults: defaults,
             runtimeSignals: signals)
         config.currentAccessState = access
+        config.makeChangeMonitor = { .withoutPhotoLibrary(tokenURL: $0) }
         config.bulkResourceResolver = resolver
         config.bulkResourceCoordinator = coordinator ?? LibraryResourceCoordinator(runtimeState: LibraryRuntimeState())
         let controller = PhotoLibraryBackupController(
