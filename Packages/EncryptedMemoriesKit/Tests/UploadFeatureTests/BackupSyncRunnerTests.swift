@@ -568,6 +568,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private var readFailed = false
     private var unknownEntryReads: Int
     var refusesMissingRemoval = false
+    /// True: the removal of the settled earlier revisions of a replaced photo fails, as a failed write does.
+    var refusesSettledRevisionRemoval = false
     /// When set, the first keyed read after a refused receipt write answers unknown: the read that tells a removed row
     /// from a failed write.
     var unknownReadAfterRefusedMark = false
@@ -692,7 +694,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
 
     func removeSettledRevisions(of source: UploadSourceIdentity, except revision: UploadBackupRevision) -> Bool {
-        inner.removeSettledRevisions(of: source, except: revision)
+        !refusesSettledRevisionRemoval && inner.removeSettledRevisions(of: source, except: revision)
     }
 
     func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) -> Int {
@@ -4742,6 +4744,79 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(current.remoteContentIndexHealth, complete)
     }
 
+    /// An identity resolver that answers each named file with its scripted decision.
+    private func decided(_ decisions: [String: UploadDuplicateDecision]) -> FakeIdentityResolver {
+        let fake = FakeIdentityResolver()
+        fake.decisionsByFilename = decisions
+        return fake
+    }
+
+    /// The issue that a failed row stores: the kind and the text that the person reads.
+    private func storedIssue(of entry: UploadBackupSyncQueueEntry) throws -> BackupIssueRecord {
+        try XCTUnwrap(
+            BackupIssueRecord.decode(try queueStore.entry(for: entry.source, revision: entry.revision)?.lastError))
+    }
+
+    /// A decision that the app cannot use parks the row with the fixed text of its internal failure (#1159).
+    func testADecisionThatTheAppCannotUseParksTheRowWithTheTextOfItsInternalFailure() async throws {
+        let inconsistent = seedEntry("inconsistent.jpg")
+        _ = await makeRunner(
+            identityResolver: decided(["inconsistent.jpg": .skip(.inconsistentRemoteState, remoteLinkID: nil)])
+        ).runUntilDrained()
+        let inconsistentIssue = try storedIssue(of: inconsistent)
+        XCTAssertEqual(inconsistentIssue.kind, .remoteService)
+        XCTAssertEqual(inconsistentIssue.detail, L10n.string("upload.error_remote_inconsistent"))
+
+        // A duplicate without a link cannot pair its secondaries with a primary.
+        let unpaired = seedEntry("unpaired.jpg")
+        resolver.setSecondaries(["unpaired.mov"], for: unpaired.source.identifier)
+        _ = await makeRunner(
+            identityResolver: decided(["unpaired.jpg": .skip(.activeDuplicate, remoteLinkID: nil)])
+        ).runUntilDrained()
+        let unpairedIssue = try storedIssue(of: unpaired)
+        XCTAssertEqual(unpairedIssue.kind, .remoteService)
+        XCTAssertEqual(unpairedIssue.detail, L10n.string("upload.error_remote_inconsistent"))
+
+        let waiting = seedEntry("waiting.jpg")
+        _ = await makeRunner(identityResolver: decided(["waiting.jpg": .awaitDeletionCheck])).runUntilDrained()
+        let waitingIssue = try storedIssue(of: waiting)
+        XCTAssertEqual(waitingIssue.kind, .remoteService)
+        XCTAssertEqual(waitingIssue.detail, "Deletion journal is unavailable", "no edit replacement holds a journal")
+    }
+
+    func testASecondaryWithAnInconsistentRemoteAnswerParksTheRowWithTheLocalizedText() async throws {
+        let entry = seedEntry("live.heic")
+        resolver.setSecondaries(["live.mov"], for: entry.source.identifier)
+        checker.remoteItemsByNameHash["nh(live.mov)"] = [
+            RemotePhotoDuplicate(
+                nameHash: "nh(live.mov)", contentHash: expectedContentHash(path: "/backup/live.heic#live.mov"),
+                linkState: nil, linkID: "paired")
+        ]
+
+        _ = await makeRunner().runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["live.heic"])
+        let issue = try storedIssue(of: entry)
+        XCTAssertEqual(issue.kind, .remoteService)
+        XCTAssertEqual(issue.detail, L10n.string("upload.error_remote_inconsistent"))
+    }
+
+    func testAFailedHandoffOfAnExistingPhotoParksTheRowWithTheFixedText() async throws {
+        let entry = seedEntry("duplicate.jpg")
+        let events = SpyBackupItemEvents(queue: queueStore)
+        events.handoffOutcome = .failed
+
+        _ = await makeRunner(
+            identityResolver: decided(["duplicate.jpg": .skip(.activeDuplicate, remoteLinkID: "remote-link")]),
+            events: events
+        ).runUntilDrained()
+
+        XCTAssertNotEqual(state(of: entry), .completed, "the grid needs the handoff before the row settles")
+        let issue = try storedIssue(of: entry)
+        XCTAssertEqual(issue.kind, .remoteService)
+        XCTAssertEqual(issue.detail, "Pending handoff could not be persisted")
+    }
+
     func testDraftBlocksWithBackoffAndNeverCountsAsBackedUp() async throws {
         let entry = seedEntry("draft.jpg")
         let hashes = expectedHashes(id: "draft.jpg")
@@ -5578,6 +5653,28 @@ final class BackupSyncRunnerTests: XCTestCase {
         clock.advance(by: 1000)
         _ = await runner.runUntilDrained(mode: .eligibleOnly)
         XCTAssertEqual(uploader.requests.map(\.name), ["replacement-cancel.heic"], "retry keeps the committed upload")
+    }
+
+    /// A queue that cannot drop the settled earlier revisions of a replaced photo keeps the row retryable with the fixed
+    /// text of its internal failure, and trashes nothing (#1159).
+    func testAFailedRemovalOfTheSettledRevisionsParksTheReplacementWithTheFixedText() async throws {
+        let harness = try makeReplacementHarness()
+        let entry = seedLibraryEntry("replacement-queue.heic")
+        resolver.setEditRevision(.revision(UploadBackupRevision(rawValue: 7)), for: entry.source.identifier)
+        let old = PhotoUID(volumeID: "vol", nodeID: "queue-old")
+        try harness.journal.addSuperseded(old, for: entry.source)
+        try harness.journal.recordUpload(edited: true, for: entry.source)
+        harness.remote.active = [old]
+        let spy = SpyQueueStore(inner: queueStore, log: BackupEventLog())
+        spy.refusesSettledRevisionRemoval = true
+
+        _ = await makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement, queue: spy)
+            .runUntilDrained(mode: .eligibleOnly)
+
+        XCTAssertTrue(harness.remote.trashCalls.isEmpty, "the earlier upload stays until the queue can follow")
+        let issue = try storedIssue(of: entry)
+        XCTAssertEqual(issue.kind, .remoteService)
+        XCTAssertEqual(issue.detail, "Backup queue could not be updated")
     }
 
     private func makeReplacementHarness() throws -> ReplacementHarness {

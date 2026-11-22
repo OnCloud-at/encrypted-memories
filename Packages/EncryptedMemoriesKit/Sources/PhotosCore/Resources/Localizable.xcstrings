@@ -4456,24 +4456,6 @@
         }
       }
     },
-    "upload.error_duplicate_check_blocked": {
-      "extractionState": "manual",
-      "comment": "Fallback upload duplicate-check blocker message.",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "The duplicate check blocked this upload."
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Die Duplikatprüfung hat diesen Upload blockiert."
-          }
-        }
-      }
-    },
     "error.upload_unsupported_file %@": {
       "extractionState": "manual",
       "comment": "Unsupported file type. %@ is the file name.",

@@ -183,7 +183,7 @@ public actor UploadManager {
         guard settlementStore?.isOperationalAllowingTransientRecovery() ?? !requiresDurableSettlement else {
             return (
                 generation, nil,
-                UploadError.backend("Durable manual upload settlement is unavailable.").errorDescription!
+                UploadError.internalFailure(.manualSettlementUnavailable).errorDescription!
             )
         }
         guard let resolution = await resolveAlbum(for: destination, generation: generation) else { return nil }
@@ -515,7 +515,7 @@ public actor UploadManager {
         if record.stage == .manifestPending && !manifestAlreadyRecorded {
             do {
                 guard let identityResolver else {
-                    throw UploadError.backend("Upload identity resolver is unavailable for settlement.")
+                    throw UploadError.internalFailure(.identityResolverUnavailable)
                 }
                 try await identityResolver.recordUploaded(
                     descriptor,
@@ -727,9 +727,9 @@ public actor UploadManager {
         case .allowed:
             return
         case .receiptBacked:
-            throw UploadError.backend("Remote upload receipt exists; byte upload is not retryable.")
+            throw UploadError.internalFailure(.receiptBacksTheUpload)
         case .settlementUnavailable:
-            throw UploadError.backend("Durable manual upload settlement is unavailable; byte upload is blocked.")
+            throw UploadError.internalFailure(.byteUploadBlocked)
         }
     }
 
@@ -757,7 +757,7 @@ public actor UploadManager {
         guard let settlementStore,
             let job = jobs[id]
         else {
-            throw UploadError.backend("Durable manual upload settlement is unavailable.")
+            throw UploadError.internalFailure(.manualSettlementUnavailable)
         }
         let record = UploadManualSettlementRecord(
             queueItemID: id,
@@ -774,7 +774,7 @@ public actor UploadManager {
             updatedAt: now()
         )
         guard writeReceiptRow(record, to: settlementStore) else {
-            throw UploadError.backend("Manual upload receipt could not be persisted.")
+            throw UploadError.internalFailure(.manualReceiptNotPersisted)
         }
     }
 
@@ -902,7 +902,7 @@ public actor UploadManager {
                     // requires a server receipt or idempotency contract that this queue does not provide.
                     onRemoteCommit = { [weak self] identity, receipt in
                         guard let self else {
-                            throw UploadError.backend("Upload manager was released before receipt persistence.")
+                            throw UploadError.internalFailure(.managerReleased)
                         }
                         try await self.persistDurableSettlement(
                             id: id,
@@ -1045,17 +1045,21 @@ public actor UploadManager {
             )
 
         case .awaitDeletionCheck:
-            throw UploadError.backend(L10n.string("backup.issue_deletion_check"))
+            throw UploadError.internalFailure(.deletionCheckPending)
 
         case .uploadMissingSecondaries:
             // Manual uploads are single-resource compounds. The primary is already represented.
             return .noUpload(.skipped(.primaryAlreadyPresent))
 
         case .skip(let reason, _):
-            guard let skipReason = UploadSkipReason(duplicateReason: reason) else {
-                throw UploadError.backend(reason.blockingMessage)
+            switch reason {
+            case .activeDuplicate: return .noUpload(.skipped(.activeDuplicate))
+            case .knownFromManifest: return .noUpload(.skipped(.knownFromManifest))
+            case .trashedDuplicate: return .noUpload(.skipped(.trashedDuplicate))
+            case .deletedRemotely: return .noUpload(.skipped(.deletedRemotely))
+            case .draftExists: throw UploadError.internalFailure(.remoteDraftExists)
+            case .inconsistentRemoteState: throw UploadError.internalFailure(.remoteInconsistent)
             }
-            return .noUpload(.skipped(skipReason))
         }
     }
 
@@ -1630,35 +1634,5 @@ public actor UploadManager {
 
     private nonisolated static func message(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-    }
-}
-
-private extension UploadSkipReason {
-    init?(duplicateReason: UploadDuplicateDecision.SkipReason) {
-        switch duplicateReason {
-        case .activeDuplicate:
-            self = .activeDuplicate
-        case .knownFromManifest:
-            self = .knownFromManifest
-        case .trashedDuplicate:
-            self = .trashedDuplicate
-        case .deletedRemotely:
-            self = .deletedRemotely
-        case .draftExists, .inconsistentRemoteState:
-            return nil
-        }
-    }
-}
-
-private extension UploadDuplicateDecision.SkipReason {
-    var blockingMessage: String {
-        switch self {
-        case .draftExists:
-            return L10n.string("upload.error_remote_draft")
-        case .inconsistentRemoteState:
-            return L10n.string("upload.error_remote_inconsistent")
-        case .activeDuplicate, .knownFromManifest, .trashedDuplicate, .deletedRemotely:
-            return L10n.string("upload.error_duplicate_check_blocked")
-        }
     }
 }
