@@ -1795,6 +1795,51 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(uploader.requests.count, 1)
     }
 
+    private func storedRecord(of entry: UploadBackupSyncQueueEntry) throws -> BackupIssueRecord {
+        let row = try queueStore.entry(for: entry.source, revision: entry.revision)
+        return try XCTUnwrap(BackupIssueRecord.decode(row?.lastError))
+    }
+
+    /// A wait for iCloud keeps the moment it began while it continues, so the backup can tell a wait that never ends.
+    /// The retries and their dates are unchanged.
+    func testAWaitForICloudKeepsTheMomentItBegan() async throws {
+        let entry = seedEntry("long-cloud.heic")
+        resolver.set(
+            .failure(photoKitFailure(.networkAccessRequired, for: "long-cloud.heic"), times: 3),
+            for: entry.source.identifier)
+        let began = clock.now
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let first = try storedRecord(of: entry)
+        XCTAssertEqual(first.waitingSince, began)
+
+        clock.advance(by: 3_600)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let second = try storedRecord(of: entry)
+        XCTAssertEqual(second.automaticRetryAttempt, 2, "the second wait of the same kind")
+        XCTAssertEqual(second.waitingSince, began, "a continuing wait keeps its start")
+        XCTAssertNotEqual(second.nextAttemptAt, first.nextAttemptAt)
+    }
+
+    /// A temporary Proton failure keeps the moment its wait began; an item retry of another error records none.
+    func testATemporaryProtonWaitKeepsTheMomentItBegan() async throws {
+        let entry = seedEntry("busy.jpg")
+        let busy = MockUploader(
+            workDuration: .milliseconds(1), deliverProgress: false, serviceFailures: ["busy.jpg": 3])
+        let began = clock.now
+        let runner = makeRunner(uploader: busy)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let first = try storedRecord(of: entry)
+        XCTAssertEqual(first.kind, .remoteService)
+        XCTAssertEqual(first.waitingSince, began)
+
+        clock.advance(by: 3_600)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let second = try storedRecord(of: entry)
+        XCTAssertEqual(second.automaticRetryAttempt, 2)
+        XCTAssertEqual(second.waitingSince, began)
+    }
+
     func testAPhotoThatPhotosReportsMissingIsCheckedAgainHoursLaterAndBacksUp() async throws {
         let entry = seedEntry("interrupted.heic")
         resolver.set(
@@ -5863,6 +5908,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(BackupFailedItem(entry: waiting).reason, L10n.string("backup.issue_waiting_original"))
         XCTAssertEqual(issue.nextAttemptAt, waiting.updatedAt)
         XCTAssertEqual(issue.detail, "backup.issue_waiting_original", "the reason does not depend on the language")
+        XCTAssertEqual(issue.waitingSince, clock.now, "the wait for the original begins now")
         XCTAssertEqual(
             stateStore.record(for: edited.source, revision: UploadBackupRevision(date: resolver.defaultModified))?
                 .isComplete, false,
