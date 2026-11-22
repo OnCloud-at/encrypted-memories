@@ -13,10 +13,10 @@
         private var loadThumbnail: (PhotoUID) async -> UIImage?
         private var onSelectPhoto: (PhotoUID) -> Void
         private var onSelectCluster: (([PhotoUID], CLLocationCoordinate2D) -> Void)?
-        /// In-flight async thumbnail loads keyed by UID. The loader tells us (via its `onRemoved` callback)
-        /// which to cancel when their annotations leave the viewport - otherwise every pinch-zoom in a dense
-        /// region leaves orphan tasks racing to set thumbnails on recycled views.
-        private var thumbnailLoadTasks: [PhotoUID: Task<Void, Never>] = [:]
+        /// In-flight async thumbnail loads. The loader tells us (via its `onRemoved` callback) which to cancel when
+        /// their annotations leave the viewport - otherwise every pinch-zoom in a dense region leaves orphan tasks
+        /// racing to set thumbnails on recycled views.
+        private let thumbnailLoads = MapThumbnailLoads<UIImage>()
         private var lastMapBoundsSize = CGSize.zero
         /// Shared engine (MapCore): framing, off-main aggregation, diff, generation guard, add/remove.
         private var loader: PhotoMapAnnotationLoader!
@@ -40,7 +40,7 @@
                 policy: visibleCoordinatePolicy,
                 onRemoved: { [weak self] uids in
                     guard let self else { return }
-                    for uid in uids { self.thumbnailLoadTasks.removeValue(forKey: uid)?.cancel() }
+                    self.thumbnailLoads.cancel(uids)
                 }
             )
             configureMap()
@@ -52,14 +52,6 @@
         @available(*, unavailable)
         public required init?(coder: NSCoder) {
             fatalError("init(coder:) has not been implemented")
-        }
-
-        deinit {
-            // Cancel all in-flight thumbnail loads when the view is torn down so they don't try to
-            // access a deallocated host after a region change or screen dismissal.
-            for (_, task) in thumbnailLoadTasks {
-                task.cancel()
-            }
         }
 
         public override func layoutSubviews() {
@@ -135,37 +127,27 @@
 
         public func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
             if let photo = view.annotation as? PhotoMapAnnotation {
-                // A single-cell tap: if the cell represents one photo, open it directly; if it bundles
-                // several, present them as a cluster series so the user can pick.
-                if photo.memberUIDs.count == 1 {
-                    onSelectPhoto(photo.uid)
-                } else if let handler = onSelectCluster {
-                    handler(photo.memberUIDs, photo.coordinate)
-                } else {
-                    onSelectPhoto(photo.uid)
+                switch photo.selection {
+                case .photo(let uid):
+                    onSelectPhoto(uid)
+                case .cluster(let uids, let coordinate):
+                    // Without a cluster handler the hero photo opens.
+                    if let handler = onSelectCluster {
+                        handler(uids, coordinate)
+                    } else {
+                        onSelectPhoto(photo.uid)
+                    }
                 }
                 mapView.deselectAnnotation(view.annotation, animated: false)
             }
         }
 
         private func requestThumbnailIfNeeded(_ uid: PhotoUID) {
-            // Skip if already in-flight OR already resident (the sync `thumbnail()` check in `viewFor`
-            // covers the resident case, but the in-flight check here avoids queuing a duplicate load
-            // for the same UID while the first one is still running).
-            if thumbnailLoadTasks[uid] != nil { return }
-            let loadThumbnail = loadThumbnail
-            let task = Task { @MainActor [weak self] in
-                let image = await loadThumbnail(uid)
-                guard let self else { return }
-                // Remove the task entry first - the load is done, the slot is free for a future re-request.
-                self.thumbnailLoadTasks.removeValue(forKey: uid)
-                // If the task was cancelled (annotation removed during a region change), don't bother
-                // looking for the view - it's gone.
-                if Task.isCancelled { return }
-                guard let image else { return }
-                self.applyLoadedThumbnail(image, for: uid)
+            // The resident case is answered by the sync `thumbnail()` check in `viewFor`; the loads skip a photo whose
+            // load still runs.
+            thumbnailLoads.requestIfNeeded(uid, load: loadThumbnail) { [weak self] image, uid in
+                self?.applyLoadedThumbnail(image, for: uid)
             }
-            thumbnailLoadTasks[uid] = task
         }
 
         private func applyLoadedThumbnail(_ image: UIImage, for uid: PhotoUID) {
