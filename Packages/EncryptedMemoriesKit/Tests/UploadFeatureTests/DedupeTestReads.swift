@@ -5,6 +5,19 @@ import PhotosCore
 
 // Short reads for assertions. Each one goes through the production read that the app uses.
 
+extension ExactDuplicateFingerprint {
+    /// The details of a photo or video in the tests of possibly identical photos: one camera, 4000 x 3000 pixels, no
+    /// place, and the capture second 1,700,000,000 plus `second`, unless a test says otherwise.
+    static func possiblePhoto(
+        type: String = "image/jpeg", camera: String? = "Camera", width: Int? = 4000, height: Int? = 3000,
+        latitude: Double? = nil, longitude: Double? = nil, duration: Double? = nil, second: TimeInterval = 0
+    ) -> ExactDuplicateFingerprint {
+        ExactDuplicateFingerprint(
+            captureTime: Date(timeIntervalSince1970: 1_700_000_000 + second), latitude: latitude, longitude: longitude,
+            device: camera, pixelWidth: width, pixelHeight: height, durationSeconds: duration, mimeType: type)
+    }
+}
+
 extension ExactDuplicateFingerprintStore {
     /// The saved details of `members` through the group read of the Duplicates screen. Nil when one member has none.
     func fingerprints(for members: [PhotoUID], in snapshot: Snapshot) -> [PhotoUID: ExactDuplicateFingerprint]? {

@@ -528,8 +528,21 @@ public struct ExactDuplicateFinder: Sendable {
             includesVideos: policy.includesVideos)
         // The cursor before the first read: the details saved during this check belong to it.
         let snapshot = await possibleDuplicateSnapshot()
-        let cache = fingerprintCache
-        let saved = cache?.facts(of: candidates.flatMap { $0 }, in: snapshot) ?? [:]
+        let lookup = fingerprintCache.map { $0.facts(of: candidates.flatMap { $0 }, in: snapshot) }
+        let saved: [PhotoUID: ExactDuplicateFingerprintStore.Facts]
+        let cache: ExactDuplicateFingerprintCache?
+        switch lookup {
+        case .found(let facts):
+            saved = facts
+            cache = fingerprintCache
+        case .absent, nil:
+            saved = [:]
+            cache = fingerprintCache
+        case .unknown:
+            // The saved facts cannot be read: every candidate is read again, and nothing is saved to that store.
+            saved = [:]
+            cache = nil
+        }
         let remote = remote
         let index = index
         let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) {

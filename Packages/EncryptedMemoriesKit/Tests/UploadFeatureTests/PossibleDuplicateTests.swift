@@ -17,13 +17,14 @@ final class PossibleDuplicateTests: XCTestCase {
             timelineOrder: exact.map { TimelineOrderMetadata(exactCaptureTime: Date(timeIntervalSince1970: $0)) })
     }
 
+    /// The shared details with a place, which most of these tests compare.
     private func details(
         camera: String? = "Camera", width: Int? = 4000, height: Int? = 3000, latitude: Double? = 47.0,
-        longitude: Double? = 15.0, type: String = "image/jpeg", duration: Double? = nil, time: Date? = nil
+        longitude: Double? = 15.0, type: String = "image/jpeg", duration: Double? = nil
     ) -> ExactDuplicateFingerprint {
-        ExactDuplicateFingerprint(
-            captureTime: time ?? second, latitude: latitude, longitude: longitude, device: camera, pixelWidth: width,
-            pixelHeight: height, durationSeconds: duration, mimeType: type)
+        .possiblePhoto(
+            type: type, camera: camera, width: width, height: height, latitude: latitude, longitude: longitude,
+            duration: duration)
     }
 
     // MARK: - Candidates from the library, before any request
@@ -153,6 +154,41 @@ final class PossibleDuplicateTests: XCTestCase {
         XCTAssertEqual(
             PossibleDuplicatePolicy(rule: .sameShape, includesVideos: false).groups(
                 of: candidates, fingerprints: fingerprints), [])
+    }
+
+    func testTheBoundariesOfTheShapeLengthAndMomentCount() {
+        let shape = PossibleDuplicatePolicy(rule: .sameShape, includesVideos: true)
+        let square = [uid("a"): details(width: 100, height: 100)]
+        XCTAssertEqual(
+            shape.groups(
+                of: [[uid("a"), uid("b")]],
+                fingerprints: square.merging([uid("b"): details(width: 101, height: 100)]) { $1 }
+            )
+            .count, 1, "a ratio exactly 1 % off counts")
+        XCTAssertEqual(
+            shape.groups(
+                of: [[uid("a"), uid("b")]],
+                fingerprints: square.merging([uid("b"): details(width: 102, height: 100)]) { $1 }),
+            [], "2 % off does not")
+        let video = { (duration: Double) in self.details(type: "video/mp4", duration: duration) }
+        XCTAssertEqual(
+            shape.groups(of: [[uid("a"), uid("b")]], fingerprints: [uid("a"): video(10), uid("b"): video(10.5)]).count,
+            1,
+            "a length exactly half a second off counts")
+        XCTAssertEqual(
+            shape.groups(of: [[uid("a"), uid("b")]], fingerprints: [uid("a"): video(10), uid("b"): video(10.51)]), [],
+            "more than half a second does not")
+        let sameMillisecond = [photo("p", exact: 1_700_000_000.2001), photo("q", exact: 1_700_000_000.2004)]
+        XCTAssertEqual(
+            PossibleDuplicateCandidates.groups(of: sameMillisecond, sameBytes: [], includesVideos: true),
+            [[uid("p"), uid("q")]], "moments within the same millisecond are one moment")
+        let nextMillisecond = [
+            photo("p", exact: 1_700_000_000.2004), photo("q", exact: 1_700_000_000.2006),
+            photo("r", exact: 1_700_000_000.2006),
+        ]
+        XCTAssertEqual(
+            PossibleDuplicateCandidates.groups(of: nextMillisecond, sameBytes: [], includesVideos: true),
+            [[uid("q"), uid("r")]], "the next millisecond is another moment")
     }
 
     func testAPhotoAndAVideoOfTheSameSecondAreNoPair() {

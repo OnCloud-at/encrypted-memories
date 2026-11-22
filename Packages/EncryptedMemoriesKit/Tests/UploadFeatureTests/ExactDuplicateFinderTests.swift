@@ -4857,16 +4857,11 @@ final class ExactDuplicateFinderTests: XCTestCase {
         PhotoItem(uid: PhotoUID(volumeID: "vol", nodeID: node), captureTime: date(offset), mediaType: type)
     }
 
-    private func possibleDetails(type: String = "image/jpeg") -> ExactDuplicateFingerprint {
-        ExactDuplicateFingerprint(
-            captureTime: date(0), device: "Camera", pixelWidth: 4000, pixelHeight: 3000, mimeType: type)
-    }
-
     func testPossibleDuplicatesReadOnlyTheCandidatesAndGroupThemByThePolicy() async {
         let (a, b, c) = (libraryPhoto("a"), libraryPhoto("b"), libraryPhoto("c"))
         server.setLibraryItems([a, b, c, libraryPhoto("other-second", second: 1), libraryPhoto("v", type: "video/mp4")])
-        server.setFingerprint(possibleDetails(), of: a.uid)
-        server.setFingerprint(possibleDetails(type: "image/heic"), of: b.uid)
+        server.setFingerprint(ExactDuplicateFingerprint.possiblePhoto(), of: a.uid)
+        server.setFingerprint(ExactDuplicateFingerprint.possiblePhoto(type: "image/heic"), of: b.uid)
         server.setNodeSize(4_000_000, of: a.uid)
         server.setNodeSize(1_500_000, of: b.uid)
         let sameBytes = ExactDuplicateGroup(contentHash: "h", hashKeyEpoch: epoch, members: [b.uid, c.uid])
@@ -4876,7 +4871,12 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
         XCTAssertEqual(scan?.groups, [PossibleDuplicateGroup(members: [a.uid, b.uid], differences: [.fileType])])
         XCTAssertEqual(scan?.byteSizes, [a.uid: 4_000_000, b.uid: 1_500_000])
-        XCTAssertEqual(scan?.fingerprints, [a.uid: possibleDetails(), b.uid: possibleDetails(type: "image/heic")])
+        XCTAssertEqual(
+            scan?.fingerprints,
+            [
+                a.uid: ExactDuplicateFingerprint.possiblePhoto(),
+                b.uid: ExactDuplicateFingerprint.possiblePhoto(type: "image/heic"),
+            ])
         XCTAssertEqual(server.readCounts.sharingMembers, 2, "only the candidates cost a node read")
     }
 
@@ -4884,12 +4884,10 @@ final class ExactDuplicateFinderTests: XCTestCase {
         let early = [libraryPhoto("a"), libraryPhoto("b")]
         let late = [libraryPhoto("x", second: 7), libraryPhoto("y", second: 7)]
         server.setLibraryItems(early + late)
-        for item in early { server.setFingerprint(possibleDetails(), of: item.uid) }
+        for item in early { server.setFingerprint(ExactDuplicateFingerprint.possiblePhoto(), of: item.uid) }
         for item in late {
             server.setFingerprint(
-                ExactDuplicateFingerprint(
-                    captureTime: date(7), device: "Camera", pixelWidth: 4000, pixelHeight: 3000,
-                    mimeType: item.uid.nodeID == "x" ? "image/jpeg" : "image/png"), of: item.uid)
+                .possiblePhoto(type: item.uid.nodeID == "x" ? "image/jpeg" : "image/png", second: 7), of: item.uid)
         }
         server.loseNode(early[1].uid)
 

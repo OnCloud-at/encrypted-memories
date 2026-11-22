@@ -3864,19 +3864,14 @@ final class ExactDuplicatesModelTests: XCTestCase {
     private let x3 = PhotoUID(volumeID: "v", nodeID: "x3")
     private let shape = PossibleDuplicatePolicy(rule: .sameShape, includesVideos: true)
 
-    private func photoDetails(_ type: String) -> ExactDuplicateFingerprint {
-        ExactDuplicateFingerprint(
-            captureTime: Date(timeIntervalSince1970: 1_700_000_000), device: "Camera", pixelWidth: 4000,
-            pixelHeight: 3000, mimeType: type)
-    }
-
     /// x1 and x2 are JPEGs and x3 a HEIC of the same moment.
     private var threeFiles: PossibleDuplicateScan {
         PossibleDuplicateScan(
             groups: [PossibleDuplicateGroup(members: [x1, x2, x3], differences: [.fileType])],
             byteSizes: [x1: 3, x2: 2, x3: 1],
             fingerprints: [
-                x1: photoDetails("image/jpeg"), x2: photoDetails("image/jpeg"), x3: photoDetails("image/heic"),
+                x1: .possiblePhoto(type: "image/jpeg"), x2: .possiblePhoto(type: "image/jpeg"),
+                x3: .possiblePhoto(type: "image/heic"),
             ])
     }
 
@@ -4005,7 +4000,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
         let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
         let scanned = PossibleDuplicateScan(
             groups: [PossibleDuplicateGroup(members: [a1, x1], differences: [.fileType])],
-            byteSizes: [:], fingerprints: [a1: photoDetails("image/jpeg"), x1: photoDetails("image/heic")])
+            byteSizes: [:],
+            fingerprints: [a1: .possiblePhoto(type: "image/jpeg"), x1: .possiblePhoto(type: "image/heic")])
         finder.possible = scanned
         let (model, _) = makeModel(finder)
         await model.load()

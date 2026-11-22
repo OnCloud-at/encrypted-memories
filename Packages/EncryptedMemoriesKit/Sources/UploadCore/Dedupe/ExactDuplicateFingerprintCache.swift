@@ -66,11 +66,12 @@ public final class ExactDuplicateFingerprintCache: @unchecked Sendable {
         return currentSnapshot()
     }
 
-    /// The saved facts of `uids` under `snapshot`.
+    /// The saved facts of `uids` under `snapshot`. Without a snapshot no saved fact applies.
     func facts(
         of uids: [PhotoUID], in snapshot: ExactDuplicateFingerprintStore.Snapshot?
-    ) -> [PhotoUID: ExactDuplicateFingerprintStore.Facts] {
-        guard let snapshot, !uids.isEmpty else { return [:] }
+    ) -> StoreLookup<[PhotoUID: ExactDuplicateFingerprintStore.Facts]> {
+        guard let snapshot else { return .absent }
+        guard !uids.isEmpty else { return .found([:]) }
         return store.facts(ofLinks: uids, in: snapshot)
     }
 

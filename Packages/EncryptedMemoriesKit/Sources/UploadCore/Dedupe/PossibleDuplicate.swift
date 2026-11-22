@@ -3,12 +3,14 @@ import PhotosCore
 
 /// How closely the details of two different files must agree before the screen lists them as possibly the same photo.
 /// Every rule needs the same capture second, the same kind (photo or video) and a known camera, and leaves out a copy
-/// whose details are unknown. A video also needs the same length within `PossibleDuplicatePolicy.durationTolerance`.
+/// whose details are unknown. The capture time of a node is the server's whole second, so every rule compares it
+/// exactly. A video also needs the same length within `PossibleDuplicatePolicy.durationTolerance`.
 public enum PossibleDuplicateRule: Sendable, CaseIterable {
     /// The same camera and the same dimensions in either orientation. A place may be missing on one copy.
     case strict
     /// The same camera and the same aspect ratio in either orientation, within
-    /// `PossibleDuplicatePolicy.aspectTolerance`, so a smaller copy counts. A place may be missing on one copy.
+    /// `PossibleDuplicatePolicy.aspectTolerancePercent` of the first copy's ratio, so a smaller copy counts. A place may
+    /// be missing on one copy.
     case sameShape
     /// Nothing more: copies of another camera, place or size count too.
     case sameSecond
@@ -19,8 +21,9 @@ public struct PossibleDuplicatePolicy: Sendable, Equatable {
     public let rule: PossibleDuplicateRule
     public let includesVideos: Bool
 
-    /// The largest difference of the aspect ratio, as a share of the first copy's ratio.
-    public static let aspectTolerance = 0.01
+    /// The largest difference of the aspect ratio, in percent of the first copy's ratio. The comparison uses whole
+    /// numbers, so a difference of exactly this much counts.
+    public static let aspectTolerancePercent: Int64 = 1
     /// The largest difference of a video's length, in seconds.
     public static let durationTolerance = 0.5
 
@@ -82,9 +85,10 @@ public struct PossibleDuplicatePolicy: Sendable, Equatable {
             guard first.device == other.device, Self.placesAgree(first, other),
                 let sides = Self.sides(first), let otherSides = Self.sides(other)
             else { return false }
-            let ratio = Double(sides.long) / Double(sides.short)
-            let otherRatio = Double(otherSides.long) / Double(otherSides.short)
-            return abs(ratio - otherRatio) <= Self.aspectTolerance * ratio
+            // |long/short - otherLong/otherShort| <= percent/100 * long/short, multiplied out in whole numbers.
+            let crossed = Int64(sides.long) * Int64(otherSides.short)
+            let difference = abs(crossed - Int64(otherSides.long) * Int64(sides.short))
+            return 100 * difference <= Self.aspectTolerancePercent * crossed
         }
     }
 

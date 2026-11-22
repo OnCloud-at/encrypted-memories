@@ -110,12 +110,9 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
     /// Two different files of the same second, a JPEG and a HEIC of the same camera and size, in the stored timeline.
     @discardableResult
     private func seedPossiblePair(_ name: String, second offset: TimeInterval = 0) -> [PhotoUID] {
-        let time = Date(timeIntervalSince1970: 1_700_000_000 + offset)
         let pair = [server.seedLink(digest: digest("\(name)-jpeg")), server.seedLink(digest: digest("\(name)-heic"))]
         for (uid, type) in zip(pair, ["image/jpeg", "image/heic"]) {
-            server.setFingerprint(
-                ExactDuplicateFingerprint(
-                    captureTime: time, device: "camera", pixelWidth: 100, pixelHeight: 100, mimeType: type), of: uid)
+            server.setFingerprint(.possiblePhoto(type: type, width: 100, height: 100, second: offset), of: uid)
             server.setNodeSize(type == "image/jpeg" ? 300 : 200, of: uid)
         }
         return pair
@@ -168,9 +165,9 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
         let shared = PhotoUID(volumeID: "shared-volume", nodeID: server.seedLink(digest: digest("shared")).nodeID)
         let time = Date(timeIntervalSince1970: 1_700_000_000)
         for (uid, type) in [(own, "image/jpeg"), (shared, "image/heic")] {
-            server.setFingerprint(
-                ExactDuplicateFingerprint(
-                    captureTime: time, device: "camera", pixelWidth: 100, pixelHeight: 100, mimeType: type), of: uid)
+            server.setFingerprint(.possiblePhoto(type: type, width: 100, height: 100), of: uid)
+            // A size, so the saved row is complete and the test checks only the volume.
+            server.setNodeSize(100, of: uid)
         }
         server.setLibraryItems([own, shared].map { PhotoItem(uid: $0, captureTime: time, mediaType: "image/jpeg") })
         publishIndex(eventID: "event-1")
@@ -191,12 +188,7 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
             cache.currentSnapshot(orBeginAt: "vol", hashKeyEpoch: epoch, eventID: "event-1"))
         // Rows as a ranking saved them before it saved sizes.
         let details = zip(pair, ["image/jpeg", "image/heic"]).map { uid, type in
-            (
-                uid,
-                ExactDuplicateFingerprint(
-                    captureTime: Date(timeIntervalSince1970: 1_700_000_000), device: "camera", pixelWidth: 100,
-                    pixelHeight: 100, mimeType: type)
-            )
+            (uid, ExactDuplicateFingerprint.possiblePhoto(type: type, width: 100, height: 100))
         }
         XCTAssertTrue(cache.store.store(Dictionary(uniqueKeysWithValues: details), for: snapshot))
 
@@ -218,8 +210,9 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
         let scan = try await finder.duplicateGroups()
         _ = await finder.rankedMembers(of: scan.groups)
 
-        let saved = cache.facts(of: pair, in: cache.currentSnapshot())
+        let lookup = cache.facts(of: pair, in: cache.currentSnapshot())
 
+        guard case .found(let saved) = lookup else { return XCTFail("the saved facts read as \(lookup)") }
         XCTAssertEqual(saved.mapValues(\.byteSize), [pair[0]: 5_000, pair[1]: 5_000])
     }
 
@@ -232,6 +225,22 @@ final class ExactDuplicateFingerprintCacheTests: XCTestCase {
         let scan = await finder(cache: try openCache()).possibleDuplicates(excluding: [], policy: shape)
 
         XCTAssertEqual(scan?.byteSizes, [pair[0]: 300])
+    }
+
+    func testAnUnreadableStoreReadsEveryCandidateAgainWithTheSameResult() async throws {
+        let pair = seedPossiblePair("one")
+        setLibrary([pair])
+        publishIndex(eventID: "event-1")
+        let cache = try openCache()
+        let first = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+        let fault = try SQLiteReadInterrupt(in: cache.store, matching: "SELECT payload FROM fingerprint WHERE")
+        defer { fault.stop() }
+
+        let again = await finder(cache: cache).possibleDuplicates(excluding: [], policy: shape)
+
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(again, first, "the nodes give the same groups and sizes")
+        XCTAssertEqual(nodeReads, 4, "nothing saved can be trusted, so every candidate is read again")
     }
 
     func testAPassThatStopsKeepsTheFactsOfItsFinishedGroups() async throws {

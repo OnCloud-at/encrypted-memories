@@ -152,25 +152,41 @@ public final class ExactDuplicateFingerprintStore: @unchecked Sendable {
         } ?? false
     }
 
-    /// The saved facts of each photo in `uids` of the snapshot's volume, in one read. A missing, corrupt or foreign
-    /// photo is left out, and a stale snapshot returns nothing.
-    public func facts(ofLinks uids: [PhotoUID], in snapshot: Snapshot) -> [PhotoUID: Facts] {
-        transaction(writing: false) { db in
-            guard case .found(snapshot) = self.context(db) else { return nil }
+    /// The saved facts of each photo in `uids` of the snapshot's volume, in one read.
+    /// - `found`: the photos with a readable row. A photo without a row, with a row that does not decode, or of
+    ///   another volume is left out, so the caller reads that node again and a new save replaces the row.
+    /// - `absent`: the saved facts belong to another snapshot, or no snapshot is saved; none of them applies.
+    /// - `unknown`: the context or a row could not be read; nothing is known about the saved facts.
+    public func facts(ofLinks uids: [PhotoUID], in snapshot: Snapshot) -> StoreLookup<[PhotoUID: Facts]> {
+        let read = transaction(writing: false) { db -> StoreLookup<[PhotoUID: Facts]>? in
+            switch self.context(db) {
+            case .unknown: return nil
+            case .absent: return .absent
+            case .found(let current) where current != snapshot: return .absent
+            case .found: break
+            }
             var result: [PhotoUID: Facts] = [:]
             var statement: OpaquePointer?
             defer { sqlite3_finalize(statement) }
             for uid in uids where uid.volumeID == snapshot.scope.volumeID {
                 guard self.prepare(db, "SELECT payload FROM fingerprint WHERE link_id=?;", reusing: &statement)
                 else { return nil }
-                // A missing or corrupt row is left out, so the caller reads that node again.
-                guard let data = self.read(statement, text: uid.nodeID),
-                    let row = try? JSONDecoder().decode(SavedFingerprint.self, from: data)
-                else { continue }
-                result[uid] = Facts(fingerprint: row.fingerprint(for: uid), byteSize: row.byteSize)
+                guard let data = self.read(statement, text: uid.nodeID) else {
+                    // No row is no saved fact; a failed step marked the connection and makes the read unknown.
+                    if self.connection.operationFailed { return nil }
+                    continue
+                }
+                do {
+                    let row = try JSONDecoder().decode(SavedFingerprint.self, from: data)
+                    result[uid] = Facts(fingerprint: row.fingerprint(for: uid), byteSize: row.byteSize)
+                } catch {
+                    continue
+                }
             }
-            return result
-        } ?? [:]
+            return .found(result)
+        }
+        guard let read else { return .unknown }
+        return read
     }
 
     /// The details of every member of each group in `groups` whose members all have current details, in one read.
