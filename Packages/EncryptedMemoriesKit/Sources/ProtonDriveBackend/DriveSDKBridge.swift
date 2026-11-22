@@ -3251,11 +3251,14 @@ extension DriveSDKBridge: SeriesDissolutionRemote {
     }
 }
 
-enum DriveBridgeError: LocalizedError {
+enum DriveBridgeError: LocalizedError, LibraryLoadFailureSentence {
     case noPhotosShare
-    var errorDescription: String? {
+    var errorDescription: String? { librarySentence }
+
+    /// The key lives in the shared catalog, so the iPhone and iPad read the sentence too.
+    var librarySentence: String {
         switch self {
-        case .noPhotosShare: String(localized: "error.no_photos_library")
+        case .noPhotosShare: L10n.string("error.no_photos_library")
         }
     }
 }
@@ -3269,7 +3272,7 @@ private struct TimelineLocalRebuildUnavailableError: LocalizedError {
 /// recover, so the shared monitor stops until account lifecycle creates a new backend instance.
 private struct DriveEventScopeAccessLostError: LocalizedError, LibraryChangeTerminalError {
     var errorDescription: String? {
-        String(localized: "error.no_photos_library")
+        L10n.string("error.no_photos_library")
     }
 }
 

@@ -126,14 +126,27 @@ public enum ProtonDriveBackendFactory {
     }
 }
 
-/// Classifies a library-open failure that no Retry with the same session can clear.
-public enum LibraryOpenFailurePermanence {
-    /// True only for a confirmed permanent cause: the account has no photos share, the drive scope is terminally
-    /// lost, or the server rejected the session. Account fetches report an unsuccessful refresh separately
-    /// when rejection is unproved. Network failures, rate limits and unclear answers keep Retry.
-    public static func isPermanent(_ error: Error) -> Bool {
-        if error is DriveBridgeError { return true }
-        if error is any LibraryChangeTerminalError { return true }
-        return ProtonFailureClassifier.isUnauthorized(error)
+/// What the library-open screen shows for a failure: the text under its title, empty when the screen has none, and
+/// whether another attempt can help.
+///
+/// Only a cause that is proven fixed hides Try again: a session that Proton rejected (the person signs in again) and
+/// a drive scope that is terminally lost (its own recovery runs). Every other cause keeps it: a network failure, a
+/// rate limit, an unclear answer, a library that does not exist yet and may appear later. The text is the app's own
+/// sentence where one exists; Proton is named only for the rejected session.
+public struct LibraryOpenFailurePresentation: Equatable, Sendable {
+    public let message: String
+    public let isRetryable: Bool
+
+    public init(for error: any Error) {
+        if ProtonFailureClassifier.isUnauthorized(error) {
+            message = LibraryLoadFailureMessage.rejectedSession
+            isRetryable = false
+        } else if error is any LibraryChangeTerminalError {
+            message = ""
+            isRetryable = false
+        } else {
+            message = LibraryLoadFailureMessage.message(for: error)
+            isRetryable = true
+        }
     }
 }

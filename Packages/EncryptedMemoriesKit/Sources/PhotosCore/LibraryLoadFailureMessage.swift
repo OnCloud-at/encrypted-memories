@@ -1,13 +1,20 @@
 import Foundation
 
-/// The one builder of the library-load error screen's message. The iOS and macOS load paths both read
-/// this function so the screen's text stays identical across platforms.
+/// An error whose own sentence the library-load screen may show under its title. Only an error that the app
+/// itself words qualifies; a system or server text never does.
+public protocol LibraryLoadFailureSentence: Error {
+    var librarySentence: String { get }
+}
+
+/// The one builder of the library-load error screen's text. The iOS and macOS load paths both read this enum so the
+/// screen reads the same on every platform.
 public enum LibraryLoadFailureMessage {
-    /// Maps a first library-load failure to the text the error screen shows.
-    ///
-    /// A failed library creation shows one generic text that names no cause. Every other failure
-    /// keeps its localized description.
+    /// The sentence under the screen's title: the error's own sentence when the app words it, otherwise empty, and the
+    /// screen shows the title and Try again alone. The text of a system or server error means nothing to the person.
     public static func message(for error: Error) -> String {
-        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        (error as? any LibraryLoadFailureSentence)?.librarySentence ?? ""
     }
+
+    /// The sentence for a session that Proton rejected: the person signs in again.
+    public static var rejectedSession: String { L10n.string("auth.sign_in_again") }
 }

@@ -208,7 +208,7 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
     }
 
     /// A refresh that the person starts (menu refresh, refresh after a manual upload) is awaited: with nothing loaded
-    /// its failure shows the failed library, as before.
+    /// its failure shows the failed library, with its title and Try again and no technical text.
     @MainActor
     func testFailedRefreshThatAPersonStartedShowsTheFailedLibraryWhenNothingIsLoaded() async {
         let started: [(String, @MainActor (TimelineViewModel) async -> TimelineRefreshResult)] = [
@@ -225,7 +225,8 @@ final class UploadRefreshAndInteractionTests: XCTestCase {
                 XCTFail("\(name): a refresh that a person waits for shows its failure")
                 continue
             }
-            XCTAssertEqual(message, "terminal refresh failure", name)
+            XCTAssertEqual(
+                message, "", "\(name): the text of an error that the app did not word never reaches the screen")
         }
     }
 

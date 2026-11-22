@@ -3965,6 +3965,24 @@
         }
       }
     },
+    "error.no_photos_library": {
+      "extractionState": "manual",
+      "comment": "Shown when the account has no photo share yet.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No Photos library was found on this account yet."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auf diesem Konto wurde noch keine Fotomediathek gefunden."
+          }
+        }
+      }
+    },
     "error.auth_api %lld %@": {
       "extractionState": "manual",
       "comment": "Sign-in API error. %lld is the API code, %@ the server message (kept as detail).",

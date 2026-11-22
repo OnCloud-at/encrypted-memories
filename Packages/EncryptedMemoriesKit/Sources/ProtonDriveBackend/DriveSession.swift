@@ -668,8 +668,7 @@ extension DriveSession {
                 try Task.checkCancellation()
                 let page = try await getJSON(path, as: AlbumPhotosResponse.self)
                 if page.more == true && (page.anchorID.map { usedAnchors.contains($0) } ?? true) {
-                    let failure = UploadError.retryableBackend(
-                        code: nil, message: L10n.string("albums.load_failed_message"))
+                    let failure = AlbumReadIncompleteError()
                     let policy = FailurePolicy.resolve(
                         failure.failureCause, situation: .awaitedByPerson, safety: .safeRead, retriesExhausted: retried)
                     guard policy.retry == .automatic else { throw failure }
@@ -789,6 +788,15 @@ private struct BatchLinkResponses: Decodable {
         }
     }
     enum CodingKeys: String, CodingKey { case responses = "Responses" }
+}
+
+/// An album listing never ended: a page said that more follows and its cursor was missing or already seen. A new read
+/// can end it, so it classifies as a temporary service failure. The sentence is the app's own, so the library screen
+/// may show it under its title.
+struct AlbumReadIncompleteError: LocalizedError, FailureClassifiable, LibraryLoadFailureSentence, Equatable {
+    var failureCause: FailureCause { .serviceTemporary }
+    var librarySentence: String { L10n.string("albums.load_failed_message") }
+    var errorDescription: String? { librarySentence }
 }
 
 /// A batched link mutation partially or fully failed (per-item multistatus codes).

@@ -1669,8 +1669,9 @@ final class MobileLibraryModel {
     private func handleAccountOpenFailure(_ error: Error, session: ProtonSession, loadGeneration: Int) {
         guard !Task.isCancelled, loadGeneration == loadToken, self.session == session else { return }
         if isRecoveringScope { isRecoveringScope = false }
+        let failure = LibraryOpenFailurePresentation(for: error)
         hostLoadState = LibraryLoadPolicy.reduce(
-            hostLoadState, .failed(message: LibraryLoadFailureMessage.message(for: error), retryable: true))
+            hostLoadState, .failed(message: failure.message, retryable: failure.isRetryable))
         initialLibraryLoadSettled = true
     }
 
@@ -1963,6 +1964,15 @@ final class MobileLibraryModel {
                 // Once a timeline exists, only its core fixture replays the library events above.
                 hostLoadState = events.reduce(.initial) { LibraryLoadPolicy.reduce($0, $1) }
             }
+        }
+
+        /// Fails the account open with `error` through the shipping handler, so a test sees the sentence and the Try
+        /// again decision that `LibraryOpenFailurePresentation` gives this host. An open failure happens before a
+        /// timeline model exists, so the fixture drops its own.
+        func applyIsolatedOpenFailureForTesting(_ error: Error, session: ProtonSession) {
+            timeline = nil
+            self.session = session
+            handleAccountOpenFailure(error, session: session, loadGeneration: loadToken)
         }
 
         /// Stands for an initial library load that runs until `load` returns and settles then.

@@ -137,7 +137,7 @@ struct MobileLibraryErrorView: View {
         ContentUnavailableView {
             Label(L10n.string("error.load_library_title"), systemImage: "exclamationmark.icloud")
         } description: {
-            Text(message)
+            if !message.isEmpty { Text(message) }
         } actions: {
             if retryable {
                 RetryButton(.prominent, action: onRetry)

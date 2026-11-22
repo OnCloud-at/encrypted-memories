@@ -20,7 +20,7 @@ struct BackendErrorView: View {
                     .foregroundStyle(ProtonColor.warning)
             }
         } description: {
-            Text(message)
+            if !message.isEmpty { Text(message) }
         } actions: {
             HStack(spacing: 10) {
                 if isRetryable {

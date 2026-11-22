@@ -19,7 +19,7 @@ struct AccountDataRefreshRetryTests {
 
         let error = try await accountDataFailure(fixture)
 
-        #expect(!LibraryOpenFailurePermanence.isPermanent(error))
+        #expect(LibraryOpenFailurePresentation(for: error).isRetryable)
         #expect(error.localizedDescription.isEmpty, "the existing library-open title needs no technical detail")
         #expect(fixture.session.current == fixture.initial)
         #expect(fixture.session.authorization().generation == 0)
@@ -33,7 +33,7 @@ struct AccountDataRefreshRetryTests {
 
         let error = try await accountDataFailure(fixture)
 
-        #expect(LibraryOpenFailurePermanence.isPermanent(error))
+        #expect(!LibraryOpenFailurePresentation(for: error).isRetryable)
         #expect(fixture.session.current == fixture.initial)
         #expect(try fixture.store.load() == fixture.initial)
     }
@@ -45,7 +45,7 @@ struct AccountDataRefreshRetryTests {
 
         let error = try await accountDataFailure(fixture)
 
-        #expect(!LibraryOpenFailurePermanence.isPermanent(error))
+        #expect(LibraryOpenFailurePresentation(for: error).isRetryable)
         #expect(error.localizedDescription.isEmpty)
         #expect(fixture.session.current == fixture.initial)
         #expect(try fixture.store.load() == fixture.initial)
@@ -57,7 +57,7 @@ struct AccountDataRefreshRetryTests {
 
         let error = try await accountDataFailure(fixture)
 
-        #expect(LibraryOpenFailurePermanence.isPermanent(error))
+        #expect(!LibraryOpenFailurePresentation(for: error).isRetryable)
         #expect(
             fixture.authorizations(for: AccountDataRefreshFixture.usersPath) == [
                 "Bearer fixture-expired-access", "Bearer fixture-renewed-access",
@@ -73,7 +73,7 @@ struct AccountDataRefreshRetryTests {
 
         let error = try await accountDataFailure(fixture)
 
-        #expect(!LibraryOpenFailurePermanence.isPermanent(error))
+        #expect(LibraryOpenFailurePresentation(for: error).isRetryable)
         #expect(fixture.keychain.saveAttempts == 2, "the refresh reached the real session store")
         #expect(fixture.session.current == fixture.initial)
         #expect(fixture.session.authorization().generation == 0)
@@ -84,7 +84,7 @@ struct AccountDataRefreshRetryTests {
         let fixture = try AccountDataRefreshFixture(refresh: .transport(.timedOut))
         defer { fixture.close() }
         let error = try await accountDataFailure(fixture)
-        #expect(!LibraryOpenFailurePermanence.isPermanent(error))
+        #expect(LibraryOpenFailurePresentation(for: error).isRetryable)
 
         fixture.setRefreshReply(.success)
         _ = try await fixture.session.fetchAccountData()

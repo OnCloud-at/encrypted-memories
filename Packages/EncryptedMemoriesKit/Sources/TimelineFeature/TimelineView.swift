@@ -217,8 +217,10 @@ public struct TimelineView: View {
         ContentUnavailableView {
             Label(L10n.string("error.load_library_title"), systemImage: "exclamationmark.triangle")
         } description: {
-            Text(message)
-                .textSelection(.enabled)
+            if !message.isEmpty {
+                Text(message)
+                    .textSelection(.enabled)
+            }
         } actions: {
             if retryable {
                 RetryButton(.prominent) { Task { await model.retry() } }
