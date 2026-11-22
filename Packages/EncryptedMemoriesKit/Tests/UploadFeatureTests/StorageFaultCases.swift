@@ -47,6 +47,10 @@ let storageFaultCases: [any StorageFaultCase] = [
     DeviceRootEnrollmentCase(id: "deviceRoot.beginCreate", step: .beginCreate),
     DeviceRootEnrollmentCase(id: "deviceRoot.markDispatchAttempted", step: .markDispatchAttempted),
     DeviceRootEnrollmentCase(id: "deviceRoot.finishCreate", step: .finishCreate),
+    BackupRunCase(),
+    BackupExecutionLockCase(),
+    ManualUploadCase(),
+    PendingTrashCase(),
 ]
 
 /// A deletion decision on the real queue and journal, by its production operations. By `start`:

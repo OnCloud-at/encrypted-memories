@@ -3908,10 +3908,7 @@ final class BackupSyncRunnerTests: XCTestCase {
     }
 
     private func expectedContentHash(path: String) -> String {
-        var digest = Data(repeating: 0, count: 20)
-        for (i, byte) in path.utf8.enumerated() { digest[i % 20] ^= byte }
-        let hex = UploadContentSHA1.hexString(digest: digest)
-        return "ch(\(hex))"
+        storageFaultContentHash(path: path)
     }
 
     private func state(of entry: UploadBackupSyncQueueEntry) -> UploadBackupSyncQueueState? {

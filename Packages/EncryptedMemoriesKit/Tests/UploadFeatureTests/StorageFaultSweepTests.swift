@@ -22,6 +22,8 @@ final class StorageFaultSweepTests: XCTestCase {
         "localReadFailureHints.insert": 4, "localReadFailureHints.remove": 4,
         "localReadFailureHints.saveSweepCursor": 3,
         "deviceRoot.beginCreate": 3, "deviceRoot.markDispatchAttempted": 3, "deviceRoot.finishCreate": 3,
+        "backup.runUntilDrained": 174, "backup.executionLock": 9, "manualUpload.library": 14,
+        "pending.excludeAndTrash": 31,
     ]
 
     func testEncodedIssueComparisonKeepsAllFieldsValuesAndArrayOrder() {

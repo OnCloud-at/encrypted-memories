@@ -101,7 +101,11 @@ final class FakeHasher: UploadHashing, @unchecked Sendable {
         }
         try Task.checkCancellation()
         let path = descriptor.fileURL.path
-        let seed = lock.withLock { contentSeeds[path] } ?? path
+        return Self.digest(ofSeed: lock.withLock { contentSeeds[path] } ?? path)
+    }
+
+    /// The digest of a content seed; without a seed of its own, a file's seed is its path.
+    static func digest(ofSeed seed: String) -> Data {
         var digest = Data(repeating: 0, count: 20)
         for (i, byte) in seed.utf8.enumerated() {
             digest[i % 20] ^= byte

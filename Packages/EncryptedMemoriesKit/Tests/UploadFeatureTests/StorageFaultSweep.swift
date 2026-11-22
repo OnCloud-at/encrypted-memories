@@ -54,8 +54,10 @@ import XCTest
 //   fault-free run.
 //
 // The sweep is deterministic: every point starts from a copy of one seed, the cases use fixed clocks, and nothing
-// waits for wall-clock time. The sweep also checks that each fault hits the point it names (on the same target): a run
-// that ends before point k reports `faultDidNotFire`, and a run whose k-th point differs reports
+// waits for wall-clock time, except one limit: the manual upload case fails a run whose items have not all ended after
+// 20 seconds, so a run that never ends cannot stop the sweep. A run reaches its end long before that limit. The sweep
+// also checks that each fault hits the point it names (on the same target): a run that ends before point k reports
+// `faultDidNotFire`, and a run whose k-th point differs reports
 // `faultHitAnotherStatement`. The check compares the SQL text before binding, or the kind and file name of a file
 // write: an order change between points with different text fails the sweep; points with identical text, such as two
 // inserts of one prepared statement with different values, are not told apart.
@@ -148,10 +150,14 @@ struct StorageFaultState: Equatable {
 
     /// Adds every table of the SQLite file at `url`, every row as text with its SQLite type. It reads on its own
     /// connection, so it sees only committed transactions; a store in WAL mode may keep the file open meanwhile. The
-    /// sweep itself passes a copy that no store has open. This is the shared table dump of the test target.
+    /// sweep itself passes a copy that no store has open. This is the shared table dump of the test target. The
+    /// statistics tables of the query planner (`sqlite_stat1` to `sqlite_stat4`; `PRAGMA optimize` writes them when a
+    /// store closes) hold no record, so the dump leaves out exactly those four names.
     mutating func addSQLiteTables(of url: URL) throws {
         try withSQLiteDatabase(at: url) { database in
-            let names = "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;"
+            let names =
+                "SELECT name FROM sqlite_schema WHERE type='table' "
+                + "AND name NOT IN ('sqlite_stat1', 'sqlite_stat2', 'sqlite_stat3', 'sqlite_stat4') ORDER BY name;"
             for table in try sqliteRows(database, names, typed: false) {
                 tables["\(url.lastPathComponent)/\(table)"] = try sqliteRows(
                     database, "SELECT * FROM \"\(table)\";"
@@ -214,10 +220,13 @@ protocol StorageFaultCase: Sendable {
     func state(in directory: URL) throws -> StorageFaultState
     /// Known violations of today's code that this case accepts. Empty for almost every case.
     var acceptances: [StorageFaultAcceptance] { get }
+    /// Removes what `seed` created outside the world. Runs once, after the last point.
+    func finish()
 }
 
 extension StorageFaultCase {
     var acceptances: [StorageFaultAcceptance] { [] }
+    func finish() {}
 }
 
 enum StorageFaultSweep {
@@ -226,7 +235,10 @@ enum StorageFaultSweep {
         let started = Date()
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("storage-fault-sweep-\(faultCase.id)-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            faultCase.finish()
+        }
         let seed = root.appendingPathComponent("seed", isDirectory: true)
         try FileManager.default.createDirectory(at: seed, withIntermediateDirectories: true)
         let seedRemote = StorageFaultRemote()
