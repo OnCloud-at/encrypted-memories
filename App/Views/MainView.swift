@@ -141,6 +141,8 @@ struct MainView: View {
     @State private var isSavingToLibrary = false
     @State private var confirmDeleteAlbum = false
     @State private var isDeletingAlbum = false
+    /// The Add Photos picker of the shown album while it is open.
+    @State private var addPhotosPicker: AlbumPhotoPickerModel?
     @State private var albumDeleteFailureMessage: String?
     @State private var albumCoverFailureMessage: String?
     @State private var isSettingAlbumCover = false
@@ -526,6 +528,21 @@ struct MainView: View {
                 onCompleted: { _ in showCreateAlbum = false }
             )
         }
+        .albumPhotoPickerSheet(
+            $addPhotosPicker, library: timelineModel, albumItems: isAlbumGridLoaded ? timelineModel.allItems : nil,
+            albumRevision: timelineModel.contentRevision,
+            onAlbumChanged: {
+                Task {
+                    await timelineModel.refreshLibrary()
+                    await loadAlbums()
+                }
+            }
+        ) { picker in
+            // The picker grid runs on a timeline model of its own, so the album grid underneath keeps its route.
+            MacAlbumPhotoPickerGrid(
+                picker: picker, feed: feed, uploadBadges: timelineModel.pendingPresentation.uploadBadges,
+                makeGridModel: { TimelineViewModel(repository: backend, feed: feed.feedCore, library: backend) })
+        }
         .alert(trashConfirmationTitle, isPresented: $confirmTrash) {
             Button("alert.move_to_trash", role: .destructive) {
                 let items = pendingTrashItems
@@ -639,7 +656,8 @@ struct MainView: View {
         .alert(
             albumActions.actionFailure?.title ?? "",
             isPresented: Binding(
-                get: { albumActions.actionFailure != nil },
+                // The Add Photos sheet shows its own album failure while it is open.
+                get: { albumActions.actionFailure != nil && addPhotosPicker == nil },
                 set: { if !$0 { albumActions.clearActionFailure() } }
             )
         ) {
@@ -792,6 +810,13 @@ struct MainView: View {
     /// Native toolbar menu for actions on the selected album.
     private var albumActionsToolbarMenu: some View {
         Menu {
+            Button(L10n.string("albums.add_photos_menu")) {
+                guard case .album(let albumID, _) = selection else { return }
+                addPhotosPicker = AlbumPhotoPickerModel(albumID: albumID, coordinator: albumActions)
+            }
+            .disabled(
+                !AlbumPhotoPickerModel.isOffered(for: selection, coordinator: albumActions) || albumActions.isWorking
+                    || isDeletingAlbum)
             Button(selectionMode ? L10n.string("action.done") : L10n.string("action.select")) {
                 selectionMode.toggle()
                 if !selectionMode { selectedUIDs.removeAll() }
@@ -835,6 +860,15 @@ struct MainView: View {
     private func endSelection() {
         selectionMode = false
         selectedUIDs.removeAll()
+    }
+
+    /// Whether the shown album's own grid has loaded.
+    private var isAlbumGridLoaded: Bool {
+        guard case .album = selection else { return false }
+        switch timelineModel.gridState {
+        case .loaded, .empty: return true
+        case .loading, .failed: return false
+        }
     }
 
     /// Opens the shared name form.

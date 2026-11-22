@@ -1173,6 +1173,41 @@
         "de": { "stringUnit": { "state": "translated", "value": "Einige Favoriten konnten nicht aktualisiert werden." } }
       }
     },
+    "albums.add_photos_menu": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Add Photos…" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos hinzufügen …" } }
+      }
+    },
+    "albums.add_photos_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Add Photos" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Fotos hinzufügen" } }
+      }
+    },
+    "albums.add_photos_confirm": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Add" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Hinzufügen" } }
+      }
+    },
+    "albums.add_photos_empty_title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "No photos to add" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Keine Fotos zum Hinzufügen" } }
+      }
+    },
+    "albums.add_photos_empty_message": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "All photos in your library are already in this album." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Alle Fotos deiner Mediathek sind bereits in diesem Album." } }
+      }
+    },
     "albums.add_selection_title": {
       "extractionState": "manual",
       "localizations": {

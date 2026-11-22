@@ -495,7 +495,7 @@ private actor SharedLeaveRecorder {
     }
 }
 
-private actor RecordedPendingAlbumAdds {
+actor RecordedPendingAlbumAdds {
     private(set) var adds: [(uids: [PhotoUID], album: AlbumID)] = []
     func append(_ uids: [PhotoUID], _ album: AlbumID) { adds.append((uids, album)) }
 }
