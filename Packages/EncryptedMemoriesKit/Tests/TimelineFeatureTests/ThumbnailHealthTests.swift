@@ -27,7 +27,6 @@ struct ThumbnailHealthTests {
         let result = await feed.warmDecoded([ThumbnailRequest(uid: uid)], priority: .visibleNow, limit: 10)
         #expect(result.decodedFromDisk == 1)
         #expect(result.queuedNetwork == 0)
-        #expect(result.mainThreadDecodeCount == 0)
         #expect(await loader.requestCount() == 0)
 
         let after = await feed.cacheState(for: ThumbnailRequest(uid: uid))
@@ -240,7 +239,6 @@ struct ThumbnailHealthTests {
 
         let result = await feed.warmDecoded([ThumbnailRequest(uid: uid)], priority: .visibleNow, limit: 1)
         #expect(result.decodedFromDisk == 1)
-        #expect(result.mainThreadDecodeCount == 0)
     }
 
     @Test func prefetchProgressTest() async throws {

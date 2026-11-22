@@ -568,16 +568,8 @@ public actor ThumbnailFeedCore {
     /// Subscribe to the "images available" wake (see `onImagesAvailable`). The callback fires after source
     /// admission or when a thumbnail becomes available while a viewport is recently live; the host hops to its own
     /// actor and redraws / re-warms. Registration is synchronous with respect to the nonisolated wake box, so a
-    /// first visible viewport cannot miss a tiny cached arrival while an actor task is still queued.
-    @discardableResult
-    public func setOnImagesAvailable(_ callback: (@Sendable () -> Void)?) -> ThumbnailFeedWakeRegistration {
-        guard let callback else { return ThumbnailFeedWakeRegistration(cancel: {}) }
-        return imagesAvailableWake.add(callback)
-    }
-
-    /// Nonisolated adapter for platform hosts. The wake itself is owned by `ThumbnailFeedCore`; AppKit/UIKit
-    /// facades expose only `feedCore`, then subscribe through this shared entry point instead of carrying
-    /// duplicate fire-and-forget actor-hop code. The returned token removes only this subscriber.
+    /// first visible viewport cannot miss a tiny cached arrival while an actor task is still queued. The returned
+    /// token removes only this subscriber.
     @discardableResult
     public nonisolated func setOnImagesAvailableWake(
         _ callback: @escaping @Sendable () -> Void
@@ -1015,18 +1007,6 @@ public actor ThumbnailFeedCore {
         return !priority.isEmpty || hasRecentVisibleDemand()
     }
 
-    public func warmDecoded(
-        _ requests: [ThumbnailRequest],
-        priority requestedPriority: ThumbnailPriority,
-        limit: Int
-    ) async -> WarmDecodedResult {
-        await warmDecodedImpl(
-            requests,
-            priority: requestedPriority,
-            limit: limit
-        )
-    }
-
     /// Publishes the moving viewport through a latest-value mailbox. This is deliberately `nonisolated`: a
     /// scrolling host must never queue hundreds of obsolete actor messages while disk maintenance is yielding.
     /// Network admission remains a separate stable-viewport operation.
@@ -1196,7 +1176,7 @@ public actor ThumbnailFeedCore {
         diagnostics.increment("thumb.ramDecodeCompleted")
     }
 
-    private func warmDecodedImpl(
+    public func warmDecoded(
         _ requests: [ThumbnailRequest],
         priority requestedPriority: ThumbnailPriority,
         limit: Int
@@ -1212,15 +1192,13 @@ public actor ThumbnailFeedCore {
         var decodedFromDisk = 0
         var queuedNetwork = 0
         var missing = 0
-        let mainThreadDecodeCount = 0
         guard ownerLeaseIsCurrent() else {
             return WarmDecodedResult(
                 requested: targets.count,
                 alreadyDecoded: 0,
                 decodedFromDisk: 0,
                 queuedNetwork: 0,
-                missing: 0,
-                mainThreadDecodeCount: mainThreadDecodeCount
+                missing: 0
             )
         }
         guard !Task.isCancelled else {
@@ -1229,8 +1207,7 @@ public actor ThumbnailFeedCore {
                 alreadyDecoded: 0,
                 decodedFromDisk: 0,
                 queuedNetwork: 0,
-                missing: 0,
-                mainThreadDecodeCount: mainThreadDecodeCount
+                missing: 0
             )
         }
         var needDecode: [(uid: PhotoUID, pixels: CGFloat, isUpgrade: Bool)] = []
@@ -1335,8 +1312,7 @@ public actor ThumbnailFeedCore {
             alreadyDecoded: alreadyDecoded,
             decodedFromDisk: decodedFromDisk,
             queuedNetwork: queuedNetwork,
-            missing: missing,
-            mainThreadDecodeCount: mainThreadDecodeCount
+            missing: missing
         )
     }
 
