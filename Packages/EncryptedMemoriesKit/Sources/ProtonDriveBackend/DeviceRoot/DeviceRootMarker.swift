@@ -1,6 +1,7 @@
 import CryptoKit
 import DeviceRootCore
 import Foundation
+import PhotosCore
 
 /// A signed child folder carries this name. The digest binds its claim to one container.
 enum DeviceRootMarker {
@@ -24,7 +25,7 @@ enum DeviceRootMarker {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         guard let bytes = try? encoder.encode(context) else { return nil }
-        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: bytes).lowercaseHexString
         return "\(prefix)\(incarnation)-\(digest)"
     }
 

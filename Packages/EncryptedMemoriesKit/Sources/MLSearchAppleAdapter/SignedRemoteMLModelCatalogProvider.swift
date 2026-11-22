@@ -487,7 +487,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
     }
 
     private func sha256(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        SHA256.hash(data: data).lowercaseHexString
     }
 
     private func fetchV1(
@@ -593,9 +593,7 @@ public actor SignedRemoteMLModelCatalogProvider: MLModelCatalogProvider {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         for model in decoded.models {
             let modelID = model.id.rawValue
-            let modelDigest = SHA256.hash(data: try encoder.encode(model))
-                .map { String(format: "%02x", $0) }
-                .joined()
+            let modelDigest = SHA256.hash(data: try encoder.encode(model)).lowercaseHexString
             if let previous = acceptedModels[modelID] {
                 guard model.releaseSequence >= previous.releaseSequence else {
                     throw MLRemoteCatalogTransportError.modelReleaseRollback(

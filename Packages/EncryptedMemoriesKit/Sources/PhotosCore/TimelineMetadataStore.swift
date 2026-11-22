@@ -1203,7 +1203,7 @@ public final class TimelineMetadataStore {
             update(0x1F)
             update(0x1E)
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return hasher.finalize().lowercaseHexString
     }
 
     // MARK: store_meta

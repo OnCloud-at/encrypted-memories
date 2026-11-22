@@ -67,8 +67,7 @@ public final class VideoByteRangeCache: @unchecked Sendable {
     /// Stable, filesystem-safe directory name for a uid (SHA-256 hex of the volume~node pair).
     private func dir(for uid: PhotoUID) -> URL {
         let digest = SHA256.hash(data: Data("\(uid.volumeID)~\(uid.nodeID)".utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
-        return root.appendingPathComponent(hex, isDirectory: true)
+        return root.appendingPathComponent(digest.lowercaseHexString, isDirectory: true)
     }
 
     private func file(for uid: PhotoUID, block: Int) -> URL {

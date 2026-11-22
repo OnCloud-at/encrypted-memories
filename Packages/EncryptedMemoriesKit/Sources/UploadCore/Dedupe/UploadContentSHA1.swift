@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 
 /// Streaming SHA-1 for upload identity. Proton's photo duplicate semantics compare
 /// `HMAC(hex(SHA1(bytes)), photosRootHashKey)`, and the SDK's `expectedSHA1` upload parameter wants
@@ -48,7 +49,7 @@ public enum UploadContentSHA1 {
     /// Lowercase hex encoding shared by every identity consumer (one formatting truth: a stray
     /// uppercase hex would silently change every content hash).
     public static func hexString(digest: Data) -> String {
-        digest.map { String(format: "%02x", $0) }.joined()
+        digest.lowercaseHexString
     }
 
     /// Inverse of `hexString` for manifest rows (20-byte digests persisted as 40 hex chars).

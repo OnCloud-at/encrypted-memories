@@ -93,7 +93,7 @@
             _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
         ) async throws -> PhotoUID {
             let bytes = try Data(contentsOf: request.fileURL)
-            let hash = Insecure.SHA1.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            let hash = Insecure.SHA1.hash(data: bytes).lowercaseHexString
             let payload = try JSONSerialization.data(withJSONObject: ["name": request.name, "hash": hash])
             let link = try JSONDecoder().decode(
                 Link.self, from: await UpgradeTestProbe.request("upload", body: payload))

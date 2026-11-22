@@ -333,7 +333,7 @@ public actor MLModelInstaller {
         let combined = specs.map { "\($0.relativePath):\($0.sha256)" }.joined(separator: "\n")
         let revision =
             "local-"
-            + SHA256.hash(data: Data(combined.utf8)).compactMap { String(format: "%02x", $0) }.joined().prefix(16)
+            + SHA256.hash(data: Data(combined.utf8)).lowercaseHexString.prefix(16)
 
         if let installed = installedRecord(for: entry, revision: String(revision)) {
             return installed
@@ -851,7 +851,7 @@ public actor MLModelInstaller {
         while let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty {
             hasher.update(data: chunk)
         }
-        return hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
+        return hasher.finalize().lowercaseHexString
     }
 
     private static func fileSize(of url: URL) throws -> Int64 {

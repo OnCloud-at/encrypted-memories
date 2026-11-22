@@ -214,7 +214,7 @@ public final class FileThumbnailCoverageCheckpointStore: ThumbnailCoverageCheckp
     private func token(for uid: PhotoUID, key: String) -> String {
         let material = "\(tokenScope)\u{1f}\(key)\u{1f}\(uid.volumeID)\u{1f}\(uid.nodeID)"
         let digest = SHA256.hash(data: Data(material.utf8))
-        return ThumbnailCache.lowercaseHex(digest)
+        return digest.lowercaseHexString
     }
 
     private static func safeComponent(_ value: String) -> String {

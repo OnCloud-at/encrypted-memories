@@ -9,7 +9,6 @@ public struct SupportReportIdentifierHasher: Sendable {
     public init() {}
 
     public func hash(_ identifier: String) -> String {
-        HMAC<SHA256>.authenticationCode(for: Data(identifier.utf8), using: salt)
-            .map { String(format: "%02x", $0) }.joined()
+        HMAC<SHA256>.authenticationCode(for: Data(identifier.utf8), using: salt).lowercaseHexString
     }
 }
