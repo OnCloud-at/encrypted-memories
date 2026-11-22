@@ -592,7 +592,7 @@
       }
     },
     "backup.folder_open_failed": {
-      "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
+      "comment": "Mac settings: the bookmark of the folder that the person chose for the backup could not be made.",
       "localizations": {
         "en": {
           "stringUnit": {

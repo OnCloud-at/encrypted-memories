@@ -149,20 +149,20 @@ final class FolderBackupController {
     // MARK: - Folder registry (bookmarks are the App-side boundary)
 
     func addFolder(_ url: URL) {
-        do {
-            let bookmark = try url.bookmarkData(
-                options: [.withSecurityScope],
-                includingResourceValuesForKeys: nil,
-                relativeTo: nil
-            )
+        let registered = BackupFolderRegistration.bookmark(for: url) {
+            try $0.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+        }
+        switch registered {
+        case .success(let bookmark):
             let folder = BackupFolder(id: UUID(), bookmark: bookmark, displayPath: url.path, needsRenewal: false)
             folders.removeAll { $0.displayPath == folder.displayPath }
             folders.append(folder)
             folders.sort { $0.displayPath.localizedCaseInsensitiveCompare($1.displayPath) == .orderedAscending }
             persistFolders()
             refreshFolderAccess()
-        } catch {
-            lastMessage = error.localizedDescription
+            lastMessage = BackupFolderRegistration.messageAfterSuccessfulAdd(current: lastMessage)
+        case .failure(let failure):
+            lastMessage = failure.message
         }
     }
 
