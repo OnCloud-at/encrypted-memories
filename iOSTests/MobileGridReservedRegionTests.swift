@@ -11,12 +11,12 @@ final class MobileGridReservedRegionTests: XCTestCase {
         #if os(iOS) && canImport(SwiftUI, _version: 8.0.85)
             guard #available(iOS 27.1, *) else { throw XCTSkip("Reserved regions need iOS 27.1") }
             let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-            let window = UIWindow(windowScene: scene)
-            window.frame = scene.coordinateSpace.bounds
+            let hosted = HostedTestWindow(scene: scene)
+            let window = hosted.window
             let host = UIKitTimelineGridHostView(frame: window.bounds)
             window.addSubview(host)
             window.isHidden = false
-            defer { window.isHidden = true }
+            defer { hosted.close() }
             host.layoutIfNeeded()
 
             let reported = [UIView.ReservedRegion.Kind.division, .occlusion].flatMap { kind in

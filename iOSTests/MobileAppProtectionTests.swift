@@ -97,9 +97,9 @@ final class MobileAppProtectionTests: XCTestCase {
         fixture.center.invalidate()
         let fresh = MobileAppLockCenter(gate: fixture.gate)
         defer { fresh.invalidate() }
-        let window = UIWindow(windowScene: fixture.scene)
-        defer { window.isHidden = true }
-        fresh.register(window: window)
+        let hosted = HostedTestWindow(scene: fixture.scene)
+        defer { hosted.close() }
+        fresh.register(window: hosted.window)
         XCTAssertTrue(fixture.gate.admits(.app), "Registering a window of a background scene is not a foreground entry")
         NotificationCenter.default.post(name: UIScene.willEnterForegroundNotification, object: fixture.scene)
         XCTAssertFalse(fixture.gate.admits(.app))
@@ -183,6 +183,7 @@ final class MobileAppProtectionTests: XCTestCase {
 private final class HostFixture {
     let scene: UIWindowScene
     let source: UIWindow
+    private let hosted: HostedTestWindow
     let gate: AccessGate
     let owner: FixtureOwner
     let center: MobileAppLockCenter
@@ -200,7 +201,8 @@ private final class HostFixture {
         owner = FixtureOwner(result: result)
         gate = AccessGate(authenticator: owner, defaults: defaults)
         center = MobileAppLockCenter(gate: gate)
-        source = UIWindow(windowScene: scene)
+        hosted = HostedTestWindow(scene: scene)
+        source = hosted.window
         source.rootViewController = UIHostingController(rootView: Color.red)
         source.makeKeyAndVisible()
         center.register(window: source)
@@ -208,7 +210,7 @@ private final class HostFixture {
 
     func close() {
         center.invalidate()
-        source.isHidden = true
+        hosted.close()
         NotificationCenter.default.post(name: UIScene.didActivateNotification, object: scene)
         defaults.removePersistentDomain(forName: suite)
     }

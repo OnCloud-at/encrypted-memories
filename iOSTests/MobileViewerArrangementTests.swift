@@ -30,8 +30,8 @@ final class MobileViewerArrangementTests: XCTestCase {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let frames = ArrangementFrames()
         let height = ViewerChromeLayoutProfile.regular.stackedLowerPartHeight
-        let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIHostingController(
             rootView: MobileViewerArrangement(
                 showsLowerPart: showsLowerPart,
@@ -54,7 +54,7 @@ final class MobileViewerArrangementTests: XCTestCase {
                 EmptyView()
             })
         window.isHidden = false
-        defer { window.isHidden = true }
+        defer { hosted.close() }
         // Measure once two layout passes report the same frames.
         var previous: (CGRect, CGRect) = (.null, .null)
         let settled = XCTNSPredicateExpectation(

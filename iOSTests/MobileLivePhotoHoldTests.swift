@@ -9,9 +9,9 @@ import XCTest
 final class MobileLivePhotoHoldTests: XCTestCase {
     func testInstalledLongPressUsesSharedDurationAndNativeTransitions() throws {
         var calls: [String] = []
-        let (window, scroll, coordinator) = try makeHoldHost(
+        let (hosted, scroll, coordinator) = try makeHoldHost(
             onStart: { calls.append("start") }, onStop: { calls.append("stop") })
-        defer { window.isHidden = true }
+        defer { hosted.close() }
         let press = try XCTUnwrap(coordinator.motionPress)
         XCTAssertEqual(press.minimumPressDuration, LivePhotoHoldPolicy.minimumPressDuration)
         XCTAssertTrue(scroll.gestureRecognizers?.contains(press) == true)
@@ -30,9 +30,9 @@ final class MobileLivePhotoHoldTests: XCTestCase {
 
     func testDeclinedTextSelectionQueryKeepsTheHoldPlaying() throws {
         var calls: [String] = []
-        let (window, _, coordinator) = try makeHoldHost(
+        let (hosted, _, coordinator) = try makeHoldHost(
             onStart: { calls.append("start") }, onStop: { calls.append("stop") })
-        defer { window.isHidden = true }
+        defer { hosted.close() }
         let press = InjectedMotionPress()
         press.state = .began
         coordinator.handleLongPress(press)
@@ -47,12 +47,17 @@ final class MobileLivePhotoHoldTests: XCTestCase {
     private func makeHoldHost(
         onStart: @escaping () -> Void, onStop: @escaping () -> Void
     ) throws
-        -> (UIWindow, UIScrollView, MobileZoomableImage.Coordinator)
+        -> (HostedTestWindow, UIScrollView, MobileZoomableImage.Coordinator)
     {
-        let (window, _, scroll) = try makeHostedViewer(
+        let (hosted, _, scroll) = try makeHostedViewer(
             image: UIImage(), size: CGSize(width: 390, height: 844),
             onMotionStart: onStart, onMotionStop: onStop)
-        return (window, scroll, try XCTUnwrap(scroll.delegate as? MobileZoomableImage.Coordinator))
+        do {
+            return (hosted, scroll, try XCTUnwrap(scroll.delegate as? MobileZoomableImage.Coordinator))
+        } catch {
+            hosted.close()
+            throw error
+        }
     }
 }
 

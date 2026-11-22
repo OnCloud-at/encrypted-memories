@@ -300,7 +300,8 @@ struct TimelineContextMenuTests {
     }
 
     @MainActor private final class Fixture {
-        let window: UIWindow
+        private let hosted: HostedTestWindow
+        var window: UIWindow { hosted.window }
         let host = UIKitTimelineGridHostView(frame: CGRect(x: 0, y: 0, width: 390, height: 600))
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let feed: UIKitThumbnailFeed
@@ -312,7 +313,6 @@ struct TimelineContextMenuTests {
 
         init(mode: TileContentDisplayMode = .squareFillCrop) async throws {
             let scene = try #require(UIApplication.shared.foregroundWindowScene)
-            window = UIWindow(windowScene: scene)
             let cache = ThumbnailCache(rootDirectory: root)
             feed = UIKitThumbnailFeed(cache: cache, loader: EmptyThumbnailLoader())
             let bitmap = UIGraphicsImageRenderer(size: CGSize(width: 90, height: 60)).image { context in
@@ -326,6 +326,8 @@ struct TimelineContextMenuTests {
                 items: photos, thumbnailFeed: feed, level: 0,
                 fillOrder: .topLeading, displayMode: mode, selectionMode: false)
             host.dragOutProvider = TestOriginalProvider()
+            // The window joins the scene only after the last statement that can throw.
+            hosted = HostedTestWindow(scene: scene)
             let presenter = UIViewController()
             window.rootViewController = presenter
             presenter.view.addSubview(host)
@@ -334,8 +336,7 @@ struct TimelineContextMenuTests {
 
         func close() {
             host.setActive(false)
-            window.isHidden = true
-            window.rootViewController = nil
+            hosted.close()
         }
 
         func center(of index: Int) throws -> CGPoint {

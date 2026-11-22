@@ -6,7 +6,7 @@ import UIKit
 /// What covers a place of the continued backup question, read from a real window (#1108).
 @MainActor @Suite(.serialized) struct MobileContinuedBackupPromptProbeTests {
     private struct Place {
-        let window: UIWindow
+        let hosted: HostedTestWindow
         let root: UIViewController
         let probe: MobileContinuedBackupPromptProbe
     }
@@ -14,13 +14,14 @@ import UIKit
     private func makePlace() throws -> Place {
         let scene = try #require(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first, "the test host has a scene")
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let root = UIViewController()
         window.rootViewController = root
         window.makeKeyAndVisible()
         let probe = MobileContinuedBackupPromptProbe()
         root.view.addSubview(probe.anchorView())
-        return Place(window: window, root: root, probe: probe)
+        return Place(hosted: hosted, root: root, probe: probe)
     }
 
     private func present(_ controller: UIViewController, from presenter: UIViewController) async {
@@ -37,7 +38,7 @@ import UIKit
 
     @Test func presentationsOverThePlaceCoverIt() async throws {
         let place = try makePlace()
-        defer { place.window.isHidden = true }
+        defer { place.hosted.close() }
         #expect(place.probe.presentationsOverPlace() == 0)
         #expect(!place.probe.coversPlace(ownQuestionShows: false))
 
@@ -58,7 +59,7 @@ import UIKit
 
     @Test func textInputInThePlacesSceneCoversIt() throws {
         let place = try makePlace()
-        defer { place.window.isHidden = true }
+        defer { place.hosted.close() }
         let field = UITextField()
         place.root.view.addSubview(field)
 
@@ -74,7 +75,7 @@ import UIKit
     /// Only a field that still edits covers the place: a field whose end notification never came does not block it.
     @Test func aFieldThatNoLongerEditsDoesNotCoverThePlace() throws {
         let place = try makePlace()
-        defer { place.window.isHidden = true }
+        defer { place.hosted.close() }
         let field = UITextField()
         place.root.view.addSubview(field)
 
