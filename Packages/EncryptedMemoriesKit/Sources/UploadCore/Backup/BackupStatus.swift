@@ -113,6 +113,8 @@ public struct BackupStatus: Sendable, Equatable {
     public var hasOutstandingWork = false
     /// Smoothed upload speed. Only the projector knows it; it is nil whenever the backup does not send.
     public var uploadSpeedBytesPerSecond: Double?
+    /// The step of the large first backup guide after this status (#275). Nil for backups that no guide follows.
+    public var firstBackupGuide: BackupFirstBackupGuide.State?
     /// Dominant typed reason for unfinished work and the next time Core can honestly retry it.
     public var outstandingIssue: BackupIssueKind?
     public var nextAttemptAt: Date?

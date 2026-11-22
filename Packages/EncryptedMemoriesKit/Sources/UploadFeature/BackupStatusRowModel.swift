@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import PhotosCore
 import UploadCore
 
 /// Cross-platform timeful wrapper around the pure `BackupStatusStabilizer`. Native settings views feed it
@@ -35,5 +36,17 @@ public final class BackupStatusRowModel {
             guard !Task.isCancelled, let self else { return }
             self.apply(self.stabilizer.wake(now: Date()))
         }
+    }
+}
+
+extension BackupStatusPresentation {
+    /// What makes a large first backup faster on this platform (#275). Nil while no large first backup runs.
+    public var localizedLargeBackupHint: String? {
+        guard showsLargeBackupHint else { return nil }
+        #if os(macOS)
+            return L10n.string("backup.hint_large_backup_mac")
+        #else
+            return L10n.string("backup.hint_large_backup")
+        #endif
     }
 }

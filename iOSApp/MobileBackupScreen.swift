@@ -239,6 +239,11 @@ private struct MobilePhotoBackupSections: View {
                 .onChange(of: keepDisplayAwake) { _, _ in
                     PhotoBackupBackgroundCoordinator.shared.displayPreferenceDidChange()
                 }
+            } footer: {
+                // While a large first backup runs, the footer of the display setting says what makes it faster (#275).
+                if let hint = rowModel.displayed.localizedLargeBackupHint {
+                    Text(hint)
+                }
             }
 
             Section {
@@ -382,7 +387,11 @@ private struct MobilePhotoBackupSections: View {
         )
         .onAppear { rowModel.ingest(controller.status) }
         .onChange(of: controller.status) { _, status in rowModel.ingest(status) }
-        .onDisappear { rowModel.cancel() }
+        .onDisappear {
+            // The person saw a completed first backup on this screen; next time it shows as a plain completion.
+            controller.firstBackupScreenSeen()
+            rowModel.cancel()
+        }
         .sheet(isPresented: $showFailedList) {
             MobileFailedBackupSheet(controller: controller)
         }

@@ -341,6 +341,52 @@
         }
       }
     },
+    "backup.detail_first_completed %lld": {
+      "extractionState": "manual",
+      "comment": "Detail under the one-time headline after a large first backup completed. The count is every backed-up file.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld file backed up." } },
+              "other": { "stringUnit": { "state": "translated", "value": "All %lld files backed up." } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Datei gesichert." } },
+              "other": { "stringUnit": { "state": "translated", "value": "Alle %lld Dateien gesichert." } }
+            }
+          }
+        }
+      }
+    },
+    "backup.hint_large_backup": {
+      "extractionState": "manual",
+      "comment": "iPhone and iPad: shown while a large first backup runs. Only levers that really make it faster.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Faster with the app open and on Wi-Fi." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Schneller, wenn die App geöffnet ist und WLAN nutzt." } }
+      }
+    },
+    "backup.hint_large_backup_mac": {
+      "extractionState": "manual",
+      "comment": "Mac: shown while a large first backup runs. Only levers that really make it faster.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Faster on Wi-Fi or Ethernet." } },
+        "de": { "stringUnit": { "state": "translated", "value": "Schneller mit WLAN oder Ethernet." } }
+      }
+    },
+    "backup.phase_first_completed": {
+      "extractionState": "manual",
+      "comment": "One-time backup headline after a large first backup completed without omissions.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "First backup complete" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Erste Sicherung abgeschlossen" } }
+      }
+    },
     "backup.waiting_for_library_check": {
       "comment": "Reserved for the corresponding error presentation; not used until its behavior is released.",
       "localizations": {
