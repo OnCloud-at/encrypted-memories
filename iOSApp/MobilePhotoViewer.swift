@@ -1543,6 +1543,8 @@ struct MobileImagePage: View {
         .onChange(of: isCurrent) { _, current in
             if !current { cancelZoomDecode() }
         }
+        // The motion clip has its own layer outside the video surface hook; a loop also pauses while covered.
+        .onProtectedCover { motion.setCovered($0) }
         .onDisappear {
             cancelZoomDecode()
             motion.teardown()
@@ -1676,6 +1678,7 @@ struct MobileImagePage: View {
 /// AVKit chrome is intentionally disabled because iOS exposes it only as one all-or-nothing surface; the app
 /// owns the visible play and seek controls while AVKit retains playback, poster, and Picture in Picture behavior.
 private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
+    @Environment(\.protectedContentIsCovered) private var isCovered
     let player: AVPlayer
     let poster: UIImage?
     let reduceMotion: Bool
@@ -1687,7 +1690,9 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
-        controller.player = player
+        context.coordinator.playback.update(player, attached: controller.player, isCovered: isCovered) {
+            controller.player = $0
+        }
         controller.videoGravity = .resizeAspect
         controller.showsPlaybackControls = false
         controller.allowsPictureInPicturePlayback = true
@@ -1732,11 +1737,13 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
         context.coordinator.parent = self
         context.coordinator.controller = controller
-        if controller.player !== player {
-            controller.player = player
-            context.coordinator.attachPoster(poster, to: controller)
-        } else {
-            context.coordinator.updatePoster(poster, in: controller)
+        let action = context.coordinator.playback.update(player, attached: controller.player, isCovered: isCovered) {
+            controller.player = $0
+        }
+        switch action {
+        case .attach: context.coordinator.attachPoster(poster, to: controller)
+        case .refresh: context.coordinator.updatePoster(poster, in: controller)
+        case .keep: break
         }
     }
 
@@ -1753,6 +1760,7 @@ private struct MobileNativeVideoPlayer: UIViewControllerRepresentable {
         weak var dismissPan: UIPanGestureRecognizer?
         weak var dismissPinch: UIPinchGestureRecognizer?
         weak var singleTap: UITapGestureRecognizer?
+        let playback = ProtectedMediaPlayback()
         private weak var posterView: UIImageView?
         private var displayReadinessObservation: NSKeyValueObservation?
 

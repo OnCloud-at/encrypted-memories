@@ -116,10 +116,33 @@ final class MobilePrivacyPreviewShield {
 final class MobilePrivacyPreviewShieldCenter: NSObject {
     static let shared = MobilePrivacyPreviewShieldCenter()
 
+    /// The latest phase each scene reported through a lifecycle notification. A disconnect removes it.
+    private var scenePhases: [ObjectIdentifier: MobileScenePhase.Phase] = [:]
+    private var sceneObservers: [UUID: @MainActor (UIWindowScene, Notification.Name) -> Void] = [:]
+
+    func phase(of scene: UIWindowScene) -> MobileScenePhase.Phase {
+        scenePhases[ObjectIdentifier(scene)] ?? MobileScenePhase.phase(of: scene.activationState)
+    }
+
+    /// Reports each scene lifecycle notification after the scene's phase has changed.
+    func observeScenes(_ observer: @escaping @MainActor (UIWindowScene, Notification.Name) -> Void) -> UUID {
+        let id = UUID()
+        sceneObservers[id] = observer
+        return id
+    }
+
+    func removeSceneObserver(_ id: UUID) { sceneObservers.removeValue(forKey: id) }
+
+    private func publish(_ notification: Notification) -> UIWindowScene? {
+        guard let scene = notification.object as? UIWindowScene else { return nil }
+        scenePhases[ObjectIdentifier(scene)] = MobileScenePhase.phase(after: notification.name)
+        for observer in Array(sceneObservers.values) { observer(scene, notification.name) }
+        return scene
+    }
+
     @MainActor private final class Entry {
         weak var window: UIWindow?
         let shield = MobilePrivacyPreviewShield()
-        var deactivating = false
 
         init(window: UIWindow) { self.window = window }
     }
@@ -130,6 +153,9 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     override init() {
         super.init()
         let center = NotificationCenter.default
+        center.addObserver(
+            self, selector: #selector(sceneWillEnterForeground), name: UIScene.willEnterForegroundNotification,
+            object: nil)
         center.addObserver(
             self, selector: #selector(sceneWillDeactivate), name: UIScene.willDeactivateNotification, object: nil)
         center.addObserver(
@@ -174,14 +200,17 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
         entry.shield.update(
             enabled: enabled,
             isSceneActive: isActive
-                ?? (!entry.deactivating && window.windowScene?.activationState == .foregroundActive),
+                ?? (window.windowScene.map { phase(of: $0) == .active } ?? false),
             window: window, animated: animated)
     }
 
+    @objc private func sceneWillEnterForeground(_ notification: Notification) {
+        _ = publish(notification)
+    }
+
     @objc private func sceneWillDeactivate(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
+        guard let scene = publish(notification) else { return }
         for entry in entries where entry.window?.windowScene === scene {
-            entry.deactivating = true
             if let window = entry.window {
                 refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: false, animated: true)
             }
@@ -189,9 +218,8 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     }
 
     @objc private func sceneDidEnterBackground(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
+        guard let scene = publish(notification) else { return }
         for entry in entries where entry.window?.windowScene === scene {
-            entry.deactivating = true
             if let window = entry.window {
                 refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: false)
                 entry.shield.prepareForSnapshot()
@@ -200,9 +228,8 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     }
 
     @objc private func sceneDidActivate(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
+        guard let scene = publish(notification) else { return }
         for entry in entries where entry.window?.windowScene === scene {
-            entry.deactivating = false
             if let window = entry.window {
                 refresh(window: window, enabled: PrivacyPreviewPolicy.isEnabled(), isActive: true, animated: true)
             }
@@ -210,7 +237,7 @@ final class MobilePrivacyPreviewShieldCenter: NSObject {
     }
 
     @objc private func sceneDidDisconnect(_ notification: Notification) {
-        guard let scene = notification.object as? UIWindowScene else { return }
+        guard let scene = publish(notification) else { return }
         entries.removeAll { entry in
             guard let window = entry.window else { return true }
             guard window.windowScene === scene else { return false }

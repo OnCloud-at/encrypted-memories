@@ -145,7 +145,7 @@ final class MobileAccountRuntime {
     private func installSceneObservers() {
         let center = NotificationCenter.default
         for scene in connectedScenes() {
-            sceneLedger.update(sceneID: Self.sceneID(scene), phase: Self.phase(of: scene.activationState))
+            sceneLedger.update(sceneID: Self.sceneID(scene), phase: MobileScenePhase.phase(of: scene.activationState))
         }
         if !sceneLedger.isEmpty {
             apply(sceneLedger.opportunity)
@@ -156,13 +156,7 @@ final class MobileAccountRuntime {
             smartSearchForegroundChanged(false)
         }
 
-        let phaseEvents: [(Notification.Name, LibrarySceneActivityLedger.ScenePhase)] = [
-            (UIScene.didActivateNotification, .active),
-            (UIScene.willDeactivateNotification, .inactive),
-            (UIScene.willEnterForegroundNotification, .inactive),
-            (UIScene.didEnterBackgroundNotification, .background),
-        ]
-        for (name, phase) in phaseEvents {
+        for (name, phase) in MobileScenePhase.transitions {
             sceneObservers.append(
                 center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
                     guard let scene = notification.object as? UIScene else { return }
@@ -175,7 +169,7 @@ final class MobileAccountRuntime {
                 [weak self] notification in
                 guard let scene = notification.object as? UIScene else { return }
                 let sceneID = Self.sceneID(scene)
-                let phase = Self.phase(of: scene.activationState)
+                let phase = MobileScenePhase.phase(of: scene.activationState)
                 Task { @MainActor [weak self] in self?.noteScene(sceneID, phase: phase) }
             })
         sceneObservers.append(
@@ -189,15 +183,6 @@ final class MobileAccountRuntime {
 
     private static func sceneID(_ scene: UIScene) -> String {
         scene.session.persistentIdentifier
-    }
-
-    private static func phase(of state: UIScene.ActivationState) -> LibrarySceneActivityLedger.ScenePhase {
-        switch state {
-        case .foregroundActive: .active
-        case .foregroundInactive: .inactive
-        case .background, .unattached: .background
-        @unknown default: .inactive
-        }
     }
 
     // MARK: - Account-level library signals

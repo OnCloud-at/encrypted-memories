@@ -36,6 +36,26 @@ final class ProjectHygieneTests: XCTestCase {
         return String(tail[..<next])
     }
 
+    func testFaceIDPurposeBelongsOnlyToTheMobileApp() throws {
+        let project = try String(contentsOf: repoRoot.appendingPathComponent("project.yml"), encoding: .utf8)
+        let mac = targetBlock(named: "EncryptedMemories", in: project)
+        XCTAssertFalse(mac.contains("NSFaceIDUsageDescription"))
+        XCTAssertFalse(mac.contains("InfoPlist.xcstrings"))
+        XCTAssertFalse(project.contains("INFOPLIST_KEY_NSFaceIDUsageDescription"))
+
+        let mobileData = try Data(contentsOf: repoRoot.appendingPathComponent("iOSApp/Info.plist"))
+        let mobile = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: mobileData, format: nil) as? [String: Any])
+        XCTAssertEqual(mobile["NSFaceIDUsageDescription"] as? String, "The app uses Face ID to unlock your library.")
+        let german = repoRoot.appendingPathComponent("iOSApp/de.lproj/InfoPlist.strings")
+        let translations = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: Data(contentsOf: german), format: nil) as? [String: String]
+        )
+        XCTAssertEqual(
+            translations["NSFaceIDUsageDescription"], "Die App verwendet Face ID, um deine Mediathek zu entsperren."
+        )
+    }
+
     /// The iOS catalog declares the dark rendition; both catalogs reference existing files of the declared size.
     /// The iOS renditions must be opaque. The macOS catalog is the light fallback for the Icon Composer document.
     func testAppIconCatalogsHaveValidRenditions() throws {

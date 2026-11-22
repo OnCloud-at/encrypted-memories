@@ -14,6 +14,7 @@ private final class DismissableAVPlayerView: AVPlayerView {
     var onPinchDismissEnded: (Bool) -> Void = { _ in }
     var onPageSwipe: (ViewerPageSwipeDirection) -> Void = { _ in }
 
+    let playback = ProtectedMediaPlayback()
     private var pinchDismiss = AppKitPinchDismissTracker()
     private var pageSwipeTracker = ViewerPageSwipeTracker()
     private weak var posterView: NSImageView?
@@ -98,6 +99,7 @@ private final class DismissableAVPlayerView: AVPlayerView {
 /// generic-metadata fatalError), and `AVPlayerView` is the better macOS surface anyway - native
 /// floating controls, scrubbing, Picture-in-Picture.
 private struct PlayerView: NSViewRepresentable {
+    @Environment(\.protectedContentIsCovered) private var isCovered
     let player: AVPlayer
     let poster: NSImage?
     var isDismissing: Bool = false
@@ -108,7 +110,7 @@ private struct PlayerView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> DismissableAVPlayerView {
         let view = DismissableAVPlayerView()
-        view.player = player
+        view.playback.update(player, attached: view.player, isCovered: isCovered) { view.player = $0 }
         view.controlsStyle = .floating
         view.videoGravity = .resizeAspect
         view.allowsPictureInPicturePlayback = true
@@ -121,11 +123,10 @@ private struct PlayerView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: DismissableAVPlayerView, context: Context) {
-        if view.player !== player {
-            view.player = player
-            view.attachPoster(poster)
-        } else {
-            view.updatePoster(poster)
+        switch view.playback.update(player, attached: view.player, isCovered: isCovered, attach: { view.player = $0 }) {
+        case .attach: view.attachPoster(poster)
+        case .refresh: view.updatePoster(poster)
+        case .keep: break
         }
         view.onPinchDismissBegan = onPinchDismissBegan
         view.onPinchDismissChanged = onPinchDismissChanged
@@ -600,6 +601,8 @@ private struct ViewerStillImage: View {
                 }
             }
         }
+        // The motion clip has its own layer outside the video surface hook; a loop also pauses while covered.
+        .onProtectedCover { model.motion.setCovered($0) }
     }
 }
 

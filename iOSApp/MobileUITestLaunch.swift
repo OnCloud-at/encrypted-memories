@@ -22,6 +22,22 @@ import SwiftUI
             isRequested && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesLargeGridFixture")
         }
 
+        nonisolated static func appLockFixtureResult(
+            arguments: [String] = ProcessInfo.processInfo.arguments
+        ) -> DeviceOwnerAuthResult? {
+            guard arguments.contains(fixtureArgument),
+                let index = arguments.firstIndex(of: "-EncryptedMemoriesAppLockFixture"),
+                arguments.indices.contains(index + 1)
+            else { return nil }
+            switch arguments[index + 1] {
+            case "success": return .success
+            case "cancelled": return .cancelled
+            case "failed": return .failed
+            case "noDeviceLock": return .noDeviceLock
+            default: return nil
+            }
+        }
+
         /// Exercise retention at the last production density without navigating repeated zoom menus.
         nonisolated static var denseGridSmokeLevel: Int? {
             usesLargeGridFixture && ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesDenseGridSmoke")

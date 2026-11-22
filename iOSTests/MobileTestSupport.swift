@@ -133,3 +133,10 @@ extension XCTestCase {
         try? data.write(to: url.appendingPathComponent(name))
     }
 }
+
+/// The first view controller of `type` in `controller` and its children, depth first.
+@MainActor func firstViewController<T: UIViewController>(_ type: T.Type, in controller: UIViewController?) -> T? {
+    guard let controller else { return nil }
+    if let match = controller as? T { return match }
+    return controller.children.lazy.compactMap { firstViewController(type, in: $0) }.first
+}

@@ -69,6 +69,15 @@ final class ProtectedScopeTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: AppSettingsKey.appLockGracePeriodSeconds))
     }
 
+    func testActivationWithoutForegroundContentKeepsTheOriginalBackgroundInterval() async {
+        let gate = await unlockedAppGate()
+        let start = ContinuousClock.now
+        gate.appDidEnterBackground(at: start)
+        gate.appWillEnterForeground(at: start + .seconds(1), hasForegroundContent: false)
+        gate.appWillEnterForeground(at: start + .seconds(120))
+        XCTAssertEqual(gate.state(of: app), .locked)
+    }
+
     func testABackgroundOfTheGracePeriodLocksTheScope() async {
         let gate = await unlockedAppGate()
         let start = ContinuousClock.now
@@ -246,6 +255,17 @@ final class ProtectedScopeTests: XCTestCase {
         await gate.unlockAutomatically(app, reason: "foreground")
         await gate.unlockAutomatically(app, reason: "reactivated")
         XCTAssertEqual(authenticator.reasons, ["launch", "foreground"])
+    }
+
+    func testAnotherForegroundWindowDoesNotRepeatACancelledPrompt() async {
+        defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
+        let authenticator = ScriptedAuthenticator(results: [.cancelled, .cancelled])
+        let gate = makeGate(authenticator)
+        await gate.unlockAutomatically(app, reason: "launch")
+        gate.appWillEnterForeground(at: .now)
+        await gate.unlockAutomatically(app, reason: "another window")
+        XCTAssertEqual(authenticator.reasons, ["launch"])
+        XCTAssertFalse(gate.admits(app))
     }
 
     func testTheUnlockButtonStillAsksAfterTheAutomaticPrompt() async {

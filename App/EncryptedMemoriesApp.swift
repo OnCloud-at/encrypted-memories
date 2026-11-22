@@ -7,6 +7,7 @@ import MetalRenderingCore
 import Observation
 import PhotoViewerFeature
 import PhotosCore
+import PrivacyFeature
 import SwiftUI
 import TimelineFeature
 
@@ -25,6 +26,7 @@ struct EncryptedMemoriesApp: App {
             AppleMetricKitCollector.shared.install()
         }
         _model = State(initialValue: metal3Supported ? AppModel() : nil)
+        _ = MacAppProtection.shared
         // SwiftUI exposes no per-view tooltip delay. Use a responsive 400 ms AppKit delay.
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 400])
     }
@@ -48,6 +50,7 @@ struct EncryptedMemoriesApp: App {
             .frame(minWidth: 720, minHeight: 480)
             .background(WindowConfigurator())
             .background { TipJarCelebrationWindowOverlay() }
+            .macAppProtection()
             // The library window is the only window that opens links; the delegate shows it for every route.
             .onOpenURL { url in AppRoutes.receive(url, for: .activeWindow) }
             .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
@@ -64,10 +67,13 @@ struct EncryptedMemoriesApp: App {
             CommandGroup(after: .newItem) {
                 if metal3Supported {
                     Button(L10n.string("albums.new_album_menu")) {
+                        guard MacAppProtection.shared.gate.admits(.app) else { return }
                         NotificationCenter.default.post(name: .encryptedMemoriesNewAlbum, object: nil)
                     }
+                    .disabled(!MacAppProtection.shared.gate.admits(.app))
                     Divider()
                     Button("menu.upload_photos") {
+                        guard MacAppProtection.shared.gate.admits(.app) else { return }
                         NotificationCenter.default.post(
                             name: .encryptedMemoriesUploadPhotos,
                             object: nil,
@@ -75,7 +81,9 @@ struct EncryptedMemoriesApp: App {
                         )
                     }
                     .keyboardShortcut("u", modifiers: [.command])
+                    .disabled(!MacAppProtection.shared.gate.admits(.app))
                     Button("menu.upload_folder") {
+                        guard MacAppProtection.shared.gate.admits(.app) else { return }
                         NotificationCenter.default.post(
                             name: .encryptedMemoriesUploadFolder,
                             object: nil,
@@ -83,30 +91,37 @@ struct EncryptedMemoriesApp: App {
                         )
                     }
                     .keyboardShortcut("u", modifiers: [.command, .shift])
+                    .disabled(!MacAppProtection.shared.gate.admits(.app))
                     Divider()
                     Button("menu.show_uploads") {
+                        guard MacAppProtection.shared.gate.admits(.app) else { return }
                         NotificationCenter.default.post(
                             name: .encryptedMemoriesShowUploadQueue,
                             object: nil,
                             userInfo: uploadCommandUserInfo(trigger: .menu)
                         )
                     }
+                    .disabled(!MacAppProtection.shared.gate.admits(.app))
                 }
             }
             CommandGroup(after: .sidebar) {
                 if metal3Supported {
                     Button("menu.toggle_sidebar") {
+                        guard MacAppProtection.shared.gate.admits(.app) else { return }
                         NotificationCenter.default.post(name: .encryptedMemoriesToggleSidebar, object: nil)
                     }
                     .keyboardShortcut("s", modifiers: [.command, .option])
+                    .disabled(!MacAppProtection.shared.gate.admits(.app))
                     Button("menu.refresh_library") {
+                        guard MacAppProtection.shared.gate.admits(.app) else { return }
                         NotificationCenter.default.post(name: .encryptedMemoriesRefreshLibrary, object: nil)
                     }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!MacAppProtection.shared.gate.admits(.app))
                 }
             }
             OpenLibraryWindowCommands()
-            PhotoViewerNavigationCommands()
+            if MacAppProtection.shared.gate.admits(.app) { PhotoViewerNavigationCommands() }
         }
 
         // Use the native Settings scene so macOS owns the application menu command and shortcut.
@@ -134,6 +149,7 @@ struct EncryptedMemoriesApp: App {
                 }
             }
             .background { TipJarCelebrationWindowOverlay() }
+            .macAppProtection()
         }
     }
 }
@@ -169,8 +185,11 @@ final class EncryptedMemoriesAppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private static func showLibraryWindow() {
         NSApp.activate()
-        if !LibraryWindowVisibilityController.shared.showLibrary() {
-            NSApp.windows.first(where: { $0.identifier?.rawValue == "library" })?.makeKeyAndOrderFront(nil)
+        if !LibraryWindowVisibilityController.shared.showLibrary(),
+            let window = NSApp.windows.first(where: { $0.identifier?.rawValue == "library" })
+        {
+            MacAppProtection.shared.prepareToShow(window: window)
+            window.makeKeyAndOrderFront(nil)
         }
     }
 
@@ -238,6 +257,7 @@ private final class LibraryWindowVisibilityController: NSObject {
     @discardableResult
     func showLibrary() -> Bool {
         guard let window = libraryWindow else { return false }
+        MacAppProtection.shared.prepareToShow(window: window)
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
@@ -257,6 +277,7 @@ private final class LibraryWindowDelegateProxy: NSObject, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        MacAppProtection.shared.prepareToHide(window: sender)
         sender.orderOut(nil)
         return false
     }
@@ -307,23 +328,36 @@ private struct PhotoViewerNavigationCommands: Commands {
     var body: some Commands {
         CommandGroup(after: .toolbar) {
             Divider()
-            Button(L10n.string("a11y.previous_photo")) { navigation?.goPrevious() }
-                .keyboardShortcut(.leftArrow, modifiers: [])
-                .disabled(navigation?.canGoPrevious != true)
-            Button(L10n.string("a11y.next_photo")) { navigation?.goNext() }
-                .keyboardShortcut(.rightArrow, modifiers: [])
-                .disabled(navigation?.canGoNext != true)
-            Button(L10n.string("viewer.close_photo")) { navigation?.close() }
-                .keyboardShortcut(.cancelAction)
-                .disabled(navigation == nil)
+            Button(L10n.string("a11y.previous_photo")) {
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
+                navigation?.goPrevious()
+            }
+            .keyboardShortcut(.leftArrow, modifiers: [])
+            .disabled(navigation?.canGoPrevious != true)
+            Button(L10n.string("a11y.next_photo")) {
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
+                navigation?.goNext()
+            }
+            .keyboardShortcut(.rightArrow, modifiers: [])
+            .disabled(navigation?.canGoNext != true)
+            Button(L10n.string("viewer.close_photo")) {
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
+                navigation?.close()
+            }
+            .keyboardShortcut(.cancelAction)
+            .disabled(navigation == nil)
             Divider()
             let showsOriginal = navigation?.isShowingOriginal == true
             Button(showsOriginal ? L10n.string("viewer.show_edited") : L10n.string("viewer.show_original")) {
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
                 navigation?.toggleOriginal()
             }
             .disabled(navigation?.canShowOriginal != true)
-            Button(L10n.string("viewer.revert_original")) { navigation?.revertToOriginal() }
-                .disabled(navigation?.canRevertToOriginal != true)
+            Button(L10n.string("viewer.revert_original")) {
+                guard MacAppProtection.shared.gate.admits(.app) else { return }
+                navigation?.revertToOriginal()
+            }
+            .disabled(navigation?.canRevertToOriginal != true)
         }
     }
 }
@@ -419,6 +453,7 @@ private extension View {
 }
 
 private struct LaunchVeilModifier: ViewModifier {
+    @Environment(\.protectedContentIsCovered) private var privacyCovered
     let purpose: LaunchVeilPurpose?
     let model: AppModel
 
@@ -437,7 +472,7 @@ private struct LaunchVeilModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .toolbarVisibility(visible ? .hidden : .automatic, for: .windowToolbar)
+            .toolbarVisibility(visible || privacyCovered ? .hidden : .automatic, for: .windowToolbar)
             .overlay {
                 ZStack {
                     LibraryLoadingCover(

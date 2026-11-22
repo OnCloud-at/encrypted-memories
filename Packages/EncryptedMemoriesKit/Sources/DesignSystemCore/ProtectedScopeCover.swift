@@ -57,3 +57,7 @@ public enum ProtectedScopeCoverMetrics {
     public static let symbolSize: CGFloat = 44
     public static let spacing: CGFloat = 24
 }
+
+extension EnvironmentValues {
+    @Entry public var protectedContentIsCovered = false
+}

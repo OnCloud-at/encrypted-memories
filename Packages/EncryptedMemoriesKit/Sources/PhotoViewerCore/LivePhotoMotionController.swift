@@ -47,6 +47,8 @@ public final class LivePhotoMotionController {
     private var preparationGeneration: UInt = 0
     /// Retains an ordinary press during preload. A looping photo requests playback automatically.
     public private(set) var isPlayRequested = false
+    /// True while the app lock covers the viewer. No clip plays then, also not a loop or a finished preload.
+    private var isCovered = false
 
     public init() {}
 
@@ -137,8 +139,9 @@ public final class LivePhotoMotionController {
     }
 
     /// Requests ordinary motion once, with sound. An active playback stays active; automatic loops ignore presses.
+    /// A press while the app is covered is dropped, so uncovering never starts motion without a new press.
     public func play() {
-        guard !isLooping else { return }
+        guard !isLooping, !isCovered else { return }
         isPlayRequested = true
         startPlaybackIfRequested()
     }
@@ -153,13 +156,29 @@ public final class LivePhotoMotionController {
             let streamer, isStillCurrent()
         else { return }
         prepare(for: item, streamer: streamer, isStillCurrent: isStillCurrent)
-        guard !isLooping else { return }
+        guard !isLooping, !isCovered else { return }
         isPlayRequested = true
         startPlaybackIfRequested()
     }
 
+    /// Follows the app cover: covering stops ordinary motion and pauses a loop; uncovering lets a loop start again.
+    public func setCovered(_ covered: Bool) {
+        isCovered = covered
+        guard covered else {
+            startPlaybackIfRequested()
+            return
+        }
+        guard isLooping else {
+            stop()
+            return
+        }
+        guard isPlaying else { return }
+        isPlaying = false
+        player?.pause()
+    }
+
     private func startPlaybackIfRequested() {
-        guard isPlayRequested, let player, !isPlaying else { return }
+        guard isPlayRequested, !isCovered, let player, !isPlaying else { return }
         isPlaying = true
         player.isMuted = isLooping
         player.volume = 1

@@ -52,6 +52,8 @@ targets:
       - macOSTests/ThumbnailSupportHostTests.swift
       - macOSTests/BackendErrorViewTests.swift
       - Packages/EncryptedMemoriesKit/Tests/DesignSystemCoreTests/RenderedInk.swift
+      - App/MacAppProtection.swift
+      - macOSTests/MacAppProtectionTests.swift
     dependencies:
       - {package: EncryptedMemoriesKit, product: DesignSystemCore}
       - {package: EncryptedMemoriesKit, product: MapFeature}
@@ -62,6 +64,7 @@ targets:
       - {package: EncryptedMemoriesKit, product: ProtonAuth}
       - {package: EncryptedMemoriesKit, product: ProtonDriveBackend}
       - {package: EncryptedMemoriesKit, product: TimelineCore}
+      - {package: EncryptedMemoriesKit, product: PrivacyFeature}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: at.oncloud.encryptedmemories.macsupporttests

@@ -31,21 +31,23 @@ struct MobileLibraryLoadingView: View {
                 accessibilityLabel: accessibilityLabel,
                 activityMessage: activityMessage,
                 activityState: activityState,
-                contentBounds: loadingBounds(in: geometry)
+                contentBounds: geometry.mobileCenteredContentBounds
             ) { isActive in
                 MobileFrostedBackdrop(isActive: isActive)
             }
         }
         .ignoresSafeArea()
     }
+}
 
-    private func loadingBounds(in geometry: GeometryProxy) -> CGRect? {
+extension GeometryProxy {
+    var mobileCenteredContentBounds: CGRect? {
         #if canImport(SwiftUI, _version: 8.0.85)
             if #available(iOS 27.1, *) {
                 return ReservedRegionLayout(
-                    areas: geometry.reservedRegions(kind: .division).map {
+                    areas: reservedRegions(kind: .division).map {
                         ReservedRegionArea(frame: $0.frame, isActive: $0.isActive, isDivision: true)
-                    }, bounds: CGRect(origin: .zero, size: geometry.size)
+                    }, bounds: CGRect(origin: .zero, size: size)
                 )
                 .centeredLoadingBounds
             }
