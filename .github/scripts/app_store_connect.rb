@@ -669,7 +669,7 @@ module AppStoreConnect
     # Apple can list a build and still answer HTTP 404 for its id for a short time, and Apple
     # replaces the build record when the same build number is processed again (run 34993650537).
     # Every operation in the block tolerates repetition (upserts, group membership, and a
-    # reconciled beta review submission), so the block runs again with newly resolved build ids. A build that stays missing is an owner decision, not a retry case.
+    # reconciled beta review submission), so the block runs again with newly resolved build ids. A build that stays missing is not a retry case: a person has to resolve it.
     def with_current_builds(builds, version:, build_number:, attempts: 4, wait_seconds: 20)
       attempt = 0
       begin
@@ -2124,7 +2124,7 @@ module AppStoreConnect
     # A rejected attempt stays open in UNRESOLVED_ISSUES and blocks the next submission of the
     # same platform. Apple does not accept new items in that state. The workflow cancels only
     # a rejected attempt of the version that it submits now. Every other open submission belongs
-    # to a different owner decision and stops the run with an exact instruction.
+    # to something other than this run: the run leaves it open and stops with an exact instruction.
     def settle_blocking_review_submission(submission, platform:, version_id:, cancel_requested:)
       submission_id = submission.fetch("id")
       state = submission.dig("attributes", "state")

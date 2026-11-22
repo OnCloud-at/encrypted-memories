@@ -282,7 +282,7 @@ final class DurableFileWriterTests: XCTestCase {
     }
 
     /// Today's behavior, kept unchanged: a barrier write that fails after the first line is ignored, and the next open
-    /// places the barrier. Whether it should throw is an open owner decision on #1149.
+    /// places the barrier. Whether it should throw is still open on #1149.
     func testAFailedBarrierAfterTheFirstLineIsIgnoredAsBefore() throws {
         let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory, fileSystem: files))
         let barrierURL = directory.appendingPathComponent(EditReplacementJournalFileStore.fileName)

@@ -2793,7 +2793,7 @@
     },
     "brand.made_in_austria": {
       "extractionState": "manual",
-      "comment": "Quiet line in the Settings footer on every platform. The English text is on purpose also under \"de\" (owner decision, no translation). Keep the emoji.",
+      "comment": "Quiet line in the Settings footer on every platform. The English text is on purpose also under \"de\": the line is not translated. Keep the emoji.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Made with ❤️ in Austria 🇦🇹" } },
         "de": { "stringUnit": { "state": "translated", "value": "Made with ❤️ in Austria 🇦🇹" } }
