@@ -50,7 +50,12 @@ public final class LivePhotoMotionController {
     /// True while the app lock covers the viewer. No clip plays then, also not a loop or a finished preload.
     private var isCovered = false
 
-    public init() {}
+    /// Waits out the pause before the one silent repeat of a failed preparation. A cancelled preparation ends it early.
+    private let repeatPause: @Sendable (Duration) async -> Void
+
+    public init(repeatPause: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }) {
+        self.repeatPause = repeatPause
+    }
 
     /// Preloads the paired motion clip for a Live Photo. No-op for non-Live items / when no streamer is
     /// available (per `LivePhotoMotionPolicy`). `isStillCurrent` lets the caller abort if the user paged away
@@ -76,64 +81,81 @@ public final class LivePhotoMotionController {
         loadState = .loading
         let generation = preparationGeneration
         prepareTask = Task { [weak self] in
-            do {
-                // Download the encrypted clip into the local encrypted block cache. No plaintext reaches disk.
-                try await streamer.prefetchEncrypted(for: motionUID)
-                guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else { return }
-                // Build the streaming player. Its resource loader serves entirely from the local encrypted cache.
-                let stream = try await streamer.makeStreamingAsset(for: motionUID)
-                var adopted = false
-                defer { if !adopted { stream.close() } }
-                guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else { return }
-                let template = AVPlayerItem(asset: stream.asset)
-                let player: AVPlayer
-                let looper: AVPlayerLooper?
-                if loops {
-                    let duration = CMTimeGetSeconds(try await stream.asset.load(.duration))
-                    guard duration.isFinite, duration > 0,
+            var repeated = false
+            while true {
+                do {
+                    // Download the encrypted clip into the local encrypted block cache. No plaintext reaches disk.
+                    try await streamer.prefetchEncrypted(for: motionUID)
+                    guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else { return }
+                    // Build the streaming player. Its resource loader serves entirely from the local encrypted cache.
+                    let stream = try await streamer.makeStreamingAsset(for: motionUID)
+                    var adopted = false
+                    defer { if !adopted { stream.close() } }
+                    guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else { return }
+                    let template = AVPlayerItem(asset: stream.asset)
+                    let player: AVPlayer
+                    let looper: AVPlayerLooper?
+                    if loops {
+                        let duration = CMTimeGetSeconds(try await stream.asset.load(.duration))
+                        guard duration.isFinite, duration > 0,
+                            self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true
+                        else {
+                            self?.markPreparationFailed(generation, isStillCurrent: isStillCurrent)
+                            return
+                        }
+                        let queue = AVQueuePlayer()
+                        looper = AVPlayerLooper(player: queue, templateItem: template)
+                        player = queue
+                    } else {
+                        looper = nil
+                        player = AVPlayer(playerItem: template)
+                    }
+                    player.actionAtItemEnd = loops ? .advance : .pause
+                    player.automaticallyWaitsToMinimizeStalling = false
+                    // Wait until ready, then preroll - the clip is local + encrypted-cached, so this is fast.
+                    var tries = 0
+                    while player.currentItem?.status != .readyToPlay, !Task.isCancelled,
+                        player.currentItem?.status != .failed, tries < LivePhotoMotionPolicy.prerollMaxTries
+                    {
+                        try await Task.sleep(for: .milliseconds(LivePhotoMotionPolicy.prerollPollMilliseconds))
+                        tries += 1
+                    }
+                    guard player.currentItem?.status == .readyToPlay,
                         self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true
                     else {
                         self?.markPreparationFailed(generation, isStillCurrent: isStillCurrent)
                         return
                     }
-                    let queue = AVQueuePlayer()
-                    looper = AVPlayerLooper(player: queue, templateItem: template)
-                    player = queue
-                } else {
-                    looper = nil
-                    player = AVPlayer(playerItem: template)
-                }
-                player.actionAtItemEnd = loops ? .advance : .pause
-                player.automaticallyWaitsToMinimizeStalling = false
-                // Wait until ready, then preroll - the clip is local + encrypted-cached, so this is fast.
-                var tries = 0
-                while player.currentItem?.status != .readyToPlay, !Task.isCancelled,
-                    player.currentItem?.status != .failed, tries < LivePhotoMotionPolicy.prerollMaxTries
-                {
-                    try await Task.sleep(for: .milliseconds(LivePhotoMotionPolicy.prerollPollMilliseconds))
-                    tries += 1
-                }
-                guard player.currentItem?.status == .readyToPlay,
-                    self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true
-                else {
+                    player.preroll(atRate: 1) { _ in }
+                    // Expose the player only after preparation. An active press starts playback as soon as it is ready.
+                    guard let self,
+                        self.isCurrentPreparation(generation, isStillCurrent: isStillCurrent)
+                    else { return }
+                    self.asset = stream
+                    adopted = true
+                    self.player = player
+                    self.looper = looper
+                    self.loadState = .ready
+                    self.startPlaybackIfRequested()
+                } catch is CancellationError {
+                    // Teardown already restored `.idle`; a replaced generation must not publish stale state.
+                } catch {
+                    // The clip is a read. One silent repeat behind the loading state; the still and a waiting press stay.
+                    if !repeated, let delay = LivePhotoMotionPolicy.repeatDelay(after: error),
+                        let pause = self?.repeatPause,
+                        self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true
+                    {
+                        repeated = true
+                        // Only the pause closure is held across the wait, so a viewer that goes away is not kept alive.
+                        await pause(delay)
+                        guard self?.isCurrentPreparation(generation, isStillCurrent: isStillCurrent) == true else {
+                            return
+                        }
+                        continue
+                    }
                     self?.markPreparationFailed(generation, isStillCurrent: isStillCurrent)
-                    return
                 }
-                player.preroll(atRate: 1) { _ in }
-                // Expose the player only after preparation. An active press starts playback as soon as it is ready.
-                guard let self,
-                    self.isCurrentPreparation(generation, isStillCurrent: isStillCurrent)
-                else { return }
-                self.asset = stream
-                adopted = true
-                self.player = player
-                self.looper = looper
-                self.loadState = .ready
-                self.startPlaybackIfRequested()
-            } catch is CancellationError {
-                // Teardown already restored `.idle`; a replaced generation must not publish stale state.
-            } catch {
-                self?.markPreparationFailed(generation, isStillCurrent: isStillCurrent)
+                return
             }
         }
     }

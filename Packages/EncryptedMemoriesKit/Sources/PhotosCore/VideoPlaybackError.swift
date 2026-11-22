@@ -95,17 +95,53 @@ public enum VideoPlaybackError: Error, Equatable, Sendable {
         }
     }
 
-    /// The waits before the silent retries of a rate limit while the viewer prepares the video.
-    public static let rateLimitSilentRetryDelays: [Duration] = [.seconds(3), .seconds(8), .seconds(20)]
+    /// The waits before the silent retries of a failure that goes away by itself while the viewer prepares the video.
+    public static let silentRetryDelaySchedule: [Duration] = [.seconds(3), .seconds(8), .seconds(20)]
 
-    /// The waits before the silent retries of a failure that goes away by itself. The viewer keeps its loading
-    /// indicator during these waits and shows the failure only when the last retry fails too.
+    /// The waits before the silent retries of a failure that goes away by itself: a rate limit, a network failure and a
+    /// timeout. The viewer keeps its loading indicator during these waits and shows the failure only when the last retry
+    /// fails too. Missing video information (an HTTP 404 or 410 answer) can mean that the video is gone, so it waits once.
+    /// A failure of the player, of a local file and an unclear failure show at once, and so does every failure after the
+    /// video started to play: the viewer prepares only.
     public var silentRetryDelays: [Duration] {
         switch self {
-        case .quotaOrRateLimited: return Self.rateLimitSilentRetryDelays
+        case .quotaOrRateLimited, .networkUnavailable, .timedOut: return Self.silentRetryDelaySchedule
+        case .metadataUnavailable: return Array(Self.silentRetryDelaySchedule.prefix(1))
         default: return []
         }
     }
+
+    /// Whether another attempt would fail the same way, so the failure shows at once instead of after the silent
+    /// retries. A cancellation is no failure to repeat. A device that says it has no network for this app (offline,
+    /// cellular data off, roaming off, a call) cannot repeat, also inside a wrapped error (`NSUnderlyingErrorKey`, up to
+    /// five levels; a Swift error that is not an `NSError` chain is not unwrapped). Of the other URL errors only the
+    /// transport failures that go away by themselves repeat: a timeout, a lost connection, a refused connection and a
+    /// failed host lookup. Every other code (a bad or unsupported URL, a refused authentication, a certificate or
+    /// secure-connection failure, a blocked insecure connection, too many redirects, undecodable content) is final.
+    /// A failed host lookup repeats on purpose: the host of Proton is fixed, so the lookup fails only while the device
+    /// changes its network. An error outside the URL domain is decided by its class.
+    public static func repeatCannotHelp(_ error: any Error) -> Bool {
+        if FailureCancellation.isCancellation(error) { return true }
+        var current: NSError? = error as NSError
+        var depth = 0
+        while let ns = current, depth < 5 {
+            if ns.domain == NSURLErrorDomain, noNetworkURLErrorCodes.contains(ns.code) { return true }
+            current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+            depth += 1
+        }
+        let outer = error as NSError
+        return outer.domain == NSURLErrorDomain && !recoverableURLErrorCodes.contains(outer.code)
+    }
+
+    private static let noNetworkURLErrorCodes: Set<Int> = [
+        NSURLErrorNotConnectedToInternet, NSURLErrorDataNotAllowed, NSURLErrorInternationalRoamingOff,
+        NSURLErrorCallIsActive,
+    ]
+
+    private static let recoverableURLErrorCodes: Set<Int> = [
+        NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost, NSURLErrorCannotConnectToHost,
+        NSURLErrorDNSLookupFailed, NSURLErrorCannotFindHost,
+    ]
 }
 
 public extension VideoPlaybackError {

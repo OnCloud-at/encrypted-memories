@@ -26,11 +26,19 @@ final class VideoFailureRetryTests: XCTestCase {
         }
     }
 
-    func testTheProductionWaitsOfARateLimitAreThreeEightAndTwentySeconds() {
+    /// The failures that go away by themselves wait behind the loading indicator before the viewer shows them.
+    private let silentFailures: [VideoPlaybackError] = [.quotaOrRateLimited, .networkUnavailable, .timedOut]
+
+    func testTheProductionWaitsAreThreeEightAndTwentySecondsForEveryFailureThatGoesAwayByItself() {
         let production: [Duration] = [.seconds(3), .seconds(8), .seconds(20)]
-        XCTAssertEqual(VideoPlaybackError.rateLimitSilentRetryDelays, production)
-        XCTAssertEqual(VideoPlaybackError.quotaOrRateLimited.silentRetryDelays, production)
-        for failure in fixedFailures + changeableFailures where failure != .quotaOrRateLimited {
+        XCTAssertEqual(VideoPlaybackError.silentRetryDelaySchedule, production)
+        for failure in silentFailures {
+            XCTAssertEqual(failure.silentRetryDelays, production, "\(failure.token) asks again before it shows")
+        }
+        // A 404 or 410 answer maps to missing video information and can mean that the video is gone: one attempt only.
+        XCTAssertEqual(VideoPlaybackError.metadataUnavailable.silentRetryDelays, [.seconds(3)])
+        for failure in fixedFailures + changeableFailures
+        where !silentFailures.contains(failure) && failure != .metadataUnavailable {
             XCTAssertTrue(failure.silentRetryDelays.isEmpty, "\(failure.token) shows its failure at once")
         }
     }
@@ -41,6 +49,112 @@ final class VideoFailureRetryTests: XCTestCase {
     }
 
     // MARK: - Silent retries
+
+    /// A network failure, a timeout and missing video information wait behind the loading indicator like a rate
+    /// limit, and the viewer shows the same failure when the last attempt fails too.
+    @MainActor
+    func testEveryFailureThatGoesAwayByItselfIsRetriedSilentlyAndThenShowsItsOwnFailure() async throws {
+        let cases: [(error: any Error, shown: VideoPlaybackError)] = [
+            (Self.timeout, .networkUnavailable), (URLError(.networkConnectionLost), .networkUnavailable),
+            (URLError(.cannotConnectToHost), .networkUnavailable),
+            (URLError(.dnsLookupFailed), .networkUnavailable), (URLError(.cannotFindHost), .networkUnavailable),
+            (TypedFailure(cause: .timedOut), .timedOut),
+        ]
+        for (error, shown) in cases {
+            let streamer = ScriptedStreamProvider(failures: [error])
+            let wait = ControlledWait()
+            let model = try makeModel(streamer: streamer, wait: wait)
+            model.start()
+
+            try await waitUntil { model.videoState.error != nil || wait.requested.count > 3 }
+            let calls = await streamer.calls
+            XCTAssertEqual(wait.requested, [.seconds(3), .seconds(8), .seconds(20)], "\(shown.token)")
+            XCTAssertEqual(calls, 4, "\(shown.token): the first attempt and one after each wait")
+            XCTAssertEqual(model.videoState, .failed(shown))
+            XCTAssertEqual(model.videoState.error?.isRetryable, true, "\(shown.token) keeps Try again")
+            model.stop()
+        }
+    }
+
+    /// Missing video information can mean that the video is gone (404, 410): one more attempt after 3 seconds, then
+    /// the failure.
+    @MainActor
+    func testMissingVideoInformationIsAskedAgainOnceBeforeItShows() async throws {
+        let streamer = ScriptedStreamProvider(failures: [Self.notFound])
+        let wait = ControlledWait()
+        let model = try makeModel(streamer: streamer, wait: wait)
+        model.start()
+
+        try await waitUntil { model.videoState.error != nil }
+        let calls = await streamer.calls
+        XCTAssertEqual(wait.requested, [.seconds(3)])
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(model.videoState, .failed(.metadataUnavailable))
+        XCTAssertEqual(model.videoState.error?.isRetryable, true)
+    }
+
+    /// Another attempt would fail the same way, so the failure shows at once: the device says that it has no network
+    /// for this app (offline, cellular data off, roaming off, a call), a wrapped error says so, or the connection is
+    /// refused for good (an untrusted certificate, a blocked insecure connection).
+    @MainActor
+    func testAFailureThatAnotherAttemptCannotChangeShowsAtOnceWithoutAWait() async throws {
+        // A recoverable outer error that wraps a device without a network is final, too.
+        let wrapped: [any Error] = [
+            URLError.Code.notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff, .callIsActive,
+        ].map {
+            NSError(
+                domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost,
+                userInfo: [NSUnderlyingErrorKey: URLError($0)])
+        }
+        let failures: [any Error] =
+            wrapped + [
+                URLError(.notConnectedToInternet), URLError(.dataNotAllowed), URLError(.internationalRoamingOff),
+                URLError(.callIsActive), URLError(.serverCertificateUntrusted),
+                URLError(.serverCertificateHasBadDate), URLError(.serverCertificateHasUnknownRoot),
+                URLError(.serverCertificateNotYetValid), URLError(.clientCertificateRejected),
+                URLError(.appTransportSecurityRequiresSecureConnection),
+                URLError(.badURL), URLError(.unsupportedURL), URLError(.userAuthenticationRequired),
+                URLError(.userCancelledAuthentication), URLError(.secureConnectionFailed),
+                URLError(.clientCertificateRequired), URLError(.httpTooManyRedirects),
+                URLError(.cannotDecodeContentData), URLError(.cannotDecodeRawData), URLError(.cancelled),
+            ]
+        for failure in failures {
+            let streamer = ScriptedStreamProvider(failures: [failure])
+            let wait = ControlledWait()
+            let model = try makeModel(streamer: streamer, wait: wait)
+            model.start()
+
+            try await waitUntil { model.videoState.error != nil }
+            let calls = await streamer.calls
+            XCTAssertEqual(calls, 1, "\(failure)")
+            XCTAssertTrue(wait.requested.isEmpty, "\(failure)")
+            XCTAssertEqual(model.videoState, .failed(.networkUnavailable), "\(failure)")
+            XCTAssertEqual(model.videoState.error?.isRetryable, true, "\(failure)")
+            model.stop()
+        }
+    }
+
+    /// Only the failures that go away by themselves wait. A failure of the player or of a local file shows at once.
+    @MainActor
+    func testAFailureThatMayNotGoAwayByItselfShowsAtOnce() async throws {
+        let failures: [any Error] = [
+            NSError(domain: "AVFoundationErrorDomain", code: -11800),
+            NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError),
+            NSError(domain: "Custom", code: 1),
+        ]
+        for failure in failures {
+            let streamer = ScriptedStreamProvider(failures: [failure])
+            let wait = ControlledWait()
+            let model = try makeModel(streamer: streamer, wait: wait)
+            model.start()
+
+            try await waitUntil { model.videoState.error != nil }
+            let calls = await streamer.calls
+            XCTAssertEqual(calls, 1, "\(failure)")
+            XCTAssertTrue(wait.requested.isEmpty, "\(failure)")
+            model.stop()
+        }
+    }
 
     @MainActor
     func testARateLimitIsRetriedWithTheProductionWaitsAndThenShowsTheFailure() async throws {
@@ -272,6 +386,9 @@ final class VideoFailureRetryTests: XCTestCase {
         domain: "ProtonAuth", code: 429,
         userInfo: [NSLocalizedDescriptionKey: "HTTP 429 for /drive/x"])
     private static let codec = NSError(domain: "AVFoundationErrorDomain", code: -11828)
+    private static let timeout = URLError(.timedOut)
+    private static let notFound = NSError(
+        domain: "ProtonAuth", code: 404, userInfo: [NSLocalizedDescriptionKey: "HTTP 404 for /drive/x"])
 
     private static func video(_ number: Int) -> PhotoItem {
         PhotoItem(
