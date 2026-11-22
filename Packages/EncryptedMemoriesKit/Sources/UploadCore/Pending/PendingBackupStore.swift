@@ -1637,18 +1637,13 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     /// The locked recheck, table and version commit together. A refused statement or a crash leaves v1 intact.
     static func migrateLegacyStore(_ handle: OpaquePointer) -> Bool {
         return SQLiteStoreSchemaGate.withDurableCommits(handle) {
-            guard sqlite3_exec(handle, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return false }
-            var committed = false
-            defer { if !committed { sqlite3_exec(handle, "ROLLBACK;", nil, nil, nil) } }
-            guard verifyVersion(handle, expected: 1),
-                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: legacySchema),
-                sqlite3_exec(handle, operationSchema, nil, nil, nil) == SQLITE_OK,
-                stampVersion(handle),
-                SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema),
-                sqlite3_exec(handle, "COMMIT;", nil, nil, nil) == SQLITE_OK
-            else { return false }
-            committed = true
-            return true
+            SQLiteTransaction.immediate(handle) {
+                verifyVersion(handle, expected: 1)
+                    && SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: legacySchema)
+                    && sqlite3_exec(handle, operationSchema, nil, nil, nil) == SQLITE_OK
+                    && stampVersion(handle)
+                    && SQLiteStoreSchemaGate.matchesCurrentSchema(handle, schemaSQL: schema)
+            }
         } ?? false
     }
 
