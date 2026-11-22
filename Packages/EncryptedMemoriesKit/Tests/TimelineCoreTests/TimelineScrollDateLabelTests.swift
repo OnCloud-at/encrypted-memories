@@ -1698,4 +1698,187 @@ private struct SplitMix64 {
         await settle(until: { controller.index?.itemCount == 2 })
         #expect(controller.index?.itemCount == 2)
     }
+
+    // MARK: - Presentation shared by the native presenters
+
+    /// Records what the session asks the native label to do, in order.
+    @MainActor
+    private final class RecordingDisplay: TimelineScrollDateLabelDisplay {
+        var events: [String] = []
+        private(set) var displayedText: String?
+        private(set) var measurements = 0
+
+        func setText(_ text: String) {
+            displayedText = text
+            events.append("text \(text)")
+        }
+
+        func prepareTextLayout() {
+            measurements += 1
+            events.append("measure")
+        }
+
+        func applyIndicatorOffset(of presentation: TimelineScrollDateLabelController.Presentation) {
+            events.append("offset \(presentation.indicatorOffset)")
+        }
+
+        func setShown(_ shown: Bool, duration: TimeInterval?, changesVisibility: Bool) {
+            let kind = changesVisibility ? "visibility" : "fade"
+            events.append("\(kind) \(shown) \(duration.map { "\($0)" } ?? "now")")
+        }
+
+        func presentationDidApply() { events.append("applied") }
+    }
+
+    @MainActor
+    private struct Shared {
+        let manual = ManualClock()
+        let controller: TimelineScrollDateLabelController
+        let session: TimelineScrollDateLabelSession
+        let display = RecordingDisplay()
+        let items: [PhotoItem]
+
+        /// Ten photos per month, January to April 2026.
+        init(count: Int = 40) {
+            controller = TimelineScrollDateLabelController(
+                clock: manual.clock,
+                build: { items, revision in
+                    TimelineScrollDateIndex.build(
+                        items: items, revision: revision, calendar: timelineTestUTCCalendar,
+                        locale: Locale(identifier: "en_US"))
+                })
+            session = TimelineScrollDateLabelSession(controller: controller)
+            items = (0..<count).map {
+                PhotoItem(
+                    uid: PhotoUID(volumeID: "v", nodeID: "n\($0)"),
+                    captureTime: timelineTestUTCCalendar.date(
+                        from: DateComponents(year: 2026, month: 1 + $0 / 10, day: 2))!,
+                    mediaType: "image/jpeg")
+            }
+            session.attach(display, reduceMotion: false)
+        }
+
+        func month(_ flatIndex: Int) -> String? { controller.index?.month(containing: flatIndex)?.text }
+
+        /// Turns the label on with the photos and waits for their months.
+        func enable() async throws {
+            session.contentChanged(items, replacesList: true)
+            session.setEnabled(true)
+            await settle(until: { controller.index != nil })
+            try #require(controller.index != nil, "SETUP: the months are built")
+        }
+
+        /// A brisk scroll through the session, as a host forwards it.
+        func flick() {
+            var offset = 0.0
+            for _ in 0..<12 {
+                session.viewportMoved(.init(isTracking: true), offsetY: offset)
+                manual.advance(by: 1 / 120)
+                offset += 2_000 / 120
+            }
+        }
+    }
+
+    @Test func attachingWiresTheControllerAndForwardsReduceMotion() {
+        let controller = TimelineScrollDateLabelController(clock: ManualClock().clock)
+        let session = TimelineScrollDateLabelSession(controller: controller)
+        let display = RecordingDisplay()
+        session.attach(display, reduceMotion: true)
+        #expect(controller.reduceMotion)
+        #expect(controller.onChange != nil && controller.onIndexInstalled != nil)
+        session.setReduceMotion(false)
+        #expect(!controller.reduceMotion)
+    }
+
+    @Test func aShowSetsTheTextAndTheOffsetFadesInOnceAndThenLaysOut() async throws {
+        let shared = Shared()
+        try await shared.enable()
+        shared.session.setAnchor(flatIndex: 25)
+        shared.display.events.removeAll()
+        shared.flick()
+        let fade = try #require(shared.controller.presentation.fadeDuration, "SETUP: a normal show fades")
+        let text = try #require(shared.month(25))
+        #expect(shared.display.events == ["text \(text)", "offset 0.0", "visibility true \(fade)", "applied"])
+        #expect(shared.session.isShown)
+    }
+
+    @Test func onlyAChangedFadeDurationRepeatsTheTransitionOfAnUnchangedVisibility() async throws {
+        let shared = Shared()
+        try await shared.enable()
+        shared.session.setAnchor(flatIndex: 5)
+        shared.flick()
+        #expect(shared.session.isShown, "SETUP: the label shows")
+
+        shared.display.events.removeAll()
+        shared.session.setReduceMotion(true)
+        let text = try #require(shared.month(5))
+        #expect(
+            shared.display.events == ["text \(text)", "offset 0.0", "fade true now", "applied"],
+            "Reduce Motion during a fade ends the fade at once")
+
+        shared.display.events.removeAll()
+        shared.session.setAnchor(flatIndex: 35)
+        let next = try #require(shared.month(35))
+        #expect(next != text, "SETUP: another month")
+        #expect(
+            shared.display.events == ["text \(next)", "offset 0.0", "applied"],
+            "a new month with the same visibility and fade starts no transition")
+    }
+
+    @Test func aHideEndsTheLabelAtOnce() async throws {
+        let shared = Shared()
+        try await shared.enable()
+        shared.session.setAnchor(flatIndex: 5)
+        shared.flick()
+        #expect(shared.session.isShown, "SETUP: the label shows")
+        shared.display.events.removeAll()
+        shared.controller.hide()
+        let transitions = shared.display.events.filter { $0.hasPrefix("visibility") || $0.hasPrefix("fade") }
+        #expect(transitions == ["visibility false now"])
+        #expect(shared.display.events.last == "applied")
+        #expect(!shared.session.isShown)
+    }
+
+    @Test func newMonthsPrepareTheFirstMonthOnceAndOnlyBeforeAnyText() async throws {
+        let shared = Shared()
+        try await shared.enable()
+        let first = try #require(shared.month(0))
+        #expect(shared.display.displayedText == first, "the first month is shaped before any scroll")
+        #expect(shared.display.measurements == 1)
+
+        let previous = shared.controller.index
+        shared.session.contentChanged(Array(shared.items.dropFirst(10)), replacesList: false)
+        await settle(until: { shared.controller.index != previous })
+        try #require(shared.controller.index != previous, "SETUP: the refreshed months are installed")
+        #expect(shared.display.displayedText == first, "a label with text keeps it")
+        #expect(shared.display.measurements == 1, "the text is measured once")
+    }
+
+    @Test func aDisabledLabelIgnoresMovementsAndAnchors() async throws {
+        let shared = Shared()
+        shared.session.contentChanged(shared.items, replacesList: true)
+        shared.flick()
+        #expect(!shared.controller.policy.isVisible, "a disabled label does not measure scrolling")
+        shared.session.setAnchor(flatIndex: 25)
+
+        try await shared.enable()
+        shared.flick()
+        #expect(!shared.controller.presentation.isVisible, "the anchor sent while disabled was ignored")
+        shared.session.setAnchor(flatIndex: 25)
+        #expect(shared.controller.presentation.isVisible, "CONTROL: an anchor of the enabled label shows it")
+        #expect(shared.controller.presentation.text == shared.month(25))
+    }
+
+    @Test func noMonthReachesTheDisplayAfterRetiring() async throws {
+        let retired = Shared()
+        retired.session.contentChanged(retired.items, replacesList: true)
+        retired.session.setEnabled(true)
+        retired.session.retire()
+        let control = Shared()
+        try await control.enable()
+        #expect(control.display.displayedText != nil, "CONTROL: built months reach a live display")
+        await settle()
+        #expect(retired.display.displayedText == nil && retired.display.measurements == 0)
+        #expect(retired.display.events.isEmpty, "a retired label draws nothing: \(retired.display.events)")
+    }
 }

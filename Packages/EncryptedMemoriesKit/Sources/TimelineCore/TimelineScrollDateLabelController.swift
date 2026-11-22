@@ -218,6 +218,7 @@ public final class TimelineScrollDateLabelController {
         policy.suppress()
         cancelHide()
         onChange = nil
+        onIndexInstalled = nil
         presentation = .hidden
     }
 

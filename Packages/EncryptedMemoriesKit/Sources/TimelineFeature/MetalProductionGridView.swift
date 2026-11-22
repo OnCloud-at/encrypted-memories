@@ -71,6 +71,14 @@ struct MetalProductionGridView: NSViewRepresentable {
     var dragOutProvider: (any OriginalFileProvider)? = nil
     /// Reports a failed drag-out session (mapped to the shell's shared failure alert).
     var onDragOutFailed: ((DragOutFailureKind) -> Void)? = nil
+    /// Shows the transient month and year label beside the scroller while the person scrolls briskly. Off for
+    /// loading, failed, pending and relevance-ordered results (`TimelineScrollDateLabelEligibility`).
+    var showsScrollDateLabel: Bool = false
+    /// Points at the trailing edge that the date scrubber reserves; the label stays left of it.
+    var scrollDateLabelTrailingInset: CGFloat = 0
+    /// The identity of the shown list (library, filter or search). A new identity is another list: the label drops
+    /// its old months at once. A refresh keeps the identity.
+    var scrollDateLabelListID: AnyHashable? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(isProvisionalPresentation: isProvisionalPresentation) }
 
@@ -120,10 +128,7 @@ struct MetalProductionGridView: NSViewRepresentable {
         let selection = MetalGridSelectionController()
         let interaction = MetalGridInteractionController(coordinator: host.coordinator, selection: selection)
         interaction.selectionMode = selectionMode
-        interaction.onOpen = { [weak coord] uid in
-            guard let coord, let item = coord.allItems.first(where: { $0.uid == uid }) else { return }
-            coord.onOpen?(item, coord.allItems)
-        }
+        interaction.onOpen = { [weak coord] uid in coord?.openPhoto(uid) }
         selection.onChange = { [weak coord] set in
             coord?.host?.coordinator.setSelection(set)
             coord?.a11y?.selected = set
@@ -161,6 +166,12 @@ struct MetalProductionGridView: NSViewRepresentable {
         header.markers = MetalGridProductionAdapter.monthMarkers(sections: sections)
         coord.header = header
 
+        host.installScrollDateLabel()
+        host.scrollDateLabel?.contentChanged(allItems, replacesList: true)
+        host.scrollDateLabel?.setTrailingInset(scrollDateLabelTrailingInset)
+        host.setScrollDateLabelEnabled(showsScrollDateLabel)
+        coord.scrollDateLabelListID = scrollDateLabelListID
+
         let a11y = MetalGridAccessibilityProvider(host: host, coordinator: host.coordinator)
         a11y.items = allItems
         coord.a11y = a11y
@@ -194,9 +205,11 @@ struct MetalProductionGridView: NSViewRepresentable {
         configurePhotoActions(host: host, coordinator: coord)
         coord.a11y?.selected = host.coordinator.selectedUIDs
 
+        host.scrollDateLabel?.setTrailingInset(scrollDateLabelTrailingInset)
+        host.setScrollDateLabelEnabled(showsScrollDateLabel)
         coord.receiveContent(
             items: allItems, revision: dataRevision, routeGeneration: routeScrollGeneration,
-            initialViewport: routeInitialViewport,
+            listID: scrollDateLabelListID, initialViewport: routeInitialViewport,
             markers: MetalGridProductionAdapter.monthMarkers(sections: sections),
             isProvisionalPresentation: isProvisionalPresentation,
             makeSource: {
@@ -217,6 +230,10 @@ struct MetalProductionGridView: NSViewRepresentable {
         host.reconcileLevelBinding(level)
         wireProxy(host: host, levelBinding: $level, sourceRevision: sourceRevision)
         coord.header?.reposition()
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        (nsView as? MetalGridScrollHost)?.retireScrollDateLabel()
     }
 
     private func configurePhotoActions(host: MetalGridScrollHost, coordinator coord: Coordinator) {
@@ -315,6 +332,8 @@ struct MetalProductionGridView: NSViewRepresentable {
         var onDragOutFailed: ((DragOutFailureKind) -> Void)?
         var dataRevision = 0
         var appliedRouteScrollGeneration = 0
+        /// The list identity of the content the grid shows; see `MetalProductionGridView.scrollDateLabelListID`.
+        var scrollDateLabelListID: AnyHashable?
         private var wasProvisionalPresentation = false
 
         init(isProvisionalPresentation: Bool = false) {
@@ -324,13 +343,15 @@ struct MetalProductionGridView: NSViewRepresentable {
             let preservesVisibleAnchor: Bool
             let items: [PhotoItem]
             let revision: Int
+            /// Another list (route or list identity), not a refresh of the shown one.
+            let replacesList: Bool
             let markers: [(index: Int, text: String)]
             let makeSource: () -> MetalGridDataSource
         }
         private var deferredOrderUpdate: OrderUpdate?
 
         func receiveContent(
-            items: [PhotoItem], revision: Int, routeGeneration: Int,
+            items: [PhotoItem], revision: Int, routeGeneration: Int, listID: AnyHashable? = nil,
             initialViewport: GridInitialViewport, markers: @autoclosure () -> [(index: Int, text: String)],
             isProvisionalPresentation: Bool = false,
             makeSource: @escaping () -> MetalGridDataSource
@@ -347,9 +368,14 @@ struct MetalProductionGridView: NSViewRepresentable {
                 return
             }
             if !routePending, deferredOrderUpdate?.revision == revision { return }
+            // A route or list change replaces the list; a deferred replacement stays one when a refresh supersedes it.
+            let replacesList =
+                routePending || listID != scrollDateLabelListID || deferredOrderUpdate?.replacesList == true
+            scrollDateLabelListID = listID
             let update = OrderUpdate(
                 preservesVisibleAnchor: provisionalUpdate && !routePending,
-                items: items, revision: revision, markers: markers(), makeSource: makeSource)
+                items: items, revision: revision, replacesList: replacesList, markers: markers(),
+                makeSource: makeSource)
             let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
             let decision: TimelineOrderRefinementPolicy.Decision =
                 routePending
@@ -374,6 +400,13 @@ struct MetalProductionGridView: NSViewRepresentable {
             if routePending { appliedRouteScrollGeneration = routeGeneration }
         }
 
+        /// Opens a photo of the grid. The viewer covers the grid, so the scroll date label leaves at once.
+        func openPhoto(_ uid: PhotoUID) {
+            guard let item = allItems.first(where: { $0.uid == uid }) else { return }
+            host?.scrollDateLabel?.hideForRoute()
+            onOpen?(item, allItems)
+        }
+
         func viewportChanged() {
             if let host, host.coordinator.canPresentResize, let pending = deferredOrderUpdate {
                 let visible = Set(host.coordinator.visibleCells().map(\.flatIndex))
@@ -395,6 +428,7 @@ struct MetalProductionGridView: NSViewRepresentable {
             dataRevision = update.revision
             a11y?.items = update.items
             host?.setDataSource(update.makeSource(), initialViewport: viewport, preservingColumnPhase: preservesPhase)
+            host?.scrollDateLabel?.contentChanged(update.items, replacesList: update.replacesList)
             header?.markers = update.markers
         }
 

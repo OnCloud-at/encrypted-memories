@@ -1925,6 +1925,26 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
             overscanCount: overscanUIDs.count, realCount: realCount, cellCount: slots.count, now: now)
     }
 
+    /// Receives the flat index of the photo that anchors the visible area (the first photo row below the toolbar)
+    /// whenever it changes. Nil while nobody listens, so the frame path skips the lookup.
+    var onTopVisibleIndexChange: ((Int?) -> Void)? {
+        didSet { lastTopVisibleIndex = nil }
+    }
+    private var lastTopVisibleIndex: Int?
+
+    /// One pass over the slots this frame already resolved, without allocation.
+    private func reportTopVisibleIndex(in visibleSlots: [GridSlot], viewportHeight: CGFloat) {
+        guard let onTopVisibleIndexChange else { return }
+        let top = PhotoPerformanceSignposts.grid.interval("scrollDateLabel.anchor") {
+            GridScrollAnchorPolicy.anchor(
+                among: visibleSlots, visibleTop: topBarInset, visibleBottom: viewportHeight, frame: \.viewportRect)?
+                .index
+        }
+        guard top != lastTopVisibleIndex else { return }
+        lastTopVisibleIndex = top
+        onTopVisibleIndexChange(top)
+    }
+
     // MARK: - Engine render
 
     /// Resolves a `GridFramePlan` and draws its square slots. The engine owns settled and live geometry.
@@ -1969,6 +1989,7 @@ final class MetalGridCoordinator: NSObject, MTKViewDelegate {
                     level: level, viewportSize: layoutViewportSize,
                     scrollOffset: CGPoint(x: rawOrigin.x, y: renderY), overscan: overscan, columnPhase: phase)
             }
+            reportTopVisibleIndex(in: plan.visibleSlots, viewportHeight: viewportSize.height)
             slots = renderTranslate(
                 plan.visibleSlots.map {
                     GridRenderSlot(index: $0.index, column: $0.column, row: $0.row, rect: $0.viewportRect)
