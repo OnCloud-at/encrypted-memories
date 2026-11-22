@@ -164,7 +164,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                     default: "backup.phase_waiting"
                     }
             }
-            // A full Proton storage is the person's to fix (D5), so its wait asks the person.
+            // A full Proton storage is the person's to fix, so its wait asks the person.
             self.init(
                 headlineKey: headlineKey, isActive: false,
                 accessory: headlineKey == "backup.phase_waiting_account_storage" ? .attention : .waiting,

@@ -1893,7 +1893,9 @@ public actor BackupSyncRunner {
                         entry, from: persistedState, until: eligibleAt,
                         issue: BackupIssueRecord(
                             kind: .unknown, detail: detail, nextAttemptAt: eligibleAt,
-                            automaticRetryAttempt: waits
+                            automaticRetryAttempt: waits,
+                            waitingSince: BackupItemOutcome.waitStart(
+                                continuing: earlier, sameWait: waits > 0, now: now())
                         ))
                     return
                 case .replacementGone:
@@ -2542,10 +2544,13 @@ public actor BackupSyncRunner {
             let detail = BackupItemOutcome.sourceUnavailableDetail
             let attempt = min(32, Self.sourceWaits(of: entry, detail: detail) + 1)
             let eligibleAt = now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempt))
+            let earlier = BackupIssueRecord.decode(entry.lastError)
             deferSource(
                 entry, from: oldState, until: eligibleAt,
                 issue: BackupIssueRecord(
-                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: attempt))
+                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: attempt,
+                    waitingSince: BackupItemOutcome.waitStart(
+                        continuing: earlier, sameWait: earlier?.detail == detail, now: now())))
             return
         }
         // Photos reports the file as missing. A short iCloud fault can report that too, so the row checks again
@@ -2919,11 +2924,15 @@ public actor BackupSyncRunner {
             previousAttempt = 0
         }
         let attempt = min(32, previousAttempt + 1)
+        // Only a temporary Proton wait keeps its start; a lost connection has its own waiting line.
+        let continuesProtonWait = previous?.kind == .remoteService && previous?.isUnprovenServiceWait == false
         return BackupIssueRecord(
             kind: kind,
             detail: detail,
             nextAttemptAt: now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempt)),
-            automaticRetryAttempt: attempt
+            automaticRetryAttempt: attempt,
+            waitingSince: kind == .remoteService
+                ? BackupItemOutcome.waitStart(continuing: previous, sameWait: continuesProtonWait, now: now()) : nil
         )
     }
 

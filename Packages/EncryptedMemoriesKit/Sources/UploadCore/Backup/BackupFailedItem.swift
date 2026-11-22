@@ -55,9 +55,10 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         self.revision = revision
     }
 
-    public init(entry: UploadBackupSyncQueueEntry) {
+    /// `now` decides whether a wait already lasted a week; tests that run on their own clock pass it.
+    public init(entry: UploadBackupSyncQueueEntry, now: Date = Date()) {
         let record = BackupIssueRecord.decode(entry.lastError)
-        let outcome = BackupItemOutcome(state: entry.state, record: record)
+        let outcome = BackupItemOutcome(state: entry.state, record: record, now: now)
         self.init(
             id: "\(entry.source.kind.rawValue)/\(entry.source.identifier)/\(entry.source.resource.rawValue)"
                 + "#\(entry.revision.rawValue)",

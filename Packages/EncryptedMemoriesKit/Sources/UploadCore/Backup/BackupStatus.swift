@@ -138,10 +138,13 @@ public struct BackupStatus: Sendable, Equatable {
     /// these raise the orange attention line.
     public var needsAttentionCount = 0
     /// Rows that are not backed up although nothing the person can fix is known. They show in a calm line.
-    public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) }
+    public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) + longWaitingCount }
+    /// Rows the backup still runs after a week in one wait that does not end by itself. They count in the calm
+    /// line; their retries continue.
+    public var longWaitingCount = 0
     /// Whether the summary counts any photo that is not backed up, orange or calm: the problem list must show one.
     public var hasPhotosNotBackedUp: Bool { needsAttentionCount + notBackedUpCount > 0 }
-    /// The failed and final part of `notBackedUpCount`, for a host that lists missing photos in their own line.
+    /// The calm count without the missing photos, for a host that lists those in their own line.
     public var notBackedUpFailedCount: Int { max(0, notBackedUpCount - sourceMissing) }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
     /// list reloads only when its content can differ.
@@ -212,6 +215,7 @@ public struct BackupStatus: Sendable, Equatable {
         skippedRemoteDeletions = progress.skippedRemoteDeletions
         sourceMissing = progress.sourceMissing
         needsAttentionCount = min(max(0, progress.attention), progress.needsAttention)
+        longWaitingCount = min(max(0, progress.longWaiting), progress.waiting + progress.checking)
         waitingRetry = progress.blocked
         remainingCount = progress.waiting + progress.checking + progress.uploading
         hasOutstandingWork = progress.hasOutstandingWork

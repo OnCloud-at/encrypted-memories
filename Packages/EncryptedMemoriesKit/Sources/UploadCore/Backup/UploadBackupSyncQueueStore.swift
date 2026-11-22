@@ -1271,6 +1271,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     public func summary() -> UploadBackupSyncQueueSummary? {
         // The parked rows are copied under the lock and judged after it: their stored errors are decoded one by one,
         // and the lock also serves the health probe that the views read.
+        let now = Date()
         let read: (UploadBackupSyncQueueSummary, [(UploadBackupSyncQueueState, String?)])? = connection.withLock {
             var summary = UploadBackupSyncQueueSummary()
             // An unknown state is a lasting failure at once; the read stops at that row.
@@ -1287,6 +1288,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     summary.pendingSourceRechecks += row.count
                 } else {
                     summary.include(state, count: row.count)
+                    // The stored error of a waiting or checking row is part of the group, so each group is one wait.
+                    if row.checkReason != nil,
+                        BackupItemOutcome.isLongWait(
+                            state: state, record: BackupIssueRecord.decode(row.checkReason), now: now)
+                    {
+                        summary.longWaiting += row.count
+                    }
                 }
                 return true
             }
