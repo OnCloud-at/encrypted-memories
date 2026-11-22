@@ -367,7 +367,7 @@
                                 probe.appeared.fulfill()
                             }
                             .onDisappear { probe.disappeared.fulfill() }
-                            .onProtectedCover { probe.coverActions += 1 }
+                            .onProtectedCover { covered in if covered { probe.coverActions += 1 } }
                             .protectedScope(
                                 state.scope, gate: state.gate, unlockTitle: "Unlock", accessibilityLabel: "Locked",
                                 reason: "Unlock", snapshot: state.snapshot, scenePhase: state.phase)

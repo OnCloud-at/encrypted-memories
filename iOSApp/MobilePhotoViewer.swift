@@ -1543,8 +1543,8 @@ struct MobileImagePage: View {
         .onChange(of: isCurrent) { _, current in
             if !current { cancelZoomDecode() }
         }
-        // The motion clip plays with sound through its own layer, outside the video surface hook.
-        .onProtectedCover { motion.stop() }
+        // The motion clip has its own layer outside the video surface hook; a loop also pauses while covered.
+        .onProtectedCover { motion.setCovered($0) }
         .onDisappear {
             cancelZoomDecode()
             motion.teardown()

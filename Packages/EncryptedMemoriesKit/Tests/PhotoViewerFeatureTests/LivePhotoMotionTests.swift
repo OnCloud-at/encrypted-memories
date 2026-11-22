@@ -247,6 +247,61 @@ final class LivePhotoMotionTests: XCTestCase {
     }
 
     @MainActor
+    func testTheAppCoverPausesARealLoopAndUncoveringStartsItAgain() async throws {
+        let provider = MotionPrefetchProbe(url: try motionFixture())
+        let controller = LivePhotoMotionController()
+        defer { controller.teardown() }
+        controller.prepare(
+            for: item(isLivePhoto: true, relatedVideoID: "motion", looping: true), streamer: provider
+        ) { true }
+        try await waitUntil(timeout: .seconds(10)) { await controller.loadState == .ready }
+        let player = try XCTUnwrap(controller.player)
+        try await waitForPlayback(of: player)
+        controller.setCovered(true)
+        XCTAssertFalse(controller.isPlaying)
+        XCTAssertEqual(player.rate, 0, "a covered loop must not keep decoding")
+        controller.setCovered(false)
+        XCTAssertTrue(controller.isPlaying)
+        try await waitForPlayback(of: player)
+    }
+
+    @MainActor
+    func testALoopThatFinishesLoadingWhileCoveredStaysPausedUntilUncovered() async throws {
+        let provider = MotionPrefetchProbe(url: try motionFixture())
+        let controller = LivePhotoMotionController()
+        defer { controller.teardown() }
+        controller.setCovered(true)
+        controller.prepare(
+            for: item(isLivePhoto: true, relatedVideoID: "motion", looping: true), streamer: provider
+        ) { true }
+        try await waitUntil(timeout: .seconds(10)) { await controller.loadState == .ready }
+        let player = try XCTUnwrap(controller.player)
+        XCTAssertFalse(controller.isPlaying, "a preload that finishes under the cover must not start")
+        XCTAssertEqual(player.rate, 0)
+        controller.setCovered(false)
+        XCTAssertTrue(controller.isPlaying)
+        XCTAssertTrue(player.isMuted)
+    }
+
+    @MainActor
+    func testAPressWhileCoveredDoesNotStartMotionAfterUncover() async throws {
+        let provider = MotionPrefetchProbe(url: try motionFixture())
+        let controller = LivePhotoMotionController()
+        defer { controller.teardown() }
+        let live = item(isLivePhoto: true, relatedVideoID: "motion")
+        controller.prepare(for: live, streamer: provider) { true }
+        try await waitUntil(timeout: .seconds(10)) { await controller.loadState == .ready }
+        let player = try XCTUnwrap(controller.player)
+        controller.setCovered(true)
+        controller.play()
+        controller.play(for: live, streamer: provider) { true }
+        XCTAssertFalse(controller.isPlayRequested, "a press under the cover must not stay requested")
+        controller.setCovered(false)
+        XCTAssertFalse(controller.isPlaying, "uncovering must not start motion without a new press")
+        XCTAssertEqual(player.rate, 0)
+    }
+
+    @MainActor
     func testRealOrdinaryMotionWaitsForAPressAndStopsAfterOnePass() async throws {
         let provider = MotionPrefetchProbe(url: try motionFixture())
         let controller = LivePhotoMotionController()
@@ -332,6 +387,13 @@ final class LivePhotoMotionTests: XCTestCase {
         let url = root.appendingPathComponent("motion.mov")
         try data.write(to: url, options: .atomic)
         return url
+    }
+
+    @MainActor
+    private func waitForPlayback(of player: AVPlayer) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while player.rate == 0, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNotEqual(player.rate, 0, "the loop must play")
     }
 
     @MainActor

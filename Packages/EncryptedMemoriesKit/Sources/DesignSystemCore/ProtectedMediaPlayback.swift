@@ -55,19 +55,17 @@ public final class ProtectedMediaPlayback {
 }
 
 extension View {
-    /// Runs `action` whenever protected content becomes covered, including content that appears covered.
-    public func onProtectedCover(_ action: @escaping () -> Void) -> some View {
+    /// Runs `action` with the cover state when protected content appears and whenever the state changes.
+    public func onProtectedCover(_ action: @escaping (Bool) -> Void) -> some View {
         modifier(ProtectedCoverAction(action: action))
     }
 }
 
 private struct ProtectedCoverAction: ViewModifier {
     @Environment(\.protectedContentIsCovered) private var isCovered
-    let action: () -> Void
+    let action: (Bool) -> Void
 
     func body(content: Content) -> some View {
-        content.onChange(of: isCovered, initial: true) { _, covered in
-            if covered { action() }
-        }
+        content.onChange(of: isCovered, initial: true) { _, covered in action(covered) }
     }
 }

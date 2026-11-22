@@ -601,8 +601,8 @@ private struct ViewerStillImage: View {
                 }
             }
         }
-        // The motion clip plays with sound through its own layer, outside the video surface hook.
-        .onProtectedCover { model.stopMotion() }
+        // The motion clip has its own layer outside the video surface hook; a loop also pauses while covered.
+        .onProtectedCover { model.motion.setCovered($0) }
     }
 }
 
