@@ -138,6 +138,7 @@ private struct StressRankingRemote: ExactDuplicateRemote {
     func trashDuplicates(_ uids: [PhotoUID]) async throws {}
     func restoreDuplicates(_ uids: [PhotoUID]) async throws {}
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date] { [:] }
+    func libraryItems() async -> [PhotoItem]? { [] }
     func ownPhotosVolumeID() async throws -> String { "vol" }
     func activeUIDs(among uids: [PhotoUID]) async throws -> Set<PhotoUID> { Set(uids) }
     func markFavorite(_ uids: [PhotoUID]) async throws {}

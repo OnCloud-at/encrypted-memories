@@ -36,6 +36,7 @@ let storageFaultCases: [any StorageFaultCase] = [
     DeletionDecisionCase(keepDeleted: true, start: .appliedOppositeIntent),
     DeletionDecisionCase(keepDeleted: false, start: .appliedOppositeIntent),
     FingerprintCacheCase(id: "fingerprints.store", step: .store),
+    FingerprintCacheCase(id: "fingerprints.storeSizes", step: .storeSizes),
     FingerprintCacheCase(id: "fingerprints.advance", step: .advance),
     FingerprintCacheCase(id: "fingerprints.discontinuity", step: .discontinuity),
     TrashedSeriesRestoreCase(id: "trashedSeries.record", step: .record),
@@ -833,6 +834,7 @@ struct DeviceRootEnrollmentCase: StorageFaultCase {
 /// One transaction of the store under the exact duplicate details (`ExactDuplicateFingerprintStore`), each as
 /// `ExactDuplicateFingerprintCache` runs it:
 /// - `store`: the details of three photos saved under the cursor of the scan;
+/// - `storeSizes`: the same with the file size of each photo, as the check of possibly identical photos saves them;
 /// - `advance`: the persisted cursor recovered as after a launch, then moved on with the details of two photos dropped;
 /// - `discontinuity`: the cursor of another key epoch, which drops every detail.
 /// Every write of the context holds a new random generation, so the state reads the context without it, and the
@@ -840,6 +842,7 @@ struct DeviceRootEnrollmentCase: StorageFaultCase {
 struct FingerprintCacheCase: StorageFaultCase {
     enum Step: Sendable {
         case store
+        case storeSizes
         case advance
         case discontinuity
     }
@@ -855,6 +858,7 @@ struct FingerprintCacheCase: StorageFaultCase {
         defer { store.close() }
         let snapshot = try XCTUnwrap(store.prepare(scope: Self.scope, eventID: "event-1"))
         if case .store = step { return }
+        if case .storeSizes = step { return }
         XCTAssertTrue(store.store(Self.details(of: ["a", "b", "c"]), for: snapshot))
     }
 
@@ -872,6 +876,13 @@ struct FingerprintCacheCase: StorageFaultCase {
         case .store:
             guard let snapshot = store.prepare(scope: Self.scope, eventID: "event-1") else { return false }
             return store.store(Self.details(of: ["a", "b", "c"]), for: snapshot)
+        case .storeSizes:
+            guard let snapshot = store.prepare(scope: Self.scope, eventID: "event-1") else { return false }
+            let sizes = Dictionary(
+                uniqueKeysWithValues: ["a", "b", "c"].enumerated().map {
+                    (PhotoUID(volumeID: "volume", nodeID: $1), Int64($0 + 1) * 1_000)
+                })
+            return store.store(Self.details(of: ["a", "b", "c"]), byteSizes: sizes, for: snapshot)
         case .advance:
             guard let snapshot = store.prepare(scope: Self.scope, eventID: "event-1") else { return false }
             return store.advance(from: snapshot, to: "event-2", invalidating: ["a", "b"]) != nil

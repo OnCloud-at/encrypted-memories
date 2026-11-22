@@ -3856,6 +3856,163 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.differingGroups, listed)
         XCTAssertEqual(finder.rankCalls, ranks, "the screen reads nothing again")
     }
+
+    // MARK: - Possibly the same photo
+
+    private let x1 = PhotoUID(volumeID: "v", nodeID: "x1")
+    private let x2 = PhotoUID(volumeID: "v", nodeID: "x2")
+    private let x3 = PhotoUID(volumeID: "v", nodeID: "x3")
+    private let shape = PossibleDuplicatePolicy(rule: .sameShape, includesVideos: true)
+
+    /// x1 and x2 are JPEGs and x3 a HEIC of the same moment.
+    private var threeFiles: PossibleDuplicateScan {
+        PossibleDuplicateScan(
+            groups: [PossibleDuplicateGroup(members: [x1, x2, x3], differences: [.fileType])],
+            byteSizes: [x1: 3, x2: 2, x3: 1],
+            fingerprints: [
+                x1: .possiblePhoto(type: "image/jpeg"), x2: .possiblePhoto(type: "image/jpeg"),
+                x3: .possiblePhoto(type: "image/heic"),
+            ])
+    }
+
+    func testThePossibleCheckListsTheFinderGroupsAndCountsTheScannedCopiesAsOneFile() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.load()
+
+        await model.checkPossibleDuplicates(policy: shape)
+
+        XCTAssertEqual(model.possibleGroups, threeFiles.groups)
+        XCTAssertEqual(model.possibleSizes, [x1: 3, x2: 2, x3: 1])
+        XCTAssertEqual(finder.possibleRequests, [.init(sameBytes: ["A"], policy: shape)])
+        XCTAssertFalse(model.possibleCheckFailed)
+    }
+
+    func testACopyTrashedInTheLibraryLeavesThePossibleGroupsAtOnce() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+
+        model.didTrashElsewhere([x3])
+
+        XCTAssertEqual(
+            model.possibleGroups, [PossibleDuplicateGroup(members: [x1, x2], differences: [])],
+            "two different files with equal details stay possibly the same photo")
+
+        model.didTrashElsewhere([x2])
+
+        XCTAssertEqual(model.possibleGroups, [], "one file is left")
+        XCTAssertEqual(model.possibleSizes, [:])
+        XCTAssertEqual(finder.possibleRequests.count, 1, "the list follows without a new check")
+    }
+
+    func testTheGroupOfTheFirstCopyFollowsWhenTheFirstCopyLeaves() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+
+        model.didTrashElsewhere([x1])
+
+        XCTAssertEqual(model.possibleGroups, [PossibleDuplicateGroup(members: [x2, x3], differences: [.fileType])])
+        XCTAssertEqual(model.possibleSizes, [x2: 2, x3: 1])
+    }
+
+    func testACopyTrashedWhileTheCheckRunsIsNotListed() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        finder.possibleGate.close()
+        let (model, _) = makeModel(finder)
+        let check = Task { await model.checkPossibleDuplicates(policy: shape) }
+        await assertEventually({ finder.possibleGate.hasWaiters }, "the check reads")
+        XCTAssertTrue(model.isCheckingPossibleDuplicates)
+
+        model.didTrashElsewhere([x1])
+        finder.possibleGate.open()
+        await check.value
+
+        XCTAssertEqual(model.possibleGroups, [PossibleDuplicateGroup(members: [x2, x3], differences: [.fileType])])
+        XCTAssertFalse(model.isCheckingPossibleDuplicates)
+    }
+
+    func testAnUnreadableLibraryKeepsTheLastPossibleGroupsAndSaysSo() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+
+        finder.possible = nil
+        await model.checkPossibleDuplicates(policy: shape)
+
+        XCTAssertEqual(model.possibleGroups, threeFiles.groups)
+        XCTAssertTrue(model.possibleCheckFailed)
+    }
+
+    func testAnOpenScreenChecksThePossibleDuplicatesAfterTheIdenticalCopies() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.possible = threeFiles
+        let model = ExactDuplicatesModel(finder: finder, possibleDuplicatePolicy: shape)
+
+        await model.load()
+
+        XCTAssertEqual(finder.possibleRequests, [], "a load without the screen checks nothing")
+
+        await model.load(checkAllGroups: true)
+
+        XCTAssertEqual(finder.possibleRequests, [.init(sameBytes: ["A"], policy: shape)])
+        XCTAssertEqual(finder.rankCallsBeforePossibleChecks, [finder.rankCalls], "the identical copies come first")
+        XCTAssertEqual(model.possibleGroups, threeFiles.groups)
+    }
+
+    func testWithoutAPolicyTheScreenChecksNoPossibleDuplicates() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+
+        await model.load(checkAllGroups: true)
+
+        XCTAssertEqual(finder.possibleRequests, [])
+        XCTAssertEqual(model.possibleGroups, [])
+    }
+
+    func testACancelledCheckKeepsTheLastPossibleGroups() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+        finder.possible = PossibleDuplicateScan()
+        finder.possibleGate.close()
+        let check = Task { await model.checkPossibleDuplicates(policy: shape) }
+        await assertEventually({ finder.possibleGate.hasWaiters }, "the second check reads")
+
+        check.cancel()
+        finder.possibleGate.open()
+        await check.value
+
+        XCTAssertEqual(model.possibleGroups, threeFiles.groups, "a cancelled check may have read only a part")
+        XCTAssertFalse(model.possibleCheckFailed)
+        XCTAssertFalse(model.isCheckingPossibleDuplicates)
+    }
+
+    func testACopyThatAMergeMovedToRecentlyDeletedLeavesThePossibleGroups() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        let scanned = PossibleDuplicateScan(
+            groups: [PossibleDuplicateGroup(members: [a1, x1], differences: [.fileType])],
+            byteSizes: [:],
+            fingerprints: [a1: .possiblePhoto(type: "image/jpeg"), x1: .possiblePhoto(type: "image/heic")])
+        finder.possible = scanned
+        let (model, _) = makeModel(finder)
+        await model.load()
+        await model.checkPossibleDuplicates(policy: shape)
+        model.keep(a2, inGroup: "A")
+
+        await model.merge(groupID: "A")
+
+        XCTAssertEqual(finder.merges, [.init(group: "A", kept: a2)])
+        XCTAssertEqual(model.possibleGroups, [], "the merge moved a1 to Recently Deleted")
+    }
 }
 
 @MainActor
@@ -3918,6 +4075,30 @@ private final class FakeDuplicateFinder: ExactDuplicateMerging, @unchecked Senda
     var buildError: Error?
     /// Holds the build while it is closed.
     let buildGate = BuildGate()
+    struct PossibleRequest: Equatable {
+        let sameBytes: [String]
+        let policy: PossibleDuplicatePolicy
+    }
+    /// The result of the check of possibly identical photos; nil for an unreadable library.
+    var possible: PossibleDuplicateScan?
+    private var _possibleRequests: [PossibleRequest] = []
+    var possibleRequests: [PossibleRequest] { lock.withLock { _possibleRequests } }
+    private var _rankCallsBeforePossibleChecks: [Int] = []
+    /// The rankings that ran before each check of possibly identical photos.
+    var rankCallsBeforePossibleChecks: [Int] { lock.withLock { _rankCallsBeforePossibleChecks } }
+    /// Holds the check of possibly identical photos while it is closed.
+    let possibleGate = BuildGate()
+
+    func possibleDuplicates(
+        excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
+    ) async -> PossibleDuplicateScan? {
+        lock.withLock {
+            _possibleRequests.append(PossibleRequest(sameBytes: sameBytes.map(\.id), policy: policy))
+            _rankCallsBeforePossibleChecks.append(_rankCalls)
+        }
+        await possibleGate.pass()
+        return lock.withLock { possible }
+    }
     /// Holds the merge while it is closed.
     let mergeGate = BuildGate()
     var ranked: [String: [PhotoUID]] = [:]

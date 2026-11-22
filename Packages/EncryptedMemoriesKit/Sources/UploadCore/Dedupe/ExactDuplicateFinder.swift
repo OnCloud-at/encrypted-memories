@@ -18,6 +18,8 @@ public protocol ExactDuplicateRemote: PhotoCarryOverRemote {
     func restoreDuplicates(_ uids: [PhotoUID]) async throws
     /// The capture dates that the device already knows, without a request. Unknown photos are left out.
     func captureDates(of uids: [PhotoUID]) async -> [PhotoUID: Date]
+    /// The photos of the device's stored timeline, without a request. Nil while no stored timeline can be read.
+    func libraryItems() async -> [PhotoItem]?
     /// The sharing state and the size of each photo, from one node read for each photo. A trash ends the sharing.
     func nodeFacts(of uids: [PhotoUID]) async throws -> [PhotoUID: ExactDuplicateNodeFacts]
 }
@@ -466,6 +468,7 @@ public struct ExactDuplicateFinder: Sendable {
             var pageFacts: [String: [PhotoUID: ExactDuplicateKeepFacts]] = [:]
             var memberSizes: [String: [PhotoUID: Int64]] = [:]
             var fingerprints: [String: [PhotoUID: ExactDuplicateFingerprint]] = [:]
+            var savedSizes: [String: [PhotoUID: Int64]] = [:]
             for group in page {
                 guard let read = facts[group.id] else {
                     failed += 1
@@ -483,6 +486,7 @@ public struct ExactDuplicateFinder: Sendable {
                     memberSizes[group.id] = Dictionary(known, uniquingKeysWith: { first, _ in first })
                 }
                 fingerprints[group.id] = read.mapValues(\.fingerprint)
+                savedSizes[group.id] = read.mapValues(Self.savedSize)
                 var memberFacts: [PhotoUID: ExactDuplicateKeepFacts] = [:]
                 for member in group.members {
                     memberFacts[member] = Self.keepFacts(
@@ -496,8 +500,9 @@ public struct ExactDuplicateFinder: Sendable {
             // Details of a successful read only, and only while the index still stands at the cursor of the scan.
             if let cache = fingerprintCache, let epoch = page.first?.hashKeyEpoch {
                 cache.record(
-                    fingerprints.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } }, for: snapshot,
-                    currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
+                    fingerprints.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } },
+                    byteSizes: savedSizes.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } },
+                    for: snapshot, currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
             }
             await ranked(
                 ExactDuplicateRankingPage(
@@ -508,6 +513,106 @@ public struct ExactDuplicateFinder: Sendable {
             "[Duplicates] ranking groups=\(groups.count) members=\(members.count) failedGroups=\(failed) "
                 + "nodeReads=\(members.count) "
                 + "duration=\(start.duration(to: .now))")
+    }
+
+    /// Different files of the library that are possibly the same photo, by `policy`. The candidates come from the
+    /// stored timeline without a request, and only their nodes are read, one candidate group at a time and
+    /// `rankingConcurrency` groups at once. The copies of `sameBytes` after their first copy are no candidates. When
+    /// the read of a candidate group fails, the copies of that group that needed a read are left out of the result. Nil
+    /// while the stored timeline cannot be read, because then nothing is known about the candidates.
+    public func possibleDuplicates(
+        excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
+    ) async -> PossibleDuplicateScan? {
+        let start = ContinuousClock.now
+        guard let items = await remote.libraryItems() else { return nil }
+        let candidates = PossibleDuplicateCandidates.groups(
+            of: items, sameBytes: sameBytes.map(\.members),
+            includesVideos: policy.includesVideos)
+        // The cursor before the first read: the details saved during this check belong to it.
+        let snapshot = await possibleDuplicateSnapshot()
+        let lookup = fingerprintCache.map { $0.facts(of: candidates.flatMap { $0 }, in: snapshot) }
+        let saved: [PhotoUID: ExactDuplicateFingerprintStore.Facts]
+        let cache: ExactDuplicateFingerprintCache?
+        switch lookup {
+        case .found(let facts):
+            saved = facts
+            cache = fingerprintCache
+        case .absent, nil:
+            saved = [:]
+            cache = fingerprintCache
+        case .unknown:
+            // The saved facts cannot be read: every candidate is read again, and nothing is saved to that store.
+            saved = [:]
+            cache = nil
+        }
+        let remote = remote
+        let index = index
+        let reads = await BoundedConcurrency.map(candidates, limit: Self.rankingConcurrency) {
+            (members: [PhotoUID]) -> [PhotoUID: ExactDuplicateNodeFacts]? in
+            // A saved row without size information, such as one from before sizes were saved, is read again. A row of
+            // a node that states no size holds zero, and a node without photo details matches no other copy; neither
+            // is read again.
+            let unsaved = members.filter { member in
+                guard let row = saved[member] else { return true }
+                return row.byteSize == nil && !row.fingerprint.matchesOnlyItsNode
+            }
+            guard !unsaved.isEmpty else { return [PhotoUID: ExactDuplicateNodeFacts]() }
+            guard let read = try? await remote.nodeFacts(of: unsaved) else { return nil }
+            // Each group saves at once, so a pass that stops keeps what it read. Only while the index still stands at
+            // the cursor of the snapshot, and only the photos of its volume.
+            if let cache, let snapshot {
+                let own = read.filter { $0.key.volumeID == snapshot.scope.volumeID }
+                cache.record(
+                    own.mapValues(\.fingerprint), byteSizes: own.mapValues(Self.savedSize), for: snapshot,
+                    currentEventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: snapshot.scope.hashKeyEpoch)?
+                        .eventID)
+            }
+            return read
+        }
+        var fingerprints = saved.mapValues(\.fingerprint)
+        var sizes = saved.compactMapValues { Self.shownSize($0.byteSize) }
+        var readCount = 0
+        for case let read?? in reads {
+            readCount += read.count
+            fingerprints.merge(read.mapValues(\.fingerprint)) { _, read in read }
+            sizes.merge(read.compactMapValues(Self.positiveSize)) { _, read in read }
+        }
+        let groups = policy.groups(of: candidates, fingerprints: fingerprints)
+        let members = Set(groups.flatMap(\.members))
+        log(
+            "possible duplicates candidates=\(candidates.count) saved=\(saved.count) nodeReads=\(readCount) "
+                + "groups=\(groups.count) duration=\(start.duration(to: .now))")
+        return PossibleDuplicateScan(
+            groups: groups, byteSizes: sizes.filter { members.contains($0.key) },
+            fingerprints: fingerprints.filter { members.contains($0.key) })
+    }
+
+    /// A size above zero; zero and no size are never shown.
+    private static func shownSize(_ size: Int64?) -> Int64? {
+        size.flatMap { $0 > 0 ? $0 : nil }
+    }
+
+    /// The size that a node states, when it states one above zero.
+    private static func positiveSize(_ facts: ExactDuplicateNodeFacts) -> Int64? {
+        shownSize(facts.byteSize)
+    }
+
+    /// The size to save for a node that was read: its size above zero, or zero for a node that states none, so the
+    /// next check knows that the node was read and does not read it again. Zero is never shown.
+    private static func savedSize(_ facts: ExactDuplicateNodeFacts) -> Int64 {
+        positiveSize(facts) ?? 0
+    }
+
+    /// The snapshot of the latest scan, or a new one at the current cursor of the content index. Nil without a cache
+    /// or a cursor: the check then reads every candidate and saves nothing.
+    private func possibleDuplicateSnapshot() async -> ExactDuplicateFingerprintStore.Snapshot? {
+        guard let fingerprintCache else { return nil }
+        if let current = fingerprintCache.currentSnapshot() { return current }
+        guard let epoch = try? await checker.hashKeyEpoch(), let volumeID = try? await remote.ownPhotosVolumeID()
+        else { return nil }
+        return fingerprintCache.currentSnapshot(
+            orBeginAt: volumeID, hashKeyEpoch: epoch,
+            eventID: index.remoteContentIndexCheckpoint(hashKeyEpoch: epoch)?.eventID)
     }
 
     private typealias GroupFacts = [PhotoUID: ExactDuplicateNodeFacts]

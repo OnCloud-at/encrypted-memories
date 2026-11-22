@@ -70,6 +70,11 @@ public protocol ExactDuplicateMerging: Sendable {
     func merge(
         _ requests: [ExactDuplicateMergeRequest], in run: ExactDuplicateMergeRun
     ) async -> [Result<ExactDuplicateMergeOutcome, any Error>]
+    /// Different files of the library that are possibly the same photo, by `policy`. The copies of `sameBytes` after
+    /// their first copy count as one file. Nil while the library cannot be read.
+    func possibleDuplicates(
+        excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
+    ) async -> PossibleDuplicateScan?
     /// Checks the merges that an earlier failure or the end of the process left open, and restores a copy of a group
     /// that has none in the library. Reads nothing from the server while no merge is open.
     func resolvePendingMerges() async
@@ -90,6 +95,11 @@ extension ExactDuplicateMerging {
     public func storedFingerprints(of groups: [ExactDuplicateGroup]) async -> [PhotoUID: ExactDuplicateFingerprint] {
         [:]
     }
+
+    /// Mergers without a library read know nothing about possibly identical photos.
+    public func possibleDuplicates(
+        excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
+    ) async -> PossibleDuplicateScan? { nil }
 
     /// Mergers without a merge journal leave no merge open.
     public func resolvePendingMerges() async {}
@@ -425,6 +435,20 @@ public final class ExactDuplicatesModel {
     /// The copies with the same bytes whose details differ, each group with the known metadata of every copy. No
     /// merge, count, or freed space includes them. A later check keeps them, so an open list stays while it runs.
     public private(set) var differingGroups: [ExactDuplicateDifferingGroup] = []
+    /// Different files that are possibly the same photo, from the last check that could read the library.
+    public private(set) var possibleGroups: [PossibleDuplicateGroup] = []
+    /// The file size of each copy of `possibleGroups` that its node states.
+    public private(set) var possibleSizes: [PhotoUID: Int64] = [:]
+    /// The check of possibly identical photos runs.
+    public private(set) var isCheckingPossibleDuplicates = false
+    /// The last check of possibly identical photos could not read the library; `possibleGroups` are older.
+    public private(set) var possibleCheckFailed = false
+    /// The rule of `possibleGroups`, so they follow a copy that leaves without a new check.
+    @ObservationIgnored private var possiblePolicy: PossibleDuplicatePolicy?
+    /// The details of the copies of `possibleGroups`.
+    @ObservationIgnored private var possibleFingerprints: [PhotoUID: ExactDuplicateFingerprint] = [:]
+    /// The copies that left the library while the check of possibly identical photos ran.
+    @ObservationIgnored private var trashedDuringPossibleCheck: Set<PhotoUID> = []
     /// The screen waits for its scan and metadata check.
     public private(set) var isCheckingGroups = false
     /// The metadata check, else the running library check, for example while a reopened screen reads its groups.
@@ -567,10 +591,15 @@ public final class ExactDuplicatesModel {
     /// Called with the photos that a merge moved to Recently Deleted, so the library stops showing them.
     @ObservationIgnored private let didTrash: @MainActor ([PhotoUID]) async -> Void
 
+    /// The rule of the check of possibly identical photos that an open screen runs. Nil: no such check runs.
+    @ObservationIgnored private let possibleDuplicatePolicy: PossibleDuplicatePolicy?
+
     public init(
-        finder: any ExactDuplicateMerging, didTrash: @escaping @MainActor ([PhotoUID]) async -> Void = { _ in }
+        finder: any ExactDuplicateMerging, possibleDuplicatePolicy: PossibleDuplicatePolicy? = nil,
+        didTrash: @escaping @MainActor ([PhotoUID]) async -> Void = { _ in }
     ) {
         self.finder = finder
+        self.possibleDuplicatePolicy = possibleDuplicatePolicy
         self.didTrash = didTrash
     }
 
@@ -897,7 +926,7 @@ public final class ExactDuplicatesModel {
     /// to the next copy.
     public func didTrashElsewhere(_ uids: [PhotoUID]) {
         let trashed = Set(uids)
-        leaveDifferingGroups(trashed)
+        leaveDerivedLists(trashed)
         guard groups.contains(where: { group in group.members.contains(where: trashed.contains) }) else { return }
         var updated = groups
         for index in updated.indices.reversed() where updated[index].members.contains(where: trashed.contains) {
@@ -911,6 +940,33 @@ public final class ExactDuplicatesModel {
             }
         }
         groups = updated
+    }
+
+    /// Checks the library for different files that are possibly the same photo, by `policy`. The copies of the
+    /// groups of the last scan after their first copy count as one file. A check that cannot read the library keeps
+    /// the last groups and sets `possibleCheckFailed`; a cancelled check keeps them, too. A copy that leaves the library
+    /// during the check is not listed.
+    public func checkPossibleDuplicates(policy: PossibleDuplicatePolicy) async {
+        guard !isRetired, !isCheckingPossibleDuplicates else { return }
+        isCheckingPossibleDuplicates = true
+        trashedDuringPossibleCheck = []
+        defer {
+            isCheckingPossibleDuplicates = false
+            trashedDuringPossibleCheck = []
+        }
+        let scan = await finder.possibleDuplicates(excluding: scannedGroups, policy: policy)
+        // A cancelled check may have read only a part of the candidates.
+        guard !Task.isCancelled else { return }
+        guard let scan else {
+            possibleCheckFailed = true
+            return
+        }
+        possibleCheckFailed = false
+        possiblePolicy = policy
+        possibleFingerprints = scan.fingerprints
+        possibleSizes = scan.byteSizes
+        possibleGroups = scan.groups
+        leavePossibleGroups(trashedDuringPossibleCheck)
     }
 
     /// Reads the groups, then ranks the first two pages, or every page for an open screen, and brings the content
@@ -937,6 +993,10 @@ public final class ExactDuplicatesModel {
         async let ranked: Void = rank(around: 0)
         async let built: Void = buildAndRescan(generation: generation)
         _ = await (ranked, built)
+        // An open screen checks for possibly identical photos once the identical copies are known.
+        if checksAllGroups, let possibleDuplicatePolicy, generation == loadGeneration, !Task.isCancelled {
+            await checkPossibleDuplicates(policy: possibleDuplicatePolicy)
+        }
     }
 
     /// The screen shows the group. After a short pause without another group shown, ranks the pages of the first and
@@ -1268,6 +1328,25 @@ public final class ExactDuplicatesModel {
         if differing != differingGroups { differingGroups = differing }
     }
 
+    /// The copies in `trashed` left the library, so they leave every list that the scans and checks derived, at once.
+    private func leaveDerivedLists(_ trashed: Set<PhotoUID>) {
+        leaveDifferingGroups(trashed)
+        leavePossibleGroups(trashed)
+    }
+
+    /// The copies in `trashed` leave the possibly identical photos without a new check. The other copies of a group
+    /// form their groups again by the same rule, so a group whose first copy left follows its next copy.
+    private func leavePossibleGroups(_ trashed: Set<PhotoUID>) {
+        if isCheckingPossibleDuplicates { trashedDuringPossibleCheck.formUnion(trashed) }
+        guard let possiblePolicy, possibleGroups.contains(where: { $0.members.contains(where: trashed.contains) })
+        else { return }
+        possibleGroups = possiblePolicy.groups(
+            of: possibleGroups.map { $0.members.filter { !trashed.contains($0) } }, fingerprints: possibleFingerprints)
+        let members = Set(possibleGroups.flatMap(\.members))
+        possibleSizes = possibleSizes.filter { members.contains($0.key) }
+        possibleFingerprints = possibleFingerprints.filter { members.contains($0.key) }
+    }
+
     /// The copies in `trashed` left the library, so they leave the differing copies at once, without a new scan.
     private func leaveDifferingGroups(_ trashed: Set<PhotoUID>) {
         guard scannedGroups.contains(where: { $0.members.contains(where: trashed.contains) }) else { return }
@@ -1597,7 +1676,7 @@ public final class ExactDuplicatesModel {
                 }
             }
             if updated != groups { groups = updated }
-            leaveDifferingGroups(Set(trashed))
+            leaveDerivedLists(Set(trashed))
             if !trashed.isEmpty { await didTrash(trashed) }
             guard all else { continue }
             mergeAllProgress = ExactDuplicateScanProgress(completed: handled, total: selected.count)
