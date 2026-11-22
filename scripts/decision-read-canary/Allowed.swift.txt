@@ -29,3 +29,21 @@ var current: StoreLookup<Int> {
 extension StoreLookup {
     static func make() -> Self { _ = try? lookUp(); return .unknown }
 }
+
+// Decision protocols (#1148): a store reached through its protocol, created by its constructor, or named for a nested
+// type. A comment that names `queue: UploadBackupSyncQueueManifestStore` is no declaration.
+func allowedStores(queue: any UploadBackupSyncQueueStore, settlement: (any UploadManualSettlementStoreProtocol)?) {
+    let store = UploadBackupSyncQueueManifestStore(url: url)
+    let update: UploadBackupSyncQueueManifestStore.StateUpdate? = nil
+    let other = flag ? settlement : UploadManualSettlementStore(url: url)
+    use(queue, UploadBackupSyncQueueManifestStore(url: url))
+    use(queue, UploadCore.PendingBackupManifestStore.databaseFileName)
+    // Known gaps of the store rule: a type alias, a same-type requirement, an inferred type, a store passed as `Any`,
+    // a metatype after `=`, and a declaration after a `//` in a string earlier on the line.
+    typealias Queue = UploadBackupSyncQueueManifestStore
+    func narrow<W>(_ value: W?) where W == PendingBackupManifestStore {}
+    let inferred = makeCatalog() as Any
+    _ = PendingBackupManifestStore.self
+    let slash = "//"; let late: UploadManualSettlementStore
+    /// A doc comment that names `queue: UploadBackupSyncQueueManifestStore` is no declaration either.
+}

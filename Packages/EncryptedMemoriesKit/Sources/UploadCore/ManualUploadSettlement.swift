@@ -209,12 +209,6 @@ public struct UploadManualSettlementRecord: Codable, Sendable, Equatable {
     public var isProvenTerminal: Bool { stage == .terminal && terminalState != nil }
 }
 
-/// The result of one settlement-table sweep. An unreadable sweep is never an empty table (#1104).
-public enum UploadManualSettlementListReadOutcome: Sendable {
-    case records([UploadManualSettlementRecord])
-    case unreadable
-}
-
 /// Synchronous, thread-safe store contract used by the actor-owned manual queue and its settlement
 /// worker. Implementations must return `false` after an I/O failure. An empty failed read is never
 /// interpreted as a drained queue.
@@ -230,7 +224,9 @@ public protocol UploadManualSettlementStoreProtocol: Sendable {
     @discardableResult
     func upsert(_ record: UploadManualSettlementRecord) -> Bool
     func readOutcome(for queueItemID: UploadQueueItemID) -> StoreLookup<UploadManualSettlementRecord>
-    func readAllOutcome() -> UploadManualSettlementListReadOutcome
+    /// One sweep of the whole settlement table: `found` holds every row, `absent` says that a complete sweep found
+    /// none, and `unknown` says that the sweep failed. An unknown sweep is never an empty table (#1104, #1140).
+    func readAllOutcome() -> StoreLookup<[UploadManualSettlementRecord]>
     @discardableResult
     func remove(queueItemID: UploadQueueItemID) -> Bool
     func close()
@@ -380,9 +376,8 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
         }
     }
 
-    public func readAllOutcome() -> UploadManualSettlementListReadOutcome {
-        guard let records = readRecords(whereClause: nil) else { return .unreadable }
-        return .records(records)
+    public func readAllOutcome() -> StoreLookup<[UploadManualSettlementRecord]> {
+        StoreLookup(catchingRows: readRecords)
     }
 
     @discardableResult
@@ -418,27 +413,28 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
         }
     }
 
-    private func readRecords(whereClause: String?) -> [UploadManualSettlementRecord]? {
+    /// Every row, oldest first. Throws `SQLiteStoreUnknownReadError` when the sweep could not run to its end or a row
+    /// does not decode.
+    private func readRecords() throws -> [UploadManualSettlementRecord] {
         allowTransientRecovery()
-        return connection.withLock {
+        return try connection.withLock {
             guard let db, sqlite3_get_autocommit(db) != 0 else {
                 connection.markFailed()
-                return nil
+                throw SQLiteStoreUnknownReadError()
             }
-            guard !connection.operationFailed else { return nil }
+            guard !connection.operationFailed else { throw SQLiteStoreUnknownReadError() }
             var statement: OpaquePointer?
-            let suffix = whereClause.map { " WHERE \($0)" } ?? ""
             guard
                 sqlite3_prepare_v2(
                     db,
-                    "SELECT payload FROM manual_upload_settlement\(suffix) ORDER BY updated_at ASC;",
+                    "SELECT payload FROM manual_upload_settlement ORDER BY updated_at ASC;",
                     -1,
                     &statement,
                     nil
                 ) == SQLITE_OK
             else {
                 connection.markFailed(resultCode: sqlite3_extended_errcode(db))
-                return nil
+                throw SQLiteStoreUnknownReadError()
             }
             defer { sqlite3_finalize(statement) }
             var records: [UploadManualSettlementRecord] = []
@@ -449,14 +445,14 @@ public final class UploadManualSettlementStore: UploadManualSettlementStoreProto
                     let record = try? decoder.decode(UploadManualSettlementRecord.self, from: data)
                 else {
                     connection.markFailed()
-                    return nil
+                    throw SQLiteStoreUnknownReadError()
                 }
                 records.append(record)
                 result = sqlite3_step(statement)
             }
             guard result == SQLITE_DONE else {
                 connection.markFailed(resultCode: sqlite3_extended_errcode(db))
-                return nil
+                throw SQLiteStoreUnknownReadError()
             }
             return records
         }

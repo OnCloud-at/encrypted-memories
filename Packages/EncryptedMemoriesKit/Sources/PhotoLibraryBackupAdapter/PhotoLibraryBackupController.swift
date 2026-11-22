@@ -1813,6 +1813,8 @@ public final class PhotoLibraryBackupController {
     public func estimatedOutstandingBytes(limit: Int) async -> Int64? {
         guard let queueStore, let catalogStore else { return nil }
         return await Task.detached(priority: .utility) {
+            // `catching:` on purpose: no unsettled row is found([]), so zero bytes. `catchingRows:` would answer absent
+            // and return nil, so the prompt would decide by the count alone.
             guard case .found(let rows) = StoreLookup(catching: { try queueStore.decisionUnsettledRows() }) else {
                 return nil
             }

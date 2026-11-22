@@ -28,5 +28,16 @@ public enum StoreLookup<Value> {
     }
 }
 
+extension StoreLookup {
+    /// Wraps a strict read of a set: complete rows are `found`, a complete read without rows is `absent`, and every
+    /// thrown error is `unknown`. A failed read is never taken for no rows.
+    public init<Element>(catchingRows read: () throws -> [Element]) where Value == [Element] {
+        self.init(catching: {
+            let rows = try read()
+            return rows.isEmpty ? nil : rows
+        })
+    }
+}
+
 extension StoreLookup: Sendable where Value: Sendable {}
 extension StoreLookup: Equatable where Value: Equatable {}

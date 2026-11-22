@@ -1576,9 +1576,11 @@ public actor UploadManager {
         guard let settlementStore else { return .skipped }
         let records: [UploadManualSettlementRecord]
         switch settlementStore.readAllOutcome() {
-        case .records(let rows):
+        case .found(let rows):
             records = rows
-        case .unreadable:
+        case .absent:
+            records = []
+        case .unknown:
             // Latching the flag on a failed sweep would skip the replay for the whole
             // session (#1104). Leave it unset so the next trigger retries the sweep
             // after the transient store failure heals.
