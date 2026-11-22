@@ -418,6 +418,51 @@ import Testing
         await lifecycle.shutdown()
     }
 
+    @Test @MainActor func theQueryCoordinatorAnswersOnlyForTheQueryThatOwnsTheResult() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-coordinator-committed-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let expected = PhotoUID(volumeID: "volume", nodeID: "invoice-result")
+        let catalogProvider = BlockingCatalogProvider(.init(entries: []))
+        let lifecycle = try makeColdStartLifecycle(
+            root: root,
+            state: MLSmartSearchPersistentState(isEnabled: true),
+            catalogProvider: catalogProvider,
+            assetInventory: .authoritative([expected]),
+            nativeSearchFactory: { RestoredNativeSearch(results: [expected]) }
+        )
+        let controller = MLSmartSearchController(lifecycle: lifecycle)
+        #expect(await waitUntilMainActor { controller.availableSearchScopes == [.all, .text] })
+
+        let coordinator = MLSmartSearchQueryCoordinator(
+            lifecycle: lifecycle, initialScope: .text, debounce: .milliseconds(1))
+        #expect(coordinator.rankedMatches(forCommittedQuery: "invoice") == nil)
+        #expect(!coordinator.isResolving(committedQuery: "invoice"))
+
+        coordinator.update(query: "  invoice ")
+        #expect(coordinator.isResolving(committedQuery: "invoice"), "the trimmed query is the one being resolved")
+        #expect(!coordinator.isResolving(committedQuery: "receipt"))
+        #expect(await waitUntilMainActor { !coordinator.isSearching })
+
+        #expect(coordinator.rankedMatches(forCommittedQuery: "invoice") == [expected])
+        #expect(coordinator.rankedMatches(forCommittedQuery: "receipt") == nil, "another query never gets the result")
+        #expect(!coordinator.isResolving(committedQuery: "invoice"))
+
+        // A newer query is under way: the old result stays with the old query, and the new query has none yet.
+        coordinator.update(query: "receipt")
+        #expect(coordinator.isResolving(committedQuery: "receipt"))
+        #expect(coordinator.rankedMatches(forCommittedQuery: "invoice") == [expected], "the old result is still held")
+        #expect(coordinator.rankedMatches(forCommittedQuery: "receipt") == nil, "the new query has no result yet")
+
+        #expect(MLSmartSearchQueryCoordinator.normalized("  invoice \n") == "invoice")
+
+        coordinator.clear()
+        #expect(coordinator.rankedMatches(forCommittedQuery: "invoice") == nil)
+
+        await catalogProvider.release()
+        await lifecycle.shutdown()
+    }
+
     @Test @MainActor func developerImportHoldsTheSecurityScopeUntilInstallCompletes() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ml-controller-scope-\(UUID().uuidString)", isDirectory: true)

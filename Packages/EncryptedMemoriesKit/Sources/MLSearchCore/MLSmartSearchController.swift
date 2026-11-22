@@ -166,11 +166,17 @@ public final class MLSmartSearchQueryCoordinator {
         pendingTask?.cancel()
     }
 
+    /// The form of a search text that the coordinator compares and resolves: without leading and trailing whitespace
+    /// and newlines. A host passes its committed text through this before it asks for a result.
+    public static func normalized(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     public func update(query: String) {
         pendingTask?.cancel()
         querySequence &+= 1
         let sequence = querySequence
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = Self.normalized(query)
         guard !trimmed.isEmpty else {
             rankedUIDs = nil
             isSearching = false
@@ -195,6 +201,18 @@ public final class MLSmartSearchQueryCoordinator {
             self.resolvedQuery = trimmed
             self.isSearching = false
         }
+    }
+
+    /// The ranked UIDs as a set when `query` is exactly the query that owns them, otherwise `nil`. A host passes its
+    /// committed, trimmed search text, so the result of an older query never filters the grid of a newer one.
+    public func rankedMatches(forCommittedQuery query: String) -> Set<PhotoUID>? {
+        guard resolvedQuery == query else { return nil }
+        return rankedUIDs.map(Set.init)
+    }
+
+    /// True while `query` itself is still being resolved, so a host keeps its grid on the last result.
+    public func isResolving(committedQuery query: String) -> Bool {
+        requestedQuery == query && isSearching
     }
 
     public func setScope(_ scope: MLSearchScope) {
