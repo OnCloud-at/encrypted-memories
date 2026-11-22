@@ -101,6 +101,49 @@ struct ProtonAuthControllerTests {
     }
 
     @MainActor
+    @Test func aClosedBrowserSheetEndsOnlyASignInThatStillWaits() {
+        let controller = ProtonAuthController(store: FakeSessionStore(), authenticator: HangingAuthenticator())
+
+        #expect(controller.cancelSignInIfAuthenticating() == nil, "no sign-in runs yet")
+        #expect(controller.state == .checking)
+
+        controller.signIn(openURL: { _ in })
+        guard case .authenticating = controller.state else {
+            Issue.record("the sign-in must be waiting")
+            return
+        }
+        #expect(controller.cancelSignInIfAuthenticating() == .signedOut(error: nil))
+        #expect(controller.state == .signedOut(error: nil))
+
+        #expect(controller.cancelSignInIfAuthenticating() == nil, "a late callback changes nothing")
+        #expect(controller.state == .signedOut(error: nil))
+    }
+
+    @MainActor
+    @Test func aLateBrowserCallbackLeavesACompletedSignInAlone() async {
+        let session = ProtonSession(uid: "uid-completed", accessToken: "at", refreshToken: "rt", keyPassword: "kp")
+        let controller = ProtonAuthController(
+            store: FakeSessionStore(), authenticator: FakeAuthenticator(session: session))
+        controller.signIn(openURL: { _ in })
+        #expect(await waitUntil { controller.state == .signedIn(session) })
+
+        #expect(controller.cancelSignInIfAuthenticating() == nil)
+        #expect(controller.state == .signedIn(session), "the person stays signed in")
+    }
+
+    @MainActor
+    @Test func aLateBrowserCallbackLeavesTheMessageOfAFailedSignInAlone() async {
+        let controller = ProtonAuthController(
+            store: FakeSessionStore(), authenticator: FakeAuthenticator(error: FakeAuthError.offline))
+        controller.signIn(openURL: { _ in })
+        let failed = ProtonAuthState.signedOut(error: L10n.string("auth.sign_in_incomplete"))
+        #expect(await waitUntil { controller.state == failed })
+
+        #expect(controller.cancelSignInIfAuthenticating() == nil)
+        #expect(controller.state == failed, "the error text stays")
+    }
+
+    @MainActor
     @Test func signInFailurePublishesSignedOutErrorWithoutSaving() async {
         let store = FakeSessionStore()
         let controller = ProtonAuthController(

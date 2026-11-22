@@ -193,8 +193,8 @@ final class MobileSessionModel: ObservableObject {
             url: url,
             presentationContextProvider: webAuthenticationPresentationContext
         ) { [weak self] in
-            guard let self, self.isSigningIn else { return }
-            self.apply(self.authController.cancelSignIn())
+            guard let self, let state = self.authController.cancelSignInIfAuthenticating() else { return }
+            self.apply(state)
         }
     }
 
