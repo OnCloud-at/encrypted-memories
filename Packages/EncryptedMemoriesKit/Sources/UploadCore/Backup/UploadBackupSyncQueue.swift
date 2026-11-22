@@ -190,8 +190,8 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     /// Parked rows (failed, final or missing) that wait for the person's decision or for a cause only the person can
     /// fix. A subset of `failed + sourceMissing`; the rest is not backed up without anything the person can do.
     public var attention = 0
-    /// Rows that the backup still runs and that waited at least a week in one wait that does not end by itself.
-    /// A subset of `waiting`; the retries continue.
+    /// `discovered` rows that wait for their next retry and waited at least a week in one wait that does not end by
+    /// itself. A subset of `waiting`, so a row counts once; the retries continue.
     public var longWaiting = 0
 
     public init() {}

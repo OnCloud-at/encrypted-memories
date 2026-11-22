@@ -153,7 +153,7 @@ public struct BackupStatus: Sendable, Equatable {
             phase: phase,
             counts: [
                 failed, sourceMissing, needsAttentionCount, waitingRetry, dismissedFailures, skippedRemoteDeletions,
-                outstandingCount,
+                outstandingCount, longWaitingCount,
             ],
             issue: outstandingIssue, nextAttemptAt: nextAttemptAt)
     }
@@ -215,7 +215,7 @@ public struct BackupStatus: Sendable, Equatable {
         skippedRemoteDeletions = progress.skippedRemoteDeletions
         sourceMissing = progress.sourceMissing
         needsAttentionCount = min(max(0, progress.attention), progress.needsAttention)
-        longWaitingCount = min(max(0, progress.longWaiting), progress.waiting + progress.checking)
+        longWaitingCount = min(max(0, progress.longWaiting), progress.waiting)
         waitingRetry = progress.blocked
         remainingCount = progress.waiting + progress.checking + progress.uploading
         hasOutstandingWork = progress.hasOutstandingWork

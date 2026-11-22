@@ -486,11 +486,13 @@ public actor BackupSyncRunner {
                 stopRequested = true
                 return progress
             }
-            let issue = automaticRetryIssue(
+            var issue = automaticRetryIssue(
                 kind: Self.indexPreparationIssueKind(for: error),
                 detail: message,
                 previous: previous
             )
+            // The start of a wait lives on queue rows only; nothing reads it from this issue.
+            issue.waitingSince = nil
             guard queue.setRuntimeIssue(issue, for: .remoteIndexPreparation) else {
                 stopRequested = true
                 return progress
@@ -2480,6 +2482,14 @@ public actor BackupSyncRunner {
         rememberDeferredSource(entry)
         let detail = L10n.string("error.upload_cancelled")
         let previous = BackupIssueRecord.decode(entry.lastError)
+        // An interruption does not end a bounded wait: the record stays, so the wait keeps its start and its reason. The
+        // pause is the one of any first interruption.
+        if let previous, previous.waitingSince != nil, BackupItemOutcome.tracksWaitStart(previous) {
+            var kept = previous
+            kept.nextAttemptAt = boundedDeferralIssue(detail: detail, previous: nil).nextAttemptAt
+            deferSource(entry, from: state, until: kept.nextAttemptAt ?? now().addingTimeInterval(30), issue: kept)
+            return
+        }
         let issue = boundedDeferralIssue(detail: detail, previous: previous?.detail == detail ? previous : nil)
         deferSource(entry, from: state, until: issue.nextAttemptAt ?? now().addingTimeInterval(30), issue: issue)
     }

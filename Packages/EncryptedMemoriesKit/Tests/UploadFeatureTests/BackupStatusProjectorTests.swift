@@ -703,6 +703,32 @@ final class BackupStatusProjectorTests: XCTestCase {
         }
     }
 
+    /// A wait of a week shows once, in the calm line; the waiting line counts only the rows that still wait normally.
+    func testALongWaitCountsOnceInTheCalmLineAndNotAsWaiting() async throws {
+        let weekOld = BackupIssueRecord(
+            kind: .unknown, detail: BackupItemOutcome.sourceUnavailableDetail, automaticRetryAttempt: 3,
+            waitingSince: Date().addingTimeInterval(-8 * 24 * 3600))
+        for id in ["long-1", "long-2", "long-3"] {
+            var row = entry(id: id, state: .discovered)
+            row.lastError = weekOld.persistedValue
+            XCTAssertTrue(queue.upsert(row))
+        }
+        for id in ["plain-1", "plain-2"] {
+            XCTAssertTrue(queue.upsert(entry(id: id, state: .discovered)))
+        }
+        let projector = BackupStatusProjector(queue: queue)
+        let recorder = Recorder()
+        await projector.start(generation: UUID(), context: .init()) { recorder.append($0) }
+        let status = try XCTUnwrap(recorder.values.last).status
+        let display = BackupStatusPresentation(status)
+        XCTAssertEqual(status.phase, .waiting)
+        XCTAssertEqual(status.longWaitingCount, 3)
+        XCTAssertEqual(display.localizedNotBackedUp, L10n.string("backup.progress_not_backed_up \(3)"))
+        XCTAssertEqual(display.waitingCount, 2, "the three long waits are not counted a second time")
+        XCTAssertEqual(display.localizedWaitingDetail, L10n.string("backup.detail_waiting \(2)"))
+        await projector.stop()
+    }
+
     func testDismissedSourceRechecksUsePhotosWordingWithoutAProblemListAction() async throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let due = now.addingTimeInterval(600)
