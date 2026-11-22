@@ -11,8 +11,13 @@ import UploadCore
 
 @Suite("Related-file bridge transfers", .serialized)
 struct DriveSDKRelatedFileTransferTests {
+    /// The account of this test's sessions. Every test and every argument runs on a new instance, so a request that
+    /// work of an earlier test sends late carries another account and never counts here.
+    private let account = "related-fixture-\(UUID().uuidString)"
+    /// The refused requests of this test's sessions.
+    private var requestCount: Int { RelatedFileDenyHTTP.requestCount(forAccount: account) }
+
     @Test func sdkClientConstructsOfflineWithoutAccountKeysOrHTTP() async throws {
-        RelatedFileDenyHTTP.reset()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -21,13 +26,28 @@ struct DriveSDKRelatedFileTransferTests {
         let client = try await EncryptedMemoriesClient.testClient(
             session: session, governor: governor, protocols: [RelatedFileDenyHTTP.self])
 
-        #expect(RelatedFileDenyHTTP.requestCount == 0)
+        #expect(requestCount == 0)
         await client.shutdown()
-        #expect(RelatedFileDenyHTTP.requestCount == 0)
+        #expect(requestCount == 0)
+    }
+
+    /// A request of another account, such as one that an earlier test's refresh sends late, never counts for this test.
+    @Test func aRequestOfAnotherAccountDoesNotCountForThisTest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RelatedFileDenyHTTP.self]
+        let urlSession = URLSession(configuration: configuration)
+        defer { urlSession.invalidateAndCancel() }
+        let other = "related-fixture-\(UUID().uuidString)"
+        var late = URLRequest(url: URL(string: "https://fixture.invalid/core/v4/users")!)
+        late.setValue(other, forHTTPHeaderField: "x-pm-uid")
+
+        _ = try? await urlSession.data(for: late)
+
+        #expect(RelatedFileDenyHTTP.requestCount(forAccount: other) == 1)
+        #expect(requestCount == 0)
     }
 
     @Test func realBridgeDispatchesUploadThroughTheExistentialOffline() async throws {
-        RelatedFileDenyHTTP.reset()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -54,12 +74,11 @@ struct DriveSDKRelatedFileTransferTests {
             #expect(await probe.uploadCount == 1)
             #expect(!FileManager.default.fileExists(atPath: file.path))
             #expect(await probe.reservation?.isActive == false)
-            #expect(RelatedFileDenyHTTP.requestCount == 0)
+            #expect(requestCount == 0)
         }
     }
 
     @Test func realBridgeDispatchesDownloadThroughTheExistentialOffline() async throws {
-        RelatedFileDenyHTTP.reset()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -97,7 +116,7 @@ struct DriveSDKRelatedFileTransferTests {
             await bridge.shutdown()
             #expect(await probe.sourceCount == 1)
             #expect(await probe.streamCount == 1)
-            #expect(RelatedFileDenyHTTP.requestCount == 0)
+            #expect(requestCount == 0)
         }
     }
 
@@ -133,8 +152,6 @@ struct DriveSDKRelatedFileTransferTests {
 
     @Test(arguments: [true, false])
     func bridgeChecksProtonStorageBeforeTheTransport(full: Bool) async throws {
-        RelatedFileDenyHTTP.reset()
-        defer { RelatedFileDenyHTTP.reset() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -162,10 +179,10 @@ struct DriveSDKRelatedFileTransferTests {
         if full {
             #expect(throws: ExactDuplicateRelatedFileTransferError.copyFailed(.accountStorage)) { try result.get() }
             // The full answer is refreshed once, as for a backup upload; the offline fixture refuses it.
-            #expect(RelatedFileDenyHTTP.requestCount >= 1)
+            #expect(requestCount >= 1)
         } else {
             #expect(try result.get() == PhotoUID(volumeID: "vol", nodeID: "copied"))
-            #expect(RelatedFileDenyHTTP.requestCount == 0)
+            #expect(requestCount == 0)
         }
         #expect(await probe.uploadCount == (full ? 0 : 1))
         #expect(!FileManager.default.fileExists(atPath: file.path))
@@ -240,7 +257,6 @@ struct DriveSDKRelatedFileTransferTests {
     }
 
     @Test func bridgeWaitsForWiFiWithoutReadingDownloadingOrUploading() async throws {
-        RelatedFileDenyHTTP.reset()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -273,12 +289,11 @@ struct DriveSDKRelatedFileTransferTests {
             #expect(await probe.streamCount == 0)
             #expect(await probe.uploadCount == 0)
             #expect(!FileManager.default.fileExists(atPath: file.path))
-            #expect(RelatedFileDenyHTTP.requestCount == 0)
+            #expect(requestCount == 0)
         }
     }
 
     @Test func bridgeMapsAnUnsupportedSourceToCopyFailedWithoutStreaming() async throws {
-        RelatedFileDenyHTTP.reset()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -303,7 +318,7 @@ struct DriveSDKRelatedFileTransferTests {
             #expect(await probe.sourceCount == 1)
             #expect(await probe.streamCount == 0)
             #expect(!FileManager.default.fileExists(atPath: file.path))
-            #expect(RelatedFileDenyHTTP.requestCount == 0)
+            #expect(requestCount == 0)
         }
     }
 
@@ -449,8 +464,6 @@ struct DriveSDKRelatedFileTransferTests {
     }
 
     @Test func theNativeUploadImplErrorPathOmitsPrivateDetailsOffline() async throws {
-        RelatedFileDenyHTTP.reset()
-        defer { RelatedFileDenyHTTP.reset() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -474,13 +487,11 @@ struct DriveSDKRelatedFileTransferTests {
         }
         await bridge.shutdown()
         // The real SDK reaches one HTTP request, which the deny-all URLProtocol rejects without networking.
-        #expect(RelatedFileDenyHTTP.requestCount == 1)
+        #expect(requestCount == 1)
         #expect(sink.lines.isEmpty)
     }
 
     @Test func normalUploadClassifiesTheSDKFailure() async throws {
-        RelatedFileDenyHTTP.reset()
-        defer { RelatedFileDenyHTTP.reset() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -506,7 +517,7 @@ struct DriveSDKRelatedFileTransferTests {
         }
         reservation.release()
         await bridge.shutdown()
-        #expect(RelatedFileDenyHTTP.requestCount == 1)
+        #expect(requestCount == 1)
     }
 
     @Test func streamOriginalBytesKeepsTheViewerDefaultOnTheActualBlockRequest() async throws {
@@ -671,7 +682,7 @@ struct DriveSDKRelatedFileTransferTests {
             throw error
         }
         await bridge.shutdown()
-        #expect(RelatedFileDenyHTTP.requestCount == 0)
+        #expect(requestCount == 0)
     }
 
     private func request(
@@ -706,7 +717,7 @@ struct DriveSDKRelatedFileTransferTests {
 
     private func makeSession(directory: URL, governor: ProtonRequestGovernor) -> DriveSession {
         DriveSession(
-            session: ProtonSession(uid: "related-fixture", accessToken: "", refreshToken: "", keyPassword: ""),
+            session: ProtonSession(uid: account, accessToken: "", refreshToken: "", keyPassword: ""),
             store: SessionKeychainStore(
                 service: "related-file-fixture", account: "fixture", keychain: DenyingKeychainStore()),
             accountCacheDirectory: directory,
@@ -715,16 +726,21 @@ struct DriveSDKRelatedFileTransferTests {
     }
 }
 
+/// Refuses every request, as an offline network does, and counts the refused requests by the account that sends them
+/// (`x-pm-uid`). A count by account keeps a request that an earlier test's background work sends late out of the next
+/// test's count. A request without an account counts for every account.
 private final class RelatedFileDenyHTTP: URLProtocol {
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var requests = 0
-    static var requestCount: Int { lock.withLock { requests } }
-    static func reset() { lock.withLock { requests = 0 } }
+    nonisolated(unsafe) private static var requests: [String: Int] = [:]
+    static func requestCount(forAccount account: String) -> Int {
+        lock.withLock { requests[account, default: 0] + requests["", default: 0] }
+    }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        Self.lock.withLock { Self.requests += 1 }
+        let account = request.value(forHTTPHeaderField: "x-pm-uid") ?? ""
+        Self.lock.withLock { Self.requests[account, default: 0] += 1 }
         client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
     }
     override func stopLoading() {}
