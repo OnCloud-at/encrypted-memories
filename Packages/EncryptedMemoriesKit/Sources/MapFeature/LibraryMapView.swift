@@ -12,7 +12,7 @@ import SwiftUI
 /// remains bounded while every represented UID stays in exactly one visible count. Annotations refresh as
 /// the background GPS crawl fills the index (the `revision` binding).
 public struct LibraryMapView: NSViewRepresentable {
-    private let index: PhotoLocationIndex
+    let index: PhotoLocationIndex
     private let thumbnail: (PhotoUID) -> NSImage?
     private let loadThumbnail: (PhotoUID) async -> NSImage?
     private let onSelectPhoto: (PhotoUID) -> Void

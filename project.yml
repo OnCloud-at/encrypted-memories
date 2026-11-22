@@ -51,6 +51,7 @@ targets:
       - App/Views/BackendErrorView.swift
       - macOSTests/ThumbnailSupportHostTests.swift
       - macOSTests/BackendErrorViewTests.swift
+      - macOSTests/LibraryMapScreenObservationTests.swift
       - Packages/EncryptedMemoriesKit/Tests/DesignSystemCoreTests/RenderedInk.swift
       - App/MacAppProtection.swift
       - macOSTests/MacAppProtectionTests.swift
