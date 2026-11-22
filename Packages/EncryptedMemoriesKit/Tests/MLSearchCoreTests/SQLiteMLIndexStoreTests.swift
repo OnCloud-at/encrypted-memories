@@ -536,6 +536,70 @@ struct TestMLVectorCipher: MLVectorCipher {
         }
     }
 
+    /// SQLite can end the transaction when an insert fails, for example on a full disk; the trigger ends it the same
+    /// way. The batch then stores nothing: no later record commits on its own, and every record counts as transient.
+    @Test func anInsertThatEndsTheTransactionFailsTheWholeBatch() throws {
+        try withStore { store, url in
+            var handle: OpaquePointer?
+            #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+            #expect(
+                sqlite3_exec(
+                    handle,
+                    """
+                    CREATE TRIGGER end_transaction_on_b BEFORE INSERT ON ml_embeddings WHEN NEW.node_id = 'b'
+                    BEGIN
+                      SELECT RAISE(ROLLBACK, 'injected end of the transaction');
+                    END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            sqlite3_close(handle)
+
+            let report = store.upsert([
+                record("a", descriptorV1, [1, 0, 0, 0]),
+                record("b", descriptorV1, [0, 1, 0, 0]),
+                record("c", descriptorV1, [0, 0, 1, 0]),
+            ])
+
+            #expect(report.indexed == 0)
+            #expect(report.transientFailure == 3)
+            for id in ["a", "c"] {
+                let stored = try store.contains(uid: uid(id), descriptor: descriptorV1)
+                #expect(!stored, "the failed batch stores no record: \(id)")
+            }
+            #expect(store.upsert([record("d", descriptorV1, [0, 0, 0, 1])]).indexed == 1, "the store writes again")
+        }
+    }
+
+    /// An insert that fails alone leaves the transaction running: only that record fails, the others are stored.
+    @Test func anInsertThatFailsAloneFailsOnlyThatRecord() throws {
+        try withStore { store, url in
+            var handle: OpaquePointer?
+            #expect(sqlite3_open(url.path, &handle) == SQLITE_OK)
+            #expect(
+                sqlite3_exec(
+                    handle,
+                    """
+                    CREATE TRIGGER fail_insert_of_b BEFORE INSERT ON ml_embeddings WHEN NEW.node_id = 'b'
+                    BEGIN
+                      SELECT RAISE(ABORT, 'injected insert failure');
+                    END;
+                    """, nil, nil, nil) == SQLITE_OK)
+            sqlite3_close(handle)
+
+            let report = store.upsert([
+                record("a", descriptorV1, [1, 0, 0, 0]),
+                record("b", descriptorV1, [0, 1, 0, 0]),
+                record("c", descriptorV1, [0, 0, 1, 0]),
+            ])
+
+            #expect(report.indexed == 2)
+            #expect(report.transientFailure == 1)
+            for id in ["a", "c"] {
+                let stored = try store.contains(uid: uid(id), descriptor: descriptorV1)
+                #expect(stored, "the other records are stored: \(id)")
+            }
+        }
+    }
+
     @Test func removeAllRollsBackEmbeddingsFailuresAndGenerationTogether() throws {
         let url = makeTempURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

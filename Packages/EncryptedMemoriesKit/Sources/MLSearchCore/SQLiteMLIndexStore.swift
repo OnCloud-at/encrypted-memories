@@ -66,7 +66,7 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
             }
             // A failed begin, prepare, failure cleanup, generation bump or commit stores nothing. Every record not
             // rejected before the failure then counts as transient. A failed insert bind or insert step counts only that
-            // record.
+            // record, unless the failed step ended the transaction.
             let committed = SQLiteTransaction.immediate(db) {
                 guard
                     sqlite3_prepare_v2(
@@ -143,6 +143,10 @@ public final class SQLiteMLIndexStore: MLIndexStore, @unchecked Sendable {
                             sqlite3_step(clearFailureStmt) == SQLITE_DONE
                         else { return false }
                     } else {
+                        // SQLite can end the whole transaction after a failed step, for example on a full disk. The
+                        // later writes would then commit one by one, so the batch fails and stores nothing. A busy step
+                        // keeps the transaction, but cannot occur here: BEGIN IMMEDIATE already holds the write lock.
+                        guard sqlite3_get_autocommit(db) == 0 else { return false }
                         failed += 1
                     }
                 }
