@@ -368,17 +368,18 @@ private func waitUntil(
     private func makeHostedImagePage(
         _ page: ViewerImagePageProbe
     ) throws -> (
-        UIWindow, UIHostingController<ViewerImagePageProbe>
+        HostedTestWindow, UIHostingController<ViewerImagePageProbe>
     ) {
         let scene = try #require(UIApplication.shared.foregroundWindowScene)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let host = UIHostingController(rootView: page)
         window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
         window.rootViewController = host
         window.makeKeyAndVisible()
         host.view.frame = window.bounds
         host.view.layoutIfNeeded()
-        return (window, host)
+        return (hosted, host)
     }
 
     @Test(.serialized, arguments: [false, true])
@@ -388,10 +389,9 @@ private func waitUntil(
         let store = UIKitViewerImageStore(thumbnailProvider: { _ in thumbnail }, media: provider)
         let visibility = ViewerPageVisibility()
         let item = PhotoItem(uid: uid("zoom-cancel"), captureTime: Date(), mediaType: "image/jpeg")
-        let (window, host) = try makeHostedImagePage(.init(visibility: visibility, store: store, item: item))
+        let (hosted, host) = try makeHostedImagePage(.init(visibility: visibility, store: store, item: item))
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
+            hosted.close()
         }
 
         do {
@@ -450,12 +450,11 @@ private func waitUntil(
             uid: uid("live-preload"), captureTime: Date(), mediaType: "image/heic",
             isLivePhoto: true, relatedVideoID: "motion"
         )
-        let (window, host) = try makeHostedImagePage(
+        let (hosted, host) = try makeHostedImagePage(
             .init(visibility: visibility, store: store, item: item, streamer: provider)
         )
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
+            hosted.close()
         }
         do {
             try await waitUntil {
@@ -603,13 +602,13 @@ private func waitUntil(
     func viewerZoomAdapterReflowsAspectFitAcrossRotationAndPreservesVisibleAnchor() throws {
         let mediaSize = CGSize(width: 1600, height: 1200)
         let image = makeViewerImage(size: mediaSize)
-        let (window, host, scrollView) = try makeHostedViewer(
+        let (hosted, host, scrollView) = try makeHostedViewer(
             image: image,
             size: CGSize(width: 390, height: 844)
         )
+        let window = hosted.window
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
+            hosted.close()
         }
 
         let portraitViewport = scrollView.bounds.size
@@ -675,13 +674,12 @@ private func waitUntil(
     func viewerZoomAdapterUsesMediaEdgesAtIntermediateZoom() throws {
         let mediaSize = CGSize(width: 1080, height: 1920)
         let requestedViewport = CGSize(width: 390, height: 844)
-        let (window, _, scrollView) = try makeHostedViewer(
+        let (hosted, _, scrollView) = try makeHostedViewer(
             image: makeViewerImage(size: mediaSize),
             size: requestedViewport
         )
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
+            hosted.close()
         }
 
         scrollView.setZoomScale(2, animated: false)
@@ -712,10 +710,9 @@ private func waitUntil(
         let viewport = CGSize(width: 390, height: 844)
         let firstImage = makeViewerImage(size: CGSize(width: 1200, height: 1800), color: .white)
         let replacementImage = makeViewerImage(size: CGSize(width: 2400, height: 3600), color: .yellow)
-        let (window, host, scrollView) = try makeHostedViewer(image: firstImage, size: viewport)
+        let (hosted, host, scrollView) = try makeHostedViewer(image: firstImage, size: viewport)
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
+            hosted.close()
         }
 
         scrollView.setZoomScale(2.5, animated: false)

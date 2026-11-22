@@ -23,9 +23,10 @@ func makeHostedViewer(
     size: CGSize,
     onMotionStart: (() -> Void)? = nil,
     onMotionStop: (() -> Void)? = nil
-) throws -> (UIWindow, UIHostingController<MobileZoomableImage>, UIScrollView) {
+) throws -> (HostedTestWindow, UIHostingController<MobileZoomableImage>, UIScrollView) {
     let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-    let window = UIWindow(windowScene: scene)
+    let hosted = HostedTestWindow(scene: scene)
+    let window = hosted.window
     let host = UIHostingController(
         rootView: MobileZoomableImage(
             image: image,
@@ -43,7 +44,13 @@ func makeHostedViewer(
     host.view.layoutIfNeeded()
     RunLoop.main.run(until: Date().addingTimeInterval(0.01))
     host.view.layoutIfNeeded()
-    let scrollView = try XCTUnwrap(findViewerScrollView(in: host.view))
+    let scrollView: UIScrollView
+    do {
+        scrollView = try XCTUnwrap(findViewerScrollView(in: host.view))
+    } catch {
+        hosted.close()
+        throw error
+    }
     scrollView.layoutIfNeeded()
-    return (window, host, scrollView)
+    return (hosted, host, scrollView)
 }

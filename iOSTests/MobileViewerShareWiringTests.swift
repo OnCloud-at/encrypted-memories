@@ -493,8 +493,8 @@ final class MobileViewerShareWiringTests: XCTestCase {
         let probe = MobileViewerShareDecisionProbe()
         let router = MobileViewerRouter()
         let root = UIHostingController(rootView: AnyView(Color.black))
-        let window: UIWindow
-        let previous: UIWindow?
+        private let hosted: HostedTestWindow
+        var window: UIWindow { hosted.window }
         private let releaseOnClose: () -> Void
 
         init(
@@ -514,9 +514,7 @@ final class MobileViewerShareWiringTests: XCTestCase {
                 thumbnailFeed: seed.feed, thumbnailCache: seed.cache)
             let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
             let scene = try XCTUnwrap(scenes.first { $0.activationState == .foregroundActive } ?? scenes.first)
-            previous = scene.windows.first { $0.isKeyWindow }
-            window = UIWindow(windowScene: scene)
-            window.frame = scene.coordinateSpace.bounds
+            hosted = HostedTestWindow(scene: scene)
             window.rootViewController = root
             window.makeKeyAndVisible()
             // The production route presents the viewer: `MobileMainTabView` binds one
@@ -690,9 +688,7 @@ final class MobileViewerShareWiringTests: XCTestCase {
             releaseOnClose()
             router.presentation = nil
             root.rootView = AnyView(Color.black)
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
             seed.removeCache()
         }
     }

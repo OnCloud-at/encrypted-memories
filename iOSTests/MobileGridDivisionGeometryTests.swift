@@ -11,10 +11,11 @@ import XCTest
 final class MobileGridDivisionGeometryTests: XCTestCase {
     @MainActor func testProfileChangeComparesTheDisplayedTileSizes() throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = CGRect(x: 0, y: 0, width: 867, height: 669)
         window.isHidden = false
-        defer { window.isHidden = true }
+        defer { hosted.close() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let feed = UIKitThumbnailFeed(cache: ThumbnailCache(rootDirectory: directory), loader: ChromeProbeLoader())
@@ -59,10 +60,11 @@ final class MobileGridDivisionGeometryTests: XCTestCase {
 
     @MainActor func testGridUsesFullWidthAndKeepsHitTargetsInBothLayoutDirections() throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = CGRect(x: 0, y: 0, width: 867, height: 669)
         window.isHidden = false
-        defer { window.isHidden = true }
+        defer { hosted.close() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let feed = UIKitThumbnailFeed(cache: ThumbnailCache(rootDirectory: directory), loader: ChromeProbeLoader())

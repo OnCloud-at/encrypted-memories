@@ -42,7 +42,8 @@ private final class HostedCardPage {
         var scrolls = false
     }
 
-    private let window: UIWindow
+    private let hosted: HostedTestWindow
+    private var window: UIWindow { hosted.window }
     private let report = Report()
     private let card = PlaybackFailedCardFrame()
 
@@ -51,7 +52,7 @@ private final class HostedCardPage {
     ) async throws {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         let scene = try XCTUnwrap(scenes.first { $0.activationState == .foregroundActive } ?? scenes.first)
-        window = UIWindow(windowScene: scene)
+        hosted = HostedTestWindow(scene: scene)
         window.frame = CGRect(origin: .zero, size: size)
         let report = report
         let host = UIHostingController(
@@ -63,13 +64,18 @@ private final class HostedCardPage {
         window.rootViewController = host
         window.makeKeyAndVisible()
         let window = window
-        try await card.settle { window.layoutIfNeeded() }
+        do {
+            try await card.settle { window.layoutIfNeeded() }
+        } catch {
+            hosted.close()
+            throw error
+        }
     }
 
     var reportsScrolling: Bool { report.scrolls }
 
     func close() {
-        window.isHidden = true
+        hosted.close()
     }
 
     /// The frame of the card in window coordinates: the page fills the window.

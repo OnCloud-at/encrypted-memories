@@ -95,17 +95,14 @@ final class MobileViewerInspectorTests: XCTestCase {
             thumbnailCache: fixture.cache)
         let router = MobileViewerRouter()
         let cover = ViewerCoverState()
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
-        window.frame = scene.coordinateSpace.bounds
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let root = UIHostingController(rootView: CoveredViewerHost(cover: cover, router: router, libraryModel: model))
         window.rootViewController = root
         window.makeKeyAndVisible()
         defer {
             root.presentedViewController?.dismiss(animated: false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previous?.makeKey()
+            hosted.close()
         }
         let videoIndex = try XCTUnwrap(fixture.items.firstIndex(where: \.isVideo))
         var transaction = Transaction()

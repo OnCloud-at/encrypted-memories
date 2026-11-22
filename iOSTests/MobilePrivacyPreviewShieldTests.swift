@@ -10,7 +10,8 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
     @MainActor func testInactivePreviewBlursContentWithoutTurningBlack() async throws {
         let scene = try XCTUnwrap(
             UIApplication.shared.foregroundWindowScene)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = CGRect(x: 0, y: 0, width: 200, height: 200)
         window.overrideUserInterfaceStyle = .dark
         let root = UIViewController()
@@ -20,7 +21,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         root.view.addSubview(white)
         window.rootViewController = root
         window.makeKeyAndVisible()
-        defer { window.isHidden = true }
+        defer { hosted.close() }
 
         let shield = MobilePrivacyPreviewShield()
         let uncovered = try brightnessStatistics(of: window)
@@ -380,7 +381,8 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
     @MainActor func testSceneLifecycleCoversAndRestoresTheRegisteredWindow() throws {
         let scene = try XCTUnwrap(
             UIApplication.shared.foregroundWindowScene)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIViewController()
         let original = UserDefaults.standard.object(forKey: AppSettingsKey.blurAppPreview)
         UserDefaults.standard.set(true, forKey: AppSettingsKey.blurAppPreview)
@@ -390,7 +392,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
             } else {
                 UserDefaults.standard.removeObject(forKey: AppSettingsKey.blurAppPreview)
             }
-            window.isHidden = true
+            hosted.close()
         }
 
         let center = MobilePrivacyPreviewShieldCenter()
