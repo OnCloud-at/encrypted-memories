@@ -330,6 +330,24 @@ private struct MobilePhotoBackupSections: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
+                if let notBackedUp = display.localizedNotBackedUp {
+                    Button {
+                        showFailedList = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(notBackedUp)
+                                .font(.caption)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Image(systemName: "chevron.right").font(.caption2)
+                        }
+                        .foregroundStyle(ProtonColor.textWeak)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("backup.notBackedUpItems")
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
                 if let waiting = display.localizedWaitingDetail {
                     Button {
                         showFailedList = true

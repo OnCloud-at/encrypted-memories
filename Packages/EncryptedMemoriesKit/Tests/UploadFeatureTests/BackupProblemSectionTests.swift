@@ -1,3 +1,4 @@
+import Foundation
 import PhotosCore
 import Testing
 import UploadCore
@@ -18,6 +19,20 @@ struct BackupProblemSectionTests {
         #expect(sections.map(\.items) == [[decision, action], [waiting], [permanent]])
         #expect(sections.map(\.title) == BackupIssueSection.allCases.map(\.localizedTitle))
         #expect(items.offersUserRetry)
+    }
+
+    /// A failed row without a cause the person can fix keeps the category that Try again selects, but its section is
+    /// "Continues by itself", because the next launch runs it again.
+    @Test func aFailedRowGroupsByItsOutcomeSection() {
+        let failed = BackupFailedItem(
+            entry: UploadBackupSyncQueueEntry(
+                source: .init(kind: .photoLibraryAsset, identifier: "failed"), revision: .init(rawValue: 1),
+                originalFilename: "failed.heic", state: .failed,
+                lastError: BackupIssueRecord(kind: .remoteService, detail: "").persistedValue, updatedAt: Date()))
+        #expect(failed.category == .userResolvable)
+        #expect(failed.section == .continuesByItself)
+        let sections = BackupProblemSection.grouped([failed], item: { $0 })
+        #expect(sections.map(\.id) == [.continuesByItself])
     }
 
     @Test func noRowsGiveNoSections() {

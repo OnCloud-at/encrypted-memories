@@ -89,6 +89,10 @@ public struct BackupIssueRecord: Codable, Sendable, Equatable {
         self.serviceRejection = serviceRejection
     }
 
+    /// The kind says remoteService, but nothing proves a temporary Proton wait: only that wait counts automatic
+    /// retries. An item retry of a local or sign-in error is stored with the same kind and counts none.
+    public var isUnprovenServiceWait: Bool { kind == .remoteService && automaticRetryAttempt == 0 }
+
     public var persistedValue: String {
         let payload = (try? JSONEncoder().encode(self))?.base64EncodedString() ?? ""
         return Self.storagePrefix + payload

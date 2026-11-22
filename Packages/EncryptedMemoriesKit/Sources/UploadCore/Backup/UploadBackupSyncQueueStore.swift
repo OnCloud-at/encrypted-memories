@@ -1269,7 +1269,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     public func summary() -> UploadBackupSyncQueueSummary? {
-        connection.withLock {
+        // The parked rows are copied under the lock and judged after it: their stored errors are decoded one by one,
+        // and the lock also serves the health probe that the views read.
+        let read: (UploadBackupSyncQueueSummary, [(UploadBackupSyncQueueState, String?)])? = connection.withLock {
             var summary = UploadBackupSyncQueueSummary()
             // An unknown state is a lasting failure at once; the read stops at that row.
             let completed = aggregateRowsLocked { row in
@@ -1288,8 +1290,47 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 }
                 return true
             }
-            return completed == true ? summary : nil
+            guard completed == true else { return nil }
+            guard summary.failed + summary.sourceMissing > 0 else { return (summary, []) }
+            guard let parked = parkedRowsLocked() else { return nil }
+            return (summary, parked)
         }
+        guard var (summary, parked) = read else { return nil }
+        summary.attention = parked.reduce(0) { count, row in
+            BackupItemOutcome.raisesAttention(state: row.0, record: BackupIssueRecord.decode(row.1)) ? count + 1 : count
+        }
+        return summary
+    }
+
+    /// The state and stored error of every parked row (failed, final, missing); nil when the read could not run. The
+    /// errors are free text, so they are read row by row: grouping the whole-queue count by that text costs more than
+    /// the count itself. Call it with the connection lock held.
+    private func parkedRowsLocked() -> [(UploadBackupSyncQueueState, String?)]? {
+        var stmt: OpaquePointer?
+        guard
+            requireOperational(
+                sqlite3_prepare_v2(
+                    db,
+                    """
+                    SELECT state, last_error FROM backup_sync_queue
+                    WHERE state IN ('failed','failedPermanent','sourceMissing');
+                    """,
+                    -1, &stmt, nil
+                ) == SQLITE_OK)
+        else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        var rows: [(UploadBackupSyncQueueState, String?)] = []
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            guard let state = columnText(stmt, 0).flatMap(UploadBackupSyncQueueState.init(rawValue:)) else {
+                connection.markFailed()
+                return nil
+            }
+            rows.append((state, columnText(stmt, 1)))
+            stepResult = sqlite3_step(stmt)
+        }
+        guard requireOperational(stepResult == SQLITE_DONE) else { return nil }
+        return rows
     }
 
     /// One row of the whole-queue count: state, source kind, the stored error of a waiting or checking row, count.

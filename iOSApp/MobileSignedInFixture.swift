@@ -315,16 +315,22 @@ import os
                 if failedItems {
                     let arguments = ProcessInfo.processInfo.arguments
                     let kinds: [BackupIssueKind]
+                    var failedKinds: [BackupIssueKind] = []
                     if arguments.contains("-EncryptedMemoriesNetworkOnlyBackupFixture") {
                         kinds = [.network]
                     } else if arguments.contains("-EncryptedMemoriesAccountStorageOnlyBackupFixture") {
                         kinds = [.accountStorage]
                     } else if arguments.contains("-EncryptedMemoriesNoUserResolvableBackupFixture") {
                         kinds = [.network, .deletedElsewhere, .unsupported]
+                    } else if arguments.contains("-EncryptedMemoriesStoppedRefusalBackupFixture") {
+                        kinds = [.remoteService, .permission]
+                        failedKinds = [.remoteService]
+                    } else if arguments.contains("-EncryptedMemoriesCalmOnlyBackupFixture") {
+                        kinds = [.remoteService]
                     } else {
                         kinds = [.network, .accountStorage, .deletedElsewhere, .unsupported]
                     }
-                    installed = controller.installFailedItemsFixtureForTesting(kinds: kinds)
+                    installed = controller.installFailedItemsFixtureForTesting(kinds: kinds, failedKinds: failedKinds)
                 } else {
                     let large = ProcessInfo.processInfo.arguments.contains(
                         "-EncryptedMemoriesDeletedBackupLargeFixture")

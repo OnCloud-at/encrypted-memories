@@ -148,10 +148,12 @@ final class BackupWaitingForWiFiTests: XCTestCase {
 
     func testWiFiWaitStaysVisibleNextToFailedPhotos() {
         var progress = waitingProgress(running: false, waitsForWiFi: true)
-        progress.failed = 1
+        progress.failed = 2
+        progress.attention = 1
         let status = BackupStatus(progress: progress, isScanning: false)
         XCTAssertEqual(status.phase, .waitingForWiFi)
-        XCTAssertEqual(BackupStatusPresentation(status).attentionCount, 1, "the failed photo stays reachable")
+        XCTAssertEqual(BackupStatusPresentation(status).attentionCount, 1, "the photo for the person stays reachable")
+        XCTAssertEqual(BackupStatusPresentation(status).notBackedUpCount, 1, "the calm photo stays reachable")
     }
 
     func testWiFiWaitEndsOnWiFiOrWhenTheSettingIsTurnedOn() {

@@ -303,9 +303,12 @@ private struct BackupSettingsTab: View {
                 if status.waitingRetry > 0 {
                     Text("settings.backup_row_blocked \(status.waitingRetry)")
                 }
-                if status.failed > 0 {
-                    Text("settings.backup_row_failed \(status.failed)")
+                if status.needsAttentionCount > 0 {
+                    Text("settings.backup_row_failed \(status.needsAttentionCount)")
                         .foregroundStyle(.orange)
+                }
+                if status.notBackedUpFailedCount > 0 {
+                    Text(L10n.string("backup.progress_not_backed_up \(status.notBackedUpFailedCount)"))
                 }
             }
             .font(.system(size: 11).monospacedDigit())
@@ -658,6 +661,22 @@ private struct PhotoLibraryBackupSection: View {
                                 .foregroundStyle(.orange)
                             }
                             .buttonStyle(.plain)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                        if let notBackedUp = display.localizedNotBackedUp {
+                            Button {
+                                showFailedList = true
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(notBackedUp)
+                                        .font(.caption)
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                }
+                                .foregroundStyle(ProtonColor.textWeak)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("backup.notBackedUpItems")
                             .transition(.opacity.combined(with: .move(edge: .top)))
                         }
                         if let waiting = display.localizedWaitingDetail {

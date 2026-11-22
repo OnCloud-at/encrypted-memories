@@ -850,12 +850,12 @@ public final class PhotoLibraryBackupController {
     /// rows for a moment; after these re-reads the list is reported as unavailable instead.
     static let problemListRereadDelays: [TimeInterval] = [0.25, 0.5, 1, 2, 4]
 
-    /// Whether the summary counts photos that need attention, so the list must show some.
-    private var summaryCountsProblemItems: Bool {
+    /// Whether the summary counts photos that are not backed up, so the list must show some.
+    var summaryCountsProblemItems: Bool {
         #if DEBUG
             if let override = problemListExpectationForTesting { return override() }
         #endif
-        return status.needsAttentionCount > 0
+        return status.hasPhotosNotBackedUp
     }
 
     /// Re-reads an empty list while the summary still counts problems, up to the bounded retry budget.
@@ -1930,16 +1930,40 @@ public final class PhotoLibraryBackupController {
         }
 
         /// Seeds the three native sections without PhotoKit or a network connection.
+        /// `failedKinds` adds one parked row per kind, after its attempts, named "<kind> failed fixture.heic".
         public func installFailedItemsFixtureForTesting(
-            kinds: [BackupIssueKind] = [.network, .accountStorage, .deletedElsewhere, .unsupported]
+            kinds: [BackupIssueKind] = [.network, .accountStorage, .deletedElsewhere, .unsupported],
+            failedKinds: [BackupIssueKind] = []
         ) -> Bool {
             guard let queueStore, pendingReplacementJournal != nil else { return false }
             let retryAt = Date().addingTimeInterval(3_600)
+            for kind in failedKinds {
+                guard
+                    queueStore.upsert(
+                        .init(
+                            source: UploadSourceIdentity(
+                                kind: .photoLibraryAsset, identifier: "fixture-failed-\(kind.rawValue)"),
+                            revision: .init(rawValue: 1), originalFilename: "\(kind.rawValue) failed fixture.heic",
+                            state: .failed,
+                            lastError: BackupIssueRecord(kind: kind, detail: "Fixture technical detail").persistedValue,
+                            updatedAt: retryAt))
+                else { return false }
+            }
             for kind in kinds {
+                // A remoteService row is a photo that stopped after Proton refused it over three days.
                 let state: UploadBackupSyncQueueState =
-                    kind == .deletedElsewhere ? .failedPermanent : kind == .unsupported ? .failed : .discovered
+                    switch kind {
+                    case .deletedElsewhere, .remoteService: .failedPermanent
+                    case .unsupported, .permission: .failed
+                    default: .discovered
+                    }
                 let source = UploadSourceIdentity(
                     kind: .photoLibraryAsset, identifier: "fixture-\(kind.rawValue)")
+                let refusal =
+                    kind == .remoteService
+                    ? BackupServiceRejection(
+                        rounds: 3, firstRoundAt: retryAt.addingTimeInterval(-4 * 86_400),
+                        lastRoundAt: retryAt.addingTimeInterval(-3_600)) : nil
                 guard
                     queueStore.upsert(
                         .init(
@@ -1947,7 +1971,9 @@ public final class PhotoLibraryBackupController {
                             originalFilename: "\(kind.rawValue) fixture.heic", state: state,
                             lastError: BackupIssueRecord(
                                 kind: kind, detail: "Fixture technical detail",
-                                nextAttemptAt: BackupItemOutcome(issue: kind).category == .automatic ? retryAt : nil
+                                nextAttemptAt: state == .discovered
+                                    && BackupItemOutcome(issue: kind).category == .automatic ? retryAt : nil,
+                                serviceRejection: refusal
                             ).persistedValue, updatedAt: retryAt))
                 else { return false }
             }

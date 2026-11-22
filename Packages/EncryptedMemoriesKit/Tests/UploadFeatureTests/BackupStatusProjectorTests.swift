@@ -62,6 +62,31 @@ final class BackupStatusProjectorTests: XCTestCase {
         await projector.stop()
     }
 
+    func testAFailedParkedReadPublishesNoProjection() async throws {
+        let inner = try XCTUnwrap(queue)
+        var row = entry(id: "parked", state: .failed)
+        row.lastError = BackupIssueRecord(kind: .permission, detail: "").persistedValue
+        XCTAssertTrue(inner.upsert(row))
+        let projector = BackupStatusProjector(queue: inner)
+        let generation = UUID()
+        let recorder = Recorder()
+        await projector.start(generation: generation, context: BackupStatusProjectionContext()) {
+            recorder.append($0)
+        }
+        XCTAssertEqual(recorder.values.last?.status.needsAttentionCount, 1)
+        let publications = recorder.values.count
+        let fault = try SQLiteReadInterrupt(in: inner, matching: "SELECT state, last_error FROM backup_sync_queue")
+        defer { fault.stop() }
+
+        let result = await projector.projectNow(
+            context: BackupStatusProjectionContext(), generation: generation, revision: 1)
+
+        XCTAssertTrue(fault.fired)
+        XCTAssertNil(result, "A summary without its attention split must not publish every parked photo as calm")
+        XCTAssertEqual(recorder.values.count, publications)
+        await projector.stop()
+    }
+
     func testStopReleasesTheProjectorAndItsCallbackOwner() async {
         var projector: BackupStatusProjector? = BackupStatusProjector(queue: queue)
         var recorder: Recorder? = Recorder()
@@ -250,6 +275,12 @@ final class BackupStatusProjectorTests: XCTestCase {
 
     func testOnlyAnIdleTerminalPassResetsThePhotoWatermark() async throws {
         XCTAssertTrue(queue.upsertBatch((0..<10).map { entry(id: "terminal-\($0)", state: .discovered) }))
+        // A failed row asks the person only for a cause that the person can fix, so these rows lack photo access.
+        func parked(_ id: String, _ state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry {
+            var row = entry(id: id, state: state)
+            if state == .failed { row.lastError = BackupIssueRecord(kind: .permission, detail: "").persistedValue }
+            return row
+        }
         for terminal in [UploadBackupSyncQueueState.failed, .completed] {
             for index in 0..<10 {
                 XCTAssertTrue(setQueueState(id: "terminal-\(index)", state: index < 8 ? .completed : .discovered))
@@ -259,7 +290,7 @@ final class BackupStatusProjectorTests: XCTestCase {
             var context = BackupStatusProjectionContext(
                 isRunning: true, photoDisplay: .init(cycleID: UUID(), scanFinished: true))
             await projector.start(generation: generation, context: context) { _ in }
-            XCTAssertTrue(queue.upsertBatch((8..<10).map { entry(id: "terminal-\($0)", state: terminal) }))
+            XCTAssertTrue(queue.upsertBatch((8..<10).map { parked("terminal-\($0)", terminal) }))
             let runningTerminal = await projector.projectNow(context: context, generation: generation, revision: 1)
             XCTAssertEqual(runningTerminal?.status.phase, terminal == .failed ? .needsAttention : .completed)
             XCTAssertNil(BackupStatusPresentation(try XCTUnwrap(runningTerminal?.status)).progressFraction)
@@ -269,7 +300,7 @@ final class BackupStatusProjectorTests: XCTestCase {
             let microDrain = await projector.projectNow(context: context, generation: generation, revision: 2)
             XCTAssertEqual(BackupStatusPresentation(try XCTUnwrap(microDrain?.status)).progressFraction, 0.8)
 
-            XCTAssertTrue(queue.upsertBatch((4..<10).map { entry(id: "terminal-\($0)", state: terminal) }))
+            XCTAssertTrue(queue.upsertBatch((4..<10).map { parked("terminal-\($0)", terminal) }))
             context.isRunning = false
             let idleTerminal = await projector.projectNow(context: context, generation: generation, revision: 3)
             XCTAssertEqual(idleTerminal?.status.phase, terminal == .failed ? .needsAttention : .completed)
@@ -646,6 +677,30 @@ final class BackupStatusProjectorTests: XCTestCase {
         XCTAssertEqual(terminal.status.phase, .completed)
         XCTAssertFalse(terminal.status.isActive)
         await projector.stop()
+    }
+
+    /// A backend error is stored as remoteService also when it is local or a sign-in failure. Only a temporary Proton
+    /// failure counts automatic retries, so only that one names Proton in the waiting headline.
+    func testOnlyATemporaryProtonFailureWaitsForProton() async throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let due = now.addingTimeInterval(600)
+        for (attempt, headline) in [(0, "backup.phase_waiting"), (1, "backup.phase_waiting_proton")] {
+            var row = entry(id: "service-\(attempt)", state: .discovered)
+            row.updatedAt = due
+            row.lastError =
+                BackupIssueRecord(
+                    kind: .remoteService, detail: "backend", nextAttemptAt: due, automaticRetryAttempt: attempt
+                ).persistedValue
+            XCTAssertTrue(queue.upsert(row))
+            let projector = BackupStatusProjector(queue: queue, now: { now })
+            let recorder = Recorder()
+            await projector.start(generation: UUID(), context: .init()) { recorder.append($0) }
+            let projection = try XCTUnwrap(recorder.values.last)
+            XCTAssertEqual(projection.status.outstandingIssue, attempt == 0 ? .unknown : .remoteService)
+            XCTAssertEqual(BackupStatusPresentation(projection.status).headlineKey, headline)
+            await projector.stop()
+            XCTAssertTrue(queue.removeMissingSource(source: row.source, revision: row.revision))
+        }
     }
 
     func testDismissedSourceRechecksUsePhotosWordingWithoutAProblemListAction() async throws {

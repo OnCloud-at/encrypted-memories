@@ -3927,9 +3927,10 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(state(of: entry), .discovered)
         XCTAssertTrue(progress.remoteIndexPreparationFailed)
         XCTAssertEqual(progress.remoteIndexPreparation?.completed, 10)
-        XCTAssertEqual(progress.remoteIndexPreparationIssue?.kind, .remoteService)
+        // A backend error proves no temporary Proton failure, so the status never says "Waiting for Proton".
+        XCTAssertEqual(progress.remoteIndexPreparationIssue?.kind, .unknown)
         var persistedIssue = try XCTUnwrap(queueStore.runtimeIssue(for: .remoteIndexPreparation))
-        XCTAssertEqual(persistedIssue.kind, .remoteService)
+        XCTAssertEqual(persistedIssue.kind, .unknown)
         XCTAssertEqual(persistedIssue.automaticRetryAttempt, 1)
         XCTAssertEqual(persistedIssue.nextAttemptAt, clock.now.addingTimeInterval(1))
         XCTAssertTrue(uploader.requests.isEmpty)
