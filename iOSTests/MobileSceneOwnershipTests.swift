@@ -120,11 +120,12 @@ import UIKit
         let scene = try #require(
             UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
                 .first { $0.activationState == .foregroundActive })
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let firstContext = MobileSceneContext()
         let secondContext = MobileSceneContext()
-        let firstWindow = UIWindow(windowScene: scene)
-        let secondWindow = UIWindow(windowScene: scene)
+        let firstHosted = HostedTestWindow(scene: scene)
+        let secondHosted = HostedTestWindow(scene: scene)
+        let firstWindow = firstHosted.window
+        let secondWindow = secondHosted.window
         firstWindow.rootViewController = UIHostingController(
             rootView: Color.clear.mobileSceneWindowAnchor(firstContext))
         secondWindow.rootViewController = UIHostingController(
@@ -132,11 +133,8 @@ import UIKit
         firstWindow.makeKeyAndVisible()
         secondWindow.isHidden = false
         defer {
-            firstWindow.isHidden = true
-            secondWindow.isHidden = true
-            firstWindow.rootViewController = nil
-            secondWindow.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            secondHosted.close()
+            firstHosted.close()
         }
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while firstContext.window !== firstWindow || secondContext.window !== secondWindow,

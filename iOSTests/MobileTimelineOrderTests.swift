@@ -19,8 +19,8 @@ final class MobileTimelineOrderTests: XCTestCase {
                 uid: PhotoUID(volumeID: "order-test", nodeID: String($0)),
                 captureTime: Date(timeIntervalSince1970: Double(500 + $0 / 2)), mediaType: "image/jpeg")
         }
-        let previousWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         let controller = UIViewController()
         controller.additionalSafeAreaInsets.top = 88
         let grid = UIKitTimelineGridHostView()
@@ -29,9 +29,7 @@ final class MobileTimelineOrderTests: XCTestCase {
         window.makeKeyAndVisible()
         defer {
             grid.setActive(false)
-            window.isHidden = true
-            window.rootViewController = nil
-            previousWindow?.makeKey()
+            hosted.close()
         }
         grid.configure(items: items, contentRevision: 1, thumbnailFeed: feed)
         window.layoutIfNeeded()

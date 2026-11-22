@@ -38,20 +38,18 @@ final class MobileWindowGeometryTests: XCTestCase {
         _ = await feed.warmDecoded(items.map(\.uid))
 
         let fullBounds = scene.coordinateSpace.bounds
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
         let state = ChromeProbeState()
         state.showsLoadingCover = false
         state.showsActivity = false
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.frame = fullBounds
         window.rootViewController = UIHostingController(
             rootView: ChromeProbeShell(items: items, feed: feed, state: state))
         window.makeKeyAndVisible()
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         try await Task.sleep(for: .seconds(2))
 

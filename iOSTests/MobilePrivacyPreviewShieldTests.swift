@@ -49,17 +49,15 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         let state = ChromeProbeState()
         state.showsLoadingCover = false
         state.showsActivity = false
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.overrideUserInterfaceStyle = .dark
         window.rootViewController = UIHostingController(
             rootView: ChromeProbeShell(items: items, feed: fixture.feed, state: state))
         window.makeKeyAndVisible()
         defer {
             descendants(window).compactMap { $0 as? UIKitTimelineGridHostView }.forEach { $0.setActive(false) }
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
         var probes: [(point: CGPoint, rgb: [Double])] = []
         var ready = false
@@ -223,16 +221,15 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
 
     @MainActor func testPreviewFadesInAndOutAndSurvivesRapidReactivation() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIViewController()
         window.rootViewController?.view.backgroundColor = .red
         window.makeKeyAndVisible()
         let shield = MobilePrivacyPreviewShield()
         defer {
             shield.remove()
-            window.isHidden = true
-            previous?.makeKey()
+            hosted.close()
         }
 
         shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
@@ -269,16 +266,15 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
     /// cover takes its place. The window must still end up covered; the old reference is stale by design.
     @MainActor func testRedeactivationAfterCompletedFadeOutReplacesTheCover() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIViewController()
         window.rootViewController?.view.backgroundColor = .red
         window.makeKeyAndVisible()
         let shield = MobilePrivacyPreviewShield()
         defer {
             shield.remove()
-            window.isHidden = true
-            previous?.makeKey()
+            hosted.close()
         }
 
         shield.update(enabled: true, isSceneActive: false, window: window, animated: true)
@@ -302,8 +298,8 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
 
     @MainActor func testBackgroundNotificationFinishesTheFadeBeforeTheSnapshot() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
-        let previous = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = UIViewController()
         window.makeKeyAndVisible()
         let original = UserDefaults.standard.object(forKey: AppSettingsKey.blurAppPreview)
@@ -312,8 +308,7 @@ final class MobilePrivacyPreviewShieldTests: XCTestCase {
         defer {
             center.refreshAll(enabled: false)
             UserDefaults.standard.set(original, forKey: AppSettingsKey.blurAppPreview)
-            window.isHidden = true
-            previous?.makeKey()
+            hosted.close()
         }
         center.register(window: window)
         NotificationCenter.default.post(name: UIScene.willDeactivateNotification, object: scene)

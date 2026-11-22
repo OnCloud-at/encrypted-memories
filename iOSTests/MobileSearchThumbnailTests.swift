@@ -19,14 +19,12 @@ final class MobileSearchThumbnailTests: XCTestCase {
         let red = try await feed(color: .red, name: "replacement", uid: uid, root: root)
         let state = SearchThumbnailProbeState()
         let host = UIHostingController(rootView: SearchThumbnailProbe(uid: uid, state: state))
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = host
         window.makeKeyAndVisible()
         defer {
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
 
         try await Task.sleep(for: .milliseconds(100))
@@ -64,15 +62,13 @@ final class MobileSearchThumbnailTests: XCTestCase {
             color: .red, name: "replacement", uid: uid, root: root)
         let state = SearchThumbnailProbeState(feed: oldFeed)
         let host = UIHostingController(rootView: SearchThumbnailProbe(uid: uid, state: state))
-        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
-        let window = UIWindow(windowScene: scene)
+        let hosted = HostedTestWindow(scene: scene)
+        let window = hosted.window
         window.rootViewController = host
         window.makeKeyAndVisible()
         defer {
             Task { await oldLoader.release() }
-            window.isHidden = true
-            window.rootViewController = nil
-            previousKeyWindow?.makeKey()
+            hosted.close()
         }
 
         await oldLoader.waitUntilEntered()
