@@ -1,6 +1,7 @@
 import AlbumSyncCore
 import Foundation
 import PhotosCore
+import UploadCore
 
 /// Whether the person pressed Stop during the current Album Sync batch, and what the message line says after it.
 /// The controller only reports the events; this type decides, so both native hosts show the same result.
@@ -59,7 +60,7 @@ struct AlbumSyncStopState: Equatable {
 
     /// A Stop reported as cancellation ends the run like `.stopped`; without a Stop it stays an error.
     func endsAsStop(_ error: any Error) -> Bool {
-        isRequested && error is CancellationError
+        isRequested && UploadError.isCancellation(error)
     }
 
     /// The new message line after `outcome`, or `nil` to keep the line. A real error stays. A run that ended with

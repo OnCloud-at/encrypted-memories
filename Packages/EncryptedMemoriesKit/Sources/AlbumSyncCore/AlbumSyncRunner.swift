@@ -90,13 +90,20 @@ public actor AlbumSyncRunner {
             let report = try await run(album: album, resolution: resolution, mappingStore: mappingStore)
             return report
         } catch {
-            if progress.phase != .needsAttention {
+            // A Stop is no failure: the card must not flash "could not be synced".
+            if progress.phase != .needsAttention, !UploadError.isCancellation(error) {
                 progress.phase = .needsAttention
-                progress.message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                progress.message = AlbumSyncFailureMessage.text(for: error)
                 publish()
             }
             throw error
         }
+    }
+
+    /// A photo that could not be attached carries the text of the backend. The progress names that a failure remains
+    /// with the short sentence, never with that text.
+    private static func attachFailureMessage(_ backendText: String?) -> String? {
+        backendText == nil ? nil : AlbumSyncFailureMessage.short
     }
 
     /// Requests a stop. The current attach chunk finishes; backup checkpoints and stops. Work
@@ -247,9 +254,6 @@ public actor AlbumSyncRunner {
         guard mappingStore.upsert(mapping) else { throw AlbumSyncError.mappingStoreUnavailable }
 
         progress.phase = report.isFullySynced ? .completed : .needsAttention
-        if !report.isFullySynced, progress.message == nil {
-            progress.message = attachResult.firstFailureMessage
-        }
         publish()
         return report
     }
@@ -275,7 +279,7 @@ public actor AlbumSyncRunner {
             progress.alreadyMember = alreadyMember + total.alreadyMember
             if publishesFailures {
                 progress.attachFailed = total.failed
-                progress.message = total.firstFailureMessage
+                progress.message = Self.attachFailureMessage(total.firstFailureMessage)
             }
             publish()
         }
@@ -333,7 +337,7 @@ public actor AlbumSyncRunner {
         }
         if !first.failedLinkIDs.isEmpty, result.failedLinkIDs != first.failedLinkIDs {
             progress.attachFailed = result.failed
-            progress.message = result.firstFailureMessage
+            progress.message = Self.attachFailureMessage(result.firstFailureMessage)
             publish()
         }
         return result

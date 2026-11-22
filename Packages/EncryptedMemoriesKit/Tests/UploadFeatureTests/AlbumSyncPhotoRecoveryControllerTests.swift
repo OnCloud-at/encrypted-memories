@@ -5,6 +5,7 @@ import Photos
 import PhotosCore
 import UploadCore
 import XCTest
+import os
 
 @testable import PhotoLibraryBackupAdapter
 
@@ -927,6 +928,100 @@ final class AlbumSyncPhotoRecoveryControllerTests: XCTestCase {
         XCTAssertEqual(fixture.device.server.links.first { $0.linkID == fixture.original.nodeID }?.state, .trashed)
     }
 
+    // MARK: - Failure reasons
+
+    /// A run that fails for a reason that names no album sync cause shows one short sentence, in the status line and in
+    /// the progress detail of the row. The system or server text of the error reaches neither. The local source throws,
+    /// so the error travels through the runner like a real read failure.
+    func testARunThatFailsWithoutAnAlbumSyncCauseShowsTheShortReason() async throws {
+        let errors: [any Error] = [
+            URLError(.notConnectedToInternet), UploadError.backend("HTTP 503 for /drive/v2/albums"),
+        ]
+        for error in errors {
+            try await withFixture(
+                localSource: RecoveryThrowingSource(error: error),
+                body: { fixture in
+                    fixture.controller.syncNow(albumID: "local-album")
+                    await waitForSync(fixture.controller)
+
+                    let short = L10n.string("albumsync.sync_failed")
+                    XCTAssertEqual(fixture.controller.lastMessage, short, "\(error)")
+                    XCTAssertEqual(fixture.controller.lastMessageStyle, .error)
+                    XCTAssertEqual(fixture.controller.progress.phase, .needsAttention, "\(error)")
+                    XCTAssertEqual(fixture.controller.progress.localizedDetail, short, "\(error)")
+                })
+        }
+    }
+
+    /// An album sync cause keeps the sentence that names it: the person can act on it.
+    func testARunThatFailsWithAnAlbumSyncCauseKeepsItsOwnReason() async throws {
+        try await withFixture(
+            localSource: RecoveryMissingAlbumSource(),
+            body: { fixture in
+                fixture.controller.syncNow(albumID: "local-album")
+                await waitForSync(fixture.controller)
+
+                XCTAssertEqual(fixture.controller.lastMessage, L10n.string("albumsync.error_local_album_missing"))
+                XCTAssertNotEqual(fixture.controller.lastMessage, L10n.string("albumsync.sync_failed"))
+                XCTAssertEqual(fixture.controller.progress.localizedDetail, fixture.controller.lastMessage)
+            })
+    }
+
+    /// The first album of a batch fails. While the second album starts, its progress shows nothing of the first
+    /// album's failure: the controller starts each album with an empty progress.
+    func testTheProgressOfTheNextAlbumDoesNotShowTheFailureOfTheAlbumBefore() async throws {
+        let gate = RecoveryGate()
+        let contextReads = OSAllocatedUnfairLock(initialState: 0)
+        let source = RecoveryBatchSource(unreadable: ["local-album"])
+        try await withFixture(
+            onContext: {
+                // The first album reads its context at once; the second one waits for the test.
+                if contextReads.withLock({
+                    $0 += 1
+                    return $0
+                }) == 2 {
+                    await gate.wait()
+                }
+            }, localSource: source, automaticBatch: true,
+            body: { fixture in
+                fixture.controller.syncSelected()
+                await fulfillment(of: [gate.entered], timeout: 5)
+
+                XCTAssertEqual(source.readAlbums, ["local-album"], "the first album failed before the second began")
+                XCTAssertEqual(fixture.controller.lastMessage, L10n.string("albumsync.sync_failed"))
+                XCTAssertEqual(fixture.controller.progress, AlbumSyncProgress(), "the second album starts empty")
+                await gate.release()
+                await waitForSync(fixture.controller)
+            })
+    }
+
+    /// The reasons that the shared function maps, without a run: a failure that only the person can fix keeps its own
+    /// sentence, because the short one would hide what to do. It is not reachable through a run today.
+    func testAFailureOnlyThePersonCanFixKeepsItsOwnSentence() {
+        let storage = UploadError.accountStorageFull(
+            "Your Proton storage is full.", requiredBytes: 10, availableBytes: 1)
+        XCTAssertEqual(AlbumSyncFailureMessage.text(for: storage), storage.errorDescription)
+        XCTAssertNotEqual(AlbumSyncFailureMessage.text(for: storage), AlbumSyncFailureMessage.short)
+        let denied = UploadError.permissionDenied("No access")
+        XCTAssertEqual(AlbumSyncFailureMessage.text(for: denied), denied.errorDescription)
+        for error in [UploadError.backend("HTTP 503"), UploadError.retryableBackend(code: 503, message: "busy")] {
+            XCTAssertEqual(AlbumSyncFailureMessage.text(for: error), AlbumSyncFailureMessage.short, "\(error)")
+        }
+    }
+
+    /// The albums of the library cannot be read before an automatic sync: the person sees the short sentence of the
+    /// album lists, not the text of the system error.
+    func testAnAutomaticRefreshThatCannotReadTheLibraryAlbumsShowsTheShortReason() async throws {
+        try await withFixture(
+            localSource: RecoveryUnreadableAlbumsSource(),
+            body: { fixture in
+                await fixture.controller.refreshLocalAlbumsForAutomaticSync()
+
+                XCTAssertEqual(fixture.controller.lastMessage, L10n.string("albums.load_failed_message"))
+                XCTAssertEqual(fixture.controller.lastMessageStyle, .error)
+            })
+    }
+
     private func waitForSync(_ controller: AlbumSyncController) async {
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
         while controller.isSyncing, ContinuousClock.now < deadline { await Task.yield() }
@@ -1126,6 +1221,28 @@ private actor RecoveryGate {
     }
 }
 
+/// A library whose album list cannot be read, with the kind of text that a system error carries.
+private struct RecoveryUnreadableAlbumsSource: AlbumSyncLocalAlbumSource {
+    struct Unreadable: LocalizedError {
+        var errorDescription: String? { "PHPhotosErrorDomain error 3311 (internal detail)" }
+    }
+    func listAlbums() async throws -> [LocalAlbumSummary] { throw Unreadable() }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { throw Unreadable() }
+}
+
+/// A library whose album read throws the given error.
+private struct RecoveryThrowingSource: AlbumSyncLocalAlbumSource {
+    let error: any Error
+    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { throw error }
+}
+
+/// A library from which the album is gone.
+private struct RecoveryMissingAlbumSource: AlbumSyncLocalAlbumSource {
+    func listAlbums() async throws -> [LocalAlbumSummary] { [] }
+    func albumContents(albumID: String) async throws -> AlbumSyncLocalAlbumContents { .missing }
+}
+
 private final class RecoveryCountingSource: AlbumSyncLocalAlbumSource, @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
@@ -1235,7 +1352,9 @@ private final class RecoveryBatchSource: AlbumSyncLocalAlbumSource, @unchecked S
     private var reads: [String] = []
     private var identifiers: [String] = []
     private let onFirstRead: @Sendable () async -> Void
-    init(onFirstRead: @escaping @Sendable () async -> Void = {}) {
+    private let unreadable: Set<String>
+    init(unreadable: Set<String> = [], onFirstRead: @escaping @Sendable () async -> Void = {}) {
+        self.unreadable = unreadable
         self.onFirstRead = onFirstRead
     }
     func includeAsset() { lock.withLock { identifiers = ["asset-1"] } }
@@ -1252,6 +1371,7 @@ private final class RecoveryBatchSource: AlbumSyncLocalAlbumSource, @unchecked S
             return reads.count == 1
         }
         if first { await onFirstRead() }
+        if unreadable.contains(albumID) { throw URLError(.notConnectedToInternet) }
         return .present(lock.withLock { identifiers })
     }
 }

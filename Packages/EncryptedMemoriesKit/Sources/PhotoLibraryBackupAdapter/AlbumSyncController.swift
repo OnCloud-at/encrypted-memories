@@ -272,12 +272,7 @@ public final class AlbumSyncController {
         defer { isLoadingAlbums = false }
         accessState = await PhotoLibraryAuthorization.request()
         guard accessState.allowsBackup else { return }
-        do {
-            availableAlbums = try await localSource.listAlbums()
-            libraryWasRead = true
-        } catch {
-            setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-        }
+        _ = await readLibraryAlbums()
         reloadSelection()
         startObservingChangesIfNeeded()
     }
@@ -699,6 +694,9 @@ public final class AlbumSyncController {
 
         syncTask = Task { [weak self] in
             while let album = self?.dequeueNextAlbum() {
+                // The progress of the album before is over: its failure text must not show while this album starts.
+                self?.progress = AlbumSyncProgress()
+                self?.lastProgressUpdate = .distantPast
                 do {
                     let generation = self?.recoveryGeneration
                     let recoveryContext = try await self?.captureRecoveryContext()
@@ -716,7 +714,7 @@ public final class AlbumSyncController {
                         self?.showStopResult(after: .stopped)
                         self?.reloadSelection()
                     default:
-                        self?.setMessage(error.errorDescription)
+                        self?.setMessage(AlbumSyncFailureMessage.text(for: error))
                         self?.reloadSelection()
                     }
                 } catch {
@@ -724,7 +722,7 @@ public final class AlbumSyncController {
                         self?.dropQueueAfterStop()
                         self?.showStopResult(after: .cancelled)
                     } else {
-                        self?.setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                        self?.setMessage(AlbumSyncFailureMessage.text(for: error))
                     }
                     self?.reloadSelection()
                 }
@@ -740,6 +738,9 @@ public final class AlbumSyncController {
         guard let next = stopState.message(after: outcome, current: current) else { return }
         setMessage(next.text, style: next.style)
     }
+
+    /// The sentence for a library whose albums cannot be read.
+    static var libraryAlbumsFailureMessage: String { L10n.string("albums.load_failed_message") }
 
     func setMessage(_ message: String?, style: MessageStyle = .error) {
         lastMessage = message
@@ -819,14 +820,23 @@ public final class AlbumSyncController {
         }
     }
 
-    private func refreshLocalAlbumsForAutomaticSync() async {
+    /// Reads the library albums before an automatic sync. Internal so that a test reads it without waiting for the
+    /// change monitor, whose next sync clears the message at once.
+    func refreshLocalAlbumsForAutomaticSync() async {
         guard accessState.allowsBackup else { return }
+        if await readLibraryAlbums() { reloadSelection() }
+    }
+
+    /// Reads the albums of the library for the picker and for the automatic sync. A failure shows one short sentence,
+    /// never the text of the system error. Returns whether the albums were read.
+    private func readLibraryAlbums() async -> Bool {
         do {
             availableAlbums = try await localSource.listAlbums()
             libraryWasRead = true
-            reloadSelection()
+            return true
         } catch {
-            setMessage((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            setMessage(Self.libraryAlbumsFailureMessage)
+            return false
         }
     }
 

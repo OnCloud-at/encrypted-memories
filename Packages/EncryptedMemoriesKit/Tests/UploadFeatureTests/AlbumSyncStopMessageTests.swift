@@ -46,6 +46,14 @@ final class AlbumSyncStopMessageTests: XCTestCase {
         XCTAssertEqual(state.message(after: .cancelled, current: none), .init(text: stoppedText, style: .information))
     }
 
+    /// The backup can report a Stop as its own cancellation error, not as a Swift cancellation.
+    func testAStopThatArrivesAsAnUploadCancellationEndsTheRunAsAStop() {
+        let state = stopped()
+        XCTAssertTrue(state.endsAsStop(UploadError.cancelled))
+        XCTAssertTrue(state.endsAsStop(UploadError.transport(code: URLError.cancelled.rawValue, message: "stopped")))
+        XCTAssertFalse(state.endsAsStop(UploadError.backend("HTTP 503")))
+    }
+
     func testACancellationWithoutAStopStaysAnError() {
         var state = AlbumSyncStopState()
         state.batchStarted()
