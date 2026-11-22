@@ -75,7 +75,7 @@ final class PhotoJournalFileFormatTests: XCTestCase {
         try store.save(revertJournal)
 
         XCTAssertEqual(try fileNames(in: revertDirectory), [mainFile], "a later save replaces the file of the photo")
-        try assertFile(revertDirectory.appendingPathComponent(mainFile), holds: revertJSON)
+        try assertJSONFile(revertDirectory.appendingPathComponent(mainFile), holds: revertJSON)
     }
 
     func testASeriesJournalIsSavedAsExactlyItsEncodedBytesInTheFileOfItsMainPhoto() throws {
@@ -84,7 +84,7 @@ final class PhotoJournalFileFormatTests: XCTestCase {
         try store.save(seriesJournal)
 
         XCTAssertEqual(try fileNames(in: seriesDirectory), [mainFile], "a later save replaces the file of the series")
-        try assertFile(seriesDirectory.appendingPathComponent(mainFile), holds: seriesJSON)
+        try assertJSONFile(seriesDirectory.appendingPathComponent(mainFile), holds: seriesJSON)
     }
 
     func testRemovingAJournalDeletesOnlyTheFileOfItsPhoto() throws {
@@ -238,13 +238,5 @@ final class PhotoJournalFileFormatTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(text.utf8).write(to: url)
-    }
-
-    private func assertFile(
-        _ url: URL, holds expected: String, file: StaticString = #filePath, line: UInt = #line
-    ) throws {
-        let text = String(decoding: try Data(contentsOf: url), as: UTF8.self)
-        XCTAssertEqual(text.utf8.count, expected.utf8.count, "exact length", file: file, line: line)
-        XCTAssertEqual(canonicalJSON(text), expected, "exact content", file: file, line: line)
     }
 }

@@ -699,6 +699,14 @@ func canonicalJSON(_ text: String) -> String {
     return isIssue ? issuePrefix + sorted.base64EncodedString() : String(decoding: sorted, as: UTF8.self)
 }
 
+/// Checks that the file at `url` holds exactly `expected`: the same number of bytes and the same JSON after
+/// `canonicalJSON`.
+func assertJSONFile(_ url: URL, holds expected: String, file: StaticString = #filePath, line: UInt = #line) throws {
+    let text = String(decoding: try Data(contentsOf: url), as: UTF8.self)
+    XCTAssertEqual(text.utf8.count, expected.utf8.count, "exact length", file: file, line: line)
+    XCTAssertEqual(canonicalJSON(text), expected, "exact content", file: file, line: line)
+}
+
 /// Every row of `sql`, each as its columns joined with " | ", each column as "type:value", or as its text alone when
 /// `typed` is false. JSON text compares by content (`canonicalJSON`).
 func sqliteRows(_ database: OpaquePointer, _ sql: String, typed: Bool = true) throws -> [String] {
