@@ -438,15 +438,15 @@ private struct MobilePhotoBackupSections: View {
         reservesSpace: Bool
     ) -> some View {
         if reservesSpace {
-            let subtitle = display.localizedSubtitle
-            Text(verbatim: subtitle ?? "\u{00a0}")
+            let line = display.reservedSubtitle
+            Text(verbatim: line.displayText)
                 .font(.footnote.monospacedDigit())
                 .foregroundStyle(ProtonColor.textWeak)
                 .contentTransition(.numericText())
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .opacity(subtitle == nil ? 0 : 1)
-                .accessibilityHidden(subtitle == nil)
+                .opacity(line.isEmpty ? 0 : 1)
+                .accessibilityHidden(line.isEmpty)
         } else if let subtitle = display.localizedSubtitle {
             Text(subtitle)
                 .font(.footnote.monospacedDigit())
@@ -460,21 +460,21 @@ private struct MobilePhotoBackupSections: View {
     /// Items left and upload speed. The slot is always present in the progress layout, so a changing speed or a
     /// vanishing count cannot move the bar.
     @ViewBuilder private func leftSlot(_ display: BackupStatusPresentation) -> some View {
-        let left = display.localizedLeftLine
-        Text(verbatim: left ?? "\u{00a0}")
+        let line = display.reservedLeftLine
+        Text(verbatim: line.displayText)
             .font(.caption.monospacedDigit())
             .foregroundStyle(ProtonColor.textWeak)
             .contentTransition(.numericText())
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityLabel(display.localizedLeftAccessibilityLabel ?? "")
             .accessibilityAddTraits(.updatesFrequently)
-            .accessibilityHidden(left == nil)
+            .accessibilityHidden(line.isEmpty)
             .accessibilityIdentifier("backup.left")
     }
 
     /// The durable-item bar stays below its actual count. Scanning stays indeterminate in the row's activity icon.
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
-        if let fraction = display.progressFraction, display.isActive || display.accessory == .paused {
+        if let fraction = display.progressBarFraction {
             ActivityProgressBar(
                 fraction: fraction, accessibilityLabel: display.localizedHeadline,
                 accessibilityValue: display.localizedSubtitle ?? ""
