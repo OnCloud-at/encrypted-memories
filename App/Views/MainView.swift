@@ -2287,18 +2287,16 @@ struct MainView: View {
     }
 
     private var normalizedCommittedSearchText: String {
-        committedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        MLSmartSearchQueryCoordinator.normalized(committedSearchText)
     }
 
     private var isCommittedSemanticSearchPending: Bool {
         committedSuggestionMatches == nil
-            && semanticQuery?.requestedQuery == normalizedCommittedSearchText
-            && semanticQuery?.isSearching == true
+            && semanticQuery?.isResolving(committedQuery: normalizedCommittedSearchText) == true
     }
 
     private var committedSemanticMatches: Set<PhotoUID>? {
-        guard semanticQuery?.resolvedQuery == normalizedCommittedSearchText else { return nil }
-        return semanticQuery?.rankedUIDs.map(Set.init)
+        semanticQuery?.rankedMatches(forCommittedQuery: normalizedCommittedSearchText)
     }
 
     private func trashSelected() {

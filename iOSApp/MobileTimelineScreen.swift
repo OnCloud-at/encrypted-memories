@@ -649,7 +649,7 @@ struct MobileTimelineScreen: View {
     }
 
     private var normalizedCommittedSearchText: String {
-        committedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        MLSmartSearchQueryCoordinator.normalized(committedSearchText)
     }
 
     /// The resolved result set of the selected suggestion while the committed text still shows its title.
@@ -669,13 +669,11 @@ struct MobileTimelineScreen: View {
 
     private var isCommittedSemanticSearchPending: Bool {
         committedSuggestionMatches == nil
-            && semanticQuery?.requestedQuery == normalizedCommittedSearchText
-            && semanticQuery?.isSearching == true
+            && semanticQuery?.isResolving(committedQuery: normalizedCommittedSearchText) == true
     }
 
     private var committedSemanticMatches: Set<PhotoUID>? {
-        guard semanticQuery?.resolvedQuery == normalizedCommittedSearchText else { return nil }
-        return semanticQuery?.rankedUIDs.map(Set.init)
+        semanticQuery?.rankedMatches(forCommittedQuery: normalizedCommittedSearchText)
     }
 
     /// The text query that file names can match; a structured suggestion has none.
