@@ -380,7 +380,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
         let offered = try XCTUnwrap(PhotoBackupAssetPlanner.candidate(for: info))
         XCTAssertEqual(offered.snapshot.revision, candidate.snapshot.revision)
         let clock = BackupTestClock()
-        try dismiss(candidate, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
+        try dismiss(
+            candidate, issue: .init(kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail))
         let dismissed = try XCTUnwrap(
             try queue.entry(for: candidate.snapshot.source, revision: candidate.snapshot.revision))
         let live = UploadBackupAssetCandidate(
@@ -430,7 +431,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         try dismiss(
             candidate,
             issue: .init(
-                kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail, automaticRetryAttempt: 3))
+                kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail, automaticRetryAttempt: 3))
         let availability = AvailabilityResolver(candidate: candidate, missing: true)
         var engine = engine(clock: clock)
         try await PhotoLibraryCatalogSync(store: catalog).reconcileMissingSources(engine: engine)
@@ -476,8 +477,8 @@ final class MissingSourceReconciliationTests: XCTestCase {
     func testPhotosChangesKeepDismissedRowsWithOtherOrUnreadableReasons() async throws {
         let reasons: [BackupIssueRecord?] = [
             .init(kind: .unsupported, detail: "unsupported"),
-            .init(kind: .deletedElsewhere, detail: BackupFailedItem.sourceReportedMissingDetail),
-            .init(kind: .unknown, detail: BackupFailedItem.sourceReportedMissingDetail),
+            .init(kind: .deletedElsewhere, detail: BackupItemOutcome.sourceReportedMissingDetail),
+            .init(kind: .unknown, detail: BackupItemOutcome.sourceReportedMissingDetail),
             nil,
         ]
         for (index, reason) in reasons.enumerated() {
@@ -512,7 +513,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
                     resourceCount: scenario == "incomplete-compound" ? 2 : original.snapshot.resourceCount),
                 originalFilename: original.originalFilename)
             try dismiss(
-                offered, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
+                offered, issue: .init(kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail))
             let dismissed = try XCTUnwrap(
                 try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
             let snapshot = offered.snapshot
@@ -550,7 +551,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
 
     func testAvailabilityCheckPreservesADismissalChangedWhileReadingTheFile() async throws {
         let offered = try candidate("changed-dismissal")
-        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
+        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail))
         let changedIssue = BackupIssueRecord(kind: .unsupported, detail: "unsupported fixture")
         let queue = try XCTUnwrap(self.queue)
         let availability = AvailabilityResolver(
@@ -584,7 +585,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
         for (index, failure) in failures.enumerated() {
             let offered = try candidate("transient-proof-\(index)")
             try dismiss(
-                offered, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
+                offered, issue: .init(kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail))
             let dismissed = try XCTUnwrap(
                 try queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
             let clock = BackupTestClock()
@@ -644,7 +645,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
 
     func testFailedRecoveredSourceWritePreservesTheDismissalAndReportsTheFailure() async throws {
         let offered = try candidate("failed-reopen-write")
-        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail))
+        try dismiss(offered, issue: .init(kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail))
         let dismissed = try XCTUnwrap(queue.entry(for: offered.snapshot.source, revision: offered.snapshot.revision))
         try sql(
             url(UploadBackupSyncQueueManifestStore.databaseFileName),
@@ -787,7 +788,7 @@ final class MissingSourceReconciliationTests: XCTestCase {
 
     private func verifyDismissedSourceRecheckWaitsForPermission(missing: Bool, relaunch: Bool) async throws {
         let offered = try candidate("permission-recheck")
-        let issue = BackupIssueRecord(kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail)
+        let issue = BackupIssueRecord(kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail)
         try dismiss(offered, issue: issue)
         let clock = BackupTestClock()
         let availability = AvailabilityResolver(candidate: offered, missing: missing)

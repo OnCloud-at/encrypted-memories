@@ -1883,7 +1883,7 @@ public actor BackupSyncRunner {
                     let detail = "backup.issue_waiting_original"
                     let earlier = BackupIssueRecord.decode(entry.lastError)
                     let waits =
-                        BackupFailedItem.isWaitingForOriginal(earlier?.detail)
+                        BackupItemOutcome.isWaitingForOriginal(earlier?.detail)
                         ? (earlier?.automaticRetryAttempt ?? 0) + 1 : 0
                     let eligibleAt = now().addingTimeInterval(
                         Self.waitingReplacementDelay(afterWaits: waits, first: min(180, longestRegularRetryWait)))
@@ -2530,14 +2530,14 @@ public actor BackupSyncRunner {
             deferSource(
                 entry, from: oldState, until: recheck,
                 issue: BackupIssueRecord(
-                    kind: .unknown, detail: BackupFailedItem.sourceNotReadyDetail, nextAttemptAt: recheck))
+                    kind: .unknown, detail: BackupItemOutcome.sourceNotReadyDetail, nextAttemptAt: recheck))
             return
         }
         // Photos cannot hand out the file yet: it waits for iCloud, an offline library volume, or an interrupted read.
         // That says nothing about the Proton connection, so the network streak stays and photos on the device keep
         // their concurrency. The row waits like a network retry, without an attempt.
         if case UploadError.sourceUnavailable = error {
-            let detail = BackupFailedItem.sourceUnavailableDetail
+            let detail = BackupItemOutcome.sourceUnavailableDetail
             let attempt = min(32, Self.sourceWaits(of: entry, detail: detail) + 1)
             let eligibleAt = now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempt))
             deferSource(
@@ -2551,7 +2551,7 @@ public actor BackupSyncRunner {
         // recovery restart the checks indefinitely. A Photos change can reopen the row through the normal upsert.
         // A check that Back Up Now starts before the planned one does not count.
         if case UploadError.sourceReportedMissing = error {
-            let detail = BackupFailedItem.sourceReportedMissingDetail
+            let detail = BackupItemOutcome.sourceReportedMissingDetail
             if let previous = BackupIssueRecord.decode(entry.lastError), previous.detail == detail,
                 let planned = previous.nextAttemptAt, now() < planned
             {
@@ -2847,7 +2847,7 @@ public actor BackupSyncRunner {
     /// True when the row used its checks of a file that Photos reports missing and its planned last check is due. A
     /// check that Back Up Now starts earlier does not count.
     static func usedReportedMissingChecks(_ entry: UploadBackupSyncQueueEntry, now: Date) -> Bool {
-        guard sourceWaits(of: entry, detail: BackupFailedItem.sourceReportedMissingDetail) >= reportedMissingRechecks
+        guard sourceWaits(of: entry, detail: BackupItemOutcome.sourceReportedMissingDetail) >= reportedMissingRechecks
         else { return false }
         guard let planned = BackupIssueRecord.decode(entry.lastError)?.nextAttemptAt else { return true }
         return now >= planned
@@ -2856,7 +2856,7 @@ public actor BackupSyncRunner {
     /// The note of a photo that backed up without the Live Photo video that Photos still reports missing. It is the
     /// record of a photo that Photos reports missing after its checks, so diagnostics read it as that reason.
     static let missingPairedVideoNote = BackupIssueRecord(
-        kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail,
+        kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail,
         automaticRetryAttempt: reportedMissingRechecks
     ).persistedValue
 

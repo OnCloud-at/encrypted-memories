@@ -1777,7 +1777,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(row.attempts, 0)
         let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
         XCTAssertEqual(issue.kind, .unknown, "Photos waits, not the connection")
-        XCTAssertEqual(issue.detail, BackupFailedItem.sourceUnavailableDetail)
+        XCTAssertEqual(issue.detail, BackupItemOutcome.sourceUnavailableDetail)
         XCTAssertEqual(issue.automaticRetryAttempt, 1)
         XCTAssertEqual(issue.nextAttemptAt, row.updatedAt)
         let item = BackupFailedItem(entry: row)
@@ -1809,7 +1809,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             XCTAssertEqual(row.attempts, 0)
             let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
             XCTAssertEqual(issue.kind, .unknown)
-            XCTAssertEqual(issue.detail, BackupFailedItem.sourceReportedMissingDetail)
+            XCTAssertEqual(issue.detail, BackupItemOutcome.sourceReportedMissingDetail)
             XCTAssertEqual(issue.automaticRetryAttempt, checks)
             XCTAssertEqual(row.updatedAt.timeIntervalSince(clock.now), wait, accuracy: 0.001)
             XCTAssertEqual(BackupFailedItem(entry: row).reason, L10n.string("backup.issue_source_unavailable"))
@@ -1870,7 +1870,7 @@ final class BackupSyncRunnerTests: XCTestCase {
     /// The note of a photo that backed up without the Live Photo video that Photos reported missing.
     private var missingPairedVideoRecord: BackupIssueRecord {
         BackupIssueRecord(
-            kind: .sourceMissing, detail: BackupFailedItem.sourceReportedMissingDetail, automaticRetryAttempt: 3)
+            kind: .sourceMissing, detail: BackupItemOutcome.sourceReportedMissingDetail, automaticRetryAttempt: 3)
     }
 
     /// A photo library backup runner: it may leave out a missing Live Photo video, and it holds the edit journal.
@@ -1904,7 +1904,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             let row = try XCTUnwrap(queue.entry(for: entry.source, revision: entry.revision))
             XCTAssertEqual(row.state, .discovered)
             let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
-            XCTAssertEqual(issue.detail, BackupFailedItem.sourceReportedMissingDetail)
+            XCTAssertEqual(issue.detail, BackupItemOutcome.sourceReportedMissingDetail)
             XCTAssertEqual(issue.automaticRetryAttempt, checks)
             clock.advance(by: wait)
         }
@@ -2272,7 +2272,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(row.state, .discovered)
         let issue = try XCTUnwrap(BackupIssueRecord.decode(row.lastError))
         XCTAssertEqual(
-            issue.detail, BackupFailedItem.sourceReportedMissingDetail, "a different failure starts the checks again")
+            issue.detail, BackupItemOutcome.sourceReportedMissingDetail, "a different failure starts the checks again")
         XCTAssertEqual(issue.automaticRetryAttempt, 1)
         XCTAssertEqual(
             Array(resolver.omissionRequests(for: entry.source.identifier).prefix(5)),
@@ -2540,7 +2540,7 @@ final class BackupSyncRunnerTests: XCTestCase {
 
         let row = try XCTUnwrap(queueStore.entry(for: entry.source, revision: entry.revision))
         XCTAssertEqual(row.state, .discovered)
-        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.detail, BackupFailedItem.sourceReportedMissingDetail)
+        XCTAssertEqual(BackupIssueRecord.decode(row.lastError)?.detail, BackupItemOutcome.sourceReportedMissingDetail)
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 1)
     }
 
