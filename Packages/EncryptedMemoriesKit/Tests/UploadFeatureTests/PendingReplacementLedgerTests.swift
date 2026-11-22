@@ -53,6 +53,24 @@ final class PendingReplacementLedgerTests: XCTestCase {
         XCTAssertEqual(store.unacknowledgedHandoffs().first?.remote, remote)
     }
 
+    /// A handoff names the uploads that the journal marks as superseded when the recorder has a journal, and names
+    /// none when it has no journal (#1159).
+    func testAHandoffNamesTheSupersededUploadsOfTheJournalAndNoneWithoutOne() throws {
+        let journal = try XCTUnwrap(EditReplacementJournalFileStore(accountDataDirectory: directory))
+        try journal.addSuperseded(main, for: source)
+        let withJournal = PendingBackupEventRecorder(store: store, replacementJournal: journal)
+        withJournal.recordHandoff(source: source, revision: revision, remote: remote, kind: .uploaded)
+        XCTAssertEqual(
+            withJournal.replacementLedger.evidence(for: PendingSourceKey(source), revision: revision)?.replaces, [main])
+
+        let other = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "other", resource: .primary)
+        let withoutJournal = PendingBackupEventRecorder(store: store)
+        withoutJournal.recordHandoff(source: other, revision: revision, remote: remote, kind: .uploaded)
+        XCTAssertNil(withoutJournal.replacementLedger.evidence(for: PendingSourceKey(other), revision: revision))
+        withJournal.finish()
+        withoutJournal.finish()
+    }
+
     func testRetriesAndSettlementCannotAddHistoricalOrRelatedLinks() {
         let recorder = PendingBackupEventRecorder(store: store)
         let historical = PhotoUID(volumeID: "vol", nodeID: "history")

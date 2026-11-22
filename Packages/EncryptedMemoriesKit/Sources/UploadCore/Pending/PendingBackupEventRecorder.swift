@@ -82,7 +82,11 @@ public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked S
                 key: handoff.key, revision: revision, remote: remote, kind: kind, createdAt: stored.createdAt)
         }
         if source.resource == .primary {
-            replacementLedger.recordHandoff(handoff) { replacementJournal?.entry(for: source).allSuperseded ?? [] }
+            replacementLedger.recordHandoff(handoff) { [replacementJournal] in
+                // Without a journal nothing is superseded.
+                guard let replacementJournal else { return [] }
+                return replacementJournal.entry(for: source).allSuperseded
+            }
         }
         continuation.yield(.handoff(handoff, outcome))
         return outcome
