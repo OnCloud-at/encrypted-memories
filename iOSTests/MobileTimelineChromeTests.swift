@@ -95,6 +95,19 @@ final class MobileTimelineChromeTests: XCTestCase {
             else { return false }
             return viewer.presentedViewController != nil || viewer.view.bounds.width - pager.view.bounds.width >= 200
         }
+        // A window change during the animated sheet entrance drops the inspector conversion of every later resize:
+        // UIKit dismisses the presentation while it transitions, SwiftUI reports "while a presentation is in
+        // progress" and never retries. Each window change waits until no presentation transition runs and Info is a
+        // sheet or a column again (run 45071189214).
+        let infoVisible: @MainActor () -> Bool = {
+            viewer.presentedViewController != nil || viewer.view.bounds.width - pager.view.bounds.width >= 200
+        }
+        let presentationSettled: @MainActor () -> Bool = {
+            viewer.presentedViewController?.transitionCoordinator == nil
+        }
+        try await waitUntil("SETUP: the Info presentation finishes its entrance", state: setupState) {
+            presentationSettled()
+        }
         let page = try XCTUnwrap(pager.viewControllers?.first)
         let viewport = try XCTUnwrap(currentPhotoViewport())
         let image = try XCTUnwrap(descendants(viewport).compactMap { $0 as? UIImageView }.first)
@@ -127,6 +140,9 @@ final class MobileTimelineChromeTests: XCTestCase {
             window.frame = CGRect(origin: .zero, size: size)
             window.layoutIfNeeded()
             try await Task.sleep(for: .milliseconds(500))
+            try await waitUntil("Info is visible again and its presentation settles", state: setupState) {
+                infoVisible() && presentationSettled()
+            }
             XCTAssertEqual(window.bounds.size, size)
             XCTAssertTrue(root.presentedViewController === viewer, "The same cover must remain presented")
             XCTAssertTrue(currentPager() === pager)
