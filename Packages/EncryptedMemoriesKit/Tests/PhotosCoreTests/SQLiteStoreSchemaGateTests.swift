@@ -50,6 +50,54 @@ final class SQLiteStoreSchemaGateTests: XCTestCase {
         XCTAssertFalse(SQLiteStoreSchemaGate.checkpointCompletely(nil))
     }
 
+    func testSchemaCreationWhoseStampFailsLeavesTheDatabaseEmpty() throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let created = SQLiteStoreSchemaGate.initializeCurrentSchema(
+            db, schemaSQL: "CREATE TABLE items(id INTEGER PRIMARY KEY);", stamp: { false })
+        XCTAssertFalse(created, "a schema without its version stamp is no current schema")
+        XCTAssertEqual(sqlite3_get_autocommit(db), 1, "the failed creation is rolled back")
+        XCTAssertEqual(SQLiteStoreSchemaGate.state(of: db), .empty, "the failed creation leaves no table behind")
+    }
+
+    /// SQLite can end the transaction by itself when a schema statement fails, for example on a full disk. The script
+    /// below ends it with ROLLBACK and then fails. The stamp must not run then: outside the transaction it would commit
+    /// at once and leave a stamped database without its tables.
+    func testSchemaCreationWhoseTransactionEndsInAFailedStatementWritesNoStamp() throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        var stamped = false
+        let created = SQLiteStoreSchemaGate.initializeCurrentSchema(
+            db, schemaSQL: "CREATE TABLE items(id INTEGER PRIMARY KEY); ROLLBACK; CREATE TABLE broken(",
+            stamp: {
+                stamped = true
+                return sqlite3_exec(db, "PRAGMA user_version = 7;", nil, nil, nil) == SQLITE_OK
+            })
+        XCTAssertFalse(created)
+        XCTAssertFalse(stamped, "the failed statement ends the creation before the stamp")
+        var stmt: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nil), SQLITE_OK)
+        defer { sqlite3_finalize(stmt) }
+        XCTAssertEqual(sqlite3_step(stmt), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(stmt, 0), 0, "the database carries no stamp")
+        XCTAssertEqual(SQLiteStoreSchemaGate.state(of: db), .empty, "the failed creation leaves no table behind")
+    }
+
+    func testSchemaCreationWhoseSchemaDoesNotMatchLeavesTheDatabaseEmpty() throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        // A stamp that also adds a table makes the created schema differ from the expected one.
+        let created = SQLiteStoreSchemaGate.initializeCurrentSchema(
+            db, schemaSQL: "CREATE TABLE items(id INTEGER PRIMARY KEY);",
+            stamp: { sqlite3_exec(db, "CREATE TABLE extra(id INTEGER);", nil, nil, nil) == SQLITE_OK })
+        XCTAssertFalse(created, "a schema that differs from the expected one is no current schema")
+        XCTAssertEqual(sqlite3_get_autocommit(db), 1, "the failed creation is rolled back")
+        XCTAssertEqual(SQLiteStoreSchemaGate.state(of: db), .empty, "the failed creation leaves no table behind")
+    }
+
     private func pragma(_ name: String, in db: OpaquePointer?) throws -> String {
         var statement: OpaquePointer?
         XCTAssertEqual(sqlite3_prepare_v2(db, "PRAGMA \(name);", -1, &statement, nil), SQLITE_OK)
