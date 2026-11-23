@@ -546,6 +546,10 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay")
         XCTAssertTrue(row.waitForExistence(timeout: 10), "the possibly identical photos stay listed")
         XCTAssertFalse(app.activityIndicators["duplicates.loading"].exists, "Back does not check the library again")
+
+        // Going back closes the review list; the row opens it again, so the person can return to the list.
+        app.tapOnScreen(row)
+        XCTAssertTrue(message.waitForExistence(timeout: 10), "the row opens the review list again")
     }
 
     func testLeavingDuplicatesFromTheDifferingCopiesClosesThemAndTheNextVisitLoadsAgain() {
