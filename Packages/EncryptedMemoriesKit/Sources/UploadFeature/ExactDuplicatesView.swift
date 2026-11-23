@@ -456,10 +456,13 @@ public struct ExactDuplicatesReviewView<Cover: View>: View {
 
     @ViewBuilder
     private func section(_ group: ExactDuplicateReviewGroup, at index: Int, margin: CGFloat) -> some View {
-        let line = Text(model.differenceLine(of: group, item: item))
-            .font(DuplicatesLayout.titleFont)
-            .foregroundStyle(DuplicatesLayout.titleStyle)
-            .accessibilityIdentifier("\(list.identifier).line.\(index)")
+        // A group without a detail that differs has no line.
+        let line = model.differenceLine(of: group, item: item).map {
+            Text($0)
+                .font(DuplicatesLayout.titleFont)
+                .foregroundStyle(DuplicatesLayout.titleStyle)
+                .accessibilityIdentifier("\(list.identifier).line.\(index)")
+        }
         let model = model
         let members = ExactDuplicateReviewMembers(
             group: group, groupIndex: index, identifier: list.identifier, item: item,
@@ -467,7 +470,7 @@ public struct ExactDuplicatesReviewView<Cover: View>: View {
             label: { [list] in model.accessibilityLabel(of: $0, in: group, of: list) }, open: onOpen, cover: cover)
         if DuplicatesLayout.cards {
             VStack(alignment: .leading, spacing: 8) {
-                line.padding(.horizontal, margin)
+                if let line { line.padding(.horizontal, margin) }
                 members
                     .padding(.horizontal, margin)
                     .padding(.vertical, 15)
@@ -477,7 +480,7 @@ public struct ExactDuplicatesReviewView<Cover: View>: View {
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 Divider()
-                line.padding(.top, 8)
+                if let line { line.padding(.top, 8) }
                 members
             }
             .padding(.bottom, 14)

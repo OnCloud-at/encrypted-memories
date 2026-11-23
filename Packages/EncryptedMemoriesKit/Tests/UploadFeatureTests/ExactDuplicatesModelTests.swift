@@ -3527,7 +3527,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.reviewRowTitle(.differing), "\(L10n.string("duplicates.differing_title")) · 1")
         XCTAssertEqual(
             model.differingGroups,
-            [ExactDuplicateDifferingGroup(contentHash: "B", members: [b1, b2], differences: differences)])
+            [ExactDuplicateReviewGroup(id: "B", members: [b1, b2], differences: differences)])
         XCTAssertEqual(model.reviewGroup(.differing, id: "B"), model.reviewGroups(.differing).first)
         XCTAssertNil(model.reviewGroup(.differing, id: "A"))
         let group = try XCTUnwrap(model.reviewGroups(.differing).first)
@@ -3603,7 +3603,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(model.groups.map(\.members), [[a1, a2]], "the equal copies stay one duplicate group")
         XCTAssertEqual(
             model.differingGroups,
-            [ExactDuplicateDifferingGroup(contentHash: "A", members: [a1, a2, a3], differences: differences)])
+            [ExactDuplicateReviewGroup(id: "A", members: [a1, a2, a3], differences: differences)])
     }
 
     func testDifferingCopiesJoinNoMergeNoCountAndNoFreedSpace() async {
@@ -3643,7 +3643,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
 
             XCTAssertEqual(
                 model.differingGroups,
-                [ExactDuplicateDifferingGroup(contentHash: "A", members: [a2, a3], differences: differences)],
+                [ExactDuplicateReviewGroup(id: "A", members: [a2, a3], differences: differences)],
                 "a copy without photo details is left out, and B has no two copies with known details")
         }
     }
@@ -3763,8 +3763,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(
             model.differingGroups,
             [
-                ExactDuplicateDifferingGroup(contentHash: "A", members: [a2, a3], differences: differences),
-                ExactDuplicateDifferingGroup(contentHash: "B", members: [b1, b2], differences: differences),
+                ExactDuplicateReviewGroup(id: "A", members: [a2, a3], differences: differences),
+                ExactDuplicateReviewGroup(id: "B", members: [b1, b2], differences: differences),
             ])
 
         model.didTrashElsewhere([a3, b2])
@@ -3784,7 +3784,7 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(finder.merges, [.init(group: "A", kept: a1)])
         XCTAssertEqual(
             model.differingGroups,
-            [ExactDuplicateDifferingGroup(contentHash: "A", members: [a1, a3], differences: differences)])
+            [ExactDuplicateReviewGroup(id: "A", members: [a1, a3], differences: differences)])
     }
 
     func testLivePhotoIsADifferenceOnlyBesideADetailThatDiffers() async {
@@ -3838,8 +3838,8 @@ final class ExactDuplicatesModelTests: XCTestCase {
         XCTAssertEqual(
             model.differingGroups,
             [
-                ExactDuplicateDifferingGroup(contentHash: "A", members: [a1, a2, a3], differences: differences),
-                ExactDuplicateDifferingGroup(contentHash: "B", members: [b1, b2], differences: differences),
+                ExactDuplicateReviewGroup(id: "A", members: [a1, a2, a3], differences: differences),
+                ExactDuplicateReviewGroup(id: "B", members: [b1, b2], differences: differences),
             ])
     }
 
@@ -4033,6 +4033,106 @@ final class ExactDuplicatesModelTests: XCTestCase {
         await model.checkPossibleDuplicates(policy: shape)
 
         XCTAssertEqual(model.reviewGroups(.possible).first?.differences, [.fileType])
+    }
+
+    func testAPossibleGroupWithoutADifferenceShowsNoLine() async throws {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        let details = ExactDuplicateFingerprint.possiblePhoto()
+        finder.possible = PossibleDuplicateScan(
+            groups: [
+                PossibleDuplicateGroup(members: [x1, x2], differences: []),
+                PossibleDuplicateGroup(members: [a1, b1], differences: []),
+            ],
+            byteSizes: [x1: 5, x2: 5], fingerprints: [x1: details, x2: details, a1: details, b1: details])
+        let (model, _) = makeModel(finder)
+
+        await model.checkPossibleDuplicates(policy: shape)
+
+        let groups = model.reviewGroups(.possible)
+        XCTAssertEqual(groups.map(\.differences), [[], []])
+        XCTAssertNil(model.differenceLine(of: groups[0], item: { _ in nil }), "equal sizes name nothing")
+        XCTAssertNil(model.differenceLine(of: groups[1], item: { _ in nil }), "unknown sizes name nothing")
+        let livePhoto = x1
+        let live = { (uid: PhotoUID) in
+            PhotoItem(uid: uid, captureTime: Date(), mediaType: "image/jpeg", isLivePhoto: uid == livePhoto)
+        }
+        XCTAssertEqual(
+            model.differenceLine(of: groups[0], item: live),
+            L10n.string("duplicates.differing_line \(L10n.string("duplicates.detail_live_photo"))"),
+            "a Live Photo among photos that are not one still names its line")
+    }
+
+    func testTheReviewListsFollowATrashedCopyWithTheirSizes() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+
+        model.didTrashElsewhere([x3])
+
+        XCTAssertEqual(
+            model.reviewGroups(.possible),
+            [ExactDuplicateReviewGroup(id: "v/x1", members: [x1, x2], differences: [.fileSize])])
+        XCTAssertEqual(model.reviewGroup(.possible, id: "v/x1")?.members, [x1, x2])
+        XCTAssertNil(model.byteSize(of: x3, in: .possible), "the trashed copy has no tile")
+
+        model.didTrashElsewhere([x2])
+
+        XCTAssertEqual(model.reviewGroups(.possible), [])
+        XCTAssertNil(model.reviewRowTitle(.possible))
+    }
+
+    func testTheRowsListTheDifferingCopiesBeforeThePossiblyIdenticalPhotos() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA, groupB], coverage: .complete)])
+        finder.fingerprints = [a1: described, a2: described, a3: described, b1: described, b2: other]
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.load()
+        await model.checkPossibleDuplicates(policy: shape)
+
+        XCTAssertEqual(ExactDuplicateReviewList.allCases, [.differing, .possible])
+        XCTAssertEqual(
+            ExactDuplicateReviewList.allCases.compactMap { model.reviewRowTitle($0) },
+            [
+                "\(L10n.string("duplicates.differing_title")) · 1",
+                "\(L10n.string("duplicates.possible_title")) · 1",
+            ])
+    }
+
+    func testThePossibleListDoesNotOpenWithoutItsRow() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [groupA], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.load()
+        var route = ExactDuplicatesRoute()
+
+        route.show(.possible, of: model)
+
+        XCTAssertNil(route.opened, "no check listed a group yet")
+        XCTAssertFalse(route.shows(.possible, of: model))
+        XCTAssertTrue(route.offersMergeAll(of: model))
+    }
+
+    func testThePossibleListStaysClosedWhenALaterCheckListsGroupsAgain() async {
+        let finder = FakeDuplicateFinder(scans: [.init(groups: [], coverage: .complete)])
+        finder.possible = threeFiles
+        let (model, _) = makeModel(finder)
+        await model.checkPossibleDuplicates(policy: shape)
+        var route = ExactDuplicatesRoute()
+        route.show(.possible, of: model)
+        model.didTrashElsewhere([x1, x2])
+        route.follow(model)
+        XCTAssertNil(route.opened)
+
+        finder.possible = PossibleDuplicateScan(
+            groups: [PossibleDuplicateGroup(members: [a1, b1], differences: [.fileType])], byteSizes: [a1: 4, b1: 3],
+            fingerprints: [a1: .possiblePhoto(type: "image/jpeg"), b1: .possiblePhoto(type: "image/heic")])
+        await model.checkPossibleDuplicates(policy: shape)
+        route.follow(model)
+
+        XCTAssertNotNil(model.reviewRowTitle(.possible), "the later check lists a group")
+        XCTAssertNil(route.opened, "the list waits until the person opens it again")
+        XCTAssertFalse(route.shows(.possible, of: model))
     }
 
     func testTheTilesOfTheDifferingCopiesShowTheSizeOfTheirBytes() async {

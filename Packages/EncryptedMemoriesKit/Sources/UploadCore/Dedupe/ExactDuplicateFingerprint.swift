@@ -113,28 +113,13 @@ public enum ExactDuplicateDetail: String, CaseIterable, Sendable {
     case livePhoto
 }
 
-/// Copies with the same bytes whose details differ, so no merge takes them: the person compares them and deletes the
-/// copy that they do not need. Every member is an active main photo of `contentHash`.
-public struct ExactDuplicateDifferingGroup: Sendable, Equatable, Identifiable {
-    public var id: String { contentHash }
-    public let contentHash: String
-    /// Every copy whose details are known, in the order of the scanned group.
-    public let members: [PhotoUID]
-    /// The details that are not equal for every member, in `ExactDuplicateDetail` order.
-    public let differences: [ExactDuplicateDetail]
-
-    public init(contentHash: String, members: [PhotoUID], differences: [ExactDuplicateDetail]) {
-        self.contentHash = contentHash
-        self.members = members
-        self.differences = differences
-    }
-}
-
 extension ExactDuplicateGroup {
-    /// The copies of these bytes whose details differ: nil while a member's fingerprint is unknown, and nil when every
-    /// known member has the same details. A member whose fingerprint matches only itself, such as a node without photo
-    /// details, is left out.
-    public func differing(by fingerprints: [PhotoUID: ExactDuplicateFingerprint]) -> ExactDuplicateDifferingGroup? {
+    /// The copies of these bytes whose details differ, so no merge takes them: the person compares them and deletes the
+    /// copy that they do not need. The group's ID is `contentHash`, and its members are the copies whose details are
+    /// known, in the order of this group. Nil while a member's fingerprint is unknown, and nil when every known member
+    /// has the same details. A member whose fingerprint matches only itself, such as a node without photo details, is
+    /// left out.
+    public func differing(by fingerprints: [PhotoUID: ExactDuplicateFingerprint]) -> ExactDuplicateReviewGroup? {
         var known: [(member: PhotoUID, fingerprint: ExactDuplicateFingerprint)] = []
         for member in members {
             guard let fingerprint = fingerprints[member] else { return nil }
@@ -145,8 +130,7 @@ extension ExactDuplicateGroup {
             known.contains { !$0.fingerprint.equals(first, in: detail) }
         }
         guard !differences.isEmpty else { return nil }
-        return ExactDuplicateDifferingGroup(
-            contentHash: contentHash, members: known.map(\.member), differences: differences)
+        return ExactDuplicateReviewGroup(id: contentHash, members: known.map(\.member), differences: differences)
     }
 
     /// The groups of true duplicates among the members: members with equal fingerprints, two or more, in the order of
