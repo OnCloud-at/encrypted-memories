@@ -141,6 +141,14 @@ final class FakeChecker: UploadDuplicateChecking, @unchecked Sendable {
     func remoteIndexPreparationNotNeeded() async {
         lock.withLock { notNeededSignals += 1 }
     }
+    /// Active remote compounds that Proton's metadata proves for a source identity.
+    var remoteAssetProofs: [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] = [:]
+
+    func findRemoteAssetProofs(
+        for identities: [UploadBackupExternalIdentity]
+    ) async throws -> [UploadBackupExternalIdentity: UploadRemoteAssetIndexRecord] {
+        lock.withLock { remoteAssetProofs.filter { identities.contains($0.key) } }
+    }
     private(set) var nameHashCalls = 0
     private var invalidationCount = 0
     private var nameLookupAttempts = 0
