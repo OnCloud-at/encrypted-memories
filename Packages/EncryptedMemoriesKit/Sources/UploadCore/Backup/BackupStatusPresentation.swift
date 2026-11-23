@@ -357,6 +357,30 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         return L10n.string("backup.detail_left_speed_spoken \(remainingCount) \(speedText)")
     }
 
+    /// A line under the headline that keeps its height while its text comes and goes, so a changing count or speed
+    /// cannot move the bar below it.
+    public struct ReservedLine: Equatable, Sendable {
+        /// Stands in for a missing text, so an empty line is as tall as a filled one.
+        public static let placeholder = "\u{00a0}"
+
+        public let text: String?
+        public var displayText: String { text ?? Self.placeholder }
+        /// An empty line is invisible and hidden from VoiceOver.
+        public var isEmpty: Bool { text == nil }
+    }
+
+    /// The count line of the progress layout: always present there, empty until the first count.
+    public var reservedSubtitle: ReservedLine { ReservedLine(text: localizedSubtitle) }
+
+    /// The items-left line of the progress layout: always present there, empty when nothing is left.
+    public var reservedLeftLine: ReservedLine { ReservedLine(text: localizedLeftLine) }
+
+    /// The fraction of the bar while a pass is active or paused. Nil hides the bar.
+    public var progressBarFraction: Double? {
+        guard let progressFraction, isActive || accessory == .paused else { return nil }
+        return progressFraction
+    }
+
     private var speedText: String? {
         guard let speed = uploadSpeedBytesPerSecond, speed >= 1 else { return nil }
         return L10n.fileSize(Int64(speed.rounded()))

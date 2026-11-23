@@ -749,13 +749,13 @@ private struct PhotoLibraryBackupSection: View {
     /// Known-total backup status reserves its count line while work runs.
     @ViewBuilder private func subtitleSlot(_ display: BackupStatusPresentation) -> some View {
         if display.detailLayout == .progress {
-            let subtitle = display.localizedSubtitle
-            Text(verbatim: subtitle ?? "\u{00a0}")
+            let line = display.reservedSubtitle
+            Text(verbatim: line.displayText)
                 .font(.footnote.monospacedDigit())
                 .foregroundStyle(ProtonColor.textWeak)
                 .contentTransition(.numericText())
-                .opacity(subtitle == nil ? 0 : 1)
-                .accessibilityHidden(subtitle == nil)
+                .opacity(line.isEmpty ? 0 : 1)
+                .accessibilityHidden(line.isEmpty)
         } else if let subtitle = display.localizedSubtitle {
             Text(subtitle)
                 .font(.footnote.monospacedDigit())
@@ -767,22 +767,20 @@ private struct PhotoLibraryBackupSection: View {
     /// Items left and upload speed. The progress layout reserves the slot, so a changing speed cannot move the bar.
     @ViewBuilder private func leftSlot(_ display: BackupStatusPresentation) -> some View {
         if display.detailLayout == .progress {
-            let left = display.localizedLeftLine
-            Text(verbatim: left ?? "\u{00a0}")
+            let line = display.reservedLeftLine
+            Text(verbatim: line.displayText)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(ProtonColor.textWeak)
                 .contentTransition(.numericText())
                 .accessibilityLabel(display.localizedLeftAccessibilityLabel ?? "")
                 .accessibilityAddTraits(.updatesFrequently)
-                .accessibilityHidden(left == nil)
+                .accessibilityHidden(line.isEmpty)
         }
     }
 
     @ViewBuilder private func progressSlot(_ display: BackupStatusPresentation) -> some View {
         Group {
-            if let fraction = display.progressFraction,
-                display.isActive || display.accessory == .paused
-            {
+            if let fraction = display.progressBarFraction {
                 ActivityProgressBar(
                     fraction: fraction, accessibilityLabel: display.localizedHeadline,
                     accessibilityValue: display.localizedSubtitle ?? ""
