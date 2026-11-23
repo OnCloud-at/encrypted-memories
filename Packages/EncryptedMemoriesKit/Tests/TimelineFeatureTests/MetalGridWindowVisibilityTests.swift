@@ -396,7 +396,7 @@ struct MetalGridWindowVisibilityTests {
 
 /// Control the WindowServer input while exercising the real host's notification registration.
 @MainActor
-private final class VisibilityWindow: NSWindow {
+final class VisibilityWindow: NSWindow {
     var testOcclusionState: NSWindow.OcclusionState = []
     override var occlusionState: NSWindow.OcclusionState { testOcclusionState }
 

@@ -22,19 +22,16 @@
         private let session: TimelineScrollDateLabelSession
         var controller: TimelineScrollDateLabelController { session.controller }
         var isEnabled: Bool { session.isEnabled }
+        private var isShown: Bool { session.isShown }
         /// Viewport bands the label must not cover (fold, camera), sorted by their top edge.
         private var avoidedBands: [ClosedRange<CGFloat>] = []
-        private var isShown = false
-        private var appliedFadeDuration: TimeInterval?
         let indicatorDragObserver = UIKitTimelineIndicatorDragObserver()
         private weak var host: UIView?
         private weak var scrollView: UIKitTimelineScrollView?
 
         init(controller: TimelineScrollDateLabelController = TimelineScrollDateLabelController()) {
             session = TimelineScrollDateLabelSession(controller: controller)
-            controller.onChange = { [weak self] presentation in self?.apply(presentation) }
-            controller.onIndexInstalled = { [weak self] index in self?.prepareText(for: index) }
-            controller.reduceMotion = UIAccessibility.isReduceMotionEnabled
+            session.attach(self, reduceMotion: UIAccessibility.isReduceMotionEnabled)
         }
 
         /// Adds the label above the grid.
@@ -59,7 +56,7 @@
 
         func setEnabled(_ enabled: Bool) { session.setEnabled(enabled) }
 
-        func setReduceMotion(_ reduce: Bool) { controller.reduceMotion = reduce }
+        func setReduceMotion(_ reduce: Bool) { session.setReduceMotion(reduce) }
 
         /// The host shows new items. `replacesList` marks another list (account, filter, search result); otherwise it is
         /// a refresh of the same list.
@@ -72,8 +69,7 @@
         }
 
         func viewportMoved(_ movement: TimelineScrollDateLabelMovement, offsetY: CGFloat) {
-            guard isEnabled else { return }
-            controller.viewportMoved(movement, offsetY: Double(offsetY))
+            session.viewportMoved(movement, offsetY: Double(offsetY))
         }
 
         private func indicatorContact(at point: CGPoint, radius: CGFloat, began: Bool) -> Bool {
@@ -96,10 +92,7 @@
         /// A photo opens over the grid: the label leaves at once.
         func hideForRoute() { controller.hide() }
 
-        func setAnchor(flatIndex: Int?) {
-            guard isEnabled else { return }
-            controller.setAnchor(flatIndex: flatIndex)
-        }
+        func setAnchor(flatIndex: Int?) { session.setAnchor(flatIndex: flatIndex) }
 
         func setAvoidedBands(_ bands: [ClosedRange<CGFloat>]) {
             guard bands != avoidedBands else { return }
@@ -137,42 +130,7 @@
         func retire() {
             indicatorDragObserver.isEnabled = false
             scrollView?.onVerticalIndicatorLayout = nil
-            controller.retire()
-        }
-
-        /// Shapes the first month once, so the first brisk scroll does not pay for font and text layout.
-        private func prepareText(for index: TimelineScrollDateIndex) {
-            guard view.text == nil, let first = index.month(containing: 0)?.text else { return }
-            view.setText(first)
-            _ = view.fittingSize
-            view.layoutIfNeeded()
-        }
-
-        private func apply(_ presentation: TimelineScrollDateLabelController.Presentation) {
-            if let text = presentation.text { view.setText(text) }
-            let targetOffset = presentation.indicatorOffset
-            if targetOffset != -view.transform.tx || presentation.slideDuration == nil {
-                // A hidden label fades in beside the contact; visible target changes use the current presentation.
-                view.setDragOffset(
-                    targetOffset, duration: !view.isHidden ? presentation.slideDuration : nil,
-                    tracking: controller.policy.isIndicatorDragging && !controller.reduceMotion && !view.isHidden)
-            }
-            if presentation.isVisible != isShown {
-                isShown = presentation.isVisible
-                if isShown { host?.bringSubviewToFront(view) }
-                // Suppression, routes and stale content hide at once; shows, linger expiry and marked jumps fade.
-                view.setShown(isShown, duration: presentation.fadeDuration)
-                #if DEBUG
-                    if isShown { showCount += 1 }
-                #endif
-            } else if presentation.fadeDuration != appliedFadeDuration {
-                view.setShown(isShown, duration: presentation.fadeDuration)
-            }
-            appliedFadeDuration = presentation.fadeDuration
-            layout()  // A new month can change the width.
-            #if DEBUG
-                updateTestElement()
-            #endif
+            session.retire()
         }
 
         #if DEBUG
@@ -222,6 +180,40 @@
                 (host as? UIKitTimelineGridHostView)?.invalidateAccessibilityElements()
             }
         #endif
+    }
+
+    extension UIKitTimelineScrollDateLabelPresenter: TimelineScrollDateLabelDisplay {
+        var displayedText: String? { view.text }
+        func setText(_ text: String) { view.setText(text) }
+
+        func prepareTextLayout() {
+            _ = view.fittingSize
+            view.layoutIfNeeded()
+        }
+
+        func applyIndicatorOffset(of presentation: TimelineScrollDateLabelController.Presentation) {
+            let targetOffset = presentation.indicatorOffset
+            guard targetOffset != -view.transform.tx || presentation.slideDuration == nil else { return }
+            // A hidden label fades in beside the contact; visible target changes use the current presentation.
+            view.setDragOffset(
+                targetOffset, duration: !view.isHidden ? presentation.slideDuration : nil,
+                tracking: controller.policy.isIndicatorDragging && !controller.reduceMotion && !view.isHidden)
+        }
+
+        func setShown(_ shown: Bool, duration: TimeInterval?, changesVisibility: Bool) {
+            if changesVisibility, shown { host?.bringSubviewToFront(view) }
+            view.setShown(shown, duration: duration)
+            #if DEBUG
+                if changesVisibility, shown { showCount += 1 }
+            #endif
+        }
+
+        func presentationDidApply() {
+            layout()
+            #if DEBUG
+                updateTestElement()
+            #endif
+        }
     }
     /// Observes touches without cancelling, delaying or preventing native gestures. UIKit exposes no indicator-drag
     /// flag. A direct contact on the actual native thumb starts immediately, before viewport movement.

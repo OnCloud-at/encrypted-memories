@@ -134,6 +134,8 @@ public struct TimelineView: View {
                 }
             case .loaded:
                 let showsMonthLabels = gridProfile.showsMonthLabels(level: level)
+                let showsScrubber =
+                    showsMonthLabels && monthMarkerRevision == gridDataRevision && monthMarkers.count > 1
                 ZStack(alignment: .trailing) {
                     if isEmptySearchResult {
                         searchEmptyState
@@ -164,14 +166,19 @@ public struct TimelineView: View {
                             media: media,
                             metadataProvider: metadataProvider,
                             dragOutProvider: dragOutProvider,
-                            onDragOutFailed: onDragOutFailed
+                            onDragOutFailed: onDragOutFailed,
+                            showsScrollDateLabel: TimelineScrollDateLabelEligibility.showsLabel(
+                                isLoading: isSearchResultPending,
+                                hasFailure: model.initialLibraryLoadState.failure != nil,
+                                hasProjectionCriteria: hasSearchQuery,
+                                resolvedProjection: resolvedSearchProjection),
+                            scrollDateLabelTrailingInset: showsScrubber
+                                ? TimelineDateScrubber.dormantTrailingReservation : 0,
+                            scrollDateLabelListID: scrollDateLabelListID
                         )
                         .ignoresSafeArea(edges: .bottom)
 
-                        if showsMonthLabels,
-                            monthMarkerRevision == gridDataRevision,
-                            monthMarkers.count > 1
-                        {
+                        if showsScrubber {
                             TimelineDateScrubber(markers: monthMarkers) { marker in
                                 proxy?.scrollToFlatIndex?(marker.index)
                             }
@@ -310,6 +317,14 @@ public struct TimelineView: View {
         return Int(truncatingIfNeeded: model.gridSourceRevision &* 2)
     }
 
+    /// The list the grid shows: the library of one filter, or one search. A refresh keeps the identity.
+    private var scrollDateLabelListID: AnyHashable {
+        guard hasSearchQuery else { return AnyHashable(model.filter) }
+        return AnyHashable(
+            TimelineScrollDateLabelList(
+                query: projectionQuery, filter: model.filter, refinement: refinement, requiredUIDs: requiredUIDs))
+    }
+
     private var markerRequest: TimelineMarkerRequest {
         TimelineMarkerRequest(
             dataRevision: gridDataRevision,
@@ -356,7 +371,25 @@ private struct TimelineMarkerRequest: Hashable {
     let showsMonthLabels: Bool
 }
 
-private struct TimelineDateScrubber: View {
+private struct TimelineScrollDateLabelList: Hashable {
+    let query: String
+    let filter: PhotoFilter
+    let refinement: TimelineRefinement
+    let requiredUIDs: Set<PhotoUID>?
+}
+
+struct TimelineDateScrubber: View {
+    /// The track column while nobody hovers it, the column while it shows a date, and the trailing margin.
+    static let dormantWidth: CGFloat = 32
+    static let expandedWidth: CGFloat = 112
+    static let trailingMargin: CGFloat = 8
+    /// The trailing width the dormant scrubber takes from the grid.
+    static let dormantTrailingReservation = dormantWidth + trailingMargin
+    /// The date pill's text; the grid's scroll date label uses the same type and padding.
+    static let pillFontSize: CGFloat = 13
+    static let pillHorizontalPadding: CGFloat = 10
+    static let pillVerticalPadding: CGFloat = 6
+
     let markers: [TimelineDateMarker]
     let onJump: (TimelineDateMarker) -> Void
 
@@ -375,11 +408,11 @@ private struct TimelineDateScrubber: View {
 
                 if let active, let index = activeIndex {
                     Text(active.text)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: Self.pillFontSize, weight: .semibold))
                         // Regular Liquid Glass flips its content between light and dark over the photos.
                         .foregroundStyle(.primary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
+                        .padding(.horizontal, Self.pillHorizontalPadding)
+                        .padding(.vertical, Self.pillVerticalPadding)
                         .glassEffect(in: Capsule(style: .continuous))
                         .position(
                             x: geometry.size.width - 66,
@@ -400,8 +433,8 @@ private struct TimelineDateScrubber: View {
             )
             .onHover { hovering = $0 }
         }
-        .frame(width: hovering || activeIndex != nil ? 112 : 32)
-        .padding(.trailing, 8)
+        .frame(width: hovering || activeIndex != nil ? Self.expandedWidth : Self.dormantWidth)
+        .padding(.trailing, Self.trailingMargin)
         .padding(.vertical, 96)
         .allowsHitTesting(markers.count > 1)
     }
