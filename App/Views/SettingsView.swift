@@ -1345,7 +1345,7 @@ private struct BugReportSettingsSection: View {
 
 private struct MacBugReportSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var isPreparingReport = false
+    @State private var preparation = SupportReportPreparation()
     @State private var errorMessage: String?
 
     private static let issueURL = URL(
@@ -1372,13 +1372,13 @@ private struct MacBugReportSheet: View {
                 Button {
                     Task { await exportSupportReport() }
                 } label: {
-                    if isPreparingReport {
+                    if preparation.isPreparing {
                         ProgressSpinner()
                     } else {
                         Text(L10n.string("settings.bug_report_download"))
                     }
                 }
-                .disabled(isPreparingReport)
+                .disabled(preparation.isPreparing)
                 Button(L10n.string("settings.bug_report_support")) {
                     if !NSWorkspace.shared.open(Self.issueURL) {
                         errorMessage = L10n.string("settings.bug_report_support_failed")
@@ -1392,22 +1392,21 @@ private struct MacBugReportSheet: View {
     }
 
     @MainActor private func exportSupportReport() async {
-        guard !isPreparingReport else { return }
-        isPreparingReport = true
-        errorMessage = nil
-        defer { isPreparingReport = false }
-        do {
-            let data = try await SupportDiagnosticsExporter.makeJSONData()
-            let panel = NSSavePanel()
-            panel.nameFieldStringValue = "Encrypted-Memories-Support.json"
-            panel.canCreateDirectories = true
-            guard panel.runModal() == .OK, let url = panel.url else { return }
-            let hasScopedAccess = url.startAccessingSecurityScopedResource()
-            defer {
-                if hasScopedAccess { url.stopAccessingSecurityScopedResource() }
-            }
-            try OriginalExportWriter.writeData(data, to: url)
-        } catch {
+        let outcome = await preparation.prepare(
+            onStart: { errorMessage = nil },
+            deliver: { data in
+                let panel = NSSavePanel()
+                panel.nameFieldStringValue = "Encrypted-Memories-Support.json"
+                panel.canCreateDirectories = true
+                guard panel.runModal() == .OK, let url = panel.url else { return .dismissed }
+                let hasScopedAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if hasScopedAccess { url.stopAccessingSecurityScopedResource() }
+                }
+                try OriginalExportWriter.writeData(data, to: url)
+                return .delivered
+            })
+        if outcome == .failed {
             errorMessage = L10n.string("settings.bug_report_export_failed")
         }
     }

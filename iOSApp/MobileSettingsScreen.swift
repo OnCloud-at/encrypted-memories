@@ -317,7 +317,7 @@ private struct MobileBugReportSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var supportExport: MobileSharePayload?
-    @State private var isPreparingReport = false
+    @State private var preparation = SupportReportPreparation()
     @State private var errorMessage: String?
 
     private static let issueURL = URL(
@@ -338,10 +338,10 @@ private struct MobileBugReportSheet: View {
                                 systemImage: "square.and.arrow.down"
                             )
                             Spacer()
-                            if isPreparingReport { ProgressSpinner() }
+                            if preparation.isPreparing { ProgressSpinner() }
                         }
                     }
-                    .disabled(isPreparingReport)
+                    .disabled(preparation.isPreparing)
                     Button {
                         openURL(Self.issueURL) { accepted in
                             if !accepted {
@@ -377,18 +377,14 @@ private struct MobileBugReportSheet: View {
     }
 
     @MainActor private func exportSupportReport() async {
-        guard !isPreparingReport else { return }
-        isPreparingReport = true
-        errorMessage = nil
-        defer { isPreparingReport = false }
-        do {
-            let data = try await SupportDiagnosticsExporter.makeJSONData()
-            guard let url = await MobileMediaExporter.exportSupportReport(data) else {
-                errorMessage = L10n.string("settings.bug_report_export_failed")
-                return
-            }
-            supportExport = MobileSharePayload(urls: [url])
-        } catch {
+        let outcome = await preparation.prepare(
+            onStart: { errorMessage = nil },
+            deliver: { data in
+                guard let url = await MobileMediaExporter.exportSupportReport(data) else { return .failed }
+                supportExport = MobileSharePayload(urls: [url])
+                return .delivered
+            })
+        if outcome == .failed {
             errorMessage = L10n.string("settings.bug_report_export_failed")
         }
     }
