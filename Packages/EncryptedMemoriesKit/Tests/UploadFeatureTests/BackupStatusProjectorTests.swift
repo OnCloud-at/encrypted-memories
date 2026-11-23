@@ -729,6 +729,36 @@ final class BackupStatusProjectorTests: XCTestCase {
         await projector.stop()
     }
 
+    /// The macOS folder row shows the waiting detail of the status itself, not the presentation's waiting count.
+    func testAFolderLongWaitCountsOnceInTheWaitingDetail() async throws {
+        let weekOld = BackupIssueRecord(
+            kind: .unknown, detail: BackupItemOutcome.sourceUnavailableDetail, automaticRetryAttempt: 3,
+            waitingSince: Date().addingTimeInterval(-8 * 24 * 3600))
+        func file(_ id: String) -> UploadBackupSyncQueueEntry {
+            var row = entry(id: id, state: .discovered)
+            row.source = UploadSourceIdentity(kind: .fileURL, identifier: "/folder/\(id).jpg")
+            return row
+        }
+        for id in ["long-1", "long-2", "long-3"] {
+            var row = file(id)
+            row.lastError = weekOld.persistedValue
+            XCTAssertTrue(queue.upsert(row))
+        }
+        for id in ["plain-1", "plain-2"] {
+            XCTAssertTrue(queue.upsert(file(id)))
+        }
+        let projector = BackupStatusProjector(queue: queue)
+        let recorder = Recorder()
+        await projector.start(generation: UUID(), context: .init()) { recorder.append($0) }
+        let status = try XCTUnwrap(recorder.values.last).status
+        XCTAssertEqual(status.phase, .waiting)
+        XCTAssertEqual(status.notBackedUpFailedCount, 3, "the folder row's calm line")
+        XCTAssertEqual(
+            status.localizedDetail, L10n.string("backup.detail_waiting \(2)"),
+            "the three long waits are not counted a second time")
+        await projector.stop()
+    }
+
     func testDismissedSourceRechecksUsePhotosWordingWithoutAProblemListAction() async throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let due = now.addingTimeInterval(600)

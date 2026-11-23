@@ -1893,15 +1893,18 @@ final class BackupSyncRunnerTests: XCTestCase {
         let afterLocal = seedEntry(
             "after-local.jpg",
             lastError: BackupIssueRecord(kind: .remoteService, detail: "local", waitingSince: weekOld).persistedValue)
+        // Enough failures that a retry inside the same pass, while the other photo still runs, still fails.
         let busy = MockUploader(
             workDuration: .milliseconds(1), deliverProgress: false,
-            serviceFailures: ["after-network.jpg": 1, "after-local.jpg": 1])
+            serviceFailures: ["after-network.jpg": 10, "after-local.jpg": 10])
         let began = clock.now
         _ = await makeRunner(uploader: busy).runUntilDrained(mode: .eligibleOnly)
         for entry in [afterNetwork, afterLocal] {
             let stored = try storedRecord(of: entry)
             XCTAssertEqual(stored.kind, .remoteService, entry.originalFilename)
-            XCTAssertEqual(stored.waitingSince, began, entry.originalFilename)
+            // The Proton wait starts with its own first failure in this pass, never at the start of the earlier wait.
+            let start = try XCTUnwrap(stored.waitingSince, entry.originalFilename)
+            XCTAssertGreaterThanOrEqual(start, began, entry.originalFilename)
         }
     }
 

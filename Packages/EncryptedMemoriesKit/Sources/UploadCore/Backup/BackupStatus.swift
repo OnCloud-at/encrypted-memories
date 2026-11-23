@@ -144,6 +144,8 @@ public struct BackupStatus: Sendable, Equatable {
     public var longWaitingCount = 0
     /// Whether the summary counts any photo that is not backed up, orange or calm: the problem list must show one.
     public var hasPhotosNotBackedUp: Bool { needsAttentionCount + notBackedUpCount > 0 }
+    /// `waiting` without the long waits: a wait of a week counts in the calm line only, never also as waiting.
+    public func withoutLongWaits(_ waiting: Int) -> Int { max(0, waiting - longWaitingCount) }
     /// The calm count without the missing photos, for a host that lists those in their own line.
     public var notBackedUpFailedCount: Int { max(0, notBackedUpCount - sourceMissing) }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
@@ -386,8 +388,8 @@ public struct BackupStatus: Sendable, Equatable {
             return L10n.string("backup.detail_backed_up \(backedUp) \(total)")
         case .waiting:
             guard !hasOnlyDismissedSourceRechecks else { return nil }
-            return L10n.string(
-                "backup.detail_waiting \(uploadQueued + waitingRetry + max(0, (totalConsidered ?? 0) - checked))")
+            let waiting = withoutLongWaits(uploadQueued + waitingRetry + max(0, (totalConsidered ?? 0) - checked))
+            return L10n.string("backup.detail_waiting \(waiting)")
         case .completed:
             guard alreadyBackedUp > 0 else { return nil }
             return L10n.string("backup.detail_already_backed_up \(alreadyBackedUp)")

@@ -112,8 +112,8 @@ public struct BackupItemOutcome: Sendable, Equatable {
     }
 
     /// Whether a row that waits for its next retry has waited at least `longWaitThreshold` in one bounded wait. Only
-    /// `discovered` rows count, because the problem list reads the same rows: a row being checked is not listed, and a
-    /// parked or finished row has its own line.
+    /// `discovered` rows count, so the problem list reads these rows (up to its per-category cap); it also reads more
+    /// rows. A row being checked is not listed, and a parked or finished row has its own line.
     public static func isLongWait(state: UploadBackupSyncQueueState, record: BackupIssueRecord?, now: Date) -> Bool {
         guard state == .discovered, let record, tracksWaitStart(record),
             let since = record.waitingSince

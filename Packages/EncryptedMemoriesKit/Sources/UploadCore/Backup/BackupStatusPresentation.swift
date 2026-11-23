@@ -170,8 +170,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
                 accessory: headlineKey == "backup.phase_waiting_account_storage" ? .attention : .waiting,
                 progressFraction: status.fractionCompleted,
                 backedUp: status.backedUp, total: backupTarget,
-                // A wait of a week counts in the calm line only.
-                waitingCount: max(0, status.outstandingCount - status.pendingSourceRechecks - status.longWaitingCount),
+                waitingCount: status.withoutLongWaits(max(0, status.outstandingCount - status.pendingSourceRechecks)),
                 skippedRemoteDeletions: status.skippedRemoteDeletions,
                 nextAttemptAt: status.nextAttemptAt)
 
