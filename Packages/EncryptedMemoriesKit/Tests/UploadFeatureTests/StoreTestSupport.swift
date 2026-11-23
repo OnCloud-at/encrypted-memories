@@ -118,7 +118,7 @@ final class SQLiteStatementStartAction {
     static func recordedFailure(
         in store: Any, matching: String, mainThreadOnly: Bool = false
     ) throws -> SQLiteStatementStartAction {
-        try SQLiteStatementStartAction(in: store, matching: matching) { connection in
+        try SQLiteStatementStartAction(in: store, matching: matching, mainThreadOnly: mainThreadOnly) { connection in
             // `markFailed` requires the connection lock, which the trace holds.
             connection.markFailed(resultCode: SQLITE_INTERRUPT)
             return true
