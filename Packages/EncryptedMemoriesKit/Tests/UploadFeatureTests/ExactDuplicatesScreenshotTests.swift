@@ -112,6 +112,59 @@
             }
         }
 
+        /// The row of the possibly identical photos on the screen, their own list with the sizes on the tiles, and the
+        /// row below "No Duplicates" when they are the only finding. The screens check with the rule of the apps.
+        func testRenderThePossiblyIdenticalPhotos() async throws {
+            let directory = try outputDirectory()
+            let members = (0..<5).map { PhotoUID(volumeID: "v", nodeID: "photo-\($0)") }
+            let same = [ExactDuplicateGroup(contentHash: "A", hashKeyEpoch: "e", members: Array(members[0..<2]))]
+            // A photo, a smaller copy of it, and the same photo in another format.
+            let group = PossibleDuplicateGroup(members: Array(members[2..<5]), differences: [.dimensions, .fileType])
+            let possible = PossibleDuplicateScan(
+                groups: [group],
+                byteSizes: [members[2]: 6_100_000, members[3]: 1_200_000, members[4]: 3_400_000])
+            let items = Dictionary(
+                uniqueKeysWithValues: members.map {
+                    (
+                        $0,
+                        PhotoItem(
+                            uid: $0, captureTime: Date(timeIntervalSince1970: 1_749_456_000), mediaType: "image/png")
+                    )
+                })
+            let model = ExactDuplicatesModel(
+                finder: ScreenshotFinder(groups: same, coverage: .complete, build: .none, possible: possible),
+                possibleDuplicatePolicy: .standard)
+            let (screen, screenHost) = host(model: model)
+            for _ in 0..<200 where model.reviewRowTitle(.possible) == nil {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertNotNil(model.reviewRowTitle(.possible))
+            let (list, listHost) = host(
+                ExactDuplicatesReviewView(
+                    model: model, list: .possible, item: { items[$0] }, onOpen: { _, _ in }, cover: Self.tile))
+            // Only possibly identical photos: the empty state with the row.
+            let only = ExactDuplicatesModel(
+                finder: ScreenshotFinder(groups: [], coverage: .complete, build: .none, possible: possible),
+                possibleDuplicatePolicy: .standard)
+            let (empty, emptyHost) = host(model: only)
+            for _ in 0..<200 where only.reviewRowTitle(.possible) == nil {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(only.content, .noDuplicates)
+            XCTAssertNotNil(only.reviewRowTitle(.possible))
+            let renders = [("screen", screen, screenHost), ("list", list, listHost), ("only", empty, emptyHost)]
+            for (name, window, view) in renders {
+                for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                    window.appearance = NSAppearance(named: appearance)
+                    try await Task.sleep(for: .milliseconds(500))
+                    let url = directory.appendingPathComponent(
+                        "duplicates-macos-possible-\(name)-\(appearance == .aqua ? "light" : "dark").png")
+                    try capture(view, to: url)
+                }
+                window.orderOut(nil)
+            }
+        }
+
         func testRenderNarrowAndLargeWaitingWindows() async throws {
             let directory = try outputDirectory()
             let members = (0..<4).map { PhotoUID(volumeID: "v", nodeID: "waiting-\($0)") }
@@ -372,10 +425,12 @@
         let holdsScan: Bool
         /// Copies whose details differ from the other copies of their bytes.
         let otherDetails: Set<PhotoUID>
+        /// The result of the check for possibly identical photos.
+        let possible: PossibleDuplicateScan?
 
         init(
             groups: [ExactDuplicateGroup], coverage: ExactDuplicateCoverage, build: Build, holdsRanking: Bool = false,
-            holdsScan: Bool = false, otherDetails: Set<PhotoUID> = []
+            holdsScan: Bool = false, otherDetails: Set<PhotoUID> = [], possible: PossibleDuplicateScan? = nil
         ) {
             self.groups = groups
             self.coverage = coverage
@@ -383,7 +438,12 @@
             self.holdsRanking = holdsRanking
             self.holdsScan = holdsScan
             self.otherDetails = otherDetails
+            self.possible = possible
         }
+
+        func possibleDuplicates(
+            excluding sameBytes: [ExactDuplicateGroup], policy: PossibleDuplicatePolicy
+        ) async -> PossibleDuplicateScan? { possible }
 
         @MainActor func isSettled(_ model: ExactDuplicatesModel) -> Bool {
             guard model.content != .loading else { return false }
