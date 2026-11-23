@@ -36,10 +36,10 @@ public struct BackupItemOutcome: Sendable, Equatable {
     public init(state: UploadBackupSyncQueueState, record: BackupIssueRecord?) {
         let issue = record?.kind ?? Self.defaultIssue(for: state)
         let detail = record?.detail
-        let waitsForOriginal = BackupFailedItem.isWaitingForOriginal(detail)
-        let waitsForPhotos = BackupFailedItem.isWaitingForPhotos(detail)
+        let waitsForOriginal = Self.isWaitingForOriginal(detail)
+        let waitsForPhotos = Self.isWaitingForPhotos(detail)
         let isSourceWait =
-            issue == .unknown && (detail == BackupFailedItem.sourceNotReadyDetail || waitsForOriginal || waitsForPhotos)
+            issue == .unknown && (detail == Self.sourceNotReadyDetail || waitsForOriginal || waitsForPhotos)
         // A failed row is no longer planned by the app: whatever its cause, only the person's retry runs it again.
         let isManualRetry = state == .failed && (Self.category(of: issue) == .automatic || issue == .unknown)
         let isPermanentState = state == .sourceMissing || state == .failedPermanent
@@ -89,6 +89,31 @@ public struct BackupItemOutcome: Sendable, Equatable {
         self.init(
             issue: issue, category: category, reason: reason, isPermanent: isPermanentState, section: section,
             raisesAttention: Self.raisesAttention(state: state, record: record))
+    }
+
+    // MARK: - Stored wait details
+
+    // The runner stores these details in a row's record, and the outcome reads them back: they are a stored format.
+
+    /// The detail of a row whose file Photos cannot hand out yet (iCloud, an offline library volume, an interrupted
+    /// read), and of a row whose file Photos reports as missing. The runner counts the waits of each separately.
+    static let sourceUnavailableDetail = "backup.issue_source_unavailable"
+    static let sourceReportedMissingDetail = "backup.issue_source_unavailable.reported_missing"
+    /// The detail of a row whose photo the camera still processes.
+    static let sourceNotReadyDetail = "error.upload_source_not_ready"
+
+    static func isWaitingForPhotos(_ detail: String?) -> Bool {
+        detail == sourceUnavailableDetail || detail == sourceReportedMissingDetail
+    }
+
+    static func isWaitingForOriginal(_ detail: String?) -> Bool {
+        // The runner persists the key. Earlier builds persisted these sentences; their waits keep their count.
+        [
+            "backup.issue_waiting_original",
+            "The edited photo is waiting for its original resources. Backup will retry automatically.",
+            "Das bearbeitete Foto wartet auf seine Originalressourcen. "
+                + "Das Backup versucht es automatisch erneut.",
+        ].contains(detail ?? "")
     }
 
     /// Whether a stored row raises attention. It builds no localized text, so the queue summary can ask it for every

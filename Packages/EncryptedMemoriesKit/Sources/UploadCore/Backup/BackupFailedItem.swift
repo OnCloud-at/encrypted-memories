@@ -74,27 +74,6 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
         else { return next }
         return min(next, entry.updatedAt)
     }
-
-    /// The detail of a row whose file Photos cannot hand out yet (iCloud, an offline library volume, an interrupted
-    /// read), and of a row whose file Photos reports as missing. The runner counts the waits of each separately.
-    static let sourceUnavailableDetail = "backup.issue_source_unavailable"
-    static let sourceReportedMissingDetail = "backup.issue_source_unavailable.reported_missing"
-    /// The detail of a row whose photo the camera still processes.
-    static let sourceNotReadyDetail = "error.upload_source_not_ready"
-
-    static func isWaitingForPhotos(_ detail: String?) -> Bool {
-        detail == sourceUnavailableDetail || detail == sourceReportedMissingDetail
-    }
-
-    static func isWaitingForOriginal(_ detail: String?) -> Bool {
-        // The runner persists the key. Earlier builds persisted these sentences; their waits keep their count.
-        [
-            "backup.issue_waiting_original",
-            "The edited photo is waiting for its original resources. Backup will retry automatically.",
-            "Das bearbeitete Foto wartet auf seine Originalressourcen. "
-                + "Das Backup versucht es automatisch erneut.",
-        ].contains(detail ?? "")
-    }
 }
 
 extension BackupIssueSection {
@@ -108,6 +87,6 @@ extension BackupIssueSection {
 }
 
 extension Collection where Element == BackupFailedItem {
-    /// The list offers Try again only while it shows a photo whose problem the person can fix.
+    /// The list offers Try again while it shows a photo that a retry can help.
     public var offersUserRetry: Bool { contains { $0.category == .userResolvable } }
 }
