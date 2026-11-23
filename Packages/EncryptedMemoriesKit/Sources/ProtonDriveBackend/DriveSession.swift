@@ -115,7 +115,7 @@ final class DriveSession: @unchecked Sendable {
             result = try await BufferedHTTPExecutor.perform(
                 try makeRequest(), urlSession: urlSession, governor: requestGovernor,
                 label: .api(method: method, path: path),
-                retryOn401: retryOn401, retryOn429: retryOn429,
+                retryOn401: retryOn401, retryOn429: retryOn429, taskDelegate: RedirectRefusingTaskDelegate.shared,
                 retryAfterRateLimit: { _ in try makeRequest() },
                 refreshAfterUnauthorized: { attempt in
                     switch await self.refreshOutcome(after: attempt.credentialGeneration) {
@@ -171,7 +171,9 @@ final class DriveSession: @unchecked Sendable {
             let permit = try? await requestGovernor.acquire(
                 scope: .api, priority: .immediate, label: .api(method: "POST", path: "/auth/v4/refresh"))
         else { return .unavailable }
-        guard let (data, response) = try? await urlSession.data(for: req),
+        guard
+            let (data, response) = try? await urlSession.data(
+                for: req, delegate: RedirectRefusingTaskDelegate.shared),
             let http = response as? HTTPURLResponse
         else {
             await requestGovernor.finish(permit, statusCode: nil)

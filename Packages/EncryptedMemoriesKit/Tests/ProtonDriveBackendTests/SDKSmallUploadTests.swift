@@ -170,6 +170,80 @@ struct SDKSmallUploadTests {
             "the authenticated request must never be replayed to the redirect target")
     }
 
+    @Test(arguments: [301, 302, 303, 307, 308])
+    func aTokenRefreshRedirectIsNotFollowed(status: Int) async throws {
+        SmallUploadURLProtocol.reset(
+            uploadStatuses: [200],
+            refresh: (status, "{}"),
+            refreshRedirectLocation: "https://untrusted.invalid/redirected/refresh"
+        )
+        let session = makeSession()
+
+        let refreshed = await session.refreshToken(after: session.authorization().generation)
+
+        #expect(!refreshed, "a redirect is not a refreshed token")
+        #expect(
+            SmallUploadURLProtocol.requests.map(\.path) == [SmallUploadURLProtocol.refreshPath],
+            "the refresh token must never be sent to the redirect target")
+    }
+
+    @Test(arguments: [301, 302, 303, 307, 308])
+    func anAuthenticatedJSONRequestRedirectIsNotFollowed(status: Int) async throws {
+        SmallUploadURLProtocol.reset(
+            uploadStatuses: [status, 200],
+            redirectLocation: "https://untrusted.invalid/redirected/drive"
+        )
+
+        let code = await apiErrorCode {
+            _ = try await makeSession().getJSON("/drive/tests/redirected", as: EmptyAnswer.self)
+        }
+
+        #expect(code == status, "the redirect status comes back as the API error of the request")
+        #expect(
+            SmallUploadURLProtocol.requests.map(\.path) == ["/drive/tests/redirected"],
+            "the authenticated request must never be replayed to the redirect target")
+    }
+
+    @Test(arguments: [301, 302, 303, 307, 308])
+    func aRefreshRedirectAfterA401KeepsTheOriginal401(status: Int) async throws {
+        SmallUploadURLProtocol.reset(
+            uploadStatuses: [401],
+            refresh: (status, "{}"),
+            refreshRedirectLocation: "https://untrusted.invalid/redirected/refresh"
+        )
+
+        let code = await apiErrorCode {
+            _ = try await makeSession().getJSON("/drive/tests/rejected", as: EmptyAnswer.self)
+        }
+
+        #expect(code == 401, "a refresh that is answered with a redirect leaves the original 401")
+        #expect(
+            SmallUploadURLProtocol.requests.map(\.path)
+                == ["/drive/tests/rejected", SmallUploadURLProtocol.refreshPath],
+            "the request and one refresh are sent, and nothing reaches the redirect target")
+    }
+
+    @Test(arguments: [301, 302, 303, 307, 308])
+    func aRefreshRedirectAfterA401OfTheAccountFetchIsUnavailable(status: Int) async throws {
+        SmallUploadURLProtocol.reset(
+            uploadStatuses: [401],
+            refresh: (status, "{}"),
+            refreshRedirectLocation: "https://untrusted.invalid/redirected/refresh"
+        )
+
+        var unavailable = false
+        do {
+            _ = try await makeSession().fetchAccountData()
+        } catch AccountDataRefreshError.unavailable {
+            unavailable = true
+        } catch {}
+
+        #expect(unavailable, "the account fetch reports its refresh as unavailable")
+        #expect(
+            !SmallUploadURLProtocol.requests.map(\.path).contains("/redirected/refresh"),
+            "the refresh must never be sent to the redirect target")
+    }
+
     @Test func failedRefreshReturnsUnauthorizedWithoutResendingUpload() async throws {
         SmallUploadURLProtocol.reset(uploadStatuses: [401, 200], refresh: (401, "{}"))
 
@@ -753,6 +827,16 @@ struct SDKSmallUploadTests {
         return await condition()
     }
 
+    /// The code of the API error that `body` throws, or nil when it throws something else or nothing.
+    private func apiErrorCode(_ body: () async throws -> Void) async -> Int? {
+        do {
+            try await body()
+        } catch ProtonAuthError.apiError(let code, _) {
+            return code
+        } catch {}
+        return nil
+    }
+
     private func makeClient(
         expensiveUploadAccess: ExpensiveUploadAccess? = nil, session: DriveSession? = nil
     ) -> SDKHttpClient {
@@ -781,6 +865,8 @@ struct SDKSmallUploadTests {
     }
 }
 
+private struct EmptyAnswer: Decodable {}
+
 private actor BufferedCompletion {
     private(set) var isFinished = false
 
@@ -803,6 +889,7 @@ private final class SmallUploadURLProtocol: URLProtocol {
     nonisolated(unsafe) private static var uploadFailure: URLError.Code?
     nonisolated(unsafe) private static var refresh: (status: Int, json: String) = (401, "{}")
     nonisolated(unsafe) private static var redirectLocation: String?
+    nonisolated(unsafe) private static var refreshRedirectLocation: String?
     nonisolated(unsafe) private static var recorded: [Recorded] = []
     nonisolated(unsafe) private static var payload = Data("response".utf8)
     nonisolated(unsafe) private static var nonHTTPResponse = false
@@ -818,6 +905,7 @@ private final class SmallUploadURLProtocol: URLProtocol {
         uploadFailure: URLError.Code? = nil,
         refresh: (status: Int, json: String) = (401, "{}"),
         redirectLocation: String? = nil,
+        refreshRedirectLocation: String? = nil,
         payload: Data = Data("response".utf8),
         nonHTTPResponse: Bool = false,
         holdResponses: Bool = false,
@@ -828,6 +916,7 @@ private final class SmallUploadURLProtocol: URLProtocol {
             self.uploadFailure = uploadFailure
             self.refresh = refresh
             self.redirectLocation = redirectLocation
+            self.refreshRedirectLocation = refreshRedirectLocation
             self.payload = payload
             self.nonHTTPResponse = nonHTTPResponse
             self.holdResponses = holdResponses
@@ -852,7 +941,7 @@ private final class SmallUploadURLProtocol: URLProtocol {
                     path: url.path, body: body, headers: headers,
                     allowsExpensiveNetworkAccess: request.allowsExpensiveNetworkAccess))
             if url.path == Self.refreshPath {
-                return (Self.refresh.status, Data(Self.refresh.json.utf8), nil, nil)
+                return (Self.refresh.status, Data(Self.refresh.json.utf8), nil, Self.refreshRedirectLocation)
             }
             let status =
                 Self.uploadStatuses.count > 1 ? Self.uploadStatuses.removeFirst() : Self.uploadStatuses.first ?? 200
