@@ -662,11 +662,13 @@ import os
         case unavailable
         case pendingAccountPurge
         case rateLimited
+        case networkFailure
         case permanentVideoFailure
 
         var videoPlaybackError: VideoPlaybackError? {
             switch self {
             case .rateLimited: .quotaOrRateLimited
+            case .networkFailure: .networkUnavailable
             case .permanentVideoFailure: .decryptionFailed
             default: nil
             }
@@ -838,9 +840,12 @@ import os
         /// Without the scenario argument the video never prepares and fails in a changeable way, as before. With
         /// `-EncryptedMemoriesVideoFailureScenario` the first preparation hits a rate limit, which the viewer retries
         /// silently, the second fails in a way that a new attempt can change, and every later one fails for good.
+        /// `-EncryptedMemoriesVideoNetworkScenario` runs the same course with a network failure as the first one.
         func makeStreamingAsset(for uid: PhotoUID) async throws -> StreamingVideoAsset {
             if let streamingAssetLoader { return try await streamingAssetLoader(uid) }
-            guard ProcessInfo.processInfo.arguments.contains("-EncryptedMemoriesVideoFailureScenario") else {
+            let arguments = ProcessInfo.processInfo.arguments
+            let networkScenario = arguments.contains("-EncryptedMemoriesVideoNetworkScenario")
+            guard networkScenario || arguments.contains("-EncryptedMemoriesVideoFailureScenario") else {
                 throw MobileFixtureError.unavailable
             }
             let attempt = streamingAttempts.withLock { count in
@@ -848,7 +853,7 @@ import os
                 return count
             }
             switch attempt {
-            case 1: throw MobileFixtureError.rateLimited
+            case 1: throw networkScenario ? MobileFixtureError.networkFailure : MobileFixtureError.rateLimited
             case 2: throw MobileFixtureError.unavailable
             default: throw MobileFixtureError.permanentVideoFailure
             }

@@ -237,6 +237,23 @@ final class MobileLibraryUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Try again"].exists, "a failure that no new attempt changes still offers Try again")
     }
 
+    /// The first preparation of the video fails for the network. The viewer asks again behind its loading indicator, so
+    /// the network message never shows. The second failure is the one that the person sees, with Try again.
+    func testANetworkFailureOfTheVideoIsAskedAgainSilentlyBeforeItShows() {
+        app.terminate()
+        app.launchArguments += ["-EncryptedMemoriesVideoNetworkScenario"]
+        app.launch()
+        XCTAssertTrue(firstVideo.waitForExistence(timeout: 60), "the library grid shows no video")
+        firstVideo.tap()
+
+        XCTAssertTrue(
+            app.buttons["Try again"].waitForExistence(timeout: 30), "the video shows no failure after the repeat")
+        XCTAssertTrue(
+            app.staticTexts["The video couldn’t be played."].exists,
+            "the card does not show the failure of the second attempt")
+        XCTAssertFalse(app.staticTexts["No network connection."].exists, "the network failure showed before the repeat")
+    }
+
     func testTheAlbumButtonOfTheViewerAddsTheOpenPhotoToAnAlbum() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         try app.visiblePhoto(beside: app.verticalTabColumn()).tap()

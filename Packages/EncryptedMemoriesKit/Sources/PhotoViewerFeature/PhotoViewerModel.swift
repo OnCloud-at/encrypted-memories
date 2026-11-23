@@ -788,7 +788,11 @@ public final class PhotoViewerModel {
             video.reset()
             if item.isVideo {
                 let failure = VideoPlaybackError.classify(error)
-                if let delay = silentRetryDelays(failure).dropFirst(silentRetries).first { return delay }
+                if let delay = VideoPreparationRetry.nextDelay(
+                    after: error, retries: silentRetries, delays: silentRetryDelays)
+                {
+                    return delay
+                }
                 video.fail(failure, uid: item.uid)
             } else {
                 await loadBoundedStillIfNeeded(for: item, needsDisplayFallback: needsDisplayFallback)
