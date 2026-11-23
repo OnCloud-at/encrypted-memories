@@ -160,6 +160,46 @@ public final class TimelineScrollDateLabelController {
         publish()
     }
 
+    /// One validated contact sample from an adapter: the finger's x and radius, the label's usual trailing edge and
+    /// the native thumb's leading edge, all in the host's coordinates. The shared geometry turns them into the label
+    /// offset. Returns whether the contact holds.
+    @discardableResult
+    public func indicatorContact(
+        atX x: CGFloat, radius: CGFloat, normalRightX: CGFloat, thumbLeftX: CGFloat, began: Bool
+    ) -> Bool {
+        let offset = TimelineScrollDateLabelGeometry.indicatorDragOffset(
+            normalRightX: normalRightX, thumbLeftX: thumbLeftX, contactX: x, contactRadius: radius)
+        if began {
+            indicatorDragBegan(offset: offset, radius: radius)
+        } else {
+            indicatorDragMoved(offset: offset, radius: radius)
+        }
+        return policy.isIndicatorDragging
+    }
+
+    /// One horizontal move of the label away from a finger on the native indicator.
+    public struct IndicatorSlide: Equatable, Sendable {
+        /// Points to the left of the label's usual place.
+        public let offset: CGFloat
+        /// The slide's duration, or nil to move at once.
+        public let duration: TimeInterval?
+        /// Whether the move follows a live finger, so a running onset slide keeps its remaining animation.
+        public let tracking: Bool
+    }
+
+    /// The slide that a label at `currentOffset` needs for `presentation`, or nil when it already sits at the target
+    /// and the presentation animates. A hidden label moves at once, so it fades in beside the contact; a visible label
+    /// uses the presentation's slide duration and follows a held contact directly.
+    public func indicatorSlide(
+        for presentation: Presentation, currentOffset: CGFloat, labelHidden: Bool
+    ) -> IndicatorSlide? {
+        let target = presentation.indicatorOffset
+        guard target != currentOffset || presentation.slideDuration == nil else { return nil }
+        return IndicatorSlide(
+            offset: target, duration: labelHidden ? nil : presentation.slideDuration,
+            tracking: policy.isIndicatorDragging && !reduceMotion && !labelHidden)
+    }
+
     /// Retirement suppresses the policy and ends its contact, so the policy rejects subsequent movement.
     public func indicatorDragMoved(offset: CGFloat, radius: CGFloat) {
         if policy.indicatorDragMoved(offset: offset, radius: radius) { publish() }

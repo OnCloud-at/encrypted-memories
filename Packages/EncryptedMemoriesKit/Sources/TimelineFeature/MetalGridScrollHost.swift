@@ -1147,7 +1147,7 @@ final class MetalGridScrollHost: NSView {
         scrollDateLabelLayoutDepth += 1
         defer {
             scrollDateLabelLayoutDepth -= 1
-            scrollDateLabel?.layout()
+            scrollDateLabel?.scrollersReflected()
         }
         metalView.frame = bounds
         let newFrame = viewportScreenFrame()
@@ -1362,7 +1362,7 @@ final class MetalGridScrollHost: NSView {
         presenter.setTopInset(topBarInset)
         presenter.attach(to: self, scrollView: scrollView)
         // AppKit moves the knob after the clip's bounds notification, when the scroll view reflects the clip.
-        scrollView.onScrollersReflected = { [weak presenter] in presenter?.layout() }
+        scrollView.onScrollersReflected = { [weak presenter] in presenter?.scrollersReflected() }
         updateScrollDateLabelGate()
     }
 

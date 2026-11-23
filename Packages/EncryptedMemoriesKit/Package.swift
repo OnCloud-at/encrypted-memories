@@ -266,7 +266,7 @@ let package = Package(
             name: "TimelineFeature",
             dependencies: [
                 "PhotosCore", "DesignSystem", "MediaCache", "MediaByteCache", "MediaDecodingCore", "MediaFeedCore",
-                "GridCore", "TimelineCore", "MetalRenderingCore", "MetalGridTextureCore",
+                "GridCore", "TimelineCore", "TimelineAppleAdapter", "MetalRenderingCore", "MetalGridTextureCore",
                 "MetalGridTextureAppKitAdapter", "MetalGridComposeCore",
             ],
             swiftSettings: disableDynamicActorIsolation

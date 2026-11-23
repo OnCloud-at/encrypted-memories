@@ -1,5 +1,6 @@
 #if canImport(UIKit)
     import TimelineAppleAdapter
+    import TimelineCore
     import UIKit
 
     /// Forwards the native vertical indicator's public UIView geometry after UIKit lays it out. It never reads a
@@ -27,10 +28,9 @@
         }
 
         var clampedVerticalEnds: (top: Bool, bottom: Bool) {
-            let range = verticalOffsetRange
             // UIKit can round a fractional endpoint to the nearest device pixel.
-            let tolerance = 0.5 / traitCollection.displayScale
-            return (contentOffset.y <= range.lowerBound + tolerance, contentOffset.y >= range.upperBound - tolerance)
+            TimelineScrollDateLabelGeometry.clampedEnds(
+                offset: contentOffset.y, range: verticalOffsetRange, scale: traitCollection.displayScale)
         }
 
         override func didAddSubview(_ subview: UIView) {
