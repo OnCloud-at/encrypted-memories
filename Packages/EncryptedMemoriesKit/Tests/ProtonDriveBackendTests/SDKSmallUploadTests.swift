@@ -152,6 +152,24 @@ struct SDKSmallUploadTests {
             "the authenticated body must never be replayed to the redirect target")
     }
 
+    @Test(arguments: [301, 302, 303, 307, 308])
+    func driveAPIRedirectsAreNotFollowed(status: Int) async throws {
+        SmallUploadURLProtocol.reset(
+            uploadStatuses: [status, 200],
+            redirectLocation: "https://untrusted.invalid/drive/photos/volumes/fixture/albums"
+        )
+
+        let response = try await makeClient().requestDriveApi(
+            method: "POST", relativePath: "drive/photos/volumes/fixture/albums", content: multipartBody,
+            headers: []
+        ).get()
+
+        #expect(response.statusCode == status, "the redirect status must reach the SDK unchanged")
+        #expect(
+            SmallUploadURLProtocol.requests.count == 1,
+            "the authenticated request must never be replayed to the redirect target")
+    }
+
     @Test func failedRefreshReturnsUnauthorizedWithoutResendingUpload() async throws {
         SmallUploadURLProtocol.reset(uploadStatuses: [401, 200], refresh: (401, "{}"))
 

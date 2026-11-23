@@ -154,11 +154,8 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
         Self.applyDriveAcceptHeader(&req)
         applyExpensiveNetworkAccess(&req)
 
-        // Redirects are refused: following one would replay the authenticated body against a
-        // Location the trusted-host check above never saw. The 3xx status reaches the SDK unchanged.
         let result = await perform(
-            req, credentialGeneration: credentialGeneration, retryOn401: true, retryOn429: false,
-            taskDelegate: RedirectRefusingTaskDelegate.shared)
+            req, credentialGeneration: credentialGeneration, retryOn401: true, retryOn429: false)
         switch result {
         case .success(let resp) where resp.statusCode >= 400:
             DebugLog.log("smallUpload \(method) -> \(resp.statusCode)")
@@ -223,19 +220,20 @@ final class SDKHttpClient: HttpClientProtocol, @unchecked Sendable {
 
     // MARK: - Helpers
 
+    /// Sends an authenticated API request. Redirects are refused: following one would replay the credentials and
+    /// the body against a Location that the trusted-host check never saw. The 3xx status reaches the SDK unchanged.
     private func perform(
         _ request: URLRequest,
         credentialGeneration: UInt64,
         retryOn401: Bool,
-        retryOn429: Bool,
-        taskDelegate: URLSessionTaskDelegate? = nil
+        retryOn429: Bool
     ) async -> Result<HttpClientResponse, NSError> {
         do {
             let result = try await BufferedHTTPExecutor.perform(
                 .init(request: request, credentialGeneration: credentialGeneration),
                 urlSession: urlSession, governor: requestGovernor,
                 label: Self.label(for: request, scope: .api),
-                retryOn401: retryOn401, retryOn429: retryOn429, taskDelegate: taskDelegate,
+                retryOn401: retryOn401, retryOn429: retryOn429, taskDelegate: RedirectRefusingTaskDelegate.shared,
                 retryAfterRateLimit: { $0 },
                 refreshAfterUnauthorized: { attempt in
                     guard await self.driveSession.refreshToken(after: attempt.credentialGeneration) else { return nil }
