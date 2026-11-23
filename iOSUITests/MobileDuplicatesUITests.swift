@@ -514,6 +514,40 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertFalse(row.exists, "no possibly identical photos are left")
     }
 
+    func testOnlyPossiblyIdenticalPhotosOpenFromTheEmptyState() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture",
+            extra: ["-EncryptedMemoriesDuplicatesOnlyDifferingDetails", "-EncryptedMemoriesDuplicatesPossibleDetails"])
+        XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 10), "no identical copies are left")
+        let button = app.buttons["duplicates.possible"]
+        XCTAssertTrue(button.waitForExistence(timeout: 20), "the empty state offers the possibly identical photos")
+        XCTAssertEqual(button.label, "Possibly the Same Photo · 1")
+
+        button.tap()
+
+        XCTAssertTrue(app.staticTexts["duplicates.possible.message"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["duplicates.possible.member.0.1"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["duplicates.differing.message"].exists, "the tapped list opens, not the other")
+    }
+
+    func testGoingBackFromThePossiblyIdenticalPhotosKeepsTheDuplicatesAndTheRow() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesPossibleDetails"])
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10))
+        let row = app.buttons["duplicates.possible"]
+        XCTAssertTrue(row.waitForExistence(timeout: 20))
+        app.tapOnScreen(row)
+        let message = app.staticTexts["duplicates.possible.message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+
+        app.backButton(to: "Duplicates").tap()
+
+        waitUntilGone(message, "Back shows the duplicates")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay")
+        XCTAssertTrue(row.waitForExistence(timeout: 10), "the possibly identical photos stay listed")
+        XCTAssertFalse(app.activityIndicators["duplicates.loading"].exists, "Back does not check the library again")
+    }
+
     func testLeavingDuplicatesFromTheDifferingCopiesClosesThemAndTheNextVisitLoadsAgain() {
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesFixture",
