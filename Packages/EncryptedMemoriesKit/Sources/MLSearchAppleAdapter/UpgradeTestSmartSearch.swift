@@ -15,7 +15,7 @@
         ) -> MLSmartSearchLifecycle {
             let artifact = MLModelArtifactSpec(
                 relativePath: "Model.mlmodelc/weights.bin",
-                sha256: SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined(),
+                sha256: SHA256.hash(data: payload).lowercaseHexString,
                 byteCount: Int64(payload.count))
             let entry = MLModelCatalogEntry(
                 id: MLModelID("synthetic-model"), displayName: "Synthetic fixture", family: "Fixture",

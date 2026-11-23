@@ -62,6 +62,28 @@ import Testing
         #expect(month.placeLabels == ["Vienna", "Graz"])
     }
 
+    @Test func anEventIDCarriesItsLabelAsLowercaseHexOfItsUTF8Bytes() {
+        let first = item("first", date: date(2026, 3, 4, 10, 0))
+        let second = item("second", date: date(2026, 3, 4, 11, 0))
+        let enrichment = TimelineTemporalEnrichment(
+            placeLabelsByUID: [:],
+            eventLabelsByUID: [first.uid: "Café Zürich"]
+        )
+
+        let projection = TimelineTemporalProjection(
+            mode: .months,
+            sections: [section("March", [second, first])],
+            calendar: Self.calendar,
+            enrichment: enrichment
+        )
+
+        let day = projection.monthGroups.single.dayGroups[0]
+        let labeled = day.events.first { $0.eventLabel == "Café Zürich" }
+        let unlabeled = day.events.first { $0.eventLabel == nil }
+        #expect(labeled?.id == "\(day.id)-event-436166c3a9205ac3bc72696368")
+        #expect(unlabeled?.id == "\(day.id)-event-unlabeled")
+    }
+
     @Test func allPhotosModeHasExplicitReadyAndEmptyStates() {
         let photo = item("photo", date: date(2026, 4, 1))
         let ready = TimelineTemporalProjection(

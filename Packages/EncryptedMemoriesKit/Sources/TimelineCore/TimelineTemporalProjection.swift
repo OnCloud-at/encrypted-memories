@@ -913,15 +913,7 @@ fileprivate extension TimelineTemporalProjection {
         case .unlabeled:
             return "\(dayID)-event-unlabeled"
         case .labeled(let label):
-            return "\(dayID)-event-\(hexIdentifier(label))"
-        }
-    }
-
-    static func hexIdentifier(_ value: String) -> String {
-        let digits = Array("0123456789abcdef")
-        return value.utf8.reduce(into: "") { result, byte in
-            result.append(digits[Int(byte >> 4)])
-            result.append(digits[Int(byte & 0x0f)])
+            return "\(dayID)-event-\(label.utf8.lowercaseHexString)"
         }
     }
 }

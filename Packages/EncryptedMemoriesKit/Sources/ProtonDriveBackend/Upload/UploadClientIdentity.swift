@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosCore
 
 /// Proton's upload client identity is per account and installation, not merely per account. Keeping
 /// devices distinct lets the backend tell another device's live draft from this installation's own
@@ -7,7 +8,7 @@ import Foundation
 enum UploadClientIdentity {
     static func make(accountUID: String, deviceIdentifier: String, prefix: String = platformPrefix) -> String {
         let digest = SHA256.hash(data: Data((accountUID + deviceIdentifier).utf8))
-        return prefix + digest.map { String(format: "%02x", $0) }.joined()
+        return prefix + digest.lowercaseHexString
     }
 
     private static var platformPrefix: String {

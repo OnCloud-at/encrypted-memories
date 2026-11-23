@@ -13,7 +13,7 @@ import UploadCore
 enum ProtonPhotoHMAC {
     static func hex(message: String, key: Data) -> String {
         let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: key))
-        return mac.map { String(format: "%02x", $0) }.joined()
+        return mac.lowercaseHexString
     }
 }
 
@@ -526,7 +526,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         }
         try Task.checkCancellation()
         guard !isShutDown else { throw CancellationError() }
-        let epoch = SHA256.hash(data: common.hashKey).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let epoch = SHA256.hash(data: common.hashKey).prefix(8).lowercaseHexString
         let resolved = Material(context: common.context, rootKey: common.rootKey, hashKey: common.hashKey, epoch: epoch)
         material = resolved
         return resolved
@@ -678,7 +678,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
             sourceHasher.update(data: Data(id.utf8))
             sourceHasher.update(data: Data([0]))
         }
-        let sourceFingerprint = sourceHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let sourceFingerprint = sourceHasher.finalize().lowercaseHexString
         guard
             let build = store.beginRemoteContentIndexBuild(
                 hashKeyEpoch: material.epoch,

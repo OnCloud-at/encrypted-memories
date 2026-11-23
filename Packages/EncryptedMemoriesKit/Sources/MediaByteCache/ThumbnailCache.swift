@@ -989,19 +989,7 @@ public actor ThumbnailCache {
     private nonisolated func filename(uid: PhotoUID, account: String) -> String {
         let material = "\(namespace)\u{1f}\(account)\u{1f}\(uid.volumeID)\u{1f}\(uid.nodeID)"
         let digest = SHA256.hash(data: Data(material.utf8))
-        return Self.lowercaseHex(digest) + ".blob"
-    }
-
-    private static let lowercaseHexDigits = Array("0123456789abcdef".utf8)
-
-    package nonisolated static func lowercaseHex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
-        var output: [UInt8] = []
-        output.reserveCapacity(64)
-        for byte in bytes {
-            output.append(lowercaseHexDigits[Int(byte >> 4)])
-            output.append(lowercaseHexDigits[Int(byte & 0x0F)])
-        }
-        return String(decoding: output, as: UTF8.self)
+        return digest.lowercaseHexString + ".blob"
     }
 
     private static func defaultDerivative(for namespace: String) -> String {

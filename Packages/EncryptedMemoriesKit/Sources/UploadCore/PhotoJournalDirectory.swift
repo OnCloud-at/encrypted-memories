@@ -48,7 +48,6 @@ struct PhotoJournalDirectory: Sendable {
 
     private func fileURL(for uid: PhotoUID) -> URL {
         let digest = SHA256.hash(data: Data("\(uid.volumeID)/\(uid.nodeID)".utf8))
-        let name = digest.map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent("\(name).json")
+        return directory.appendingPathComponent("\(digest.lowercaseHexString).json")
     }
 }
