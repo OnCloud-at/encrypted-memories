@@ -64,7 +64,7 @@ public struct LibraryMapView: NSViewRepresentable {
         var onSelectPhoto: (PhotoUID) -> Void
         var onSelectCluster: ([PhotoUID], CLLocationCoordinate2D) -> Void
         private weak var map: MKMapView?
-        private var thumbnailLoadTasks: [PhotoUID: Task<Void, Never>] = [:]
+        private let thumbnailLoads = MapThumbnailLoads<NSImage>()
         /// Shared engine (MapCore): framing, off-main aggregation, diff, generation guard, add/remove.
         private var loader: PhotoMapAnnotationLoader!
 
@@ -85,13 +85,9 @@ public struct LibraryMapView: NSViewRepresentable {
                 policy: .standard,
                 onRemoved: { [weak self] uids in
                     guard let self else { return }
-                    for uid in uids { self.thumbnailLoadTasks.removeValue(forKey: uid)?.cancel() }
+                    self.thumbnailLoads.cancel(uids)
                 }
             )
-        }
-
-        deinit {
-            for (_, task) in thumbnailLoadTasks { task.cancel() }
         }
 
         func attach(_ map: MKMapView) {
@@ -131,25 +127,17 @@ public struct LibraryMapView: NSViewRepresentable {
 
         public func mapView(_ mapView: MKMapView, didSelect view: MKAnnotationView) {
             if let photo = view.annotation as? PhotoMapAnnotation {
-                if photo.memberUIDs.count == 1 {
-                    onSelectPhoto(photo.uid)
-                } else {
-                    onSelectCluster(photo.memberUIDs, photo.coordinate)
+                switch photo.selection {
+                case .photo(let uid): onSelectPhoto(uid)
+                case .cluster(let uids, let coordinate): onSelectCluster(uids, coordinate)
                 }
                 mapView.deselectAnnotation(view.annotation, animated: false)
             }
         }
 
         private func requestThumbnailIfNeeded(_ uid: PhotoUID) {
-            guard thumbnailLoadTasks[uid] == nil else { return }
-            let loadThumbnail = loadThumbnail
-            thumbnailLoadTasks[uid] = Task { @MainActor [weak self] in
-                let image = await loadThumbnail(uid)
-                guard let self else { return }
-                self.thumbnailLoadTasks.removeValue(forKey: uid)
-                if Task.isCancelled { return }
-                guard let image else { return }
-                self.applyLoadedThumbnail(image, for: uid)
+            thumbnailLoads.requestIfNeeded(uid, load: loadThumbnail) { [weak self] image, uid in
+                self?.applyLoadedThumbnail(image, for: uid)
             }
         }
 
