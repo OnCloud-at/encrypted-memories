@@ -362,8 +362,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         let (fixture, queue, entry) = try await makeRetryFailureFixture(prefix: "backup-retry-probe-count")
         defer { fixture.cleanup() }
         let controllerQueue = try photoBackupQueueStore(fixture.controller)
+        // The retry compares the recorded failure counts around its reopen writes, then probes the database itself
+        // (run 45096416748): the probe statement is shared with the status projection, which runs off the main actor.
+        // Main-thread-only injection keeps the projection's probe from spending the fault between the two counts.
         let fault = try SQLiteStatementStartAction.recordedFailure(
-            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;")
+            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;", mainThreadOnly: true)
         defer { fault.stop() }
 
         await fixture.controller.retryUserResolvableWork()
@@ -375,6 +378,26 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertEqual(row.state, .discovered)
         XCTAssertEqual(row.attempts, 0)
         XCTAssertEqual(row.lastError, entry.lastError)
+        await fixture.controller.shutdown()
+    }
+
+    func testAHealthProbeOffTheMainThreadDoesNotConsumeTheMainThreadsInjection() async throws {
+        let fixture = try makeControllerFixture(prefix: "backup-probe-thread-injection")
+        defer { fixture.cleanup() }
+        let controllerQueue = try photoBackupQueueStore(fixture.controller)
+        let fault = try SQLiteStatementStartAction.recordedFailure(
+            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;", mainThreadOnly: true)
+        defer { fault.stop() }
+
+        // A probe on another thread runs the same statement without spending the fault.
+        let backgroundAnswer = await Task.detached(priority: .utility) { controllerQueue.isOperational() }.value
+        XCTAssertTrue(backgroundAnswer)
+        XCTAssertFalse(fault.fired)
+
+        // The probe on the main thread spends the fault and forgets the transient failure at once.
+        XCTAssertTrue(controllerQueue.isOperational())
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(controllerQueue.isOperational())
         await fixture.controller.shutdown()
     }
 
