@@ -61,9 +61,15 @@ public actor ProtonForkAuthenticator {
     private static let maxPollTime: Duration = .seconds(600)
 
     public init(config: ProtonAPIConfig = ProtonAPIConfig()) {
+        self.init(config: config, urlProtocolClasses: nil)
+    }
+
+    init(config: ProtonAPIConfig, urlProtocolClasses: [AnyClass]?) {
         self.config = config
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpAdditionalHeaders = ["Accept": "application/vnd.protonmail.v1+json"]
+        // Test seam: lets unit tests intercept requests with a URLProtocol stub (never set in production).
+        if let urlProtocolClasses { cfg.protocolClasses = urlProtocolClasses }
         self.session = URLSession(configuration: cfg)
     }
 
@@ -111,7 +117,7 @@ public actor ProtonForkAuthenticator {
 
     func initFork() async throws -> ForkInit {
         let req = request("/auth/v4/sessions/forks", method: "GET")
-        let (data, response) = try await session.data(for: req)
+        let (data, response) = try await session.data(for: req, delegate: RedirectRefusingTaskDelegate.shared)
         try Self.ensureOK(response, data: data)
         let body = try JSONDecoder().decode(ForkInitResponse.self, from: data)
         guard body.code == 1000, let selector = body.selector, let userCode = body.userCode else {
@@ -134,7 +140,7 @@ public actor ProtonForkAuthenticator {
         while ContinuousClock.now < deadline {
             try Task.checkCancellation()
             let req = request("/auth/v4/sessions/forks/\(selector)", method: "GET")
-            let (data, response) = try await session.data(for: req)
+            let (data, response) = try await session.data(for: req, delegate: RedirectRefusingTaskDelegate.shared)
             guard let http = response as? HTTPURLResponse else { throw ProtonAuthError.invalidResponse }
 
             if http.statusCode == 422 {  // not approved yet
