@@ -162,6 +162,8 @@ public protocol EditReplacementJournaling: DeletionDecisionLog {
     func restoreDeletionChoice(
         _ previous: EditReplacementDeletionChoice, ifStill written: EditReplacementDeletionChoice,
         for source: UploadSourceIdentity) throws
+    /// The entry of `source`, from the in-memory state of the journal; a source without a line has an empty entry. A
+    /// journal that cannot be read does not open, so this read has no failed state.
     func entry(for source: UploadSourceIdentity) -> EditReplacementJournalEntry
     /// One in-memory snapshot for admission after a queue reset, without reading each queued source.
     func supersededSourceIdentifiers() -> Set<String>

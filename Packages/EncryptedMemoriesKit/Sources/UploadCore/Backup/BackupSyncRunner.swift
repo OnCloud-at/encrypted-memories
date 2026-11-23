@@ -1454,9 +1454,11 @@ public actor BackupSyncRunner {
     }
 
     private func recordUploadEvidence(_ entry: UploadBackupSyncQueueEntry) {
-        let replaces =
-            entry.source.kind == .photoLibraryAsset && entry.source.resource == .primary
-            ? editReplacement?.journal.entry(for: entry.source).allSuperseded ?? [] : []
+        // Only the primary resource of a photo library asset with an edit replacement can name superseded uploads.
+        var replaces: [PhotoUID] = []
+        if let editReplacement, entry.source.kind == .photoLibraryAsset, entry.source.resource == .primary {
+            replaces = editReplacement.journal.entry(for: entry.source).allSuperseded
+        }
         events?.recordUploadEvidence(source: entry.source, revision: entry.revision, replaces: replaces)
     }
 
