@@ -4153,7 +4153,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             let runner = makeRunner(
                 identityResolver: PreparationFailingIdentityResolver(inner: makePipeline(), error: failing))
             let progress = await runner.runUntilDrained()
-            let persisted = try XCTUnwrap(queueStore.runtimeIssue(for: .remoteIndexPreparation))
+            let persisted = try XCTUnwrap(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation))
             XCTAssertEqual(persisted.kind, .remoteService)
             XCTAssertEqual(persisted.automaticRetryAttempt, expectedAttempt)
             XCTAssertNil(persisted.waitingSince)
