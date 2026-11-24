@@ -494,7 +494,16 @@ final class MobileLibraryUITests: XCTestCase {
         if UIDevice.current.userInterfaceIdiom == .phone {
             let submit = keyboard.buttons["Search"]
             XCTAssertTrue(submit.waitForExistence(timeout: 10), "Keyboard Search must exist")
-            submit.tap()
+            let submitCenter = CGPoint(x: submit.frame.midX, y: submit.frame.midY)
+            if !submit.frame.isEmpty && app.windows.firstMatch.frame.contains(submitCenter) {
+                // A coordinate tap reaches the keyboard button where the accessibility scroll-to-visible
+                // fails on the second display of the Duo.
+                submit.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            } else {
+                // On the Duo outer display the keyboard renders on the inactive inner display, so no touch
+                // can reach the submit button; the field return key submits the same search.
+                field.typeText("\n")
+            }
             XCTAssertTrue(wait(for: keyboard, "exists == false", timeout: 10), "Keyboard must close")
         }
         XCTAssertFalse(keyboard.exists, "The keyboard must not cover the Library tap")
@@ -603,7 +612,7 @@ final class MobileLibraryUITests: XCTestCase {
 
     /// The end of the search suggestions scrolls clear of the bottom search field, so the Smart Search hint can be read
     /// with the keyboard up and with the keyboard down.
-    func testTheSmartSearchHintScrollsAboveTheSearchField() {
+    func testTheSmartSearchHintScrollsAboveTheSearchField() throws {
         XCTAssertTrue(firstPhoto.waitForExistence(timeout: 60))
         app.tab(titled: "Search").tap()
         let searchField = app.searchFields.firstMatch
@@ -621,6 +630,18 @@ final class MobileLibraryUITests: XCTestCase {
         }
         XCTAssertTrue(hint.waitForExistence(timeout: 10), "the suggestions did not return after the searches")
         XCTAssertTrue(app.keyboards.firstMatch.exists, "the keyboard is not up")
+
+        // On the unposed Duo outer display the system keyboard renders at y 722..967, wholly
+        // below the 466x678 pt window on the inactive inner display; the suggestions fit the
+        // viewport, so no scroll arms the dismissal and no drag inside the window reaches the
+        // keyboard. The keyboard is in the window in the fully open pose.
+        let windowFrame = app.windows.firstMatch.frame
+        guard windowFrame.intersects(app.keyboards.firstMatch.frame) else {
+            throw XCTSkip(
+                "The keyboard \(NSCoder.string(for: app.keyboards.firstMatch.frame)) lies below the window "
+                    + "\(NSCoder.string(for: windowFrame)) on the second display of the Duo; "
+                    + "this run needs the fully open pose")
+        }
 
         scrollSuggestionsToTheEnd()
         XCTAssertLessThanOrEqual(
