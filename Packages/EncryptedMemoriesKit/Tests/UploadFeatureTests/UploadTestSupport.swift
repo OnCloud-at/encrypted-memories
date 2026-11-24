@@ -681,3 +681,16 @@ extension UploadBackupStateManifestStore {
         return read.first?.directRecord
     }
 }
+
+/// A photo-library source with the primary resource.
+func photoLibrarySource(_ identifier: String) -> UploadSourceIdentity {
+    UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
+}
+
+/// The stored record of a row that Proton refused for `rounds` rounds between `firstRoundAt` and `lastRoundAt`.
+func serviceRefusalRecord(rounds: Int, firstRoundAt: Date, lastRoundAt: Date) -> String {
+    BackupIssueRecord(
+        kind: .remoteService, detail: "refused",
+        serviceRejection: BackupServiceRejection(rounds: rounds, firstRoundAt: firstRoundAt, lastRoundAt: lastRoundAt)
+    ).persistedValue
+}

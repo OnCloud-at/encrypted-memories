@@ -744,6 +744,9 @@ extension SpyQueueStore: UploadBackupSyncQueueObserving {
     }
     func changes() -> AsyncStream<UploadBackupSyncQueueChange> { inner.changes() }
     func decisionUnsettledRows() throws -> [UploadBackupQueueRowState] { try inner.decisionUnsettledRows() }
+    func decisionForEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) throws {
+        try inner.decisionForEachProblemEntry(body)
+    }
     func backedUpRevisions(kind: UploadSourceIdentity.Kind) -> [String: UploadBackupRevision] {
         inner.backedUpRevisions(kind: kind)
     }
@@ -771,6 +774,9 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     func recordedFailureCount() -> UInt64 { inner.recordedFailureCount() }
     func synchronizeToDisk() -> Bool { inner.synchronizeToDisk() }
     func upsert(_ entry: UploadBackupSyncQueueEntry) -> Bool { inner.upsert(entry) }
+    func decisionForEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) throws {
+        try inner.decisionForEachProblemEntry(body)
+    }
     func decisionEntry(
         for source: UploadSourceIdentity, revision: UploadBackupRevision
     ) throws -> StoreLookup<UploadBackupSyncQueueEntry> {

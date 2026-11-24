@@ -52,6 +52,7 @@ let storageFaultCases: [any StorageFaultCase] = [
     BackupExecutionLockCase(),
     ManualUploadCase(),
     PendingTrashCase(),
+    AlbumSyncRefusalWriteBackCase(),
 ]
 
 /// A deletion decision on the real queue and journal, by its production operations. By `start`:
@@ -1015,8 +1016,8 @@ struct LocalReadFailureHintCase: StorageFaultCase {
     func seed(in directory: URL, remote: StorageFaultRemote) async throws {
         let store = try open(directory, remote: remote)
         defer { store.close() }
-        XCTAssertTrue(store.insert(Self.photo("a")))
-        XCTAssertTrue(store.insert(Self.photo("b")))
+        XCTAssertTrue(store.insert(photoLibrarySource("a")))
+        XCTAssertTrue(store.insert(photoLibrarySource("b")))
         XCTAssertTrue(store.saveSweepCursor(1))
     }
 
@@ -1031,8 +1032,8 @@ struct LocalReadFailureHintCase: StorageFaultCase {
 
     func run(_ store: BackupLocalReadFailureHintStore) async -> Bool {
         switch step {
-        case .insert: store.insert(Self.photo("c"))
-        case .remove: store.remove([Self.photo("a"), Self.photo("b")])
+        case .insert: store.insert(photoLibrarySource("c"))
+        case .remove: store.remove([photoLibrarySource("a"), photoLibrarySource("b")])
         case .saveSweepCursor: store.saveSweepCursor(2)
         }
     }
@@ -1048,8 +1049,125 @@ struct LocalReadFailureHintCase: StorageFaultCase {
             sql: "SELECT source_kind || '/' || source_id FROM local_read_failure_hint;")
         return state
     }
+}
 
-    private static func photo(_ identifier: String) -> UploadSourceIdentity {
-        UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
+/// Album Sync's refusal rounds (#884), in the order of one album run after its queue reset: the scan, the carry onto
+/// the album queue, the run, and the write-back into the refusal file through the file-system seam. The scan and the run
+/// write through a second store object on the same queue file, which is no fault target: they stand for the runner,
+/// which has its own sweep case. The scan leaves a photo that Proton refused until the backup stopped, a photo that
+/// Proton refuses in this run, and a photo that ended backed up. The run refuses every photo that still waits. The file
+/// holds the stopped photo, the backed-up photo and a photo of another album. The file is a cache: losing a write loses
+/// only rounds, and the next run writes it again.
+struct AlbumSyncRefusalWriteBackCase: StorageFaultCase {
+    struct World {
+        let directory: URL
+        let queue: UploadBackupSyncQueueManifestStore
+        let files: StorageFaultFiles
+        let executor: PhotoAlbumBackupExecutor
+    }
+
+    let id = "albumSync.refusals.writeBack"
+    let atomicity = StorageFaultAtomicity.convergesAfterRestart
+    private static let build = "7"
+    private static let revision = UploadBackupRevision(rawValue: 1_700_000_000_000_000)
+    private static let date = Date(timeIntervalSince1970: 1_700_000_000)
+    private static let photos = ["stopped", "refused", "backed-up"]
+
+    private static func queueURL(in directory: URL) -> URL {
+        directory.appendingPathComponent(PhotoAlbumBackupExecutor.queueDatabaseFileName)
+    }
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let queue = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: Self.queueURL(in: directory)))
+        defer { queue.close() }
+        for (identifier, state) in [
+            ("stopped", UploadBackupSyncQueueState.discovered), ("refused", .discovered), ("backed-up", .completed),
+        ] {
+            XCTAssertTrue(
+                queue.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: photoLibrarySource(identifier), revision: Self.revision,
+                        originalFilename: "\(identifier).heic", byteCount: 4, state: state, attempts: 0,
+                        updatedAt: Self.date)))
+        }
+        let stopped = serviceRefusalRecord(
+            rounds: 3, firstRoundAt: Self.date.addingTimeInterval(-80 * 3600), lastRoundAt: Self.date)
+        try AlbumSyncRefusalStore(accountDataDirectory: directory).replace(
+            with: ["another-album", "backed-up", "stopped"].map {
+                .init(
+                    source: photoLibrarySource($0), revision: Self.revision, lastError: stopped,
+                    roundBuild: Self.build)
+            })
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        let files = StorageFaultFiles()
+        return World(
+            directory: directory,
+            queue: try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: Self.queueURL(in: directory))),
+            files: files,
+            executor: PhotoAlbumBackupExecutor(
+                accountDataDirectory: directory, databasePolicy: .conservative,
+                identityResolver: FakeIdentityResolver(), uploader: MockUploader(),
+                resourceResolver: ScriptedBackupResolver(defaultModified: Self.date), appBuild: Self.build,
+                refusalFileSystem: files, log: BackgroundWorkLog { _, _ in }))
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.queue, world.files] }
+
+    func run(_ world: World) async -> Bool {
+        guard let runner = UploadBackupSyncQueueManifestStore(url: Self.queueURL(in: world.directory)) else {
+            return false
+        }
+        defer { runner.close() }
+        // The scan of a reset queue: the two photos wait for their upload again.
+        for identifier in ["stopped", "refused"] {
+            guard
+                runner.updateState(
+                    source: photoLibrarySource(identifier), revision: Self.revision, state: .discovered, attempts: 0,
+                    lastError: nil, updatedAt: Self.date)
+            else { return false }
+        }
+        let refusals = AlbumSyncRefusalStore(accountDataDirectory: world.directory).read()
+        let carry = world.executor.carry(refusals, into: world.queue)
+        // The run: Proton refuses every photo that still waits, as a first round.
+        let firstRound = serviceRefusalRecord(rounds: 1, firstRoundAt: Self.date, lastRoundAt: Self.date)
+        for identifier in ["stopped", "refused"] {
+            let lookup: StoreLookup<UploadBackupSyncQueueEntry>
+            do {
+                lookup = try runner.decisionEntry(for: photoLibrarySource(identifier), revision: Self.revision)
+            } catch {
+                return false
+            }
+            guard case .found(let row) = lookup else { return false }
+            guard row.state == .discovered else { continue }
+            guard
+                runner.updateState(
+                    source: row.source, revision: row.revision, state: .failed, attempts: 8, lastError: firstRound,
+                    updatedAt: Self.date)
+            else { return false }
+        }
+        let saved = world.executor.writeBack(
+            refusals, carry: carry, from: world.queue, localIdentifiers: Self.photos)
+        return carry.isComplete && saved
+    }
+
+    func close(_ world: World) { world.queue.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: Self.queueURL(in: directory))
+        switch AlbumSyncRefusalStore(accountDataDirectory: directory).read() {
+        case .found(let entries):
+            // The stored record is encoded JSON in no fixed key order; `canonicalJSON` compares it by content.
+            state.tables["refusals"] = entries.map {
+                "\($0.source.identifier)#\($0.revision.rawValue) build=\($0.roundBuild ?? "none") "
+                    + canonicalJSON($0.lastError)
+            }.sorted()
+            state.records["refusal entry"] = Set(entries.map { $0.source.identifier })
+        case .absent: state.tables["refusals"] = ["absent"]
+        case .unknown(let replaceable): state.tables["refusals"] = ["unknown replaceable=\(replaceable)"]
+        }
+        return state
     }
 }

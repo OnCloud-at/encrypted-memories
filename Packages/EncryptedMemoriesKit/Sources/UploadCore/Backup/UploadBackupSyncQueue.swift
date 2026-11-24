@@ -417,6 +417,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
         in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
     ) throws -> [UploadBackupSyncQueueEntry]
     func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord?
+    /// Streams the rows that keep the backup incomplete until `body` returns false; the store names the rows.
+    /// `body` runs under the store's lock and must not call the store. After a throw the caller must discard every
+    /// row it received.
+    func decisionForEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) throws
 }
 
 public extension UploadBackupSyncQueueStore {
