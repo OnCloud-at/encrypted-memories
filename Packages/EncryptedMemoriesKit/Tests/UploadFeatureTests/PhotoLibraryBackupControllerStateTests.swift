@@ -362,8 +362,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         let (fixture, queue, entry) = try await makeRetryFailureFixture(prefix: "backup-retry-probe-count")
         defer { fixture.cleanup() }
         let controllerQueue = try photoBackupQueueStore(fixture.controller)
+        // The retry compares the recorded failure counts around its reopen writes, then probes the database itself
+        // (run 45096416748): the probe statement is shared with the status projection, which runs off the main actor.
+        // Main-thread-only injection keeps the projection's probe from spending the fault between the two counts.
         let fault = try SQLiteStatementStartAction.recordedFailure(
-            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;")
+            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;", mainThreadOnly: true)
         defer { fault.stop() }
 
         await fixture.controller.retryUserResolvableWork()
@@ -376,6 +379,27 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertEqual(row.attempts, 0)
         XCTAssertEqual(row.lastError, entry.lastError)
         await fixture.controller.shutdown()
+    }
+
+    func testAHealthProbeOffTheMainThreadDoesNotConsumeTheMainThreadsInjection() async throws {
+        // A bare store has no other main-thread reader: only this test's probes touch the connection.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("probe-thread-injection-\(UUID().uuidString)").appendingPathExtension("db")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let fault = try SQLiteStatementStartAction.recordedFailure(
+            in: store, matching: "SELECT count(*) FROM sqlite_schema;", mainThreadOnly: true)
+        defer { fault.stop() }
+
+        // A probe on another thread runs the same statement without spending the fault.
+        let backgroundAnswer = await Task.detached(priority: .utility) { store.isOperational() }.value
+        XCTAssertTrue(backgroundAnswer)
+        XCTAssertFalse(fault.fired)
+
+        // The probe on the main thread spends the fault and forgets the transient failure at once.
+        XCTAssertTrue(store.isOperational())
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(store.isOperational())
     }
 
     private func makeRetryFailureFixture(
@@ -929,7 +953,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             await fixture.controller.retryUserResolvableWork()
             XCTAssertTrue(fixture.controller.isSyncing, "manual intent starts despite the system issue's future date")
             XCTAssertNotNil(fixture.controller.activeExecutionRunID)
-            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
+            XCTAssertEqual(queue.runtimeIssueForTesting(for: .remoteIndexPreparation), issue)
             await fixture.controller.shutdown()
         }
 
@@ -2046,7 +2070,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 UploadBackupSyncQueueManifestStore(
                     url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
             defer { queue.close() }
-            let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
+            let issue = try XCTUnwrap(queue.runtimeIssueForTesting(for: .remoteIndexPreparation))
             let scans = PassCounter()
             let owners = OwnerRecorder()
             let releaseScan = LockedFlag(!returnsDuringScan)
@@ -2074,7 +2098,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(waiting, "The manual pass must reach the policy wait before the network returns")
             XCTAssertEqual(scans.count, 1)
             XCTAssertEqual(owners.values, [.manual])
-            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue, "The wait preserves the issue")
+            XCTAssertEqual(
+                queue.runtimeIssueForTesting(for: .remoteIndexPreparation), issue, "The wait preserves the issue")
             XCTAssertEqual(queue.summary()!.resolved, 0, "An expensive path uploads nothing with mobile data off")
 
             if !returnsDuringScan {
@@ -2105,7 +2130,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                         owners.values, [.manual, .iOSBackgroundTask], "the window's own pass carries the retry")
                     XCTAssertFalse(controller.isSyncing, "the window ends with its pass")
                     XCTAssertNil(
-                        queue.runtimeIssue(for: .remoteIndexPreparation),
+                        queue.runtimeIssueForTesting(for: .remoteIndexPreparation),
                         "the window's pass keeps the retry's right to prepare the index before its backoff date")
                     followUps.release()
                     await controller.shutdown()
@@ -2126,7 +2151,8 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let resumed = await waitUntil { scans.count >= 2 && (!controller.isSyncing || followUps.isHolding) }
             XCTAssertTrue(resumed, "The manual retry must resume before the one-hour index retry date")
             XCTAssertEqual(owners.values, [.manual, .manual])
-            XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation), "The resumed pass prepares the index")
+            XCTAssertNil(
+                queue.runtimeIssueForTesting(for: .remoteIndexPreparation), "The resumed pass prepares the index")
             // A pass that followed the retry can prepare the index again, so the later backoff is saved after it.
             followUps.release()
             let settled = await waitUntil(timeout: .seconds(30)) { !controller.isSyncing }
@@ -2236,7 +2262,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
                 UploadBackupSyncQueueManifestStore(
                     url: fixture.directory.appendingPathComponent(PhotoLibraryBackupController.queueDatabaseFileName)))
             defer { queue.close() }
-            let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
+            let issue = try XCTUnwrap(queue.runtimeIssueForTesting(for: .remoteIndexPreparation))
             let scans = PassCounter()
             let owners = OwnerRecorder()
             // The resumed retry clears the index backoff, so the app's own passes can follow it.
@@ -2261,7 +2287,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let offlineFinished = await waitUntil { scans.count == 1 && !controller.isSyncing }
             XCTAssertTrue(offlineFinished)
             XCTAssertEqual(owners.values, [.manual])
-            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
+            XCTAssertEqual(queue.runtimeIssueForTesting(for: .remoteIndexPreparation), issue)
             XCTAssertEqual(queue.summary()!.resolved, 0, "The offline pass performs no upload")
 
             let lock = try XCTUnwrap(
@@ -2287,7 +2313,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let resumed = await waitUntil { scans.count == 2 && (!controller.isSyncing || followUps.isHolding) }
             XCTAssertTrue(resumed, "The first offline manual pass must retain its retry past the saved index backoff")
             XCTAssertEqual(owners.values, [.manual, .manual], "the retry resumes as the person's pass")
-            XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation))
+            XCTAssertNil(queue.runtimeIssueForTesting(for: .remoteIndexPreparation))
             // A pass that followed the retry can prepare the index again, so the later backoff is saved after it.
             followUps.release()
             let settled = await waitUntil(timeout: .seconds(30)) { !controller.isSyncing }
@@ -2444,7 +2470,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             // Let the policy result settle while the scan still owns the foreground pass.
             try await Task.sleep(for: .milliseconds(300))
             try holdAutomaticPasses(in: fixture)
-            let issue = try XCTUnwrap(queue.runtimeIssue(for: .remoteIndexPreparation))
+            let issue = try XCTUnwrap(queue.runtimeIssueForTesting(for: .remoteIndexPreparation))
             let runID = try XCTUnwrap(controller.activeExecutionRunID)
             XCTAssertTrue(lock.release(runID: runID))
             XCTAssertTrue(lock.acquire(owner: .manual, runID: "another-manual-run").didAcquire)
@@ -2459,7 +2485,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
 
             let scheduled = await waitUntil { controller.isAutoResumeScheduledForTesting }
             XCTAssertTrue(scheduled, "An automatic pass still honors its own remote-index backoff")
-            XCTAssertEqual(queue.runtimeIssue(for: .remoteIndexPreparation), issue)
+            XCTAssertEqual(queue.runtimeIssueForTesting(for: .remoteIndexPreparation), issue)
             XCTAssertEqual(scans.count, 1, "Another run's manual lock cannot grant this controller a manual retry")
             await controller.shutdown()
         }
@@ -6791,7 +6817,7 @@ extension PhotoLibraryBackupControllerStateTests {
                     XCTAssertEqual(row.state, .queuedForUpload, "The interrupted compound stays runnable")
                     XCTAssertEqual(row.attempts, admitted.attempts)
                     XCTAssertNil(row.remoteCommitReconciliation)
-                    XCTAssertTrue(f.queue.nextRunnableDate().map { $0 <= f.clock.now } ?? false)
+                    XCTAssertTrue(f.queue.nextRunnableDateForTesting().map { $0 <= f.clock.now } ?? false)
                     guard f.queue.isOperational(), case .readable(let pending) = f.pending.sourceStateRead(for: f.key)
                     else {
                         throw Restore829StopFixtureError.invalid("post-Stop local state is unreadable")

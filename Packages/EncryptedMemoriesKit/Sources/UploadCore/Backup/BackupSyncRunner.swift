@@ -305,15 +305,9 @@ public actor BackupSyncRunner {
         }
     }
 
-    /// Applies a live PhotoKit deletion to both durable and in-flight work. Cancellation is best
-    /// effort once the backend has started committing, but the local deletion never becomes a
-    /// failed backup row and no completion callback can resurrect it.
-    @discardableResult
-    public func removePhotoLibraryAssets(_ identifiers: [String]) async -> Int {
-        await removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
-    }
-
-    /// Removes sources from durable and in-flight work, for a local deletion or an exclusion from backup.
+    /// Removes sources from durable and in-flight work, for a local deletion or an exclusion from backup. A live
+    /// PhotoKit deletion uses it too: cancellation is best effort once the backend has started committing, but the
+    /// local deletion never becomes a failed backup row and no completion callback can resurrect it.
     @discardableResult
     public func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Int {
         let identifiers = Array(Set(identifiers))
@@ -417,7 +411,10 @@ public actor BackupSyncRunner {
         guard let summary = queue.summary() else { return progress }
         progress = BackupSyncProgress(summary: summary, isRunning: true)
         progress.remoteContentIndexHealth = previousIndexHealth
-        progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
+        // A read that finds no issue or cannot run shows no issue (#1154).
+        if case .found(let stored) = queue.runtimeIssueLookup(for: .remoteIndexPreparation) {
+            progress.remoteIndexPreparationIssue = stored
+        }
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
         guard isQueueOperational() else { return progress }
         emitProgress()
@@ -486,11 +483,13 @@ public actor BackupSyncRunner {
                 stopRequested = true
                 return progress
             }
-            let issue = automaticRetryIssue(
+            var issue = automaticRetryIssue(
                 kind: Self.indexPreparationIssueKind(for: error),
                 detail: message,
                 previous: previous
             )
+            // The start of a wait lives on queue rows only; nothing reads it from this issue.
+            issue.waitingSince = nil
             guard queue.setRuntimeIssue(issue, for: .remoteIndexPreparation) else {
                 stopRequested = true
                 return progress
@@ -982,9 +981,18 @@ public actor BackupSyncRunner {
     /// byte export), so it is cheap; worst case it warms nothing and the per-item path is unchanged.
     private func primeRunnableLookahead() async {
         let cutoff = now()
-        var peek = queue.entries(in: .discovered, updatedBefore: cutoff, limit: Self.primeBatch)
+        // A read that cannot run warms nothing, and the per-item path is unchanged (#1154).
+        func rows(in state: UploadBackupSyncQueueState, limit: Int) -> [UploadBackupSyncQueueEntry] {
+            if case .found(let found) = StoreLookup(catching: {
+                try queue.decisionEntries(in: state, updatedBefore: cutoff, limit: limit)
+            }) {
+                return found
+            }
+            return []
+        }
+        var peek = rows(in: .discovered, limit: Self.primeBatch)
         if peek.count < Self.primeBatch {
-            peek += queue.entries(in: .queuedForUpload, updatedBefore: cutoff, limit: Self.primeBatch - peek.count)
+            peek += rows(in: .queuedForUpload, limit: Self.primeBatch - peek.count)
         }
         peek.removeAll {
             $0.isDismissedSourceRecheck
@@ -1448,9 +1456,11 @@ public actor BackupSyncRunner {
     }
 
     private func recordUploadEvidence(_ entry: UploadBackupSyncQueueEntry) {
-        let replaces =
-            entry.source.kind == .photoLibraryAsset && entry.source.resource == .primary
-            ? editReplacement?.journal.entry(for: entry.source).allSuperseded ?? [] : []
+        // Only the primary resource of a photo library asset with an edit replacement can name superseded uploads.
+        var replaces: [PhotoUID] = []
+        if let editReplacement, entry.source.kind == .photoLibraryAsset, entry.source.resource == .primary {
+            replaces = editReplacement.journal.entry(for: entry.source).allSuperseded
+        }
         events?.recordUploadEvidence(source: entry.source, revision: entry.revision, replaces: replaces)
     }
 
@@ -1891,7 +1901,9 @@ public actor BackupSyncRunner {
                         entry, from: persistedState, until: eligibleAt,
                         issue: BackupIssueRecord(
                             kind: .unknown, detail: detail, nextAttemptAt: eligibleAt,
-                            automaticRetryAttempt: waits
+                            automaticRetryAttempt: waits,
+                            waitingSince: BackupItemOutcome.waitStart(
+                                continuing: earlier, sameWait: waits > 0, now: now())
                         ))
                     return
                 case .replacementGone:
@@ -2476,6 +2488,14 @@ public actor BackupSyncRunner {
         rememberDeferredSource(entry)
         let detail = L10n.string("error.upload_cancelled")
         let previous = BackupIssueRecord.decode(entry.lastError)
+        // An interruption does not end a bounded wait: the record stays, so the wait keeps its start and its reason. The
+        // pause is the one of any first interruption.
+        if let previous, previous.waitingSince != nil, BackupItemOutcome.tracksWaitStart(previous) {
+            var kept = previous
+            kept.nextAttemptAt = boundedDeferralIssue(detail: detail, previous: nil).nextAttemptAt
+            deferSource(entry, from: state, until: kept.nextAttemptAt ?? now().addingTimeInterval(30), issue: kept)
+            return
+        }
         let issue = boundedDeferralIssue(detail: detail, previous: previous?.detail == detail ? previous : nil)
         deferSource(entry, from: state, until: issue.nextAttemptAt ?? now().addingTimeInterval(30), issue: issue)
     }
@@ -2540,10 +2560,13 @@ public actor BackupSyncRunner {
             let detail = BackupItemOutcome.sourceUnavailableDetail
             let attempt = min(32, Self.sourceWaits(of: entry, detail: detail) + 1)
             let eligibleAt = now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempt))
+            let earlier = BackupIssueRecord.decode(entry.lastError)
             deferSource(
                 entry, from: oldState, until: eligibleAt,
                 issue: BackupIssueRecord(
-                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: attempt))
+                    kind: .unknown, detail: detail, nextAttemptAt: eligibleAt, automaticRetryAttempt: attempt,
+                    waitingSince: BackupItemOutcome.waitStart(
+                        continuing: earlier, sameWait: earlier?.detail == detail, now: now())))
             return
         }
         // Photos reports the file as missing. A short iCloud fault can report that too, so the row checks again
@@ -2917,11 +2940,15 @@ public actor BackupSyncRunner {
             previousAttempt = 0
         }
         let attempt = min(32, previousAttempt + 1)
+        // Only a temporary Proton wait keeps its start; a lost connection has its own waiting line.
+        let continuesProtonWait = previous?.kind == .remoteService && previous?.isUnprovenServiceWait == false
         return BackupIssueRecord(
             kind: kind,
             detail: detail,
             nextAttemptAt: now().addingTimeInterval(configuration.retry.delay(afterAttempts: attempt)),
-            automaticRetryAttempt: attempt
+            automaticRetryAttempt: attempt,
+            waitingSince: kind == .remoteService
+                ? BackupItemOutcome.waitStart(continuing: previous, sameWait: continuesProtonWait, now: now()) : nil
         )
     }
 

@@ -340,10 +340,6 @@ extension UploadBackupSyncQueueStore {
     ) -> Set<UploadSourceIdentity>? { nil }
     func insertMissingSources(_ entries: [UploadBackupSyncQueueEntry]) -> Bool { false }
 
-    func nextRunnableDate() -> Date? {
-        nextRunnableDate(excludingSourcesOf: [])
-    }
-
     func claimRunnable(limit: Int, claimedAt: Date) -> [UploadBackupSyncQueueEntry]? {
         claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
     }
@@ -374,7 +370,11 @@ extension UploadBackupSyncQueueStore {
             // Generic test stores cannot express a receipt predicate. Inspect their complete state
             // slice so ordinary rows ahead of a receipt cannot make a complete scan look empty;
             // the production SQLite store overrides this with a bounded WHERE/limit query.
-            for entry in entries(in: state, updatedBefore: .distantFuture, limit: .max) {
+            let rows: [UploadBackupSyncQueueEntry]
+            do { rows = try decisionEntries(in: state, updatedBefore: .distantFuture, limit: .max) } catch {
+                throw UploadRemoteCommitRecoveryError.storeUnavailable
+            }
+            for entry in rows {
                 if entry.remoteCommitReconciliation != nil {
                     result.append(entry)
                     if result.count == limit { return result }
@@ -385,41 +385,13 @@ extension UploadBackupSyncQueueStore {
         return result
     }
 
-    func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry? {
-        entries(in: state, updatedBefore: .distantFuture, limit: Int.max)
-            .min { $0.updatedAt < $1.updatedAt }
-    }
-
-    func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord? { nil }
-
     /// A store without a stamp is always read again.
     func changeToken() -> UploadBackupSyncQueueChangeToken? { nil }
 
-    /// Stores without a complete read prove a result by their health after the read.
-    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
-        let date = nextRunnableDate(excludingSourcesOf: excludedSources)
-        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
-        return date
-    }
-
-    func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
-        let entry = earliestEntry(in: state)
-        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
-        return entry
-    }
-
-    func decisionEntries(
-        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
-    ) throws -> [UploadBackupSyncQueueEntry] {
-        let result = entries(in: state, updatedBefore: updatedBefore, limit: limit)
-        guard isOperational() else { throw SQLiteStoreUnknownReadError() }
-        return result
-    }
-
+    /// A test store holds no runtime issue; its answer is proven by its health after the read.
     func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord? {
-        let issue = runtimeIssue(for: key)
         guard isOperational() else { throw SQLiteStoreUnknownReadError() }
-        return issue
+        return nil
     }
 
     @discardableResult
@@ -451,7 +423,7 @@ extension UploadBackupSyncQueueStore {
             .queuedForUpload,
             .needsRemoteReconciliation,
         ] {
-            for entry in entries(in: state, updatedBefore: .distantFuture, limit: .max) {
+            for entry in entriesForTesting(in: state, updatedBefore: .distantFuture, limit: .max) {
                 guard !entry.isDismissedSourceRecheck else { continue }
                 let target: UploadBackupSyncQueueState =
                     switch state {
@@ -492,8 +464,59 @@ extension UploadBackupSyncQueueStore {
     /// Read-only view of every runnable row through the store's own state reads; claiming would change the rows.
     func runnableEntries() -> [UploadBackupSyncQueueEntry] {
         UploadBackupSyncQueueManifestStore.runnableStates.flatMap {
-            entries(in: UploadBackupSyncQueueState(rawValue: $0)!, updatedBefore: .distantFuture, limit: .max)
+            entriesForTesting(in: UploadBackupSyncQueueState(rawValue: $0)!, updatedBefore: .distantFuture, limit: .max)
         }
+    }
+}
+
+extension UploadBackupSyncQueueStore {
+    /// The complete reads of a test that inspects rows. A read that fails fails the test and answers absent, so a test
+    /// never takes a failed read for absence without saying so.
+    private func readForTesting<Value>(
+        _ fallback: Value, file: StaticString, line: UInt, _ read: () throws -> Value
+    ) -> Value {
+        do { return try read() } catch {
+            XCTFail("The test queue read failed: \(error)", file: file, line: line)
+            return fallback
+        }
+    }
+
+    func nextRunnableDateForTesting(
+        excludingSourcesOf excludedSources: [UploadSourceIdentity] = [], file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> Date? {
+        readForTesting(nil, file: file, line: line) {
+            try decisionNextRunnableDate(excludingSourcesOf: excludedSources)
+        }
+    }
+
+    func earliestRunnableEntryForTesting(
+        file: StaticString = #filePath, line: UInt = #line
+    )
+        -> UploadBackupSyncQueueEntry?
+    {
+        readForTesting(nil, file: file, line: line) { try decisionEarliestRunnableEntry() }
+    }
+
+    func earliestEntryForTesting(
+        in state: UploadBackupSyncQueueState, file: StaticString = #filePath, line: UInt = #line
+    ) -> UploadBackupSyncQueueEntry? {
+        readForTesting(nil, file: file, line: line) { try decisionEarliestEntry(in: state) }
+    }
+
+    func entriesForTesting(
+        in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int, file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> [UploadBackupSyncQueueEntry] {
+        readForTesting([], file: file, line: line) {
+            try decisionEntries(in: state, updatedBefore: updatedBefore, limit: limit)
+        }
+    }
+
+    func runtimeIssueForTesting(
+        for key: BackupRuntimeIssueKey, file: StaticString = #filePath, line: UInt = #line
+    ) -> BackupIssueRecord? {
+        readForTesting(nil, file: file, line: line) { try decisionRuntimeIssue(for: key) }
     }
 }
 
@@ -657,4 +680,17 @@ extension UploadBackupStateManifestStore {
         XCTAssertEqual(read.first?.succeeded, true, "The backup state probe must succeed", file: file, line: line)
         return read.first?.directRecord
     }
+}
+
+/// A photo-library source with the primary resource.
+func photoLibrarySource(_ identifier: String) -> UploadSourceIdentity {
+    UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier)
+}
+
+/// The stored record of a row that Proton refused for `rounds` rounds between `firstRoundAt` and `lastRoundAt`.
+func serviceRefusalRecord(rounds: Int, firstRoundAt: Date, lastRoundAt: Date) -> String {
+    BackupIssueRecord(
+        kind: .remoteService, detail: "refused",
+        serviceRejection: BackupServiceRejection(rounds: rounds, firstRoundAt: firstRoundAt, lastRoundAt: lastRoundAt)
+    ).persistedValue
 }

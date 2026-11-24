@@ -190,6 +190,9 @@ public struct UploadBackupSyncQueueSummary: Sendable, Equatable {
     /// Parked rows (failed, final or missing) that wait for the person's decision or for a cause only the person can
     /// fix. A subset of `failed + sourceMissing`; the rest is not backed up without anything the person can do.
     public var attention = 0
+    /// `discovered` rows that wait for their next retry and waited at least a week in one wait that does not end by
+    /// itself. A subset of `waiting`, so a row counts once; the retries continue.
+    public var longWaiting = 0
 
     public init() {}
 
@@ -302,14 +305,6 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// Bounded, strict scan of every row carrying durable remote-commit evidence, independent of
     /// queue state. A malformed non-null payload is an error, never ordinary no-receipt work.
     func entriesWithRemoteCommitReconciliation(limit: Int) throws -> [UploadBackupSyncQueueEntry]
-    /// Earliest persisted eligibility time for any runnable row outside `excludedSources` (same kind and identifier,
-    /// as in `claimRunnable`). Retry delays survive process death, so a restarted runner can wait for due work
-    /// instead of declaring the queue drained.
-    func nextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) -> Date?
-    /// Earliest eligible/backoff row for status and scheduling. Unlike `claimRunnable`, this
-    /// is ordered by eligibility rather than newest-photo execution priority.
-    func earliestRunnableEntry() -> UploadBackupSyncQueueEntry?
-    func earliestEntry(in state: UploadBackupSyncQueueState) -> UploadBackupSyncQueueEntry?
     /// True when any row carries one of `states`. Throws `SQLiteStoreUnknownReadError` when the read could not run,
     /// so a caller never treats a failed read as "no such rows" (#1004).
     func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool
@@ -336,9 +331,6 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func addLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool
     /// Drops the list: later background claims answer `unknown` until the next load.
     func dropLocalReadFailureHints()
-    /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, oldest first.
-    /// The runner uses this to find parked `blockedByDraft` rows whose re-check backoff elapsed.
-    func entries(in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int) -> [UploadBackupSyncQueueEntry]
     /// Nil means the write failed and changed nothing; the caller must not continue as if stale rows were requeued.
     @discardableResult
     func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int?
@@ -408,20 +400,40 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func changeToken() -> UploadBackupSyncQueueChangeToken?
     /// Nil means the durable queue could not be read, not that it is empty (#1004).
     func count() -> Int?
-    func runtimeIssue(for key: BackupRuntimeIssueKey) -> BackupIssueRecord?
     @discardableResult
     func setRuntimeIssue(_ issue: BackupIssueRecord?, for key: BackupRuntimeIssueKey) -> Bool
-    /// Complete reads for decisions. Each throws `SQLiteStoreUnknownReadError` when the read could not run completely,
-    /// so a decision never treats a failed read as "nothing waits" (#1004).
+    /// The reads below are complete. Each throws `SQLiteStoreUnknownReadError` when the read could not run completely,
+    /// so a caller never treats a failed read as "nothing waits" (#1004).
+    ///
+    /// Earliest persisted eligibility time for any runnable row outside `excludedSources` (same kind and identifier,
+    /// as in `claimRunnable`). Retry delays survive process death, so a restarted runner can wait for due work
+    /// instead of declaring the queue drained.
     func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date?
+    /// Earliest eligible or backoff row for status and scheduling. Unlike `claimRunnable`, this is ordered by
+    /// eligibility rather than newest-photo execution priority.
+    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry?
     func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry?
+    /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, newest revision first and, for equal
+    /// revisions, oldest update first. The runner uses this to find parked `blockedByDraft` rows whose re-check
+    /// backoff elapsed.
     func decisionEntries(
         in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
     ) throws -> [UploadBackupSyncQueueEntry]
     func decisionRuntimeIssue(for key: BackupRuntimeIssueKey) throws -> BackupIssueRecord?
+    /// Streams the rows that keep the backup incomplete until `body` returns false; the store names the rows.
+    /// `body` runs under the store's lock and must not call the store. After a throw the caller must discard every
+    /// row it received.
+    func decisionForEachProblemEntry(_ body: (UploadBackupSyncQueueEntry) -> Bool) throws
 }
 
 public extension UploadBackupSyncQueueStore {
+    /// The stored issue of a queue-wide key as a typed answer (#1154): `found` holds the issue, `absent` says that a
+    /// complete read found none, and `unknown` says that the read failed. A caller never takes an unknown answer for
+    /// no issue.
+    func runtimeIssueLookup(for key: BackupRuntimeIssueKey) -> StoreLookup<BackupIssueRecord> {
+        StoreLookup(catching: { try decisionRuntimeIssue(for: key) })
+    }
+
     /// Sources with any queue row, across resources and revisions. Nil means a failed read.
     func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? {
         sourcesWithEntries(sources, outside: [])

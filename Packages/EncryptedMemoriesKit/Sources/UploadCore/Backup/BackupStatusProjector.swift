@@ -1,4 +1,5 @@
 import Foundation
+import PhotosCore
 
 /// Photo-only display knowledge. The controller carries its existing scan outcome and resets the
 /// identity when backup is disabled. Folder and manual backup keep their existing defaults.
@@ -406,9 +407,10 @@ public actor BackupStatusProjector {
             progress.activeExecutionItemEquivalents = 0
         }
 
-        progress.remoteIndexPreparationIssue =
-            queue.runtimeIssue(for: .remoteIndexPreparation)
-            ?? progress.remoteIndexPreparationIssue
+        // A read that finds no issue or cannot run keeps the issue that the runner reported (#1154).
+        if case .found(let stored) = queue.runtimeIssueLookup(for: .remoteIndexPreparation) {
+            progress.remoteIndexPreparationIssue = stored
+        }
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
         progress.outstanding = outstandingSnapshot(summary: summary, isRunning: context.isRunning)
         if let issue = progress.remoteIndexPreparationIssue {
@@ -477,7 +479,8 @@ public actor BackupStatusProjector {
         guard !isRunning else { return BackupOutstandingSnapshot(count: count) }
 
         var candidates: [(Date, BackupIssueKind)] = []
-        if let entry = queue.earliestRunnableEntry() {
+        // A row that cannot be read leaves out its candidate: the status then names no time or reason for it (#1154).
+        if case .found(let entry) = StoreLookup(catching: { try queue.decisionEarliestRunnableEntry() }) {
             let record = BackupIssueRecord.decode(entry.lastError)
             candidates.append(
                 (
@@ -485,7 +488,7 @@ public actor BackupStatusProjector {
                     record.map { $0.isUnprovenServiceWait ? .unknown : $0.kind } ?? .unknown
                 ))
         }
-        if let entry = queue.earliestEntry(in: .blockedByDraft) {
+        if case .found(let entry) = StoreLookup(catching: { try queue.decisionEarliestEntry(in: .blockedByDraft) }) {
             let record = BackupIssueRecord.decode(entry.lastError)
             if let due = BackupFailedItem.effectiveNextAttempt(record, entry: entry) {
                 candidates.append((due, .remoteDraft))

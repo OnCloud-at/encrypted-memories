@@ -74,6 +74,7 @@ final class MetalGridScrollHost: NSView {
         didSet {
             guard abs(topBarInset - oldValue) > 0.5 else { return }
             coordinator.topBarInset = topBarInset
+            scrollDateLabel?.setTopInset(topBarInset)
             guard !coordinator.presentationResizeActive, !coordinator.isSidebarResizing,
                 !coordinator.isZoomingLive, !coordinator.isCommitBridging
             else { return }
@@ -117,6 +118,14 @@ final class MetalGridScrollHost: NSView {
     private var pinchActive = false
     private var liveScrollInputActive = false
     private var marqueeInputActive = false
+    /// The transient month and year label; installed by the production grid only.
+    private(set) var scrollDateLabel: MetalGridScrollDateLabelPresenter?
+    /// Above zero while the host moves the clip itself through `scrollClip(toY:)`.
+    private var programmaticScrollDepth = 0
+    /// Above zero while a navigation command moves the clip: the date scrubber, a photo jump or the newest command.
+    private var scrollDateLabelJumpDepth = 0
+    /// Above zero while layout or a content-size change moves the clip.
+    private var scrollDateLabelLayoutDepth = 0
     private var reportedFeedInteractionActive = false
     /// This host's identity in the shared feed's interaction aggregate (one owner per grid host).
     private let interactionOwner = ThumbnailInteractionOwner()
@@ -327,6 +336,7 @@ final class MetalGridScrollHost: NSView {
 
     @objc private func accessibilityDisplayOptionsChanged() {
         coordinator.setPlaceholderReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        scrollDateLabel?.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
 
     @objc private func userWillScroll() {
@@ -351,6 +361,7 @@ final class MetalGridScrollHost: NSView {
     /// Initial layout keeps the one-shot newest policy. The observer is wired in `viewDidMoveToWindow`.
     @objc private func windowWillLiveResize() {
         stickToBottom = false
+        scrollDateLabel?.updateHost(scrollDateLabelHostState(liveResizing: true))
         liveResizeStartFrame = viewportScreenFrame()
         // ARM the synchronized present for the whole gesture: the renderer then commits, waits until
         // scheduled and presents inside the window's CATransaction (see `MetalGridRenderer.present`).
@@ -365,6 +376,7 @@ final class MetalGridScrollHost: NSView {
     /// Ends a live resize by resolving the final layout and rebasing the scroll once. A resize that did not start
     /// a presentation only clears the synchronized-present flag.
     @objc private func windowDidEndLiveResize() {
+        defer { updateScrollDateLabelGate() }
         metalView.presentsWithTransaction = false  // back to the cheaper async present once settled
         coordinator.liveResizeChanged?(false)
         guard coordinator.presentationResizeActive else {
@@ -420,6 +432,7 @@ final class MetalGridScrollHost: NSView {
             stickToBottom = false
             pinchActive = true
             updateFeedInteractionState()
+            updateScrollDateLabelGate()
             pinchSettling = false
             pinchBaseLevel = coordinator.level
             pinchCumulativeMagnification = 0
@@ -816,6 +829,8 @@ final class MetalGridScrollHost: NSView {
 
     /// Moves the clip view to `y` and tells the scroll view, so its scroller follows.
     private func scrollClip(toY y: CGFloat) {
+        programmaticScrollDepth += 1
+        defer { programmaticScrollDepth -= 1 }
         scrollView.contentView.scroll(to: CGPoint(x: 0, y: y))
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
@@ -876,6 +891,7 @@ final class MetalGridScrollHost: NSView {
             scrollLockOrigin = nil
         }
         requestFrame()
+        forwardScrollToDateLabel()
         onViewportChanged?()
     }
 
@@ -1038,6 +1054,7 @@ final class MetalGridScrollHost: NSView {
                 name: NSWindow.didChangeOcclusionStateNotification, object: window)
         }
         framePump.setActive(window?.occlusionState.contains(.visible) == true)
+        updateScrollDateLabelGate()
         if window != nil {
             ensureDisplayLink()
             requestFrame()
@@ -1057,6 +1074,7 @@ final class MetalGridScrollHost: NSView {
     @objc private func windowVisibilityChanged() {
         let wasActive = framePump.isActive
         framePump.setActive(window?.occlusionState.contains(.visible) == true)
+        updateScrollDateLabelGate()
         if framePump.isActive { requestFrame() }
         if wasActive, !framePump.isActive {
             coordinator.presentationSuspended()
@@ -1070,6 +1088,8 @@ final class MetalGridScrollHost: NSView {
             updateDisplayLinkIdleState()
             return
         }
+        // A zoom, pinch or sidebar transition can start without a clip change; a visible label leaves at once.
+        if scrollDateLabel?.isShown == true { updateScrollDateLabelGate() }
         if coordinator.isCommitBridging { advanceCommitBridge() }
         if coordinator.isSidebarResizing {
             advanceSidebarResize()
@@ -1124,6 +1144,11 @@ final class MetalGridScrollHost: NSView {
 
     override func layout() {
         super.layout()
+        scrollDateLabelLayoutDepth += 1
+        defer {
+            scrollDateLabelLayoutDepth -= 1
+            scrollDateLabel?.layout()
+        }
         metalView.frame = bounds
         let newFrame = viewportScreenFrame()
         let old = lastViewportScreenFrame
@@ -1255,6 +1280,8 @@ final class MetalGridScrollHost: NSView {
     /// the single consume point for a pending `.newest` initial-viewport policy. Placement waits until the
     /// spacer frame and layout geometry are valid.
     private func applyContentSize(_ size: CGSize) {
+        scrollDateLabelLayoutDepth += 1
+        defer { scrollDateLabelLayoutDepth -= 1 }
         let width = scrollView.contentView.bounds.width
         // If geometry is not valid, install nothing and leave the pending policy unchanged.
         guard width > 1, size.height > 0 else { return }
@@ -1324,6 +1351,77 @@ final class MetalGridScrollHost: NSView {
             let uid = coordinator.uid(atFlatIndex: top.flatIndex)
         else { return nil }
         return GridScrollAnchor(itemID: uid, topOffset: top.rect.minY - originY)
+    }
+
+    // MARK: - Scroll date label
+
+    /// Adds the transient month and year label above the grid. The production grid calls it once.
+    func installScrollDateLabel(_ presenter: MetalGridScrollDateLabelPresenter = MetalGridScrollDateLabelPresenter()) {
+        guard scrollDateLabel == nil else { return }
+        scrollDateLabel = presenter
+        presenter.setTopInset(topBarInset)
+        presenter.attach(to: self, scrollView: scrollView)
+        // AppKit moves the knob after the clip's bounds notification, when the scroll view reflects the clip.
+        scrollView.onScrollersReflected = { [weak presenter] in presenter?.layout() }
+        updateScrollDateLabelGate()
+    }
+
+    /// Turns the label on for chronological content and off for loading, pending or relevance-ordered results.
+    func setScrollDateLabelEnabled(_ enabled: Bool) {
+        guard let scrollDateLabel, enabled != scrollDateLabel.isEnabled else { return }
+        scrollDateLabel.setEnabled(enabled)
+        coordinator.onTopVisibleIndexChange =
+            enabled ? { [weak scrollDateLabel] index in scrollDateLabel?.setAnchor(flatIndex: index) } : nil
+        if enabled { requestFrame() }  // The next frame reports the anchor.
+    }
+
+    /// Ends the label with the host: no frame, scroller or presentation callback reaches it afterwards.
+    func retireScrollDateLabel() {
+        coordinator.onTopVisibleIndexChange = nil
+        scrollView.onScrollersReflected = nil
+        scrollDateLabel?.retire()
+    }
+
+    /// The current clip change as the shared classifier sees it. The host's own moves win over every input flag.
+    /// Layout is the host's layout, a content-size change, a live resize, or the scroll view's own tile pass, where
+    /// AppKit keeps the clip inside the document after a resize without a live resize (zoom button, full screen).
+    /// A live scroll (trackpad, Magic Mouse, its momentum, a scroller drag) is the person's. A classic mouse wheel
+    /// starts no live scroll and AppKit animates its steps after the event, so its continuous steps count through the
+    /// shared classifier's continuation rule.
+    var scrollDateLabelMovement: TimelineScrollDateLabelMovement {
+        let isJump = scrollDateLabelJumpDepth > 0
+        return TimelineScrollDateLabelMovement.observed(
+            isApplyingProgrammaticScroll: programmaticScrollDepth > 0 || isScrollBlocking(),
+            hostAnimationActive: false, systemJumpActive: false,
+            isLayout: !isJump && (scrollDateLabelLayoutDepth > 0 || scrollView.tileDepth > 0 || inLiveResize),
+            isTracking: liveScrollInputActive, isDragging: false, isDecelerating: false, isScrollAnimating: false,
+            isApplyingJump: isJump)
+    }
+
+    /// The host state that decides whether the label may show at all.
+    func scrollDateLabelHostState(liveResizing: Bool = false) -> TimelineScrollDateLabelHostState {
+        TimelineScrollDateLabelHostState(
+            hasWindow: window != nil,
+            isActive: framePump.isActive,
+            isBackgrounded: false,  // A hidden or occluded window stops the frame pump instead.
+            isTransforming: liveResizing || inLiveResize || isScrollBlocking()
+                || coordinator.presentationResizeActive || coordinator.gridTransition.isActive
+                || coordinator.isOverviewClickDissolving || coordinator.overviewDissolve != nil,
+            hasItems: coordinator.totalItems > 0,
+            isScrollable: maxScrollY > 0.5)
+    }
+
+    private func updateScrollDateLabelGate() {
+        scrollDateLabel?.updateHost(scrollDateLabelHostState())
+    }
+
+    /// Forwards one clip change: the gate first, so a zoom or resize hides the label before the movement can count.
+    private func forwardScrollToDateLabel() {
+        guard let scrollDateLabel, scrollDateLabel.isEnabled else { return }
+        PhotoPerformanceSignposts.grid.interval("scrollDateLabel.scroll") {
+            scrollDateLabel.updateHost(scrollDateLabelHostState())
+            scrollDateLabel.viewportMoved(scrollDateLabelMovement, offsetY: scrollView.contentView.bounds.origin.y)
+        }
     }
 
     // MARK: - Public controls
@@ -1419,6 +1517,8 @@ final class MetalGridScrollHost: NSView {
     /// Scroll to the newest (bottom) and re-arm the bottom pin. Resets the camera to the canonical bottom-right
     /// phase so the newest view always has the newest item in the corner (no trailing black at the bottom-right).
     func scrollToBottom() {
+        scrollDateLabelJumpDepth += 1
+        defer { scrollDateLabelJumpDepth -= 1 }
         coordinator.beginPlaceholderScroll()
         stickToBottom = true
         coordinator.resetCommittedPhase()
@@ -1428,6 +1528,8 @@ final class MetalGridScrollHost: NSView {
 
     /// Scroll a specific photo to vertical center (detaches the bottom pin - the user navigated to it).
     func scrollToItem(_ uid: PhotoUID) {
+        scrollDateLabelJumpDepth += 1
+        defer { scrollDateLabelJumpDepth -= 1 }
         stickToBottom = false
         guard let rect = coordinator.cellContentRect(forUID: uid) else { return }
         scrollWithPlaceholder(toY: rect.midY - scrollView.contentView.bounds.height / 2)
@@ -1436,6 +1538,8 @@ final class MetalGridScrollHost: NSView {
     /// Scroll a flattened timeline index near the top of the viewport. This is the date-jump primitive for the
     /// overview scrubber: no SwiftUI geometry, no synthetic sections, no custom scroll physics.
     func scrollToFlatIndex(_ index: Int) {
+        scrollDateLabelJumpDepth += 1
+        defer { scrollDateLabelJumpDepth -= 1 }
         stickToBottom = false
         guard let rect = coordinator.cellContentRect(forFlatIndex: index) else { return }
         scrollWithPlaceholder(toY: rect.minY - 24)

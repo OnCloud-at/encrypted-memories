@@ -118,6 +118,9 @@ public struct BackupSyncProgress: Sendable, Equatable {
     /// The part of `needsAttention` that waits for the person's decision or for a cause only the person can fix. The
     /// queue summary sets it; a pass that parks a row changes only `failed` until the next summary read.
     public var attention = 0
+    /// The part of `waiting` that waited at least a week in one wait that does not end by itself. The queue summary
+    /// sets it.
+    public var longWaiting = 0
 
     public var hasOutstandingWork: Bool {
         waiting + checking + uploading + blocked + pendingSourceRechecks > 0
@@ -152,5 +155,6 @@ public struct BackupSyncProgress: Sendable, Equatable {
         pendingSourceRechecks = summary.pendingSourceRechecks
         paused = summary.paused
         attention = summary.attention
+        longWaiting = summary.longWaiting
     }
 }

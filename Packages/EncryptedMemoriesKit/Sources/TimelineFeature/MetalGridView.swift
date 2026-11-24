@@ -123,8 +123,28 @@ final class MetalGridMarqueeView: NSView {
 /// the reliable backstop against the "wild scroll while pinching at the extreme detents" bug.
 final class MetalGridBlockingScrollView: NSScrollView {
     var shouldBlockScroll: ((NSEvent) -> Bool)?
+    /// Called after the scrollers follow the clip view or the scroll view lays them out, so an overlay that sits
+    /// beside the knob reads its updated rectangle.
+    var onScrollersReflected: (() -> Void)?
     override func scrollWheel(with event: NSEvent) {
         if shouldBlockScroll?(event) == true { return }
         super.scrollWheel(with: event)
+    }
+
+    override func reflectScrolledClipView(_ clipView: NSClipView) {
+        super.reflectScrolledClipView(clipView)
+        onScrollersReflected?()
+    }
+
+    /// Above zero while the scroll view lays out its clip view and scrollers. AppKit then moves the clip itself, for
+    /// example to keep it inside the document when the window changes size outside a live resize. A scroll that
+    /// AppKit delivered inside this pass would count as layout too; the host starts none there.
+    private(set) var tileDepth = 0
+
+    override func tile() {
+        tileDepth += 1
+        super.tile()
+        tileDepth -= 1
+        onScrollersReflected?()
     }
 }

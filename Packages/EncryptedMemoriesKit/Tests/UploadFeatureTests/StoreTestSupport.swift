@@ -75,16 +75,24 @@ extension SQLiteStatementFaults {
 
 /// Runs `action` once, under the store's connection lock, when the store starts the first statement whose SQL contains
 /// `matching`. The statement itself runs normally. `fired` tells whether the action ran and returned true.
+/// With `mainThreadOnly`, a statement that another thread starts does not consume the run: the first matching
+/// statement on the main thread arms the action instead, so a test that runs on the main actor cannot lose its
+/// injection to a background reader of the same connection.
 final class SQLiteStatementStartAction {
     private let connection: SQLiteStoreConnection
     private let matching: String
+    private let mainThreadOnly: Bool
     private let action: (SQLiteStoreConnection) -> Bool
     private var ran = false
     private var succeeded = false
 
-    init(in store: Any, matching: String, action: @escaping (SQLiteStoreConnection) -> Bool) throws {
+    init(
+        in store: Any, matching: String, mainThreadOnly: Bool = false,
+        action: @escaping (SQLiteStoreConnection) -> Bool
+    ) throws {
         connection = try storeConnection(store)
         self.matching = matching
+        self.mainThreadOnly = mainThreadOnly
         self.action = action
         connection.withLock {
             sqlite3_trace_v2(
@@ -95,6 +103,7 @@ final class SQLiteStatementStartAction {
                     guard !start.ran, let sql = sqlite3_sql(OpaquePointer(statement)),
                         String(cString: sql).contains(start.matching)
                     else { return 0 }
+                    if start.mainThreadOnly, !Thread.isMainThread { return 0 }
                     // The trace runs while the store holds its connection lock.
                     start.ran = true
                     start.succeeded = start.action(start.connection)
@@ -105,9 +114,11 @@ final class SQLiteStatementStartAction {
 
     /// Records one transient failure on the store's connection while the first matching statement runs, without
     /// failing that statement. The failure stands for another reader of the same connection; the store's health check
-    /// forgets it at once, because the database answers.
-    static func recordedFailure(in store: Any, matching: String) throws -> SQLiteStatementStartAction {
-        try SQLiteStatementStartAction(in: store, matching: matching) { connection in
+    /// forgets it at once, because the database answers. With `mainThreadOnly`, only a main-thread reader records it.
+    static func recordedFailure(
+        in store: Any, matching: String, mainThreadOnly: Bool = false
+    ) throws -> SQLiteStatementStartAction {
+        try SQLiteStatementStartAction(in: store, matching: matching, mainThreadOnly: mainThreadOnly) { connection in
             // `markFailed` requires the connection lock, which the trace holds.
             connection.markFailed(resultCode: SQLITE_INTERRUPT)
             return true

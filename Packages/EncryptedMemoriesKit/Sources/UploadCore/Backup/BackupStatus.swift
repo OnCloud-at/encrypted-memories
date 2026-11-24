@@ -138,7 +138,10 @@ public struct BackupStatus: Sendable, Equatable {
     /// these raise the orange attention line.
     public var needsAttentionCount = 0
     /// Rows that are not backed up although nothing the person can fix is known. They show in a calm line.
-    public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) }
+    public var notBackedUpCount: Int { max(0, failed + sourceMissing - needsAttentionCount) + longWaitingCount }
+    /// Rows the backup still runs after a week in one wait that does not end by itself. They count in the calm
+    /// line; their retries continue.
+    public var longWaitingCount = 0
     /// Files that the last folder scan skipped because the app does not back up their file type. Only a folder backup
     /// sets it; they never enter the queue.
     public var skippedUnsupportedFiles = 0
@@ -150,7 +153,9 @@ public struct BackupStatus: Sendable, Equatable {
     }
     /// Whether the summary counts any photo that is not backed up, orange or calm: the problem list must show one.
     public var hasPhotosNotBackedUp: Bool { needsAttentionCount + notBackedUpCount > 0 }
-    /// The failed and final part of `notBackedUpCount`, for a host that lists missing photos in their own line.
+    /// `waiting` without the long waits: a wait of a week counts in the calm line only, never also as waiting.
+    public func withoutLongWaits(_ waiting: Int) -> Int { max(0, waiting - longWaitingCount) }
+    /// The calm count without the missing photos, for a host that lists those in their own line.
     public var notBackedUpFailedCount: Int { max(0, notBackedUpCount - sourceMissing) }
     /// Changes when a photo can enter or leave the problem list, never on transfer progress alone, so an open
     /// list reloads only when its content can differ.
@@ -159,7 +164,7 @@ public struct BackupStatus: Sendable, Equatable {
             phase: phase,
             counts: [
                 failed, sourceMissing, needsAttentionCount, waitingRetry, dismissedFailures, skippedRemoteDeletions,
-                outstandingCount,
+                outstandingCount, longWaitingCount,
             ],
             issue: outstandingIssue, nextAttemptAt: nextAttemptAt)
     }
@@ -221,6 +226,7 @@ public struct BackupStatus: Sendable, Equatable {
         skippedRemoteDeletions = progress.skippedRemoteDeletions
         sourceMissing = progress.sourceMissing
         needsAttentionCount = min(max(0, progress.attention), progress.needsAttention)
+        longWaitingCount = min(max(0, progress.longWaiting), progress.waiting)
         waitingRetry = progress.blocked
         remainingCount = progress.waiting + progress.checking + progress.uploading
         hasOutstandingWork = progress.hasOutstandingWork
@@ -391,8 +397,8 @@ public struct BackupStatus: Sendable, Equatable {
             return L10n.string("backup.detail_backed_up \(backedUp) \(total)")
         case .waiting:
             guard !hasOnlyDismissedSourceRechecks else { return nil }
-            return L10n.string(
-                "backup.detail_waiting \(uploadQueued + waitingRetry + max(0, (totalConsidered ?? 0) - checked))")
+            let waiting = withoutLongWaits(uploadQueued + waitingRetry + max(0, (totalConsidered ?? 0) - checked))
+            return L10n.string("backup.detail_waiting \(waiting)")
         case .completed:
             guard alreadyBackedUp > 0 else { return nil }
             return L10n.string("backup.detail_already_backed_up \(alreadyBackedUp)")

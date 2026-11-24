@@ -20,7 +20,8 @@ final class AlbumSyncDeletedPhotoScenarioTests: XCTestCase {
 
         let trashReport = try await reinstalled.syncAlbum(
             ["asset-1"], backup: EditScenarioAlbumBackup(device: reinstalled, waitsForScheduledRetries: true))
-        let trashRows = reinstalled.queue.entries(in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
+        let trashRows = reinstalled.queue.entriesForTesting(
+            in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
         XCTAssertEqual(trashRows.count, 1)
         XCTAssertEqual(trashRows.first?.attempts, 0)
         XCTAssertEqual(reinstalled.queue.summary()!.failed, 0)
@@ -44,7 +45,8 @@ final class AlbumSyncDeletedPhotoScenarioTests: XCTestCase {
                 "the same words as the Backup list")
             XCTAssertEqual(report.problems.first?.isRetryable, false, "no Try again")
             XCTAssertEqual(first.server.uploadRequestCount, 1, "ordinary retries and later runs create no consent")
-            let rows = reinstalled.queue.entries(in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
+            let rows = reinstalled.queue.entriesForTesting(
+                in: .skippedRemoteDeletion, updatedBefore: .distantFuture, limit: 10)
             XCTAssertEqual(rows.map(\.attempts), [0], "the emptied trash spends no attempt")
             XCTAssertEqual(reinstalled.queue.summary()!.failed, 0)
         }

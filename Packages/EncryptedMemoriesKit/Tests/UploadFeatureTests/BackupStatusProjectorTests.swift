@@ -703,6 +703,62 @@ final class BackupStatusProjectorTests: XCTestCase {
         }
     }
 
+    /// A wait of a week shows once, in the calm line; the waiting line counts only the rows that still wait normally.
+    func testALongWaitCountsOnceInTheCalmLineAndNotAsWaiting() async throws {
+        let weekOld = BackupIssueRecord(
+            kind: .unknown, detail: BackupItemOutcome.sourceUnavailableDetail, automaticRetryAttempt: 3,
+            waitingSince: Date().addingTimeInterval(-8 * 24 * 3600))
+        for id in ["long-1", "long-2", "long-3"] {
+            var row = entry(id: id, state: .discovered)
+            row.lastError = weekOld.persistedValue
+            XCTAssertTrue(queue.upsert(row))
+        }
+        for id in ["plain-1", "plain-2"] {
+            XCTAssertTrue(queue.upsert(entry(id: id, state: .discovered)))
+        }
+        let projector = BackupStatusProjector(queue: queue)
+        let recorder = Recorder()
+        await projector.start(generation: UUID(), context: .init()) { recorder.append($0) }
+        let status = try XCTUnwrap(recorder.values.last).status
+        let display = BackupStatusPresentation(status)
+        XCTAssertEqual(status.phase, .waiting)
+        XCTAssertEqual(status.longWaitingCount, 3)
+        XCTAssertEqual(display.localizedNotBackedUp, L10n.string("backup.progress_not_backed_up \(3)"))
+        XCTAssertEqual(display.waitingCount, 2, "the three long waits are not counted a second time")
+        XCTAssertEqual(display.localizedWaitingDetail, L10n.string("backup.detail_waiting \(2)"))
+        await projector.stop()
+    }
+
+    /// The macOS folder row shows the waiting detail of the status itself, not the presentation's waiting count.
+    func testAFolderLongWaitCountsOnceInTheWaitingDetail() async throws {
+        let weekOld = BackupIssueRecord(
+            kind: .unknown, detail: BackupItemOutcome.sourceUnavailableDetail, automaticRetryAttempt: 3,
+            waitingSince: Date().addingTimeInterval(-8 * 24 * 3600))
+        func file(_ id: String) -> UploadBackupSyncQueueEntry {
+            var row = entry(id: id, state: .discovered)
+            row.source = UploadSourceIdentity(kind: .fileURL, identifier: "/folder/\(id).jpg")
+            return row
+        }
+        for id in ["long-1", "long-2", "long-3"] {
+            var row = file(id)
+            row.lastError = weekOld.persistedValue
+            XCTAssertTrue(queue.upsert(row))
+        }
+        for id in ["plain-1", "plain-2"] {
+            XCTAssertTrue(queue.upsert(file(id)))
+        }
+        let projector = BackupStatusProjector(queue: queue)
+        let recorder = Recorder()
+        await projector.start(generation: UUID(), context: .init()) { recorder.append($0) }
+        let status = try XCTUnwrap(recorder.values.last).status
+        XCTAssertEqual(status.phase, .waiting)
+        XCTAssertEqual(status.notBackedUpFailedCount, 3, "the folder row's calm line")
+        XCTAssertEqual(
+            status.localizedDetail, L10n.string("backup.detail_waiting \(2)"),
+            "the three long waits are not counted a second time")
+        await projector.stop()
+    }
+
     func testDismissedSourceRechecksUsePhotosWordingWithoutAProblemListAction() async throws {
         let now = Date(timeIntervalSince1970: 1_000)
         let due = now.addingTimeInterval(600)
@@ -1017,6 +1073,56 @@ final class BackupStatusProjectorTests: XCTestCase {
         let row = entry(id: id, state: state)
         return queue.updateState(
             source: row.source, revision: row.revision, state: state, attempts: nil, lastError: nil, updatedAt: Date())
+    }
+
+    /// The index issue that the queue stores reaches the projection. A read of it that fails keeps the issue that the
+    /// runner reported and never clears it (#1154).
+    func testAStoredIndexIssueReachesTheProjectionAndAFailedReadKeepsTheRunnersIssue() async throws {
+        let stored = BackupIssueRecord(kind: .remoteService, detail: "stored")
+        XCTAssertTrue(queue.setRuntimeIssue(stored, for: .remoteIndexPreparation))
+        let projector = BackupStatusProjector(queue: queue, coalescingInterval: 0)
+        let generation = UUID()
+        let context = BackupStatusProjectionContext(isRunning: true)
+        await projector.start(generation: generation, context: context) { _ in }
+        let healthy = await projector.projectNow(context: context, generation: generation, revision: 1)
+        XCTAssertEqual(healthy?.progress.remoteIndexPreparationIssue, stored)
+
+        var live = BackupSyncProgress()
+        live.isRunning = true
+        live.remoteIndexPreparationIssue = BackupIssueRecord(kind: .remoteService, detail: "runner")
+        projector.submit(live, generation: generation)
+        await projector.drainSubmittedEvents()
+        let fault = try SQLiteReadInterrupt(in: queue!, matching: "FROM backup_sync_runtime_issue")
+        defer { fault.stop() }
+        let failed = await projector.projectNow(context: context, generation: generation, revision: 2)
+
+        XCTAssertTrue(fault.fired)
+        XCTAssertEqual(failed?.progress.remoteIndexPreparationIssue?.detail, "runner")
+        await projector.stop()
+    }
+
+    /// The time of the next attempt comes from the earliest runnable row. A read of that row that fails leaves the
+    /// outstanding items without a time instead of guessing one (#1154).
+    func testAFailedEarliestRowReadLeavesTheOutstandingItemsWithoutATime() async throws {
+        let row = entry(id: "due", state: .discovered)
+        XCTAssertTrue(queue.upsert(row))
+        let projector = BackupStatusProjector(queue: queue, coalescingInterval: 0)
+        let generation = UUID()
+        let context = BackupStatusProjectionContext(isRunning: false)
+        await projector.start(generation: generation, context: context) { _ in }
+        let healthy = await projector.projectNow(context: context, generation: generation, revision: 1)
+        let due = try XCTUnwrap(healthy?.progress.outstanding.nextAttemptAt)
+        XCTAssertEqual(due.timeIntervalSince1970, row.updatedAt.timeIntervalSince1970, accuracy: 0.001)
+
+        let fault = try SQLiteReadInterrupt(in: queue!, matching: "UNION ALL")
+        defer { fault.stop() }
+        let failed = await projector.projectNow(context: context, generation: generation, revision: 2)
+
+        XCTAssertTrue(fault.fired)
+        let progress = try XCTUnwrap(failed?.progress)
+        XCTAssertEqual(progress.outstanding.count, 1)
+        XCTAssertNil(progress.outstanding.nextAttemptAt)
+        await projector.stop()
     }
 
     private func entry(

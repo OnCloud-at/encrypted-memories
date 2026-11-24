@@ -28,9 +28,6 @@ public enum PhotoLibraryCatalogSyncError: Error, Equatable, Sendable, CaseIterab
     /// The queue or the catalog cannot answer; the sync gives no further detail.
     case localStateUnavailable
 
-    /// The localized message that a person sees for every failed scan. One place names its key.
-    public static var localStateMessage: String { UploadError.InternalFailure.localStateMessage }
-
     /// The technical wording of the failure. Only the diagnostics read it; it never reaches a label.
     public var diagnosticText: String {
         switch self {
@@ -51,11 +48,11 @@ public enum PhotoLibraryCatalogSyncError: Error, Equatable, Sendable, CaseIterab
         case .catalogNotRead: "Photo library catalog could not be read"
         case .catalogNotUpdated: "Photo library catalog could not be updated"
         case .catalogClassificationIncomplete: "Photo library catalog classification was incomplete"
-        case .localStateUnavailable: Self.localStateMessage
+        case .localStateUnavailable: UploadError.InternalFailure.localStateMessage
         }
     }
 
-    public var errorDescription: String? { Self.localStateMessage }
+    public var errorDescription: String? { UploadError.InternalFailure.localStateMessage }
 
     public var failureCause: FailureCause { .localState }
 }
