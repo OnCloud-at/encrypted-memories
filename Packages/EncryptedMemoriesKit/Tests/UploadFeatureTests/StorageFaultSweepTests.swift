@@ -26,6 +26,7 @@ final class StorageFaultSweepTests: XCTestCase {
         "backup.runUntilDrained": 174, "backup.executionLock": 9, "manualUpload.library": 14,
         "pending.excludeAndTrash": 31,
         "albumSync.refusals.writeBack": 8,
+        "albumSync.mapping.upsert": 2, "albumSync.selections.write": 3, "albumSync.lastRun.write": 1,
     ]
 
     func testEncodedIssueComparisonKeepsAllFieldsValuesAndArrayOrder() {
