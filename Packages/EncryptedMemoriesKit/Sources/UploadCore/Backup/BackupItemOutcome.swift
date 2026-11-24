@@ -33,7 +33,7 @@ public struct BackupItemOutcome: Sendable, Equatable {
     }
 
     /// A stored queue row.
-    public init(state: UploadBackupSyncQueueState, record: BackupIssueRecord?) {
+    public init(state: UploadBackupSyncQueueState, record: BackupIssueRecord?, now: Date = Date()) {
         let issue = record?.kind ?? Self.defaultIssue(for: state)
         let detail = record?.detail
         let waitsForOriginal = Self.isWaitingForOriginal(detail)
@@ -62,6 +62,9 @@ public struct BackupItemOutcome: Sendable, Equatable {
         } else if state == .failed && category == .userResolvable && (issue == .remoteService || issue == .unknown) {
             // The stored kind of a parked row also covers local and sign-in errors; it proves no Proton cause.
             reason = L10n.string("backup.issue_after_several_tries")
+        } else if Self.isLongWait(state: state, record: record, now: now) {
+            // The retries continue; after a week the specific reason no longer helps the person.
+            reason = L10n.string("backup.issue_unknown_waiting")
         } else if isSourceWait {
             reason =
                 waitsForOriginal
@@ -89,6 +92,33 @@ public struct BackupItemOutcome: Sendable, Equatable {
         self.init(
             issue: issue, category: category, reason: reason, isPermanent: isPermanentState, section: section,
             raisesAttention: Self.raisesAttention(state: state, record: record))
+    }
+
+    // MARK: - Long waits
+
+    /// After this long, a wait that does not end by itself shows "Not finished yet." and counts in the calm line.
+    static let longWaitThreshold: TimeInterval = 7 * 24 * 3600
+
+    /// The waits that a week bounds: Photos cannot hand out the file, an edit waits for its original, or Proton is
+    /// temporarily unavailable. A lost connection has its own waiting line and does not count.
+    static func tracksWaitStart(_ record: BackupIssueRecord) -> Bool {
+        record.detail == sourceUnavailableDetail || isWaitingForOriginal(record.detail)
+            || (record.kind == .remoteService && !record.isUnprovenServiceWait)
+    }
+
+    /// The start of a wait: the stored start while the same wait continues, otherwise now.
+    static func waitStart(continuing earlier: BackupIssueRecord?, sameWait: Bool, now: Date) -> Date {
+        sameWait ? earlier?.waitingSince ?? now : now
+    }
+
+    /// Whether a row that waits for its next retry has waited at least `longWaitThreshold` in one bounded wait. Only
+    /// `discovered` rows count, so the problem list reads these rows (up to its per-category cap); it also reads more
+    /// rows. A row being checked is not listed, and a parked or finished row has its own line.
+    public static func isLongWait(state: UploadBackupSyncQueueState, record: BackupIssueRecord?, now: Date) -> Bool {
+        guard state == .discovered, let record, tracksWaitStart(record),
+            let since = record.waitingSince
+        else { return false }
+        return now.timeIntervalSince(since) >= longWaitThreshold
     }
 
     // MARK: - Stored wait details

@@ -961,13 +961,17 @@ private final class TransportCancellingStageResolver: UploadIdentityResolving, @
 
 final class PreparationFailingIdentityResolver: UploadIdentityResolving, @unchecked Sendable {
     private let inner: any UploadIdentityResolving
-    init(inner: any UploadIdentityResolving) { self.inner = inner }
+    private let error: any Error
+    init(inner: any UploadIdentityResolving, error: any Error = UploadError.backend("index unavailable")) {
+        self.inner = inner
+        self.error = error
+    }
 
     func prepareRemoteIndex(
         progress: @escaping @Sendable (UploadRemoteIndexPreparationProgress) async -> Void
     ) async throws {
         await progress(.init(phase: .indexing, completed: 10, total: 100))
-        throw UploadError.backend("index unavailable")
+        throw error
     }
     func remoteIndexPreparationNotNeeded() async { await inner.remoteIndexPreparationNotNeeded() }
     func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
@@ -1811,7 +1815,7 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(issue.detail, BackupItemOutcome.sourceUnavailableDetail)
         XCTAssertEqual(issue.automaticRetryAttempt, 1)
         XCTAssertEqual(issue.nextAttemptAt, row.updatedAt)
-        let item = BackupFailedItem(entry: row)
+        let item = BackupFailedItem(entry: row, now: clock.now)
         XCTAssertEqual(item.reason, L10n.string("backup.issue_source_unavailable"))
         XCTAssertNotEqual(item.reason, L10n.string("backup.issue_network"))
         XCTAssertEqual(item.category, .automatic)
@@ -1822,6 +1826,159 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(resolver.resolveCount(for: entry.source.identifier), 3)
         XCTAssertEqual(clock.sleeps, [1, 2])
         XCTAssertEqual(uploader.requests.count, 1)
+    }
+
+    private func storedRecord(of entry: UploadBackupSyncQueueEntry) throws -> BackupIssueRecord {
+        let row = try queueStore.entry(for: entry.source, revision: entry.revision)
+        return try XCTUnwrap(BackupIssueRecord.decode(row?.lastError))
+    }
+
+    /// A wait for iCloud keeps the moment it began while it continues, so the backup can tell a wait that never ends.
+    /// The retries and their dates are unchanged.
+    func testAWaitForICloudKeepsTheMomentItBegan() async throws {
+        let entry = seedEntry("long-cloud.heic")
+        resolver.set(
+            .failure(photoKitFailure(.networkAccessRequired, for: "long-cloud.heic"), times: 3),
+            for: entry.source.identifier)
+        let began = clock.now
+        let runner = makeRunner()
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let first = try storedRecord(of: entry)
+        XCTAssertEqual(first.waitingSince, began)
+
+        clock.advance(by: 3_600)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let second = try storedRecord(of: entry)
+        XCTAssertEqual(second.automaticRetryAttempt, 2, "the second wait of the same kind")
+        XCTAssertEqual(second.waitingSince, began, "a continuing wait keeps its start")
+        XCTAssertNotEqual(second.nextAttemptAt, first.nextAttemptAt)
+    }
+
+    /// A temporary Proton failure keeps the moment its wait began.
+    func testATemporaryProtonWaitKeepsTheMomentItBegan() async throws {
+        let entry = seedEntry("busy.jpg")
+        let busy = MockUploader(
+            workDuration: .milliseconds(1), deliverProgress: false, serviceFailures: ["busy.jpg": 3])
+        let began = clock.now
+        let runner = makeRunner(uploader: busy)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let first = try storedRecord(of: entry)
+        XCTAssertEqual(first.kind, .remoteService)
+        XCTAssertEqual(first.waitingSince, began)
+
+        clock.advance(by: 3_600)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let second = try storedRecord(of: entry)
+        XCTAssertEqual(second.automaticRetryAttempt, 2)
+        XCTAssertEqual(second.waitingSince, began)
+    }
+
+    private var weekOld: Date { clock.now.addingTimeInterval(-8 * 24 * 3600) }
+
+    /// A wait for the original is another wait than one for iCloud: its start must not carry over.
+    func testAWeekOldWaitForTheOriginalDoesNotCarryIntoAnICloudWait() async throws {
+        let earlier = BackupIssueRecord(
+            kind: .unknown, detail: "backup.issue_waiting_original", automaticRetryAttempt: 3, waitingSince: weekOld)
+        let entry = seedEntry("moved.heic", lastError: earlier.persistedValue)
+        resolver.set(
+            .failure(photoKitFailure(.networkAccessRequired, for: "moved.heic"), times: 1),
+            for: entry.source.identifier)
+        let began = clock.now
+        _ = await makeRunner().runUntilDrained(mode: .eligibleOnly)
+        let stored = try storedRecord(of: entry)
+        XCTAssertEqual(stored.detail, BackupItemOutcome.sourceUnavailableDetail)
+        XCTAssertEqual(stored.waitingSince, began)
+    }
+
+    func testAWeekOldICloudWaitDoesNotCarryIntoAWaitForTheOriginalAndThatWaitKeepsItsOwnStart() async throws {
+        let harness = try makeReplacementHarness()
+        let edited = await uploadThenEdit(harness, keepsOriginal: false)
+        let earlier = BackupIssueRecord(
+            kind: .unknown, detail: BackupItemOutcome.sourceUnavailableDetail, automaticRetryAttempt: 2,
+            waitingSince: weekOld)
+        XCTAssertTrue(
+            queueStore.updateState(
+                source: edited.source, revision: edited.revision, state: .discovered, attempts: 0,
+                lastError: earlier.persistedValue, updatedAt: clock.now.addingTimeInterval(-60)))
+        let began = clock.now
+        let runner = makeRunner(identityResolver: harness.pipeline, editReplacement: harness.replacement)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let first = try storedRecord(of: edited)
+        XCTAssertEqual(first.detail, "backup.issue_waiting_original")
+        XCTAssertEqual(first.waitingSince, began)
+
+        clock.advance(by: 3_600)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let second = try storedRecord(of: edited)
+        XCTAssertEqual(second.detail, "backup.issue_waiting_original")
+        XCTAssertEqual(second.waitingSince, began, "the same wait keeps its start")
+    }
+
+    /// Only a temporary Proton wait continues a Proton wait: a lost connection and an item retry of another error do not.
+    func testAProtonWaitDoesNotTakeTheStartOfAnotherWait() async throws {
+        let lostConnection = BackupIssueRecord(
+            kind: .network, detail: "offline", automaticRetryAttempt: 2, waitingSince: weekOld)
+        let afterNetwork = seedEntry("after-network.jpg", lastError: lostConnection.persistedValue)
+        let afterLocal = seedEntry(
+            "after-local.jpg",
+            lastError: BackupIssueRecord(kind: .remoteService, detail: "local", waitingSince: weekOld).persistedValue)
+        // Enough failures that a retry inside the same pass, while the other photo still runs, still fails.
+        let busy = MockUploader(
+            workDuration: .milliseconds(1), deliverProgress: false,
+            serviceFailures: ["after-network.jpg": 10, "after-local.jpg": 10])
+        let began = clock.now
+        _ = await makeRunner(uploader: busy).runUntilDrained(mode: .eligibleOnly)
+        for entry in [afterNetwork, afterLocal] {
+            let stored = try storedRecord(of: entry)
+            XCTAssertEqual(stored.kind, .remoteService, entry.originalFilename)
+            // The Proton wait starts with its own first failure in this pass, never at the start of the earlier wait.
+            let start = try XCTUnwrap(stored.waitingSince, entry.originalFilename)
+            XCTAssertGreaterThanOrEqual(start, began, entry.originalFilename)
+        }
+    }
+
+    func testALostConnectionStoresNoWaitStartAfterAProtonWait() async throws {
+        let earlier = BackupIssueRecord(
+            kind: .remoteService, detail: "busy", automaticRetryAttempt: 2, waitingSince: weekOld)
+        let entry = seedEntry("now-offline.jpg", lastError: earlier.persistedValue)
+        let offline = MockUploader(
+            workDuration: .milliseconds(1), deliverProgress: false, networkFailures: ["now-offline.jpg": 1])
+        _ = await makeRunner(uploader: offline).runUntilDrained(mode: .eligibleOnly)
+        let stored = try storedRecord(of: entry)
+        XCTAssertEqual(stored.kind, .network)
+        XCTAssertNil(stored.waitingSince, "a lost connection has its own waiting line")
+    }
+
+    /// An interruption does not end a wait for iCloud, so a photo that is interrupted again and again still reaches a week.
+    func testAnInterruptionKeepsTheStartOfAWaitForICloud() async throws {
+        let entry = seedEntry("cloud-interrupted.heic")
+        let failure = photoKitFailure(.networkAccessRequired, for: "cloud-interrupted.heic")
+        resolver.set(.failure(failure, times: 1), for: entry.source.identifier)
+        let began = clock.now
+        // Delays above the 30-second floor, so the pause of a first interruption differs from a later wait's pause.
+        let retry = BackupRetryPolicy(baseDelay: 60, maxDelay: 900, maxAttempts: 4)
+        let runner = makeRunner(retry: retry)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(try storedRecord(of: entry).waitingSince, began)
+
+        clock.advance(by: 3_600)
+        resolver.set(.failure(CancellationError(), times: 1), for: entry.source.identifier)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        try await runner.checkCancellation()
+        let interrupted = try storedRecord(of: entry)
+        XCTAssertEqual(interrupted.waitingSince, began, "the interruption keeps the start")
+        XCTAssertEqual(interrupted.detail, BackupItemOutcome.sourceUnavailableDetail)
+        XCTAssertEqual(
+            try XCTUnwrap(interrupted.nextAttemptAt).timeIntervalSince(clock.now), retry.delay(afterAttempts: 1),
+            "the wait pauses like any first interruption")
+
+        clock.advance(by: 3_600)
+        resolver.set(.failure(failure, times: 1), for: entry.source.identifier)
+        _ = await runner.runUntilDrained(mode: .eligibleOnly)
+        let waiting = try storedRecord(of: entry)
+        XCTAssertEqual(waiting.waitingSince, began)
+        let aWeekLater = began.addingTimeInterval(7 * 24 * 3600)
+        XCTAssertTrue(BackupItemOutcome.isLongWait(state: .discovered, record: waiting, now: aWeekLater))
     }
 
     func testAPhotoThatPhotosReportsMissingIsCheckedAgainHoursLaterAndBacksUp() async throws {
@@ -3915,7 +4072,8 @@ final class BackupSyncRunnerTests: XCTestCase {
         state: UploadBackupSyncQueueState = .discovered,
         attempts: Int = 0,
         ageSeconds: TimeInterval = 60,
-        revisionOffset: Int64 = 0
+        revisionOffset: Int64 = 0,
+        lastError: String? = nil
     ) -> UploadBackupSyncQueueEntry {
         let entry = UploadBackupSyncQueueEntry(
             source: .file(URL(fileURLWithPath: "/backup/\(id)")),
@@ -3926,6 +4084,7 @@ final class BackupSyncRunnerTests: XCTestCase {
             byteCount: 4,
             state: state,
             attempts: attempts,
+            lastError: lastError,
             updatedAt: clock.now.addingTimeInterval(-ageSeconds)
         )
         queueStore.upsert(entry)
@@ -3990,6 +4149,22 @@ final class BackupSyncRunnerTests: XCTestCase {
         let recovered = await retry.runUntilDrained()
         XCTAssertNil(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation))
         XCTAssertEqual(recovered.uploaded, 1)
+    }
+
+    /// The start of a wait lives on queue rows only: nothing reads it from the stored index preparation issue.
+    func testATemporaryProtonFailureOfTheIndexPreparationStoresNoWaitStart() async throws {
+        _ = seedEntry("waiting.jpg")
+        let failing = UploadError.retryableBackend(code: 503, message: "unavailable")
+        for expectedAttempt in 1...2 {
+            let runner = makeRunner(
+                identityResolver: PreparationFailingIdentityResolver(inner: makePipeline(), error: failing))
+            let progress = await runner.runUntilDrained()
+            let persisted = try XCTUnwrap(queueStore.runtimeIssueForTesting(for: .remoteIndexPreparation))
+            XCTAssertEqual(persisted.kind, .remoteService)
+            XCTAssertEqual(persisted.automaticRetryAttempt, expectedAttempt)
+            XCTAssertNil(persisted.waitingSince)
+            XCTAssertNil(progress.remoteIndexPreparationIssue?.waitingSince)
+        }
     }
 
     func testScopedUserRetryInvalidatesTheRemoteViewWithoutChangingEligibility() async throws {
@@ -5920,10 +6095,12 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertEqual(waiting.attempts, edited.attempts)
         XCTAssertEqual(waiting.updatedAt.timeIntervalSince(clock.now), 64)
         let issue = try XCTUnwrap(BackupIssueRecord.decode(waiting.lastError))
-        XCTAssertEqual(BackupFailedItem(entry: waiting).category, .automatic)
-        XCTAssertEqual(BackupFailedItem(entry: waiting).reason, L10n.string("backup.issue_waiting_original"))
+        XCTAssertEqual(BackupFailedItem(entry: waiting, now: clock.now).category, .automatic)
+        XCTAssertEqual(
+            BackupFailedItem(entry: waiting, now: clock.now).reason, L10n.string("backup.issue_waiting_original"))
         XCTAssertEqual(issue.nextAttemptAt, waiting.updatedAt)
         XCTAssertEqual(issue.detail, "backup.issue_waiting_original", "the reason does not depend on the language")
+        XCTAssertEqual(issue.waitingSince, clock.now, "the wait for the original begins now")
         XCTAssertEqual(
             stateStore.record(for: edited.source, revision: UploadBackupRevision(date: resolver.defaultModified))?
                 .isComplete, false,

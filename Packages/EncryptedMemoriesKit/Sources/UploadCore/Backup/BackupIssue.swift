@@ -74,19 +74,24 @@ public struct BackupIssueRecord: Codable, Sendable, Equatable {
     public var automaticRetryAttempt: Int
     /// Proton's repeated refusal of this revision. Older builds ignore the field and keep the row as it is.
     public var serviceRejection: BackupServiceRejection?
+    /// When a wait that does not end by itself began: Photos cannot hand out the file, an edit waits for its original,
+    /// or Proton is temporarily unavailable. It stays while the same wait continues. Older builds ignore the field.
+    public var waitingSince: Date?
 
     public init(
         kind: BackupIssueKind,
         detail: String,
         nextAttemptAt: Date? = nil,
         automaticRetryAttempt: Int = 0,
-        serviceRejection: BackupServiceRejection? = nil
+        serviceRejection: BackupServiceRejection? = nil,
+        waitingSince: Date? = nil
     ) {
         self.kind = kind
         self.detail = detail
         self.nextAttemptAt = nextAttemptAt
         self.automaticRetryAttempt = max(0, automaticRetryAttempt)
         self.serviceRejection = serviceRejection
+        self.waitingSince = waitingSince
     }
 
     /// The kind says remoteService, but nothing proves a temporary Proton wait: only that wait counts automatic

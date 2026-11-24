@@ -1238,11 +1238,22 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    public func summary() -> UploadBackupSyncQueueSummary? {
-        // The parked rows are copied under the lock and judged after it: their stored errors are decoded one by one,
-        // and the lock also serves the health probe that the views read.
-        let read: (UploadBackupSyncQueueSummary, [(UploadBackupSyncQueueState, String?)])? = connection.withLock {
+    /// A group of waiting rows that share one stored error, copied out of the lock to be judged after it.
+    private typealias WaitingGroup = (state: UploadBackupSyncQueueState, count: Int, lastError: String)
+    /// What `summary(now:)` reads under the lock: the counts, the parked rows and the groups of waiting rows.
+    private typealias SummaryRead = (
+        UploadBackupSyncQueueSummary, [(UploadBackupSyncQueueState, String?)], [WaitingGroup]
+    )
+
+    public func summary() -> UploadBackupSyncQueueSummary? { summary(now: Date()) }
+
+    /// `now` decides which waits already lasted a week.
+    public func summary(now: Date) -> UploadBackupSyncQueueSummary? {
+        // The parked rows and the groups of waiting rows are copied under the lock and judged after it: their stored
+        // errors are decoded one by one, and the lock also serves the health probe that the views read.
+        let read: SummaryRead? = connection.withLock {
             var summary = UploadBackupSyncQueueSummary()
+            var waiting: [WaitingGroup] = []
             // An unknown state is a lasting failure at once; the read stops at that row.
             let completed = aggregateRowsLocked { row in
                 guard let raw = row.state, let state = UploadBackupSyncQueueState(rawValue: raw) else {
@@ -1253,19 +1264,27 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     UploadBackupSyncQueueEntry.isDismissedSourceRecheck(
                         sourceKind: kind, state: state, lastError: row.checkReason)
                 {
+                    // A dismissed recheck counts as a dismissed failure and never as a long wait.
                     summary.include(.dismissedFailure, count: row.count)
                     summary.pendingSourceRechecks += row.count
                 } else {
                     summary.include(state, count: row.count)
+                    // The stored error of a waiting or checking row is part of the group, so each group is one wait.
+                    if let lastError = row.checkReason { waiting.append((state, row.count, lastError)) }
                 }
                 return true
             }
             guard completed == true else { return nil }
-            guard summary.failed + summary.sourceMissing > 0 else { return (summary, []) }
+            guard summary.failed + summary.sourceMissing > 0 else { return (summary, [], waiting) }
             guard let parked = parkedRowsLocked() else { return nil }
-            return (summary, parked)
+            return (summary, parked, waiting)
         }
-        guard var (summary, parked) = read else { return nil }
+        guard var (summary, parked, waiting) = read else { return nil }
+        summary.longWaiting = waiting.reduce(0) { count, group in
+            let record = BackupIssueRecord.decode(group.lastError)
+            let isLong = BackupItemOutcome.isLongWait(state: group.state, record: record, now: now)
+            return isLong ? count + group.count : count
+        }
         summary.attention = parked.reduce(0) { count, row in
             BackupItemOutcome.raisesAttention(state: row.0, record: BackupIssueRecord.decode(row.1)) ? count + 1 : count
         }
