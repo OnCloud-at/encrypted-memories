@@ -1179,9 +1179,12 @@ struct AlbumSyncRefusalWriteBackCase: StorageFaultCase {
 /// The runner's persistence of one synced album (`AlbumSyncRunner.sync`): it reads the stored mapping row, moves the
 /// synced-at time and the run's counts onto it, and writes the row back with one upsert. The mapping store is
 /// authoritative, not a rebuildable cache: a lost mapping sends the next sync through the name-conflict flow again.
-/// Both statements of the run live on one connection: a faulted read marks the connection failed, so the same run's
-/// upsert refuses too, and the next sync's read-plus-upsert writes the row again (converging restart). The upsert
-/// never updates `created_at` on conflict, so even the fresh-mapping fallback of a faulted read keeps the row's age.
+/// A faulted read (point 1) still reports success: the fresh-mapping fallback writes the row, and the state converges
+/// exactly, because the conflict clause never updates `created_at` and every other written field takes the same
+/// value. A faulted upsert (point 2) fails and leaves the row unchanged; the next sync's read-plus-upsert writes the
+/// row again (converging restart). A maintainer who adds a conflict-updated field that differs between the stored and
+/// the fresh mapping (for example a fresh `createdAt`) turns point 1 into an honest-outcome failure on purpose: the
+/// sweep then demands a real refusal or an unchanged convergence.
 struct AlbumSyncMappingUpsertCase: StorageFaultCase {
     struct World {
         let url: URL
@@ -1241,17 +1244,19 @@ struct AlbumSyncMappingUpsertCase: StorageFaultCase {
         try state.addSQLiteTables(of: Self.url(in: directory))
         try state.addRecords(
             "mapping", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_mapping;")
+        try state.addRecords(
+            "selection", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_selection;")
         return state
     }
 }
 
 /// The controller's application of one picker result (`AlbumSyncController.applySelection`): the availability probe,
-/// then one `addSelection` per added album, then one `removeSelection` per deselected album; the loop stops at the
-/// first failed write. Deselecting keeps the mapping row, so a later re-selection reuses the same Proton album
-/// without a name-conflict round. The writes are separate transactions: a fault between them leaves a partially
-/// applied selection, and applying the picker again completes it (both writes are idempotent), so the restart
-/// converges. A faulted probe or write makes the controller report the store unavailable before any further write,
-/// which is the fail-closed answer the store documents.
+/// then one `addSelection` per added album, then one `removeSelection` per deselected album — and, exactly as
+/// production, a failed add breaks only the adds loop, so the removals still run. Deselecting keeps the mapping row,
+/// so a later re-selection reuses the same Proton album without a name-conflict round. The writes are separate
+/// transactions: a fault between them leaves a partially applied selection, and applying the picker again completes it
+/// (both writes are idempotent), so the restart converges. A faulted probe stops every write: the controller reports
+/// the store unavailable, which is the fail-closed answer the store documents.
 struct AlbumSyncSelectionWriteCase: StorageFaultCase {
     struct World {
         let url: URL
@@ -1291,11 +1296,17 @@ struct AlbumSyncSelectionWriteCase: StorageFaultCase {
 
     func run(_ world: World) async -> Bool {
         guard world.store.isOperational() else { return false }
-        guard
-            world.store.addSelection(
-                AlbumSyncSelection(localAlbumID: Self.added, title: "Sunny", addedAt: Self.date))
-        else { return false }
-        return world.store.removeSelection(localAlbumID: Self.deselected)
+        var added = true
+        let selection =
+            AlbumSyncSelection(localAlbumID: Self.added, title: "Sunny", addedAt: Self.date)
+        if !world.store.addSelection(selection) {
+            added = false
+            // Production keeps going after a failed add: `applySelection` breaks only the adds loop.
+        }
+        if !world.store.removeSelection(localAlbumID: Self.deselected) {
+            return false
+        }
+        return added
     }
 
     func close(_ world: World) { world.store.close() }
@@ -1305,6 +1316,8 @@ struct AlbumSyncSelectionWriteCase: StorageFaultCase {
         try state.addSQLiteTables(of: Self.url(in: directory))
         try state.addRecords(
             "mapping", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_mapping;")
+        try state.addRecords(
+            "selection", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_selection;")
         return state
     }
 }
