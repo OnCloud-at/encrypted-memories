@@ -292,9 +292,8 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("spy.sqlite")))
         defer { store.close() }
         let spy = SpyQueueStore(inner: store, log: BackupEventLog(), failsRunnableDateRead: true)
-        XCTAssertNil(spy.nextRunnableDate())
-        XCTAssertFalse(spy.isOperational())
         XCTAssertThrowsError(try spy.decisionNextRunnableDate(excludingSourcesOf: []))
+        XCTAssertFalse(spy.isOperational())
         XCTAssertThrowsError(try spy.decisionEarliestEntry(in: .discovered))
         XCTAssertThrowsError(try spy.decisionEntries(in: .discovered, updatedBefore: .distantFuture, limit: 1))
         XCTAssertThrowsError(try spy.decisionRuntimeIssue(for: .remoteIndexPreparation))
@@ -315,11 +314,11 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         for queue in stores {
             XCTAssertNil(queue.changeToken(), "test stores without a token must always refresh")
             XCTAssertNil(queue.restoredCompoundReopener, "the test wrapper does not supply atomic restore")
-            XCTAssertNil(queue.runtimeIssue(for: .remoteIndexPreparation))
             XCTAssertNil(try queue.decisionRuntimeIssue(for: .remoteIndexPreparation))
             XCTAssertTrue(queue.setRuntimeIssue(nil, for: .remoteIndexPreparation))
             XCTAssertEqual(
-                inner.runtimeIssue(for: .remoteIndexPreparation), issue, "the test default does not write through")
+                inner.runtimeIssueForTesting(for: .remoteIndexPreparation), issue,
+                "the test default does not write through")
         }
         XCTAssertTrue(log.events.isEmpty)
     }
@@ -329,7 +328,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("receipt-before.sqlite")))
         defer { inner.close() }
         let spy = SpyQueueStore(inner: inner, log: BackupEventLog(), failsRunnableDateRead: true)
-        XCTAssertNil(spy.nextRunnableDate())
+        XCTAssertThrowsError(try spy.decisionNextRunnableDate(excludingSourcesOf: []))
         let reads = try SQLiteStatementFaults(in: inner, fails: false) { $0.contains("WHERE state =") }
         defer { reads.stop() }
         XCTAssertThrowsError(try spy.entriesWithRemoteCommitReconciliation(limit: 1)) {
@@ -347,7 +346,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         // This branch only takes the spy's lock, so the SQL callback never re-enters its connection.
         let fault = try SQLiteReadInterrupt(
             in: inner, matching: "WHERE state = ? AND updated_at < ?",
-            onFire: { _ = spy.nextRunnableDate() })
+            onFire: { _ = try? spy.decisionNextRunnableDate(excludingSourcesOf: []) })
         defer { fault.stop() }
         XCTAssertThrowsError(try spy.entriesWithRemoteCommitReconciliation(limit: 1)) {
             XCTAssertEqual($0 as? UploadRemoteCommitRecoveryError, .storeUnavailable)
@@ -535,12 +534,12 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         do {
             let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
             XCTAssertTrue(store.setRuntimeIssue(expected, for: .remoteIndexPreparation))
-            XCTAssertEqual(store.runtimeIssue(for: .remoteIndexPreparation), expected)
+            XCTAssertEqual(store.runtimeIssueForTesting(for: .remoteIndexPreparation), expected)
         }
         let reopened = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
-        XCTAssertEqual(reopened.runtimeIssue(for: .remoteIndexPreparation), expected)
+        XCTAssertEqual(reopened.runtimeIssueForTesting(for: .remoteIndexPreparation), expected)
         XCTAssertTrue(reopened.setRuntimeIssue(nil, for: .remoteIndexPreparation))
-        XCTAssertNil(reopened.runtimeIssue(for: .remoteIndexPreparation))
+        XCTAssertNil(reopened.runtimeIssueForTesting(for: .remoteIndexPreparation))
     }
 
     func testCatalogReplayStateSurvivesReopenAndDistinguishesInterruptedRecovery() throws {
@@ -846,13 +845,15 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 ))
         }
 
-        let due = store.entries(in: .blockedByDraft, updatedBefore: Date(timeIntervalSince1970: 50), limit: 10)
+        let due = store.entriesForTesting(
+            in: .blockedByDraft, updatedBefore: Date(timeIntervalSince1970: 50), limit: 10)
         XCTAssertEqual(
             due.map(\.source.identifier), ["blocked-old", "blocked-new"],
-            "state filter + oldest-first ordering + strict updatedBefore cutoff")
+            "state filter + oldest update first for equal revisions + strict updatedBefore cutoff")
         XCTAssertEqual(
-            store.entries(in: .blockedByDraft, updatedBefore: Date(timeIntervalSince1970: 50), limit: 1).count, 1)
-        XCTAssertTrue(store.entries(in: .sourceMissing, updatedBefore: .distantFuture, limit: 10).isEmpty)
+            store.entriesForTesting(in: .blockedByDraft, updatedBefore: Date(timeIntervalSince1970: 50), limit: 1)
+                .count, 1)
+        XCTAssertTrue(store.entriesForTesting(in: .sourceMissing, updatedBefore: .distantFuture, limit: 10).isEmpty)
     }
 
     func testQueueRemovalDeletesExactRevisionOrAllResourcesForSource() throws {
@@ -974,7 +975,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertTrue(store.upsert(earlier))
         XCTAssertTrue(store.upsert(newerPhotoButLaterRetry))
 
-        let stored = try XCTUnwrap(store.earliestRunnableEntry())
+        let stored = try XCTUnwrap(store.earliestRunnableEntryForTesting())
         XCTAssertEqual(stored.source.identifier, "earlier")
         XCTAssertEqual(BackupIssueRecord.decode(stored.lastError), issue)
         XCTAssertEqual(
@@ -1011,7 +1012,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             XCTAssertTrue(store.upsert(entry))
         }
 
-        let first = try XCTUnwrap(store.earliestRunnableEntry())
+        let first = try XCTUnwrap(store.earliestRunnableEntryForTesting())
         XCTAssertEqual(
             first.source.identifier, "reconciling", "oldest runnable row wins even when a failed row is older")
         XCTAssertEqual(first.state, .needsRemoteReconciliation)
@@ -1026,7 +1027,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                 updatedAt: Date(timeIntervalSince1970: 21)
             ))
 
-        let second = try XCTUnwrap(store.earliestRunnableEntry())
+        let second = try XCTUnwrap(store.earliestRunnableEntryForTesting())
         XCTAssertEqual(
             second.source.identifier, "discovered", "after the oldest runnable row leaves, the next oldest wins")
         XCTAssertEqual(second.state, .discovered)
@@ -1061,7 +1062,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             XCTAssertTrue(store.upsert(entry))
         }
 
-        XCTAssertEqual(store.nextRunnableDate(), old.updatedAt)
+        XCTAssertEqual(store.nextRunnableDateForTesting(), old.updatedAt)
 
         let firstClaim = try XCTUnwrap(store.claimRunnable(limit: 2, claimedAt: now))
 
@@ -1077,7 +1078,7 @@ final class UploadBackupSyncQueueTests: XCTestCase {
 
         let secondClaim = try XCTUnwrap(store.claimRunnable(limit: 10, claimedAt: Date(timeIntervalSince1970: 250)))
         XCTAssertEqual(secondClaim.map(\.source.identifier), ["future"])
-        XCTAssertNil(store.nextRunnableDate())
+        XCTAssertNil(store.nextRunnableDateForTesting())
     }
 
     func testClaimSkipsEveryRowOfAnExcludedSource() throws {
@@ -1126,11 +1127,11 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         ]
         for row in rows { XCTAssertTrue(store.upsert(row)) }
 
-        XCTAssertEqual(store.nextRunnableDate(), Date(timeIntervalSince1970: 10))
+        XCTAssertEqual(store.nextRunnableDateForTesting(), Date(timeIntervalSince1970: 10))
         XCTAssertEqual(
-            store.nextRunnableDate(excludingSourcesOf: [source("running")]), Date(timeIntervalSince1970: 300),
+            store.nextRunnableDateForTesting(excludingSourcesOf: [source("running")]), Date(timeIntervalSince1970: 300),
             "any resource of an excluded source stays out")
-        XCTAssertNil(store.nextRunnableDate(excludingSourcesOf: [source("running"), source("waiting")]))
+        XCTAssertNil(store.nextRunnableDateForTesting(excludingSourcesOf: [source("running"), source("waiting")]))
     }
 
     func testConcurrentStoreInstancesNeverClaimTheSameRows() async throws {
@@ -1572,8 +1573,8 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         store.close()
 
         XCTAssertFalse(store.isOperational())
-        XCTAssertTrue(store.runnableEntries().isEmpty)
-        XCTAssertFalse(store.isOperational(), "an empty read after a DB failure must not mean drained")
+        XCTAssertThrowsError(try store.decisionEntries(in: .discovered, updatedBefore: .distantFuture, limit: 10))
+        XCTAssertFalse(store.isOperational(), "a read of a closed store is unknown and never means drained")
         XCTAssertFalse(
             store.upsert(
                 UploadBackupSyncQueueEntry(

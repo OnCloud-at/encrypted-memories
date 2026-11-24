@@ -536,10 +536,6 @@ public actor UploadBackupSyncEngine: UploadBackupCandidateEnqueueing {
         return .internalFailure(.localStateUnavailable)
     }
 
-    public func summary() -> UploadBackupSyncQueueSummary {
-        (queue.summary() ?? UploadBackupSyncQueueSummary())
-    }
-
     private func entry(
         for candidate: UploadBackupAssetCandidate,
         state: UploadBackupSyncQueueState

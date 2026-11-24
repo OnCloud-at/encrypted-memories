@@ -364,8 +364,8 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
     func testNextRunnableDateExcludingASourceLongerThanTheLimitIsUnknown() throws {
         XCTAssertTrue(store.upsert(entry("runnable")))
         try lowerLengthLimit()
-        XCTAssertNil(
-            store.nextRunnableDate(
+        XCTAssertThrowsError(
+            try store.decisionNextRunnableDate(
                 excludingSourcesOf: [UploadSourceIdentity(kind: .photoLibraryAsset, identifier: long)]))
         try assertBindFailureRecorded()
     }

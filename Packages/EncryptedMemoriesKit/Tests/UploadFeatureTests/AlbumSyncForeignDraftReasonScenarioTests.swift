@@ -34,7 +34,8 @@ final class AlbumSyncForeignDraftReasonScenarioTests: XCTestCase {
         XCTAssertEqual(Set(device.server.links.map(\.contentHash)).count, 100)
         let members = try await device.server.childMainLinkIDs(albumID: "own-album")
         XCTAssertEqual(members.count, 100)
-        XCTAssertEqual(device.queue.entries(in: .completed, updatedBefore: .distantFuture, limit: 101).count, 100)
+        XCTAssertEqual(
+            device.queue.entriesForTesting(in: .completed, updatedBefore: .distantFuture, limit: 101).count, 100)
         var savedLinkIDs: Set<String> = []
         for asset in assets {
             let record = try XCTUnwrap(device.identities.record(for: asset.source))
@@ -82,7 +83,7 @@ final class AlbumSyncForeignDraftReasonScenarioTests: XCTestCase {
         let problem = try XCTUnwrap(report.problems.first)
         XCTAssertEqual(problem.source, asset.source)
         XCTAssertEqual(problem.issue, stale ? .remoteDraftStale : .remoteDraft)
-        let rows = device.queue.entries(
+        let rows = device.queue.entriesForTesting(
             in: stale ? .failedPermanent : .blockedByDraft, updatedBefore: .distantFuture, limit: 10)
         XCTAssertEqual(rows.count, 1)
         XCTAssertEqual(rows.first?.attempts, stale ? 4 : 1)

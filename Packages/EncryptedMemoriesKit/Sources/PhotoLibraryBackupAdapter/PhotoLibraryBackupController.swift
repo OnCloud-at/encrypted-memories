@@ -574,7 +574,9 @@ public final class PhotoLibraryBackupController {
                 outcomes[state.key] = .waiting(until: Date().addingTimeInterval(30))
                 continue
             }
-            guard let entry = (catalogStore.presentEntries(for: [state.key.identifier]) ?? [:])[state.key.identifier],
+            // A row that cannot be read or is absent leaves no entry: the outcome stays unreadable and the durable duty
+            // asks again (#1154).
+            guard let entry = catalogStore.presence(for: [state.key.identifier]).present[state.key.identifier],
                 let candidate = PhotoBackupAssetPlanner.candidate(for: PhotoLibraryCatalogMapper.info(for: entry)),
                 let plan = PhotoBackupAssetPlanner.exportPlan(for: PhotoLibraryCatalogMapper.info(for: entry)),
                 catalogStore.isOperational()
@@ -971,7 +973,7 @@ public final class PhotoLibraryBackupController {
         bulkPreparationMessage = nil
         let confirmation = await bulkPhotoActions.prepareBackUpAgain(in: queueStore)
         if confirmation == nil, !Task.isCancelled, !isShuttingDown, !queueStore.isOperational() {
-            bulkPreparationMessage = L10n.string("backup.error_local_state_unavailable")
+            bulkPreparationMessage = UploadError.InternalFailure.localStateMessage
         }
         return confirmation
     }
@@ -1119,7 +1121,7 @@ public final class PhotoLibraryBackupController {
             backgroundLog.notice(
                 .photoBackup, "decision.notSaved",
                 [(.init("choice"), .word(keepDeleted ? "keepDeleted" : "backUpAgain"))])
-            lastMessage = L10n.string("backup.error_local_state_unavailable")
+            lastMessage = UploadError.InternalFailure.localStateMessage
             refreshFromQueue()
             return false
         }
@@ -1158,7 +1160,7 @@ public final class PhotoLibraryBackupController {
         do {
             entries = try userResolvableEntries(in: queueStore)
         } catch {
-            lastMessage = L10n.string("backup.error_local_state_unavailable")
+            lastMessage = UploadError.InternalFailure.localStateMessage
             refreshFromQueue()
             return
         }
@@ -1177,7 +1179,7 @@ public final class PhotoLibraryBackupController {
             lastMessage =
                 queueIsOperational
                 ? L10n.string("backup.error_retry_incomplete")
-                : L10n.string("backup.error_local_state_unavailable")
+                : UploadError.InternalFailure.localStateMessage
             refreshFromQueue()
             return
         }
@@ -1309,7 +1311,7 @@ public final class PhotoLibraryBackupController {
             return nil
         }
         guard queueStore.isOperational(), catalogStore.isOperational(), pendingStoreIsReady else {
-            lastMessage = L10n.string("backup.error_local_state_unavailable")
+            lastMessage = UploadError.InternalFailure.localStateMessage
             refreshFromQueue()
             return nil
         }
@@ -1764,7 +1766,7 @@ public final class PhotoLibraryBackupController {
                 Task { @MainActor in self?.lastCatalogProgress = progress }
             },
             onRemoved: { identifiers in
-                _ = await runner.removePhotoLibraryAssets(identifiers)
+                _ = await runner.removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
             }
         )
         try await Self.reconcileMissingSources(sync, engine: engine)
@@ -2704,7 +2706,7 @@ public final class PhotoLibraryBackupController {
                 let sync = PhotoLibraryCatalogSync(
                     store: catalogStore, retryRows: catalogRetryRows,
                     onRemoved: { identifiers in
-                        _ = await runner.removePhotoLibraryAssets(identifiers)
+                        _ = await runner.removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
                     }
                 )
                 _ = try? await sync.run(engine: engine, identifiers: targeted)
@@ -2967,7 +2969,7 @@ public final class PhotoLibraryBackupController {
             return
         }
         guard queueStore?.isOperational() == true, catalogStore?.isOperational() == true else {
-            lastMessage = L10n.string("backup.error_local_state_unavailable")
+            lastMessage = UploadError.InternalFailure.localStateMessage
             logNext(.localStateUnavailable)
             return
         }
@@ -3068,7 +3070,7 @@ public final class PhotoLibraryBackupController {
     private func reportScanFailure(_ error: Error) {
         PhotoDiagnostics.shared.increment("backup.scan.failed")
         PhotoDiagnostics.shared.emitDebug("BackupSync", ["scanError": Self.scanFailureDetail(error)])
-        reportSyncMessage(PhotoLibraryCatalogSyncError.localStateMessage)
+        reportSyncMessage(UploadError.InternalFailure.localStateMessage)
     }
 
     /// The fixed technical wording that the diagnostics keep for a failed scan.

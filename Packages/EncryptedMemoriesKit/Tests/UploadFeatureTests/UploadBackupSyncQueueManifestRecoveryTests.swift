@@ -843,16 +843,15 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         XCTAssertTrue(store!.setRuntimeIssue(issue, for: .remoteIndexPreparation))
         let runnable = entry("runnable", revision: 1)
         XCTAssertTrue(store!.upsert(runnable))
-        XCTAssertTrue(store!.upsert(entry("draft", state: .blockedByDraft, revision: 2)))
+        let draft = entry("draft", state: .blockedByDraft, revision: 2)
+        XCTAssertTrue(store!.upsert(draft))
         XCTAssertTrue(store!.upsert(entry("failed", state: .failed, revision: 3)))
-        XCTAssertEqual(
-            try store!.decisionNextRunnableDate(excludingSourcesOf: []), store!.nextRunnableDate(excludingSourcesOf: [])
-        )
+        XCTAssertEqual(try store!.decisionNextRunnableDate(excludingSourcesOf: []), runnable.updatedAt)
         XCTAssertNil(try store!.decisionNextRunnableDate(excludingSourcesOf: [runnable.source]))
-        XCTAssertEqual(try store!.decisionEarliestEntry(in: .blockedByDraft), store!.earliestEntry(in: .blockedByDraft))
+        XCTAssertEqual(try store!.decisionEarliestRunnableEntry(), runnable)
+        XCTAssertEqual(try store!.decisionEarliestEntry(in: .blockedByDraft), draft)
         XCTAssertEqual(
-            try store!.decisionEntries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 10),
-            store!.entries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 10))
+            try store!.decisionEntries(in: .blockedByDraft, updatedBefore: .distantFuture, limit: 10), [draft])
         XCTAssertEqual(try store!.decisionRuntimeIssue(for: .remoteIndexPreparation), issue)
         var strict: [UploadBackupSyncQueueEntry] = []
         try store!.decisionForEachProblemEntry {

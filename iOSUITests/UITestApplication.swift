@@ -29,6 +29,14 @@ extension XCUIApplication {
             predicate: NSPredicate { _, _ in (window.frame.width > window.frame.height) == landscape }, object: nil)
         return XCTWaiter.wait(for: [turned], timeout: timeout) == .completed
     }
+
+    /// Swipes at most `swipes` times until `element` exists. A lazy list creates a row only near the visible area, so a
+    /// row below a small display or below large text appears only after a scroll. The caller checks the result.
+    func reveal(_ element: XCUIElement, swipingUp: Bool = true, swipes: Int = 4) {
+        for _ in 0..<swipes where !element.waitForExistence(timeout: 1) {
+            if swipingUp { swipeUp() } else { swipeDown() }
+        }
+    }
 }
 
 extension XCUIElement {

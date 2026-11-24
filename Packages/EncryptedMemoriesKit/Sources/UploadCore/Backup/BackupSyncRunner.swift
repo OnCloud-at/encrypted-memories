@@ -305,15 +305,9 @@ public actor BackupSyncRunner {
         }
     }
 
-    /// Applies a live PhotoKit deletion to both durable and in-flight work. Cancellation is best
-    /// effort once the backend has started committing, but the local deletion never becomes a
-    /// failed backup row and no completion callback can resurrect it.
-    @discardableResult
-    public func removePhotoLibraryAssets(_ identifiers: [String]) async -> Int {
-        await removeSources(kind: .photoLibraryAsset, identifiers: identifiers)
-    }
-
-    /// Removes sources from durable and in-flight work, for a local deletion or an exclusion from backup.
+    /// Removes sources from durable and in-flight work, for a local deletion or an exclusion from backup. A live
+    /// PhotoKit deletion uses it too: cancellation is best effort once the backend has started committing, but the
+    /// local deletion never becomes a failed backup row and no completion callback can resurrect it.
     @discardableResult
     public func removeSources(kind: UploadSourceIdentity.Kind, identifiers: [String]) async -> Int {
         let identifiers = Array(Set(identifiers))
@@ -417,7 +411,10 @@ public actor BackupSyncRunner {
         guard let summary = queue.summary() else { return progress }
         progress = BackupSyncProgress(summary: summary, isRunning: true)
         progress.remoteContentIndexHealth = previousIndexHealth
-        progress.remoteIndexPreparationIssue = queue.runtimeIssue(for: .remoteIndexPreparation)
+        // A read that finds no issue or cannot run shows no issue (#1154).
+        if case .found(let stored) = queue.runtimeIssueLookup(for: .remoteIndexPreparation) {
+            progress.remoteIndexPreparationIssue = stored
+        }
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
         guard isQueueOperational() else { return progress }
         emitProgress()
@@ -984,9 +981,18 @@ public actor BackupSyncRunner {
     /// byte export), so it is cheap; worst case it warms nothing and the per-item path is unchanged.
     private func primeRunnableLookahead() async {
         let cutoff = now()
-        var peek = queue.entries(in: .discovered, updatedBefore: cutoff, limit: Self.primeBatch)
+        // A read that cannot run warms nothing, and the per-item path is unchanged (#1154).
+        func rows(in state: UploadBackupSyncQueueState, limit: Int) -> [UploadBackupSyncQueueEntry] {
+            if case .found(let found) = StoreLookup(catching: {
+                try queue.decisionEntries(in: state, updatedBefore: cutoff, limit: limit)
+            }) {
+                return found
+            }
+            return []
+        }
+        var peek = rows(in: .discovered, limit: Self.primeBatch)
         if peek.count < Self.primeBatch {
-            peek += queue.entries(in: .queuedForUpload, updatedBefore: cutoff, limit: Self.primeBatch - peek.count)
+            peek += rows(in: .queuedForUpload, limit: Self.primeBatch - peek.count)
         }
         peek.removeAll {
             $0.isDismissedSourceRecheck

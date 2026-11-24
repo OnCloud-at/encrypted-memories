@@ -359,9 +359,7 @@ final class MobileDuplicatesUITests: XCTestCase {
 
     /// Large accessibility text can put a fixture group below the viewport; reach the real row by scrolling.
     private func revealGroup(_ index: Int, scrollingUp: Bool = true) {
-        for _ in 0..<4 where !group(index).waitForExistence(timeout: 1) {
-            if scrollingUp { app.swipeUp() } else { app.swipeDown() }
-        }
+        app.reveal(group(index), swipingUp: scrollingUp)
         XCTAssertTrue(group(index).waitForExistence(timeout: 10), "every fixture group remains in the list")
     }
 

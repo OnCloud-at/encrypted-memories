@@ -171,14 +171,19 @@ final class MobileFailedBackupUITests: XCTestCase {
         XCTAssertEqual(section("actionNeeded").label, "Action needed")
         XCTAssertTrue(row("permission fixture.heic").exists)
         XCTAssertTrue(app.buttons["backup.retryUserResolvable.sheet"].exists)
-        // A failed row without a cause the person can fix runs again after the next launch.
+        // A failed row without a cause the person can fix runs again after the next launch. The list is lazy, so the
+        // lower rows exist only after a scroll on a small display.
+        app.reveal(section("continuesByItself"))
         XCTAssertTrue(section("continuesByItself").waitForExistence(timeout: 5))
         let failed = row("remoteService failed fixture.heic")
+        app.reveal(failed)
         XCTAssertTrue(failed.waitForExistence(timeout: 5))
         XCTAssertTrue(failed.label.contains("Not backed up after several tries."))
+        app.reveal(section("notPossible"))
         XCTAssertTrue(section("notPossible").waitForExistence(timeout: 5))
         XCTAssertEqual(section("notPossible").label, "No further attempts")
         let refused = row("remoteService fixture.heic")
+        app.reveal(refused)
         XCTAssertTrue(refused.waitForExistence(timeout: 5))
         XCTAssertTrue(refused.label.contains("Proton did not accept this photo."))
     }

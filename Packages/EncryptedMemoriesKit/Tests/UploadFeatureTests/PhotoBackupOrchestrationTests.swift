@@ -982,7 +982,8 @@ final class PhotoBackupOrchestrationTests: XCTestCase {
         let targeted = PhotoLibraryCatalogSync(
             store: catalog, enumerator: enumerator, chunkSize: 50, now: { [clock] in clock!.now })
         _ = try await targeted.run(engine: engine, identifiers: ["D"])
-        var entry = try XCTUnwrap(queue.entries(in: .discovered, updatedBefore: .distantFuture, limit: 10).first)
+        var entry = try XCTUnwrap(
+            queue.entriesForTesting(in: .discovered, updatedBefore: .distantFuture, limit: 10).first)
         entry.updatedAt = clock.now.addingTimeInterval(30)
         XCTAssertTrue(queue.upsert(entry))
         XCTAssertEqual(
