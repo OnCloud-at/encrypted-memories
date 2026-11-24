@@ -2471,6 +2471,9 @@ final class PendingBackupCoordinatorTests: XCTestCase {
     func testRetryableActionFailureKeepsTheAction() async throws {
         enqueue("album", state: .uploading)
         effects.albumResult = .retry
+        let gate = LookupGate()
+        effects.albumGate = gate
+        defer { gate.open() }
         await coordinator.start()
         _ = await coordinator.addToAlbum([PhotoUID(localPending: .photoLibrary, identifier: "album")], albumID: "a1")
         recorder.recordHandoff(
@@ -2479,6 +2482,20 @@ final class PendingBackupCoordinatorTests: XCTestCase {
         await waitForSnapshot("handoff known") { $0.tiles.first?.handoff != nil }
         await coordinator.noteRemotePresence([key("album")])
 
+        // The dispatch of the action parks inside the album effect while the handoff publish
+        // already shows the tile badge, so the badge cannot prove the retry write. The gate
+        // parks the dispatch there: the wait ends on the dispatch itself, not on the badge or
+        // on a deadline.
+        await gate.entered()
+        XCTAssertEqual(try XCTUnwrap(store.actions().first).attempts, 0, "the handoff badge does not write the attempt")
+        let revisionBeforeWrite = await coordinator.currentSnapshot().membershipRevision
+        gate.open()
+        // The dispatch writes the result and marks the lists dirty, so the next membership publish after the
+        // write is the first one that bumps the revision again. The wait ends on that publish.
+        _ = try await publishedSnapshot(
+            "the retry write publishes",
+            after: {},
+            where: { $0.membershipRevision > revisionBeforeWrite })
         let action = try XCTUnwrap(store.actions().first)
         XCTAssertFalse(action.failed)
         XCTAssertEqual(action.attempts, 1)
@@ -5158,7 +5175,12 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
         get { lock.withLock { _favoriteGate } }
         set { lock.withLock { _favoriteGate = newValue } }
     }
+    var albumGate: LookupGate? {
+        get { lock.withLock { _albumGate } }
+        set { lock.withLock { _albumGate = newValue } }
+    }
     private var _favoriteGate: LookupGate?
+    private var _albumGate: LookupGate?
 
     func setFavorite(_ uid: PhotoUID, favorite: Bool) async -> PendingEffectResult {
         await favoriteGate?.pass()
@@ -5170,7 +5192,8 @@ private final class FakePendingEffects: PendingBackupEffects, @unchecked Sendabl
     }
 
     func addToAlbum(_ uid: PhotoUID, albumID: String) async -> PendingEffectResult {
-        lock.withLock { _albumResult }
+        await albumGate?.pass()
+        return lock.withLock { _albumResult }
     }
 }
 
