@@ -247,7 +247,7 @@ final class BackupFirstBackupGuideTests: XCTestCase {
 
         let seen = BackupStatusPresentation(status(.completed, total: 1_200, uploaded: 1_200, guide: .done))
         XCTAssertEqual(seen.localizedHeadline, L10n.string("backup.phase_completed"))
-        XCTAssertEqual(seen.localizedSubtitle, L10n.string("backup.progress_backed_up \(1_200) \(1_200)"))
+        XCTAssertEqual(seen.localizedSubtitle, L10n.string("counts.backed_up \(L10n.ofTotal(1_200, of: 1_200))"))
         let omitted = BackupStatusPresentation(
             status(.completed, total: 1_200, uploaded: 1_100, dismissedFailures: 1, guide: .completedUnseen))
         XCTAssertEqual(omitted.headlineKey, "backup.phase_completed_with_omissions")

@@ -385,16 +385,16 @@ public struct BackupStatus: Sendable, Equatable {
         case .checking:
             if isPreparingRemoteIndex {
                 if let completed = remoteIndexCompleted, let total = remoteIndexTotal, total > 0 {
-                    return L10n.string("backup.detail_preparing_index \(completed) \(total)")
+                    return L10n.string("counts.preparing_backup_index \(L10n.ofTotal(completed, of: total))")
                 }
                 return L10n.string("backup.detail_preparing_index_indeterminate")
             }
             guard !hasOnlyDismissedSourceRechecks else { return nil }
             guard let total = totalConsidered, total > 0 else { return currentItemName }
-            return L10n.string("backup.detail_checked \(checked) \(total)")
+            return L10n.string("counts.checked \(L10n.ofTotal(checked, of: total))")
         case .uploading:
             guard let total = totalConsidered, total > 0 else { return nil }
-            return L10n.string("backup.detail_backed_up \(backedUp) \(total)")
+            return L10n.string("counts.backed_up \(L10n.ofTotal(backedUp, of: total))")
         case .waiting:
             guard !hasOnlyDismissedSourceRechecks else { return nil }
             let waiting = withoutLongWaits(uploadQueued + waitingRetry + max(0, (totalConsidered ?? 0) - checked))

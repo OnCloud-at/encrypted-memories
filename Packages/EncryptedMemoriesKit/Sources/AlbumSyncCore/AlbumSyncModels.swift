@@ -222,7 +222,7 @@ public struct AlbumSyncProgress: Sendable, Equatable {
         case .idle, .scanningLocal:
             return nil
         case .backingUp:
-            return L10n.string("albumsync.detail_backed_up \(backedUp) \(totalAssets)")
+            return L10n.string("counts.backed_up \(L10n.ofTotal(backedUp, of: totalAssets))")
         case .checkingAlbum:
             return nil
         case .attaching:

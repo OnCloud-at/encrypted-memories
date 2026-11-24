@@ -96,7 +96,7 @@ private struct MobileManualUploadCheckSection: View {
                                 .foregroundStyle(ProtonColor.textNorm)
                             Spacer()
                             if total > 0 {
-                                Text(L10n.string("settings.upload_check_progress \(status.checked) \(total)"))
+                                Text(L10n.string("counts.checked \(L10n.ofTotal(status.checked, of: total))"))
                                     .font(.footnote)
                                     .foregroundStyle(ProtonColor.textWeak)
                                     .monospacedDigit()

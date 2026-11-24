@@ -293,7 +293,10 @@ private struct BackupSettingsTab: View {
         }
         if let total = status.totalConsidered, total > 0 {
             VStack(alignment: .leading, spacing: 3) {
-                Text("settings.backup_backed_up \(status.backedUp) \(status.backupTargetCount ?? total)")
+                Text(
+                    L10n.string(
+                        "counts.backed_up \(L10n.ofTotal(status.backedUp, of: status.backupTargetCount ?? total))")
+                )
                 if status.skippedRemoteDeletions > 0 {
                     Text("settings.backup_row_skipped_deleted \(status.skippedRemoteDeletions)")
                 }
@@ -1269,7 +1272,7 @@ private struct BackupStatusSummaryRow: View {
                     .font(.system(size: 12, weight: .medium))
                     Spacer()
                     if total > 0 {
-                        Text(L10n.string("settings.upload_check_progress \(status.checked) \(total)"))
+                        Text(L10n.string("counts.checked \(L10n.ofTotal(status.checked, of: total))"))
                             .font(.system(size: 11).monospacedDigit())
                             .foregroundStyle(.secondary)
                     }

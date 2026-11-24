@@ -189,7 +189,7 @@ final class BackupWaitingForWiFiTests: XCTestCase {
         XCTAssertNotEqual(display.localizedHeadline, L10n.string("backup.phase_paused"))
         XCTAssertEqual(display.localizedWaitingForWiFiDetail, L10n.string("backup.detail_waiting_wifi"))
         XCTAssertNil(display.localizedRetryDetail, "the backup resumes on Wi-Fi, not at a time")
-        XCTAssertEqual(display.localizedSubtitle, L10n.string("backup.progress_backed_up \(4) \(10)"))
+        XCTAssertEqual(display.localizedSubtitle, L10n.string("counts.backed_up \(L10n.ofTotal(4, of: 10))"))
 
         let paused = BackupStatusPresentation(
             BackupStatus(progress: waitingProgress(running: true, waitsForWiFi: false), isScanning: false))
