@@ -1387,32 +1387,36 @@ struct AlbumSyncLastRunWriteCase: StorageFaultCase {
 
     func state(in directory: URL) throws -> StorageFaultState {
         var state = StorageFaultState()
-        state.tables["last-run"] = try Self.readLists(at: Self.url(in: directory))
-        state.records["last-run album"] = Set(try Self.readRawLists(at: Self.url(in: directory)).keys)
+        state.tables["last-run"] = Self.readLists(at: Self.url(in: directory))
+        state.records["last-run album"] = Set(Self.readRawLists(at: Self.url(in: directory)).keys)
         return state
     }
 
     /// The stored rows of one state, decoded and canonicalized by the test; `JSONEncoder` writes keys in no fixed
     /// order, so the file itself does not compare byte-wise.
-    private static func readLists(at url: URL) throws -> [String] {
-        let lists = try readRawLists(at: url)
+    private static func readLists(at url: URL) -> [String] {
+        let lists = Self.readRawLists(at: url)
         let rendered: [String] = lists.map { album, items in
             let rows = items.map { item in
                 "\(item.id)#\(item.filename)#\(item.reason)#\(item.isPermanent)#\(item.isRetryable)#"
-                    + "\(item.category ?? "-")"
+                    + "\(item.category ?? "-")#\(item.issue)#\(item.source ?? "none")"
             }.sorted().joined(separator: "|")
             return album + ": " + rows
         }
         return rendered.sorted()
     }
 
-    private static func readRawLists(at url: URL) throws -> [String: [StoredLastRunItem]] {
+    /// Reads as the store itself reads it: a missing, unreadable or undecodable file answers empty, and a row whose
+    /// `source` no longer decodes keeps the row with its source read as none (AlbumSyncLastRunFile.read).
+    private static func readRawLists(at url: URL) -> [String: [StoredLastRunItem]] {
         guard let data = try? Data(contentsOf: url) else { return [:] }
-        return try JSONDecoder().decode([String: [StoredLastRunItem]].self, from: data)
+        guard let lists = try? JSONDecoder().decode([String: [StoredLastRunItem]].self, from: data) else {
+            return [:]
+        }
+        return lists
     }
 
-    /// The read side of the state comparison; a missing or unreadable file reads as an empty state, as the store
-    /// itself reads it.
+    /// The read side of the state comparison.
     private struct StoredLastRunItem: Codable {
         let id: String
         let filename: String
@@ -1420,6 +1424,25 @@ struct AlbumSyncLastRunWriteCase: StorageFaultCase {
         let category: String?
         let isPermanent: Bool
         let isRetryable: Bool
+        let issue: String
+        let source: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case id, filename, reason, category, isPermanent, isRetryable, issue, source
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            filename = try container.decode(String.self, forKey: .filename)
+            reason = try container.decode(String.self, forKey: .reason)
+            category = try container.decodeIfPresent(String.self, forKey: .category)
+            isPermanent = try container.decode(Bool.self, forKey: .isPermanent)
+            isRetryable = try container.decode(Bool.self, forKey: .isRetryable)
+            issue = try container.decodeIfPresent(String.self, forKey: .issue) ?? "unknown"
+            // A source value that no longer decodes keeps the row alive, exactly as the store keeps it.
+            source = try? container.decodeIfPresent(String.self, forKey: .source)
+        }
     }
 
     var acceptances: [StorageFaultAcceptance] {
