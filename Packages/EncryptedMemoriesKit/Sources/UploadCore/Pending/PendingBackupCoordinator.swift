@@ -66,7 +66,7 @@ public actor PendingBackupCoordinator {
     public nonisolated let snapshots: AsyncStream<PendingBackupSnapshot>
     private let snapshotContinuation: AsyncStream<PendingBackupSnapshot>.Continuation
 
-    private let store: PendingBackupManifestStore
+    private let store: any PendingBackupStore
     private let queues: [UploadSourceIdentity.Kind: any UploadBackupSyncQueueObserving]
     private let metadataProvider: any PendingSourceMetadataProviding
     private let effects: any PendingBackupEffects
@@ -253,7 +253,7 @@ public actor PendingBackupCoordinator {
     private var excludedCheckAgain = false
 
     package init(
-        store: PendingBackupManifestStore,
+        store: any PendingBackupStore,
         queues: [UploadSourceIdentity.Kind: any UploadBackupSyncQueueObserving],
         metadataProvider: any PendingSourceMetadataProviding,
         effects: any PendingBackupEffects,

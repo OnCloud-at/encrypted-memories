@@ -67,7 +67,7 @@ public final class PendingGridSession {
     /// schedule on fake time while every caller without them keeps the production timers.
     /// `nil` delays mean the production schedule.
     public init?(
-        store: PendingBackupManifestStore,
+        store: any PendingBackupStore,
         photoBackup: PhotoLibraryBackupController,
         remote: any PendingRemoteEffects,
         files: PendingFileSource? = nil,
@@ -449,7 +449,9 @@ private struct SessionEffects: PendingBackupEffects {
         var outcomes = await photoBackup.returnToBackup(states.filter { $0.key.kind == .photoLibraryAsset })
         for state in states where state.key.kind == .fileURL {
             outcomes[state.key] = .unreadable
-            guard let files, let queue = files.queue as? UploadBackupSyncQueueManifestStore, queue.isOperational(),
+            guard let files,
+                let queue = files.queue as? (any UploadBackupSyncQueueStore & UploadBackupSyncQueueObserving),
+                queue.isOperational(),
                 await files.returnToBackup([state.key.identifier]).contains(state.key.identifier),
                 queue.isOperational()
             else { continue }

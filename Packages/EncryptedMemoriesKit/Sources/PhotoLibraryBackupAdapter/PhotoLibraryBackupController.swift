@@ -200,7 +200,7 @@ public final class PhotoLibraryBackupController {
     public let pendingIdentities: (any UploadIdentityStore)?
     /// The server lookup of related files, so a delete never trashes a related file that another source needs.
     public let pendingRelations: (any UploadDuplicateChecking)?
-    private let pendingStore: PendingBackupManifestStore?
+    private let pendingStore: (any PendingBackupStore)?
     private let requiresPendingStore: Bool
     private let queueStore: UploadBackupSyncQueueManifestStore?
     private let stateStore: UploadBackupStateManifestStore?
@@ -354,7 +354,7 @@ public final class PhotoLibraryBackupController {
         uploader: any PhotoUploading,
         tagAdder: (any PhotoTagAdding)? = nil,
         editReplacement: EditedPhotoReplacement? = nil,
-        pendingStore: PendingBackupManifestStore? = nil,
+        pendingStore: (any PendingBackupStore)? = nil,
         requiresPendingStore: Bool = false,
         replacementJournal: (any EditReplacementJournaling)? = nil
     ) {

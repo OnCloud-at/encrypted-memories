@@ -2,6 +2,17 @@ import Foundation
 import PhotosCore
 import SQLite3
 
+/// The outcome of marking one pending effect done. Cases: `failed`, `saved`, `laterHandoffUnreadable`.
+public enum EffectCompletionResult: Sendable, Equatable {
+    case failed, saved, laterHandoffUnreadable
+}
+
+/// The outcome of resuming a delayed Proton trash of an earlier upload. Cases: `unchanged`, `scheduled`,
+/// `unreadable`.
+public enum LaterTrashResult: Sendable, Equatable {
+    case unchanged, scheduled, unreadable
+}
+
 /// Device-local state for pending grid tiles (`pending-backup-v1.sqlite`): desired backup state per source,
 /// duplicate-check evidence, handoffs to Proton photos, deferred actions and photos the app saved itself.
 ///
@@ -9,7 +20,7 @@ import SQLite3
 /// supported v1 schema migrates to v2; unknown schemas stay untouched. Writes are synchronous so the backup runner can record a
 /// handoff before it clears a commit receipt. An unavailable store fails closed: no pending tile shows,
 /// and the backup engine enqueues no new photos, because it cannot prove that they were not deleted.
-public final class PendingBackupManifestStore: @unchecked Sendable {
+public final class PendingBackupManifestStore: PendingBackupStore, @unchecked Sendable {
     public static let databaseFileName = "pending-backup-v1.sqlite"
 
     private static let schemaVersion = 2
@@ -640,10 +651,6 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
-    enum EffectCompletionResult: Sendable, Equatable {
-        case failed, saved, laterHandoffUnreadable
-    }
-
     /// Marks one effect done for the generation that performed it. A completion always re-reads the current
     /// desired state: a trash that finishes after a restore schedules the remote restore, and a restore that
     /// finishes after a new delete schedules the trash again. Stale generations therefore never undo a newer
@@ -654,7 +661,7 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
     ///
     /// A confirmed completion and the discovery of its next photo are separate durable steps. A failed lookup must
     /// never make the coordinator replay the completion of a photo that is already saved as trashed.
-    func completeEffectResult(
+    public func completeEffectResult(
         _ effect: PendingSourceEffect,
         for key: PendingSourceKey,
         generation: Int64,
@@ -719,13 +726,9 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
         }
     }
 
-    enum LaterTrashResult: Sendable, Equatable {
-        case unchanged, scheduled, unreadable
-    }
-
     /// Used by completion, retry and startup. Each key has its own transaction, so a failed read or write of one
     /// source cannot roll back another source's progress.
-    func resumeLaterTrash(for key: PendingSourceKey, at date: Date) -> LaterTrashResult {
+    public func resumeLaterTrash(for key: PendingSourceKey, at date: Date) -> LaterTrashResult {
         connection.withLock { resumeLaterTrashLocked(for: key, at: date) }
     }
 
@@ -1688,4 +1691,144 @@ public final class PendingBackupManifestStore: @unchecked Sendable {
             nil, nil, nil
         ) == SQLITE_OK
     }
+}
+
+/// The pending backup store as decision code receives it (#1154). Decision code names this protocol, never the
+/// concrete SQLite store, so the compiler offers only the members here. The read members answer through typed
+/// results: a read that could not run answers unknown or unreadable, and never proves a row absent (#1004, #1140).
+/// A `…Read` member answers a decision; a member without `Read` that drops the read answer is a display read, and
+/// its comment says so. The concrete store owns creating and closing itself; `AccountBackupStack` opens and closes
+/// the store and may name the concrete type.
+public protocol PendingBackupStore: UploadBackupExclusionFiltering, AnyObject, Sendable {
+    /// Closes the store. Only the owner of the store calls it.
+    func close()
+    /// False after a SQLite operation failed or the store was closed. An empty read proves "no pending work" only
+    /// while this stays true.
+    func isOperational() -> Bool
+
+    // Duplicate-check evidence
+
+    /// Records that the duplicate check decided this revision needs an upload. False when the write failed.
+    @discardableResult
+    func recordUploadEvidence(_ key: PendingSourceKey, revision: UploadBackupRevision, at date: Date) -> Bool
+    /// Every recorded revision of each key. Keys and revisions whose row does not decode stay out of the answer.
+    func evidenceRevisions() -> [PendingSourceKey: Set<UploadBackupRevision>]
+    /// Removes the evidence of exactly these revisions. False when the write failed.
+    @discardableResult
+    func removeEvidence(_ revisions: [(PendingSourceKey, UploadBackupRevision)]) -> Bool
+
+    // Handoffs
+
+    /// Records that a revision has a Proton photo, and schedules the Proton trash when the person excluded it.
+    func recordHandoff(_ handoff: PendingHandoff) -> PendingHandoffOutcome
+    /// Display only: handoffs without an acknowledgement. A handoff that cannot be read stays out.
+    func unacknowledgedHandoffs() -> [PendingHandoff]
+    /// The stored handoff of one revision, or `unreadable` when its query failed or its row did not decode.
+    func handoffRead(for key: PendingSourceKey, revision: UploadBackupRevision) -> PendingHandoffRead
+    /// Display only: the latest handoff of each key. A handoff that cannot be read stays out.
+    func latestHandoffs(for keys: [PendingSourceKey]) -> [PendingSourceKey: PendingHandoff]
+    /// The latest handoff of each key, or `unreadable` when its query failed or its row did not decode.
+    func latestHandoffsRead(for keys: [PendingSourceKey]) -> [PendingSourceKey: PendingHandoffRead]
+    /// The handoffs that list one of the given Proton links, and whether the query succeeded and every row decoded.
+    func handoffsRead(forRemoteLinkIDs linkIDs: [String]) -> PendingHandoffsRead
+    /// Marks these handoffs acknowledged. False when the write failed.
+    @discardableResult
+    func acknowledgeHandoffs(_ handoffs: [(PendingSourceKey, UploadBackupRevision)]) -> Bool
+    /// Deletes acknowledged handoffs older than the cutoff. False when the write failed.
+    @discardableResult
+    func pruneAcknowledgedHandoffs(olderThan cutoff: Date) -> Bool
+
+    // Desired state
+
+    /// Every desired state that decodes, and whether the query succeeded and every row decoded.
+    func sourceStatesRead() -> PendingSourceStatesRead
+    /// The desired state of one key, or `unreadable` when its query failed or its row did not decode.
+    func sourceStateRead(for key: PendingSourceKey) -> PendingSourceStateRead
+    /// Due sources that decode, and whether the query succeeded and every due row decoded.
+    func dueSourceStatesRead(by date: Date) -> PendingSourceStatesRead
+    /// Display only: the earliest time a deferred effect becomes due; nil when no effect is due or the read failed.
+    func nextEffectDate() -> Date?
+    /// Records an exclusion and its Proton trash duty. Nil when the write failed.
+    @discardableResult
+    func exclude(_ requests: [PendingExclusionRequest], at date: Date) -> [PendingSourceState]?
+    /// Keeps the given Proton photo of a key; another photo of the same key moves to the Proton trash. Nil when the
+    /// write failed.
+    @discardableResult
+    func keepRemote(
+        _ remote: PhotoUID, of key: PendingSourceKey, generation: Int64,
+        revision: UploadBackupRevision?, at date: Date
+    ) -> PendingSourceState?
+    /// Moves the earlier Proton upload of a key to the Proton trash. Nil when the write failed.
+    @discardableResult
+    func trashEarlierUpload(
+        _ remote: PhotoUID, of key: PendingSourceKey, generation: Int64, at date: Date
+    ) -> PendingSourceState?
+    /// Clears the exclusion of these keys. Nil when the write failed.
+    @discardableResult
+    func include(_ keys: [PendingSourceKey], at date: Date) -> [PendingSourceState]?
+    /// Clears the exclusion of keys whose Proton photo a Restore recheck confirmed. Nil when the write failed.
+    @discardableResult
+    func includeRestoredInProton(
+        _ keys: [PendingSourceKey], confirmedRemotes: [PhotoUID], at date: Date
+    ) -> [PendingSourceState]?
+
+    // Remote effects
+
+    /// Reserves the remote effect of these states for one generation. Nil means the reservation failed and nothing
+    /// changed.
+    func beginRemoteOperation(
+        _ effect: PendingSourceEffect, for states: [PendingSourceState]
+    ) -> Set<PendingSourceKey>?
+    /// Defers the effects of one key to the generation. False when the write failed.
+    @discardableResult
+    func deferEffects(for key: PendingSourceKey, at date: Date, generation: Int64?) -> Bool
+    /// Removes these keys from the Recently Deleted listing duty. False when the write failed.
+    @discardableResult
+    func unlistFromTrash(_ keys: [PendingSourceKey], at date: Date) -> Bool
+    /// Marks one Restore recheck done with its outcome. False when the write failed.
+    @discardableResult
+    func finishRestoreRecheck(
+        _ checked: PendingSourceState, outcome: PendingBackupReturnOutcome, at date: Date, retryNotBefore: Date?
+    ) -> Bool
+    /// Marks one effect done for the generation that performed it, and discovers the next duty. `.failed` when the
+    /// write failed.
+    func completeEffectResult(
+        _ effect: PendingSourceEffect,
+        for key: PendingSourceKey,
+        generation: Int64,
+        remoteLinkID: String?,
+        at date: Date
+    ) -> EffectCompletionResult
+    /// Resumes the delayed Proton trash of the earlier upload of one key. `.unreadable` when the read failed.
+    func resumeLaterTrash(for key: PendingSourceKey, at date: Date) -> LaterTrashResult
+
+    // Deferred actions
+
+    /// Records the desired favorite state of a pending photo; the app applies it after upload. False when the
+    /// write failed.
+    @discardableResult
+    func setFavoriteIntent(_ key: PendingSourceKey, favorite: Bool, at date: Date) -> Bool
+    /// Records the album that a pending photo joins after upload. False when the write failed.
+    @discardableResult
+    func addAlbumIntent(_ key: PendingSourceKey, albumID: String, at date: Date) -> Bool
+    /// Display only: every action that decodes; a row that cannot be read stays out.
+    func actions() -> [PendingAction]
+    /// Every action row that decodes, and whether the query succeeded and every row decoded.
+    func actionsRead() -> PendingActionsRead
+    /// Due actions that decode, and whether the query succeeded and every due row decoded.
+    func dueActionsRead(by date: Date) -> PendingActionsRead
+    /// Schedules the next attempt of an action. False when the write failed.
+    @discardableResult
+    func retryAction(_ action: PendingAction, at date: Date) -> Bool
+    /// Marks an action failed. False when the write failed.
+    @discardableResult
+    func failAction(_ action: PendingAction) -> Bool
+    /// Marks an action done. False when the write failed.
+    @discardableResult
+    func completeAction(_ action: PendingAction) -> Bool
+    /// Records that this app saved a photo to Apple Photos from Proton. False when the write failed.
+    @discardableResult
+    func recordSavedFromApp(localIdentifier: String, remote: PhotoUID, at date: Date) -> Bool
+    /// Display only: the identifiers the app itself saved; an unreadable identifier stays out.
+    func savedFromAppIdentifiers() -> Set<String>
 }

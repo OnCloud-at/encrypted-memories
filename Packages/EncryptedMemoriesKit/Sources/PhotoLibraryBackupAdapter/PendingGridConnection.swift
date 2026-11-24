@@ -7,9 +7,9 @@ import UploadCore
 /// replaced them. The owner closes both. `close(beforeSession:whileStoreOpen:)` keeps the order of the account teardown.
 public struct RetiredPendingGrid {
     public let session: PendingGridSession?
-    public let store: PendingBackupManifestStore?
+    public let store: (any PendingBackupStore)?
 
-    public init(session: PendingGridSession?, store: PendingBackupManifestStore?) {
+    public init(session: PendingGridSession?, store: (any PendingBackupStore)?) {
         self.session = session
         self.store = store
     }
@@ -57,7 +57,7 @@ public final class PendingGridConnection {
     public private(set) var excludedTiles: [PendingTile] = []
     /// Changes when pending favorite intents change, so favorite displays refresh.
     public private(set) var favoriteRevision: UInt64 = 0
-    @ObservationIgnored private var store: PendingBackupManifestStore?
+    @ObservationIgnored private var store: (any PendingBackupStore)?
     @ObservationIgnored private var lastFavoriteIntents: [PhotoUID: Bool] = [:]
 
     public init() {}
@@ -70,8 +70,8 @@ public final class PendingGridConnection {
     /// A session and store that are still live are retired first, so they are never overwritten while open. They
     /// come back as `replaced`, and the caller closes them. The same store passed again stays the live store.
     public func start(
-        store: PendingBackupManifestStore?,
-        makeSession: (PendingBackupManifestStore) -> PendingGridSession?,
+        store: (any PendingBackupStore)?,
+        makeSession: (any PendingBackupStore) -> PendingGridSession?,
         albumAdds: (@Sendable (@escaping @Sendable ([PhotoUID], String) async -> Bool) async -> Void)? = nil,
         prepare: (PendingGridSession) -> Void = { _ in }
     ) -> PendingGridStart {
