@@ -494,7 +494,16 @@ final class MobileLibraryUITests: XCTestCase {
         if UIDevice.current.userInterfaceIdiom == .phone {
             let submit = keyboard.buttons["Search"]
             XCTAssertTrue(submit.waitForExistence(timeout: 10), "Keyboard Search must exist")
-            submit.tap()
+            let submitCenter = CGPoint(x: submit.frame.midX, y: submit.frame.midY)
+            if !submit.frame.isEmpty && app.windows.firstMatch.frame.contains(submitCenter) {
+                // A coordinate tap reaches the keyboard button where the accessibility scroll-to-visible
+                // fails on the second display of the Duo.
+                submit.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            } else {
+                // On the Duo outer display the keyboard renders on the inactive inner display, so no touch
+                // can reach the submit button; the field return key submits the same search.
+                field.typeText("\n")
+            }
             XCTAssertTrue(wait(for: keyboard, "exists == false", timeout: 10), "Keyboard must close")
         }
         XCTAssertFalse(keyboard.exists, "The keyboard must not cover the Library tap")
