@@ -282,7 +282,7 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         if headlineKey == "backup.phase_first_completed" {
             return L10n.string("backup.detail_first_completed \(backedUp)")
         }
-        return L10n.string("backup.progress_backed_up \(backedUp) \(total)")
+        return L10n.string("counts.backed_up \(L10n.ofTotal(backedUp, of: total))")
     }
 
     /// Shown only when something actually needs the user; nil otherwise.

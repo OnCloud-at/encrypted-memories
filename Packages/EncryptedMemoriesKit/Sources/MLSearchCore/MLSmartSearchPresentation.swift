@@ -98,7 +98,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                 fraction = progress.totalAssets > 0 ? progress.fraction : nil
                 indexed = progress.indexed + progress.alreadyIndexed
                 total = progress.totalAssets
-                detail = L10n.string("mlsearch.indexed_count \(indexed) \(total)")
+                detail = L10n.string("counts.indexed \(L10n.ofTotal(indexed, of: total))")
             case .waiting(let coverage):
                 indexed = coverage.indexed
                 total = coverage.total
@@ -110,7 +110,7 @@ public struct MLSmartSearchPresentation: Sendable, Equatable {
                     status = L10n.string("mlsearch.status_waiting")
                 }
                 if total > 0, detail == nil {
-                    detail = L10n.string("mlsearch.indexed_count \(coverage.indexed) \(coverage.total)")
+                    detail = L10n.string("counts.indexed \(L10n.ofTotal(coverage.indexed, of: coverage.total))")
                     fraction = coverage.accountedFraction
                 }
                 unavailable = Self.unavailableNote(count: coverage.permanentlyUnindexable)

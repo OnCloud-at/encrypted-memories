@@ -35,7 +35,7 @@ final class BackupStatusSlotsTests: XCTestCase {
 
     func testTheCountLineCarriesTheSubtitleAndIsEmptyBeforeTheFirstTotal() {
         let counting = display(backedUp: 4, total: 10)
-        XCTAssertEqual(counting.reservedSubtitle.text, L10n.string("backup.progress_backed_up \(4) \(10)"))
+        XCTAssertEqual(counting.reservedSubtitle.text, L10n.string("counts.backed_up \(L10n.ofTotal(4, of: 10))"))
         XCTAssertFalse(counting.reservedSubtitle.isEmpty)
 
         let noTotal = display(backedUp: 0, total: 0)

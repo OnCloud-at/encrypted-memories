@@ -37,6 +37,14 @@ public enum L10n {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
+    /// The one shared "x of y" count fragment of every progress count text, e.g. "4 of 10" /
+    /// "4 von 10". Count texts compose this fragment into their phrase, e.g.
+    /// `string("counts.backed_up \(ofTotal(4, of: 10))")`, so the numbers render in one style
+    /// everywhere and a translation can reorder them in one place.
+    public static func ofTotal(_ count: Int, of total: Int) -> String {
+        string("counts.of_total \(count) \(total)")
+    }
+
     /// The bundle backing the package String Catalog.
     public static var resourceBundle: Bundle { .module }
 }

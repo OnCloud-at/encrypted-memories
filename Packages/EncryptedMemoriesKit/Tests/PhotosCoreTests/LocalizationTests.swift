@@ -294,6 +294,55 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(try loadCatalog(packageCatalog).sourceLanguage, "en")
     }
 
+    /// The shared "x of y" count fragment and the phrases that compose it carry every progress
+    /// count of backup, album sync, smart search and the upload check, so all of them are pinned here.
+    func testCountTextFragmentAndPhrasesAreEnglishAndGerman() throws {
+        let texts: [(String, String, String)] = [
+            ("counts.of_total %lld %lld", "%1$lld of %2$lld", "%1$lld von %2$lld"),
+            ("counts.backed_up %@", "%@ backed up", "%@ gesichert"),
+            ("counts.checked %@", "%@ checked", "%@ geprüft"),
+            ("counts.indexed %@", "%@ photos and videos prepared", "%@ Fotos und Videos vorbereitet"),
+            (
+                "counts.preparing_backup_index %@", "Preparing backup index: %@",
+                "Sicherungsindex wird vorbereitet: %@"
+            ),
+        ]
+        for (key, english, german) in texts {
+            XCTAssertEqual(try localizedValue(key, language: "en", in: packageCatalog), english, key)
+            XCTAssertEqual(try localizedValue(key, language: "de", in: packageCatalog), german, key)
+        }
+    }
+
+    /// The helper must resolve against the package catalog in any host language, so this test never
+    /// pins a language, only that the key exists and both numbers land in order.
+    func testOfTotalResolvesThroughThePackageCatalogInAnyHostLanguage() {
+        let fragment = L10n.ofTotal(3, of: 7)
+        XCTAssertTrue(fragment.hasPrefix("3 "), fragment)
+        XCTAssertTrue(fragment.hasSuffix(" 7"), fragment)
+        XCTAssertFalse(fragment.contains("counts.of_total"), "the raw key leaked: \(fragment)")
+    }
+
+    func testOfTotalComposesIntoThePhrasesThroughThePackageBundle() throws {
+        let expected: [(language: String, count: Int, total: Int, checked: String, backedUp: String)] = [
+            ("en", 4, 10, "4 of 10 checked", "4 of 10 backed up"),
+            ("de", 4, 10, "4 von 10 geprüft", "4 von 10 gesichert"),
+        ]
+        for (language, count, total, checked, backedUp) in expected {
+            let path = try XCTUnwrap(L10n.resourceBundle.path(forResource: language, ofType: "lproj"), language)
+            let bundle = try XCTUnwrap(Bundle(path: path), language)
+            let locale = Locale(identifier: language)
+            let fragment = String(
+                localized: "counts.of_total \(count) \(total)", bundle: bundle,
+                locale: locale)
+            let checkedPhrase = String(
+                localized: "counts.checked \(fragment)", bundle: bundle, locale: locale)
+            let backedUpPhrase = String(
+                localized: "counts.backed_up \(fragment)", bundle: bundle, locale: locale)
+            XCTAssertEqual(checkedPhrase, checked, language)
+            XCTAssertEqual(backedUpPhrase, backedUp, language)
+        }
+    }
+
     func testMergeAllProgressTextsAreEnglishAndGerman() throws {
         let texts: [(String, String, String)] = [
             ("duplicates.merging_title", "Merging Duplicates", "Duplikate werden zusammengeführt"),
