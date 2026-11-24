@@ -27,6 +27,9 @@ public struct PossibleDuplicatePolicy: Sendable, Equatable {
     /// The largest difference of a video's length, in seconds.
     public static let durationTolerance = 0.5
 
+    /// The rule of the apps on every platform: the same shape, so a smaller copy counts, and videos too.
+    public static let standard = PossibleDuplicatePolicy(rule: .sameShape, includesVideos: true)
+
     public init(rule: PossibleDuplicateRule, includesVideos: Bool) {
         self.rule = rule
         self.includesVideos = includesVideos

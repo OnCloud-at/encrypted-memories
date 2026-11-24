@@ -480,6 +480,78 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertEqual(message.wait(until: "exists == true", timeout: 4), .timedOut, "the list does not open by itself")
     }
 
+    func testPossiblyIdenticalPhotosOpenInTheLibraryViewerAndLeaveAfterTheTrash() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesPossibleDetails"])
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay a group")
+        let row = app.buttons["duplicates.possible"]
+        XCTAssertTrue(row.waitForExistence(timeout: 20), "the check lists the possibly identical photos")
+        XCTAssertEqual(row.label, "Possibly the Same Photo · 1")
+        keepScreenshot("duplicates-ios-possible-row")
+
+        app.tapOnScreen(row)
+
+        let message = app.staticTexts["duplicates.possible.message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        XCTAssertEqual(app.staticTexts["duplicates.possible.line.0"].label, "Differs in file type and file size")
+        let copy = app.buttons["duplicates.possible.member.0.1"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 10))
+        XCTAssertEqual(copy.label, "Copy 2 of 2, 1.2 MB", "each copy says its size")
+        keepScreenshot("duplicates-ios-possible-list")
+        copy.tap()
+
+        let trash = app.buttons["Move to Trash"].firstMatch
+        XCTAssertTrue(trash.waitForExistence(timeout: 10), "the library viewer offers Move to Trash")
+        XCTAssertFalse(app.buttons["duplicates.viewer.keep"].exists, "no merge tool for different files")
+        XCTAssertFalse(app.buttons["duplicates.viewer.merge"].exists, "no merge tool for different files")
+        trash.tap()
+        let confirm = app.alerts.buttons["Move to Trash"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10), "the existing confirmation asks first")
+        confirm.tap()
+
+        waitUntilGone(message, "the list closes once its last group has one copy left")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay")
+        XCTAssertFalse(row.exists, "no possibly identical photos are left")
+    }
+
+    func testOnlyPossiblyIdenticalPhotosOpenFromTheEmptyState() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture",
+            extra: ["-EncryptedMemoriesDuplicatesOnlyDifferingDetails", "-EncryptedMemoriesDuplicatesPossibleDetails"])
+        XCTAssertTrue(app.staticTexts["No Duplicates"].waitForExistence(timeout: 10), "no identical copies are left")
+        let button = app.buttons["duplicates.possible"]
+        XCTAssertTrue(button.waitForExistence(timeout: 20), "the empty state offers the possibly identical photos")
+        XCTAssertEqual(button.label, "Possibly the Same Photo · 1")
+
+        button.tap()
+
+        XCTAssertTrue(app.staticTexts["duplicates.possible.message"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["duplicates.possible.member.0.1"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["duplicates.differing.message"].exists, "the tapped list opens, not the other")
+    }
+
+    func testGoingBackFromThePossiblyIdenticalPhotosKeepsTheDuplicatesAndTheRow() {
+        openDuplicates(
+            fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesPossibleDetails"])
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10))
+        let row = app.buttons["duplicates.possible"]
+        XCTAssertTrue(row.waitForExistence(timeout: 20))
+        app.tapOnScreen(row)
+        let message = app.staticTexts["duplicates.possible.message"]
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+
+        app.backButton(to: "Duplicates").tap()
+
+        waitUntilGone(message, "Back shows the duplicates")
+        XCTAssertTrue(group(0).waitForExistence(timeout: 10), "the identical copies stay")
+        XCTAssertTrue(row.waitForExistence(timeout: 10), "the possibly identical photos stay listed")
+        XCTAssertFalse(app.activityIndicators["duplicates.loading"].exists, "Back does not check the library again")
+
+        // Going back closes the review list; the row opens it again, so the person can return to the list.
+        app.tapOnScreen(row)
+        XCTAssertTrue(message.waitForExistence(timeout: 10), "the row opens the review list again")
+    }
+
     func testLeavingDuplicatesFromTheDifferingCopiesClosesThemAndTheNextVisitLoadsAgain() {
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesFixture",

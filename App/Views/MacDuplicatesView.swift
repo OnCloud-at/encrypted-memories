@@ -5,9 +5,9 @@ import SwiftUI
 import UploadCore
 import UploadFeature
 
-/// The Duplicates route on macOS: the shared `ExactDuplicatesView` under the window toolbar, or with `showsDiffering`
-/// the shared `ExactDuplicatesDifferingView`. The toolbar owns the Merge All and Back buttons and sets
-/// `confirmsMergeAll`; a click on a photo opens it in the viewer with its group or with its differing copies.
+/// The Duplicates route on macOS: the shared `ExactDuplicatesView` under the window toolbar, or with `shownReview`
+/// the shared `ExactDuplicatesReviewView` of that list. The toolbar owns the Merge All and Back buttons and sets
+/// `confirmsMergeAll`; a click on a photo opens it in the viewer with its group or with the copies of its review group.
 struct MacDuplicatesView: View {
     let model: ExactDuplicatesModel
     let thumbnailFeed: ThumbnailFeed
@@ -18,13 +18,13 @@ struct MacDuplicatesView: View {
     let item: (PhotoUID) -> PhotoItem?
     /// Changes when the library shows other photos; `item` reads a library that is not observed.
     let libraryRevision: UInt64
-    /// Shows the copies with the same bytes whose details differ instead of the duplicates.
-    let showsDiffering: Bool
+    /// The review list that shows instead of the duplicates, such as the copies whose details differ.
+    let shownReview: ExactDuplicateReviewList?
     /// Opens a photo and the ID of its group in the viewer.
     let onOpen: (PhotoUID, String) -> Void
-    let onShowDiffering: () -> Void
-    /// Opens a differing copy and the content hash of its group in the viewer.
-    let onOpenDiffering: (PhotoUID, String) -> Void
+    let onShowReview: (ExactDuplicateReviewList) -> Void
+    /// Opens a copy of a review list and the ID of its group in the viewer.
+    let onOpenReview: (ExactDuplicateReviewList, PhotoUID, String) -> Void
 
     /// A fixed, comfortable thumbnail size: a wide window adds margins, not larger photos.
     private static let thumbnailSide: CGFloat = 132
@@ -41,21 +41,23 @@ struct MacDuplicatesView: View {
     }
 
     var body: some View {
-        // The duplicates stay under the differing copies, so their load and check go on and Back reads nothing again.
+        // The duplicates stay under a review list, so their load and check go on and Back reads nothing again.
+        let covered = shownReview != nil
         ZStack {
             ExactDuplicatesView(
                 model: model, confirmsMergeAll: $confirmsMergeAll, accent: .accentColor,
                 cornerRadius: Self.cornerRadius, canOpen: { item($0) != nil }, libraryRevision: libraryRevision,
-                onOpen: onOpen, onShowDiffering: onShowDiffering, isCoveredByDiffering: showsDiffering, cover: cover
+                onOpen: onOpen, onShowReview: onShowReview, isCoveredByReview: covered, cover: cover
             )
-            .opacity(showsDiffering ? 0 : 1)
-            .allowsHitTesting(!showsDiffering)
+            .opacity(covered ? 0 : 1)
+            .allowsHitTesting(!covered)
             // No keyboard focus either; the load and check of the screen go on.
-            .disabled(showsDiffering)
-            .accessibilityHidden(showsDiffering)
-            if showsDiffering {
-                ExactDuplicatesDifferingView(
-                    model: model, item: item, libraryRevision: libraryRevision, onOpen: onOpenDiffering, cover: cover)
+            .disabled(covered)
+            .accessibilityHidden(covered)
+            if let list = shownReview {
+                ExactDuplicatesReviewView(
+                    model: model, list: list, item: item, libraryRevision: libraryRevision,
+                    onOpen: { onOpenReview(list, $0, $1) }, cover: cover)
             }
         }
         .contentMargins(.top, topInset, for: .scrollContent)

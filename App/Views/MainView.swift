@@ -438,12 +438,14 @@ struct MainView: View {
                     confirmsMergeAll: $confirmsDuplicateMergeAll,
                     item: { timelineModel.allLibraryItem(matching: $0) },
                     libraryRevision: timelineModel.wholeLibraryRevision,
-                    showsDiffering: showsDifferingList,
+                    shownReview: shownReviewList,
                     onOpen: { openDuplicate($0, inGroup: $1) },
-                    onShowDiffering: { duplicatesRoute.showDiffering(of: duplicates) },
-                    onOpenDiffering: { openDifferingCopy($0, contentHash: $1) }
+                    onShowReview: { duplicatesRoute.show($0, of: duplicates) },
+                    onOpenReview: { openReviewCopy($1, in: $0, groupID: $2) }
                 )
-                .onChange(of: duplicates.differingGroups.isEmpty) { duplicatesRoute.follow(duplicates) }
+                .onChange(of: ExactDuplicateReviewList.allCases.map { duplicates.reviewGroups($0).isEmpty }) {
+                    duplicatesRoute.follow(duplicates)
+                }
                 .padding(.leading, leadingObstructionInset)
                 .animation(Self.sidebarAnimation, value: leadingObstructionInset)
                 .ignoresSafeArea()
@@ -1356,13 +1358,14 @@ struct MainView: View {
         case .trash: return String(localized: "sidebar.recently_deleted")
         case .map: return String(localized: "sidebar.map")
         case .duplicates:
-            return L10n.string(showsDifferingList ? "duplicates.differing_title" : "duplicates.title")
+            return shownReviewList?.title ?? L10n.string("duplicates.title")
         }
     }
 
-    /// The Duplicates route shows the copies whose details differ.
-    private var showsDifferingList: Bool {
-        selection == .duplicates && duplicates.map { duplicatesRoute.showsDiffering(of: $0) } == true
+    /// The review list that the Duplicates route shows, such as the copies whose details differ.
+    private var shownReviewList: ExactDuplicateReviewList? {
+        guard selection == .duplicates, let duplicates else { return nil }
+        return ExactDuplicateReviewList.allCases.first { duplicatesRoute.shows($0, of: duplicates) }
     }
 
     private enum NavigationChromeState: Equatable {
@@ -1784,12 +1787,12 @@ struct MainView: View {
         }
     }
 
-    /// Opens `uid` in the library viewer with the other copies of its bytes whose details differ. The viewer offers
-    /// Move to Trash and no merge tools.
-    private func openDifferingCopy(_ uid: PhotoUID, contentHash: String) {
-        let members = duplicates?.differingGroup(withContentHash: contentHash)?.members
+    /// Opens `uid` in the library viewer with the other copies of its group of a review list. The viewer offers Move
+    /// to Trash and no merge tools.
+    private func openReviewCopy(_ uid: PhotoUID, in list: ExactDuplicateReviewList, groupID: String) {
+        let members = duplicates?.reviewGroup(list, id: groupID)?.members
         openDuplicateCopies(members, asGroup: false) { item in
-            duplicates?.viewerItems(opening: uid, inDiffering: contentHash, item: item)
+            duplicates?.viewerItems(opening: uid, in: list, groupID: groupID, item: item)
         }
     }
 
@@ -2360,7 +2363,7 @@ struct MainView: View {
             Button {
                 if viewerModel != nil {
                     closePhoto()
-                } else if showsDifferingList {
+                } else if shownReviewList != nil {
                     duplicatesRoute.back()
                 } else {
                     closeMapCluster()
@@ -2369,10 +2372,10 @@ struct MainView: View {
                 Label("toolbar.back", systemImage: "chevron.left")
             }
             .help(
-                viewerModel == nil && showsDifferingList
+                viewerModel == nil && shownReviewList != nil
                     ? L10n.string("duplicates.title") : String(localized: "toolbar.back_to_library"))
         }
-        .hidden(viewerModel == nil && !(selection == .map && mapClusterPresentation != nil) && !showsDifferingList)
+        .hidden(viewerModel == nil && !(selection == .map && mapClusterPresentation != nil) && shownReviewList == nil)
         .sharedBackgroundVisibility(.visible)
 
         if let viewerModel {

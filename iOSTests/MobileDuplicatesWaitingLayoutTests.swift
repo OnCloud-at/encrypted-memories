@@ -26,7 +26,7 @@ final class MobileDuplicatesWaitingLayoutTests: XCTestCase {
                 let host = UIHostingController(
                     rootView: ExactDuplicatesView(
                         model: model, confirmsMergeAll: .constant(false), accent: .blue, cornerRadius: 8,
-                        onOpen: { _, _ in }, onShowDiffering: {}, isCoveredByDiffering: false
+                        onOpen: { _, _ in }, onShowReview: { _ in }, isCoveredByReview: false
                     ) { _ in Color.blue })
                 window.rootViewController = host
                 window.makeKeyAndVisible()
