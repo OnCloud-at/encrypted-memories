@@ -104,8 +104,8 @@ enum FixtureWorkloads {
                         $0.succeeded && $0.directRecord?.isComplete == true
                     }, "A backed-up current revision was reopened by the first scan")
             }
-            let rows = UploadBackupSyncQueueState.allCases.flatMap {
-                queue.entries(in: $0, updatedBefore: now.addingTimeInterval(1000), limit: 1000)
+            let rows = try UploadBackupSyncQueueState.allCases.flatMap {
+                try queue.decisionEntries(in: $0, updatedBefore: now.addingTimeInterval(1000), limit: 1000)
             }
             try fixtureRequire(queue.isOperational(), "Backup queue failed during enumeration")
             let keys = rows.map { "\($0.source.identifier)|\($0.source.resource.rawValue)|\($0.revision.rawValue)" }
