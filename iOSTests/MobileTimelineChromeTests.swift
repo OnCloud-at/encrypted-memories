@@ -89,19 +89,20 @@ final class MobileTimelineChromeTests: XCTestCase {
                 + " samePager=\(currentPager() === pager) cover=\(root.presentedViewController === viewer)"
                 + " widthClass=\(viewer.traitCollection.horizontalSizeClass.rawValue)"
         }
+        // One definition for "Info is a sheet or a column": the setup wait, the settle waits and the assertion use it.
+        let infoVisible: @MainActor () -> Bool = {
+            viewer.presentedViewController != nil || viewer.view.bounds.width - pager.view.bounds.width >= 200
+        }
         try await waitUntil("SETUP: Info and the media viewport finish their initial layout", state: setupState) {
             guard let viewport = currentPhotoViewport(), viewport.bounds.width > 0,
                 let image = descendants(viewport).compactMap({ $0 as? UIImageView }).first, image.bounds.width > 0
             else { return false }
-            return viewer.presentedViewController != nil || viewer.view.bounds.width - pager.view.bounds.width >= 200
+            return infoVisible()
         }
         // A window change during the animated sheet entrance drops the inspector conversion of every later resize:
         // UIKit dismisses the presentation while it transitions, SwiftUI reports "while a presentation is in
         // progress" and never retries. Each window change waits until no presentation transition runs and Info is a
         // sheet or a column again (run 45071189214).
-        let infoVisible: @MainActor () -> Bool = {
-            viewer.presentedViewController != nil || viewer.view.bounds.width - pager.view.bounds.width >= 200
-        }
         let presentationSettled: @MainActor () -> Bool = {
             viewer.presentedViewController?.transitionCoordinator == nil
         }
@@ -177,9 +178,7 @@ final class MobileTimelineChromeTests: XCTestCase {
             XCTAssertEqual(
                 restored.y, expectedCentre.y, accuracy: 0.01,
                 "The same vertical image feature stays centred within the actual pan bounds")
-            XCTAssertTrue(
-                viewer.presentedViewController != nil || viewer.view.bounds.width - pager.view.bounds.width >= 200,
-                "Info stays open as a sheet or a column")
+            XCTAssertTrue(infoVisible(), "Info stays open as a sheet or a column")
             let measurement =
                 "viewer size=\(size) viewport=\(viewport.bounds.size) scaledImage=\(scaledImage) zoom=\(viewport.zoomScale)"
                 + " rangeX=\(minX)...\(maxX) rangeY=\(minY)...\(maxY) previous=\(previousCentre)"
