@@ -53,7 +53,7 @@ struct MetalGridScrollDateLabelTextTests {
 @MainActor
 @Suite(.serialized, .enabled(if: MTLCreateSystemDefaultDevice() != nil))
 struct MetalGridScrollDateLabelTests {
-    private static let count = 3_000
+    static let count = 3_000
 
     // MARK: - Movement
 
@@ -533,8 +533,9 @@ struct MetalGridScrollDateLabelTests {
 
     // MARK: - Fixture
 
+    /// Shared with the contact tests in `MetalGridScrollDateLabelContactTests.swift`.
     @MainActor
-    private final class Fixture {
+    final class Fixture {
         static let volume = "label"
         let host: MetalGridScrollHost
         let window = VisibilityWindow()

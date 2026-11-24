@@ -187,6 +187,52 @@ import Testing
         }
     #endif
 
+    /// The timeline hands the trailing width that its date scrubber covers to the production grid's scroll date
+    /// label, so the label stays left of the scrubber.
+    @Test(.timeLimit(.minutes(1)))
+    func productionMacGridKeepsTheScrollDateLabelLeftOfTheDateScrubber() async throws {
+        _ = NSApplication.shared
+        let items = (1...6).flatMap { month in (0..<12).map { photo("scrubber-\(month)-\($0)", month: month) } }
+        let feed = makeVisibleContentFeed()
+        let model = TimelineViewModel(
+            repository: VisibleContentRepository(timelines: [[section(items)]]), feed: feed.feedCore)
+        await model.load()
+        let window = NSWindow(
+            contentRect: CGRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.borderless], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        // The date scrubber shows on the levels with month labels.
+        let level = try #require(
+            GridLevelProfile.testRegularTimeline.levels.indices.first {
+                GridLevelProfile.testRegularTimeline.showsMonthLabels(level: $0)
+            })
+        let root = NSHostingView(
+            rootView: TimelineView(
+                model: model, feed: feed, level: .constant(level), gridProfile: .testRegularTimeline,
+                onOpen: { _, _ in }))
+        window.contentView = root
+        window.orderFront(nil)
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+        }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        func label() -> MetalGridScrollDateLabelPresenter? {
+            descendants(root).compactMap { $0 as? MetalGridScrollHost }.first?.scrollDateLabel
+        }
+        let reservation = TimelineDateScrubber.dormantTrailingReservation
+        let deadline = ContinuousClock.now + .seconds(10)
+        while label()?.trailingInset != reservation, ContinuousClock.now < deadline {
+            root.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let installed = try #require(label(), "SETUP: the production grid installs its scroll date label")
+        #expect(
+            installed.trailingInset == reservation,
+            "the label keeps clear of the dormant scrubber at level \(level): \(installed.trailingInset)")
+        await feed.stopPrefetch()
+    }
+
     #if DEBUG
         @Test(.timeLimit(.minutes(1)))
         func aLaterPageFailureReplacesTheNativeGridAndRetryStartsWithOnlyNewRows() async throws {

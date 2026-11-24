@@ -297,6 +297,16 @@ public enum TimelineScrollDateLabelGeometry {
             || keepsIndicatorContact(atY: y, radius: radius, thumb: previousThumb, atTop: atTop, atBottom: atBottom)
     }
 
+    /// Which ends of the native scrollable `range` the vertical `offset` sits at. The platform can round a fractional
+    /// endpoint to the nearest device pixel, so an offset within half a device pixel of an end counts as that end.
+    /// `scale` is device pixels per point.
+    public static func clampedEnds(
+        offset: CGFloat, range: ClosedRange<CGFloat>, scale: CGFloat
+    ) -> (top: Bool, bottom: Bool) {
+        let tolerance = 0.5 / scale
+        return (offset <= range.lowerBound + tolerance, offset >= range.upperBound - tolerance)
+    }
+
     private static func indicatorContactRange(radius: CGFloat, thumb: CGRect) -> ClosedRange<CGFloat>? {
         guard thumb.width > 0, thumb.height > 0 else { return nil }
         let contactSlack = resolvedContactRadius(radius)

@@ -1882,3 +1882,232 @@ private struct SplitMix64 {
         #expect(retired.display.events.isEmpty, "a retired label draws nothing: \(retired.display.events)")
     }
 }
+
+/// The contact state that every platform's native-indicator observer shares (#777).
+@Suite struct TimelineScrollDateLabelIndicatorContactTests {
+    private let thumb = CGRect(x: 434, y: 100, width: 3, height: 36)
+
+    private func held(at y: CGFloat = 118) -> TimelineScrollDateLabelIndicatorContact {
+        var contact = TimelineScrollDateLabelIndicatorContact()
+        _ = contact.thumbDidLayout(thumb, clampedEnds: (false, false))
+        #expect(contact.accepts(at: CGPoint(x: 435, y: y), radius: 0, viewportRightX: 440, effectiveAlpha: 1))
+        contact.hold(at: CGPoint(x: 435, y: y), radius: 0)
+        return contact
+    }
+
+    @Test func touchDownNeedsAThumbSnapshotAndVisibleOpacity() {
+        var contact = TimelineScrollDateLabelIndicatorContact()
+        let point = CGPoint(x: 435, y: 118)
+        #expect(!contact.accepts(at: point, radius: 0, viewportRightX: 440, effectiveAlpha: 1), "no thumb yet")
+        let stored = contact.thumbDidLayout(thumb, clampedEnds: (false, false))
+        #expect(stored)
+        #expect(contact.thumbRect == thumb)
+        let boundary = TimelineScrollDateLabelMotion.indicatorContactAlphaThreshold
+        #expect(!contact.accepts(at: point, radius: 0, viewportRightX: 440, effectiveAlpha: boundary))
+        #expect(contact.accepts(at: point, radius: 0, viewportRightX: 440, effectiveAlpha: boundary.nextUp))
+        #expect(!contact.isHeld, "acceptance alone holds nothing")
+        let cleared = contact.thumbDidLayout(nil, clampedEnds: (false, false))
+        #expect(cleared, "no hold, nothing ends")
+        #expect(!contact.accepts(at: point, radius: 0, viewportRightX: 440, effectiveAlpha: 1), "the thumb is gone")
+    }
+
+    @Test func aZeroRadiusUsesTheSharedFallbackEnvelope() {
+        var contact = TimelineScrollDateLabelIndicatorContact()
+        _ = contact.thumbDidLayout(thumb, clampedEnds: (false, false))
+        let fallback = TimelineScrollDateLabelMotion.indicatorFallbackRadius
+        #expect(
+            contact.accepts(at: CGPoint(x: 435, y: 100 - fallback), radius: 0, viewportRightX: 440, effectiveAlpha: 1))
+        #expect(
+            !contact.accepts(
+                at: CGPoint(x: 435, y: (100 - fallback).nextDown), radius: 0, viewportRightX: 440, effectiveAlpha: 1))
+    }
+
+    @Test func aHeldContactContinuesThroughEitherCallbackOrder() {
+        // The finger moves first, then the thumb follows.
+        var touchFirst = held()
+        let fingerMoved = touchFirst.move(to: CGPoint(x: 435, y: 218), radius: 0, atTop: false, atBottom: false)
+        #expect(fingerMoved)
+        let thumbFollowed = touchFirst.thumbDidLayout(thumb.offsetBy(dx: 0, dy: 100), clampedEnds: (false, false))
+        #expect(thumbFollowed)
+        let fingerMovedAgain = touchFirst.move(to: CGPoint(x: 435, y: 220), radius: 0, atTop: false, atBottom: false)
+        #expect(fingerMovedAgain)
+        #expect(touchFirst.isHeld)
+
+        // The thumb moves first, then the finger sample arrives.
+        var layoutFirst = held()
+        let thumbMoved = layoutFirst.thumbDidLayout(thumb.offsetBy(dx: 0, dy: 100), clampedEnds: (false, false))
+        #expect(thumbMoved)
+        let fingerFollowed = layoutFirst.move(to: CGPoint(x: 435, y: 218), radius: 0, atTop: false, atBottom: false)
+        #expect(fingerFollowed)
+        #expect(layoutFirst.isHeld)
+    }
+
+    @Test func anOrdinaryPanSeparatesTheContactAndNeverBindsAgain() {
+        var contact = held()
+        let pending = contact.move(to: CGPoint(x: 435, y: 318), radius: 0, atTop: false, atBottom: false)
+        #expect(pending, "one pending")
+        let separated = contact.move(to: CGPoint(x: 435, y: 328), radius: 0, atTop: false, atBottom: false)
+        #expect(!separated, "separated")
+        #expect(!contact.isHeld)
+        let rebound = contact.move(to: CGPoint(x: 435, y: 118), radius: 0, atTop: false, atBottom: false)
+        #expect(!rebound, "no rebind")
+        #expect(!contact.isHeld)
+        let endedAgain = contact.end()
+        #expect(!endedAgain, "the separation already ended it")
+    }
+
+    @Test func aLayoutThatLeavesTheFingerEndsTheHold() {
+        var contact = held()
+        let pending = contact.thumbDidLayout(thumb.offsetBy(dx: 0, dy: 300), clampedEnds: (false, false))
+        #expect(pending, "the previous thumb still aligns: the finger sample may follow")
+        let bothMissed = contact.thumbDidLayout(thumb.offsetBy(dx: 0, dy: 305), clampedEnds: (false, false))
+        #expect(!bothMissed, "neither thumb aligns with the finger")
+        #expect(!contact.isHeld)
+        var missing = held()
+        let thumbGone = missing.thumbDidLayout(nil, clampedEnds: (false, false))
+        #expect(!thumbGone, "a missing thumb ends the hold")
+        #expect(!missing.isHeld)
+    }
+
+    @Test func aHoldSurvivesAFadeBecauseOnlyGeometryDecidesContinuation() {
+        var contact = held()
+        // The rendered opacity is a touch-down input only; geometry alone keeps the hold.
+        let unchangedThumb = contact.thumbDidLayout(thumb, clampedEnds: (false, false))
+        #expect(unchangedThumb)
+        let movedAfterFade = contact.move(to: CGPoint(x: 430, y: 120), radius: 0, atTop: false, atBottom: false)
+        #expect(movedAfterFade)
+        #expect(contact.isHeld)
+    }
+
+    @Test func onlyTheClampedEndStaysOpenDuringAHold() {
+        for (top, bottom) in [(true, false), (false, true)] {
+            var contact = held()
+            let beyond: CGFloat = top ? -200 : 500
+            let beyondEnd = contact.move(to: CGPoint(x: 435, y: beyond), radius: 0, atTop: top, atBottom: bottom)
+            #expect(beyondEnd)
+            let furtherBeyond = contact.move(
+                to: CGPoint(x: 435, y: beyond * 1.5), radius: 0, atTop: top, atBottom: bottom)
+            #expect(furtherBeyond)
+            let clampedLayout = contact.thumbDidLayout(thumb, clampedEnds: (top, bottom))
+            #expect(clampedLayout, "an unchanged clamped thumb")
+            let returned = contact.move(to: CGPoint(x: 435, y: 118), radius: 0, atTop: top, atBottom: bottom)
+            #expect(returned, "return")
+            #expect(contact.isHeld)
+
+            var opposite = held()
+            let other: CGFloat = top ? 500 : -200
+            let towardOtherEnd = opposite.move(to: CGPoint(x: 435, y: other), radius: 0, atTop: top, atBottom: bottom)
+            #expect(towardOtherEnd)
+            let beyondOtherEnd = opposite.move(
+                to: CGPoint(x: 435, y: other * 1.5), radius: 0, atTop: top, atBottom: bottom)
+            #expect(!beyondOtherEnd)
+        }
+    }
+
+    @Test func theClampedEndsAreReadOnlyWhileAContactIsHeld() {
+        final class Reads { var count = 0 }
+        let reads = Reads()
+        func ends() -> (top: Bool, bottom: Bool) {
+            reads.count += 1
+            return (false, false)
+        }
+        var free = TimelineScrollDateLabelIndicatorContact()
+        let stored = free.thumbDidLayout(thumb, clampedEnds: ends())
+        #expect(stored)
+        #expect(reads.count == 0, "without a hold, the adapter's scroll range is not read")
+        var holding = held()
+        let followed = holding.thumbDidLayout(thumb.offsetBy(dx: 0, dy: 10), clampedEnds: ends())
+        #expect(followed)
+        #expect(reads.count == 1, "a held contact reads the ends once for each layout")
+    }
+
+    @Test func endingReportsTheContactExactlyOnce() {
+        var contact = held()
+        let first = contact.end()
+        #expect(first)
+        let second = contact.end()
+        #expect(!second)
+        #expect(!contact.isHeld)
+        #expect(contact.thumbRect == thumb, "the shared thumb snapshot outlives the contact")
+    }
+
+    @Test func clampedEndsAllowHalfADevicePixel() {
+        let range: ClosedRange<CGFloat> = 0...1_000.25
+        for (scale, offset, top, bottom) in [
+            (CGFloat(2), CGFloat(0), true, false),
+            (2, 0.125, true, false),  // A quarter pixel inside the top.
+            (2, 0.25, true, false),  // Exactly half a pixel.
+            (2, CGFloat(0.25).nextUp, false, false),
+            (2, 1_000.125, false, true),  // A quarter pixel short of the fractional bottom.
+            (2, 1_000, false, true),  // Exactly half a pixel short.
+            (2, CGFloat(1_000).nextDown, false, false),
+            (2, 1_000.25, false, true),
+            (1, 999.75, false, true),  // Half a pixel at 1x is half a point.
+            (1, CGFloat(999.75).nextDown, false, false),
+            (3, 1_000.25 - 0.5 / 3, false, true),
+        ] {
+            let ends = TimelineScrollDateLabelGeometry.clampedEnds(offset: offset, range: range, scale: scale)
+            #expect(ends.top == top && ends.bottom == bottom, "offset \(offset) at \(scale)x")
+        }
+        let collapsed = TimelineScrollDateLabelGeometry.clampedEnds(offset: 0, range: 0...0, scale: 2)
+        #expect(collapsed.top && collapsed.bottom, "content that does not scroll sits at both ends")
+    }
+}
+
+@MainActor
+@Suite struct TimelineScrollDateLabelControllerContactTests {
+    @Test func aContactSampleUsesTheSharedOffsetAndReportsTheHold() {
+        let controller = TimelineScrollDateLabelController()
+        let fallback = TimelineScrollDateLabelMotion.indicatorFallbackRadius
+        #expect(controller.indicatorContact(atX: 770, radius: 0, normalRightX: 744, thumbLeftX: 785, began: true))
+        let expected = TimelineScrollDateLabelGeometry.indicatorDragOffset(
+            normalRightX: 744, thumbLeftX: 785, contactX: 770, contactRadius: fallback)
+        #expect(expected > 0, "SETUP: the finger moves the label")
+        #expect(controller.policy.indicatorOffset == expected)
+        #expect(abs(expected - (744 - (770 - fallback - TimelineScrollDateLabelMotion.indicatorFingerGap))) < 0.000_001)
+        #expect(controller.indicatorContact(atX: 760, radius: 0, normalRightX: 744, thumbLeftX: 785, began: false))
+        #expect(
+            controller.policy.indicatorOffset
+                == TimelineScrollDateLabelGeometry.indicatorDragOffset(
+                    normalRightX: 744, thumbLeftX: 785, contactX: 760, contactRadius: 0))
+        controller.indicatorDragEnded()
+        #expect(!controller.indicatorContact(atX: 760, radius: 0, normalRightX: 744, thumbLeftX: 785, began: false))
+        controller.suppress()
+        #expect(!controller.indicatorContact(atX: 770, radius: 0, normalRightX: 744, thumbLeftX: 785, began: true))
+    }
+
+    @Test func theSlideMovesAHiddenLabelAtOnceAndFollowsOnlyAHeldContactDirectly() {
+        typealias Slide = TimelineScrollDateLabelController.IndicatorSlide
+        let controller = TimelineScrollDateLabelController()
+        let animated = TimelineScrollDateLabelController.Presentation(
+            isVisible: true, text: "May 2026", fadeDuration: 0.2, slideDuration: 0.22, indicatorOffset: 30)
+        let immediate = TimelineScrollDateLabelController.Presentation(
+            isVisible: true, text: "May 2026", fadeDuration: nil, slideDuration: nil, indicatorOffset: 30)
+
+        #expect(
+            controller.indicatorSlide(for: animated, currentOffset: 0, labelHidden: true)
+                == Slide(offset: 30, duration: nil, tracking: false), "a hidden label fades in beside the contact")
+        #expect(
+            controller.indicatorSlide(for: animated, currentOffset: 0, labelHidden: false)
+                == Slide(offset: 30, duration: 0.22, tracking: false), "a visible label slides; no contact is held")
+        #expect(
+            controller.indicatorSlide(for: animated, currentOffset: 30, labelHidden: false) == nil,
+            "a label at its target keeps its running slide")
+        #expect(
+            controller.indicatorSlide(for: immediate, currentOffset: 30, labelHidden: false)
+                == Slide(offset: 30, duration: nil, tracking: false), "an immediate presentation always applies")
+
+        controller.indicatorDragBegan(offset: 30, radius: 18.15)
+        #expect(controller.policy.isIndicatorDragging, "SETUP: a contact is held")
+        #expect(
+            controller.indicatorSlide(for: animated, currentOffset: 0, labelHidden: false)
+                == Slide(offset: 30, duration: 0.22, tracking: true), "a held contact tracks a visible label")
+        #expect(
+            controller.indicatorSlide(for: animated, currentOffset: 0, labelHidden: true)
+                == Slide(offset: 30, duration: nil, tracking: false), "a hidden label never tracks")
+        controller.reduceMotion = true
+        #expect(
+            controller.indicatorSlide(for: immediate, currentOffset: 0, labelHidden: false)
+                == Slide(offset: 30, duration: nil, tracking: false), "Reduce Motion moves at once")
+    }
+}

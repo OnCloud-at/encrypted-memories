@@ -74,15 +74,9 @@
 
         private func indicatorContact(at point: CGPoint, radius: CGFloat, began: Bool) -> Bool {
             guard isEnabled, let host, let nativeThumbRect = indicatorDragObserver.thumbRect else { return false }
-            let offset = TimelineScrollDateLabelGeometry.indicatorDragOffset(
-                normalRightX: labelTrailingX(in: host), thumbLeftX: nativeThumbRect.minX,
-                contactX: point.x, contactRadius: radius)
-            if began {
-                controller.indicatorDragBegan(offset: offset, radius: radius)
-            } else {
-                controller.indicatorDragMoved(offset: offset, radius: radius)
-            }
-            return controller.policy.isIndicatorDragging
+            return controller.indicatorContact(
+                atX: point.x, radius: radius, normalRightX: labelTrailingX(in: host),
+                thumbLeftX: nativeThumbRect.minX, began: began)
         }
 
         private func labelTrailingX(in host: UIView) -> CGFloat {
@@ -192,12 +186,11 @@
         }
 
         func applyIndicatorOffset(of presentation: TimelineScrollDateLabelController.Presentation) {
-            let targetOffset = presentation.indicatorOffset
-            guard targetOffset != -view.transform.tx || presentation.slideDuration == nil else { return }
-            // A hidden label fades in beside the contact; visible target changes use the current presentation.
-            view.setDragOffset(
-                targetOffset, duration: !view.isHidden ? presentation.slideDuration : nil,
-                tracking: controller.policy.isIndicatorDragging && !controller.reduceMotion && !view.isHidden)
+            guard
+                let slide = controller.indicatorSlide(
+                    for: presentation, currentOffset: -view.transform.tx, labelHidden: view.isHidden)
+            else { return }
+            view.setDragOffset(slide.offset, duration: slide.duration, tracking: slide.tracking)
         }
 
         func setShown(_ shown: Bool, duration: TimeInterval?, changesVisibility: Bool) {
@@ -223,8 +216,8 @@
         var onContact: ((CGPoint, CGFloat, Bool) -> Bool)?
         var onEnded: (() -> Void)?
         private weak var scrollView: UIKitTimelineScrollView?
-        private var contact: (y: CGFloat, radius: CGFloat)?
-        private(set) var thumbRect: CGRect?
+        private var contact = TimelineScrollDateLabelIndicatorContact()
+        var thumbRect: CGRect? { contact.thumbRect }
 
         init() {
             super.init(target: nil, action: nil)
@@ -245,15 +238,15 @@
         func contactBegan(at point: CGPoint, radius: CGFloat) {
             finishContact()
             guard let host = view, let scrollView, scrollView.showsVerticalScrollIndicator,
-                !scrollView.isScrollAnimating, let thumb = thumbRect
+                !scrollView.isScrollAnimating
             else { return }
             guard
-                TimelineScrollDateLabelGeometry.acceptsIndicatorContact(
-                    at: point, radius: radius, thumb: thumb, viewportRightX: host.bounds.maxX,
+                contact.accepts(
+                    at: point, radius: radius, viewportRightX: host.bounds.maxX,
                     effectiveAlpha: scrollView.verticalIndicatorEffectiveAlpha)
             else { return }
             guard onContact?(point, radius, true) == true else { return }
-            contact = (point.y, radius)
+            contact.hold(at: point, radius: radius)
             state = .began
         }
 
@@ -262,73 +255,59 @@
         }
 
         func contactMoved(at point: CGPoint, radius: CGFloat) {
-            guard let previous = contact else { return }
-            defer { state = contact != nil ? .changed : .cancelled }
+            guard contact.isHeld else { return }
+            defer { state = contact.isHeld ? .changed : .cancelled }
             let ends = clampedEnds
-            guard
-                TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterMove(
-                    at: point.y, previousY: previous.y, radius: radius, thumb: thumbRect ?? .zero,
-                    atTop: ends.top, atBottom: ends.bottom)
-            else {
-                finishContact()
+            guard contact.move(to: point, radius: radius, atTop: ends.top, atBottom: ends.bottom) else {
+                onEnded?()
                 return
             }
-            contact = (point.y, radius)
             _ = onContact?(point, radius, false)
         }
 
         /// Stores the one host-space geometry snapshot for presentation and contact. Fading does not end a hold.
         func thumbDidLayout(_ thumb: CGRect?) {
-            let previous = thumbRect
-            thumbRect = thumb
-            guard let contact else { return }
-            let ends = clampedEnds
-            guard
-                TimelineScrollDateLabelGeometry.continuesIndicatorContactAfterLayout(
-                    at: contact.y, radius: contact.radius, thumb: thumb ?? .zero, previousThumb: previous ?? .zero,
-                    atTop: ends.top, atBottom: ends.bottom)
-            else {
-                finishContact()
+            guard contact.thumbDidLayout(thumb, clampedEnds: clampedEnds) else {
+                onEnded?()
                 state = .cancelled
                 return
             }
         }
 
         func finishContact() {
-            guard contact != nil else { return }
-            contact = nil
+            guard contact.end() else { return }
             onEnded?()
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
             super.touchesBegan(touches, with: event)
             guard event.allTouches?.count == 1, let touch = touches.first, touch.type == .direct else {
-                let wasDragging = contact != nil
+                let wasDragging = contact.isHeld
                 finishContact()
                 state = wasDragging ? .cancelled : .failed
                 return
             }
             contactBegan(at: touch.location(in: view), radius: touch.majorRadius + touch.majorRadiusTolerance)
-            if contact == nil { state = .failed }
+            if !contact.isHeld { state = .failed }
         }
 
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
             super.touchesMoved(touches, with: event)
-            if contact != nil, let touch = touches.first {
+            if contact.isHeld, let touch = touches.first {
                 contactMoved(at: touch.location(in: view), radius: touch.majorRadius + touch.majorRadiusTolerance)
             }
         }
 
         override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
             super.touchesEnded(touches, with: event)
-            let wasDragging = contact != nil
+            let wasDragging = contact.isHeld
             finishContact()
             state = wasDragging ? .ended : .failed
         }
 
         override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
             super.touchesCancelled(touches, with: event)
-            let wasDragging = contact != nil
+            let wasDragging = contact.isHeld
             finishContact()
             state = wasDragging ? .cancelled : .failed
         }

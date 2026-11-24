@@ -48,6 +48,8 @@ public struct TimelineView: View {
     @State private var photoNames: PhotoNameIndex?
     @State private var monthMarkers: [TimelineDateMarker] = []
     @State private var monthMarkerRevision: Int?
+    /// The trailing width the date scrubber covers right now; the scroll date label stays left of it.
+    @State private var scrubberTrailingReservation = TimelineDateScrubber.dormantTrailingReservation
 
     public init(
         model: TimelineViewModel,
@@ -172,14 +174,16 @@ public struct TimelineView: View {
                                 hasFailure: model.initialLibraryLoadState.failure != nil,
                                 hasProjectionCriteria: hasSearchQuery,
                                 resolvedProjection: resolvedSearchProjection),
-                            scrollDateLabelTrailingInset: showsScrubber
-                                ? TimelineDateScrubber.dormantTrailingReservation : 0,
+                            scrollDateLabelTrailingInset: showsScrubber ? scrubberTrailingReservation : 0,
                             scrollDateLabelListID: scrollDateLabelListID
                         )
                         .ignoresSafeArea(edges: .bottom)
 
                         if showsScrubber {
-                            TimelineDateScrubber(markers: monthMarkers) { marker in
+                            TimelineDateScrubber(
+                                markers: monthMarkers,
+                                onTrailingReservationChange: { scrubberTrailingReservation = $0 }
+                            ) { marker in
                                 proxy?.scrollToFlatIndex?(marker.index)
                             }
                         }
@@ -385,16 +389,35 @@ struct TimelineDateScrubber: View {
     static let trailingMargin: CGFloat = 8
     /// The trailing width the dormant scrubber takes from the grid.
     static let dormantTrailingReservation = dormantWidth + trailingMargin
+    /// The date pill's centre, measured from the trailing edge of the expanded column.
+    static let pillCenterInset: CGFloat = 66
     /// The date pill's text; the grid's scroll date label uses the same type and padding.
     static let pillFontSize: CGFloat = 13
     static let pillHorizontalPadding: CGFloat = 10
     static let pillVerticalPadding: CGFloat = 6
 
     let markers: [TimelineDateMarker]
+    /// Reports the trailing width the scrubber covers whenever it changes, so other trailing content stays clear.
+    var onTrailingReservationChange: (CGFloat) -> Void = { _ in }
     let onJump: (TimelineDateMarker) -> Void
 
     @State private var activeIndex: Int?
     @State private var hovering = false
+    @State private var pillWidth: CGFloat = 0
+
+    /// The trailing width the scrubber covers: its dormant column, its expanded column while it is hovered or
+    /// dragged, or the date pill, whichever reaches furthest from the trailing edge.
+    static func trailingReservation(isExpanded: Bool, pillWidth: CGFloat?) -> CGFloat {
+        guard isExpanded else { return dormantTrailingReservation }
+        let column = expandedWidth + trailingMargin
+        guard let pillWidth else { return column }
+        return max(column, trailingMargin + pillCenterInset + pillWidth / 2)
+    }
+
+    private var trailingReservation: CGFloat {
+        Self.trailingReservation(
+            isExpanded: hovering || activeIndex != nil, pillWidth: activeIndex != nil ? pillWidth.rounded(.up) : nil)
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -407,15 +430,14 @@ struct TimelineDateScrubber: View {
                     .padding(.trailing, 10)
 
                 if let active, let index = activeIndex {
-                    Text(active.text)
-                        .font(.system(size: Self.pillFontSize, weight: .semibold))
-                        // Regular Liquid Glass flips its content between light and dark over the photos.
-                        .foregroundStyle(.primary)
-                        .padding(.horizontal, Self.pillHorizontalPadding)
-                        .padding(.vertical, Self.pillVerticalPadding)
-                        .glassEffect(in: Capsule(style: .continuous))
+                    TimelineDateScrubberPill(text: active.text)
+                        .onGeometryChange(for: CGFloat.self) {
+                            $0.size.width
+                        } action: {
+                            pillWidth = $0
+                        }
                         .position(
-                            x: geometry.size.width - 66,
+                            x: geometry.size.width - Self.pillCenterInset,
                             y: markerY(index: index, height: geometry.size.height))
                 }
             }
@@ -437,6 +459,7 @@ struct TimelineDateScrubber: View {
         .padding(.trailing, Self.trailingMargin)
         .padding(.vertical, 96)
         .allowsHitTesting(markers.count > 1)
+        .onChange(of: trailingReservation, initial: true) { _, reservation in onTrailingReservationChange(reservation) }
     }
 
     private func markerIndex(at y: CGFloat, height: CGFloat) -> Int {
@@ -449,6 +472,21 @@ struct TimelineDateScrubber: View {
         guard markers.count > 1 else { return height / 2 }
         let q = CGFloat(index) / CGFloat(markers.count - 1)
         return min(max(12, q * height), max(12, height - 12))
+    }
+}
+
+/// The date the scrubber shows beside the pointer while it is dragged.
+struct TimelineDateScrubberPill: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: TimelineDateScrubber.pillFontSize, weight: .semibold))
+            // Regular Liquid Glass flips its content between light and dark over the photos.
+            .foregroundStyle(.primary)
+            .padding(.horizontal, TimelineDateScrubber.pillHorizontalPadding)
+            .padding(.vertical, TimelineDateScrubber.pillVerticalPadding)
+            .glassEffect(in: Capsule(style: .continuous))
     }
 }
 
