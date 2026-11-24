@@ -362,8 +362,11 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         let (fixture, queue, entry) = try await makeRetryFailureFixture(prefix: "backup-retry-probe-count")
         defer { fixture.cleanup() }
         let controllerQueue = try photoBackupQueueStore(fixture.controller)
+        // The retry compares the recorded failure counts around its reopen writes, then probes the database itself
+        // (run 45096416748): the probe statement is shared with the status projection, which runs off the main actor.
+        // Main-thread-only injection keeps the projection's probe from spending the fault between the two counts.
         let fault = try SQLiteStatementStartAction.recordedFailure(
-            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;")
+            in: controllerQueue, matching: "SELECT count(*) FROM sqlite_schema;", mainThreadOnly: true)
         defer { fault.stop() }
 
         await fixture.controller.retryUserResolvableWork()
@@ -376,6 +379,27 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
         XCTAssertEqual(row.attempts, 0)
         XCTAssertEqual(row.lastError, entry.lastError)
         await fixture.controller.shutdown()
+    }
+
+    func testAHealthProbeOffTheMainThreadDoesNotConsumeTheMainThreadsInjection() async throws {
+        // A bare store has no other main-thread reader: only this test's probes touch the connection.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("probe-thread-injection-\(UUID().uuidString)").appendingPathExtension("db")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let fault = try SQLiteStatementStartAction.recordedFailure(
+            in: store, matching: "SELECT count(*) FROM sqlite_schema;", mainThreadOnly: true)
+        defer { fault.stop() }
+
+        // A probe on another thread runs the same statement without spending the fault.
+        let backgroundAnswer = await Task.detached(priority: .utility) { store.isOperational() }.value
+        XCTAssertTrue(backgroundAnswer)
+        XCTAssertFalse(fault.fired)
+
+        // The probe on the main thread spends the fault and forgets the transient failure at once.
+        XCTAssertTrue(store.isOperational())
+        XCTAssertTrue(fault.fired)
+        XCTAssertTrue(store.isOperational())
     }
 
     private func makeRetryFailureFixture(
