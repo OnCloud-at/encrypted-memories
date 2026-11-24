@@ -129,6 +129,43 @@ final class BackupAttentionSplitTests: XCTestCase {
         XCTAssertNil(display.localizedNotBackedUp)
     }
 
+    /// The skipped-file line names the file type, never Proton, and shows only when the scan skipped a file.
+    func testTheSkippedFileLineShowsOnlyForSkippedFiles() {
+        var status = BackupStatus()
+        XCTAssertNil(status.localizedSkippedUnsupportedFiles)
+        status.skippedUnsupportedFiles = 1
+        XCTAssertEqual(status.localizedSkippedUnsupportedFiles, L10n.string("backup.folder_skipped_unsupported \(1)"))
+        status.skippedUnsupportedFiles = 3
+        let text = status.localizedSkippedUnsupportedFiles
+        XCTAssertEqual(text, L10n.string("backup.folder_skipped_unsupported \(3)"))
+        XCTAssertFalse(text?.contains("Proton") ?? true)
+        XCTAssertNotEqual(text, "backup.folder_skipped_unsupported %lld", "the key has a catalog entry")
+    }
+
+    /// The plural forms of the skipped-file line in each language.
+    func testTheSkippedFileLineHasItsPluralFormsInEnglishAndGerman() throws {
+        let key = "backup.folder_skipped_unsupported %lld"
+        func line(_ language: String, _ count: Int) throws -> String {
+            let bundle = L10n.resourceBundle
+            if let path = bundle.path(forResource: language, ofType: "lproj"), let localized = Bundle(path: path) {
+                let format = localized.localizedString(forKey: key, value: nil, table: nil)
+                return String(format: format, locale: Locale(identifier: language), arguments: [count])
+            }
+            // SwiftPM can copy the catalog as data; Xcode compiles it into language bundles.
+            let url = try XCTUnwrap(bundle.url(forResource: "Localizable", withExtension: "xcstrings"))
+            let catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            let entry = (catalog["strings"] as? [String: Any])?[key] as? [String: Any]
+            let localization = (entry?["localizations"] as? [String: Any])?[language] as? [String: Any]
+            let plural = (localization?["variations"] as? [String: Any])?["plural"] as? [String: Any]
+            let unit = (plural?[count == 1 ? "one" : "other"] as? [String: Any])?["stringUnit"] as? [String: Any]
+            return String(format: try XCTUnwrap(unit?["value"] as? String, language), count)
+        }
+        XCTAssertEqual(try line("en", 1), "1 file skipped: file type not supported")
+        XCTAssertEqual(try line("en", 3), "3 files skipped: file type not supported")
+        XCTAssertEqual(try line("de", 1), "1 Datei übersprungen: Dateityp nicht unterstützt")
+        XCTAssertEqual(try line("de", 3), "3 Dateien übersprungen: Dateityp nicht unterstützt")
+    }
+
     func testAPausedStatusShowsNoCalmLine() {
         var raw = progress(total: 10, uploaded: 5, waiting: 3, failed: 2)
         raw.isRunning = true

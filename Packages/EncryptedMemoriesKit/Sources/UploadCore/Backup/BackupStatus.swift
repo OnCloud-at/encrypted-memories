@@ -142,6 +142,15 @@ public struct BackupStatus: Sendable, Equatable {
     /// Rows the backup still runs after a week in one wait that does not end by itself. They count in the calm
     /// line; their retries continue.
     public var longWaitingCount = 0
+    /// Files that the last folder scan skipped because the app does not back up their file type. Only a folder backup
+    /// sets it; they never enter the queue.
+    public var skippedUnsupportedFiles = 0
+    /// A calm line for the skipped files. It names the file type, never Proton: the app's own list of supported types
+    /// decides. Nil when the scan skipped nothing.
+    public var localizedSkippedUnsupportedFiles: String? {
+        guard skippedUnsupportedFiles > 0 else { return nil }
+        return L10n.string("backup.folder_skipped_unsupported \(skippedUnsupportedFiles)")
+    }
     /// Whether the summary counts any photo that is not backed up, orange or calm: the problem list must show one.
     public var hasPhotosNotBackedUp: Bool { needsAttentionCount + notBackedUpCount > 0 }
     /// `waiting` without the long waits: a wait of a week counts in the calm line only, never also as waiting.

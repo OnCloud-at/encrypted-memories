@@ -687,6 +687,28 @@
         "de": {"stringUnit": {"state": "translated", "value": "Warten auf Proton"}}
       }
     },
+    "backup.folder_skipped_unsupported %lld": {
+      "extractionState": "manual",
+      "comment": "Calm folder backup line: files that the scan skipped because the app does not back up their file type. Never names Proton.",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld file skipped: file type not supported" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld files skipped: file type not supported" } }
+            }
+          }
+        },
+        "de": {
+          "variations": {
+            "plural": {
+              "one": { "stringUnit": { "state": "translated", "value": "%lld Datei übersprungen: Dateityp nicht unterstützt" } },
+              "other": { "stringUnit": { "state": "translated", "value": "%lld Dateien übersprungen: Dateityp nicht unterstützt" } }
+            }
+          }
+        }
+      }
+    },
     "backup.progress_not_backed_up %lld": {
       "extractionState": "manual",
       "comment": "Calm backup status line that opens the problem list: files that are not backed up although nothing the person can fix is known.",
