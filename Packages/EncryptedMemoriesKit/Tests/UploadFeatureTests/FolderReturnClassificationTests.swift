@@ -174,6 +174,45 @@ import UploadCore
         await fixture.shutdown()
     }
 
+    /// The restore recheck of a watched-folder file whose folder source never opened (`files == nil`,
+    /// e.g. the folder queue store failed to open while the shared pending store still holds the row):
+    /// the file cannot be proven returned, so the session must answer its fail-closed `.unreadable`,
+    /// which keeps the queue duty (`needs_queue_sync`) instead of settling the row as done. A default
+    /// of `.completed` here would durably retire the row of a file that never returned to the backup.
+    @Test func aFileRestoreRecheckWithoutAFolderSourceKeepsTheQueueDuty() async throws {
+        var fixture = try ReturnFixture()
+        defer { fixture.remove() }
+        let gone = fixture.path("Watched/vanished.heic")
+        let key = PendingSourceKey(kind: .fileURL, identifier: gone)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let remote = PhotoUID(volumeID: "vol", nodeID: "restored-folder-photo")
+        #expect(
+            fixture.store.recordHandoff(
+                PendingHandoff(
+                    key: key, revision: .init(rawValue: 1), remote: remote, kind: .uploaded,
+                    createdAt: date)) == .recorded)
+        let excluded = try #require(
+            fixture.store.exclude([PendingExclusionRequest(key: key, presentation: nil, remote: remote)], at: date))
+        for state in excluded {
+            #expect(
+                fixture.store.completeEffect(.remoteTrash, for: state.key, generation: state.generation, at: date))
+        }
+
+        // The session without a folder source runs the same recheck for the file row, and the
+        // fail-closed answer keeps the duty: the row stays owed, never settled as done.
+        let session = try #require(
+            PendingGridSession(store: fixture.store, photoBackup: fixture.controller, remote: NoRemoteEffects()))
+        let result = await session.restoreSources(ofRemote: [remote])
+        #expect(result.outcomes[key] != .completed, "an unprovable return never counts as done")
+
+        let after = try #require(fixture.store.sourceState(for: key), "the owed row survives the recheck")
+        #expect(after.desired == .included, "the file stays included and owes its queue duty")
+        #expect(after.needsQueueSync, "without proof of the return the duty survives the recheck")
+        #expect(after.remote == remote)
+        await session.close()
+        await fixture.shutdown()
+    }
+
     /// A read failure that is neither missing nor permission must not count as done either.
     /// A file name longer than the filesystem allows (ENAMETOOLONG) is such a failure: no such
     /// file can exist, yet the read failure classifies as transient, not missing.
