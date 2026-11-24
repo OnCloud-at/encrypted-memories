@@ -8,7 +8,7 @@ import UploadCore
 @Suite struct BackupStatusIconTests {
     private let table: [(BackupStatusPresentation.Accessory, String, Color)] = [
         (.activity, "arrow.trianglehead.2.clockwise", ProtonColor.primary),
-        (.attention, "exclamationmark.triangle.fill", .orange),
+        (.attention, "exclamationmark.triangle.fill", ProtonColor.warning),
         (.paused, "pause.circle", ProtonColor.textWeak),
         (.waiting, "clock.arrow.circlepath", ProtonColor.textWeak),
         (.waitingForWiFi, BackupStatus.waitingForWiFiSymbolName, ProtonColor.textWeak),

@@ -238,7 +238,7 @@ public struct SmartSearchSettingsSection: View {
         {
             Text(MLSmartSearchPresentation.developerModelNote)
                 .font(.footnote)
-                .foregroundStyle(.orange)
+                .foregroundStyle(ProtonColor.warning)
         }
     }
 
@@ -349,9 +349,9 @@ public struct SmartSearchSettingsSection: View {
 
     private var statusColor: Color {
         if controller.presentation.presentsAsReady { return .green }
-        if case .failed = controller.snapshot.indexingState { return .orange }
+        if case .failed = controller.snapshot.indexingState { return ProtonColor.warning }
         return switch controller.snapshot.phase {
-        case .failed: .orange
+        case .failed: ProtonColor.warning
         case .ready: .green
         default: .secondary
         }
