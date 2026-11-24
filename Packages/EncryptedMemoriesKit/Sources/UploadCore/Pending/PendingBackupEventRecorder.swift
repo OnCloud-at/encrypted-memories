@@ -13,13 +13,13 @@ public enum PendingRuntimeEvent: Sendable, Equatable {
 public final class PendingBackupEventRecorder: BackupItemEventSink, @unchecked Sendable {
     public let events: AsyncStream<PendingRuntimeEvent>
     private let continuation: AsyncStream<PendingRuntimeEvent>.Continuation
-    private let store: PendingBackupManifestStore
+    private let store: any PendingBackupStore
     public let replacementLedger: PendingReplacementLedger
     private let replacementJournal: (any EditReplacementJournaling)?
     private let now: @Sendable () -> Date
 
     public init(
-        store: PendingBackupManifestStore,
+        store: any PendingBackupStore,
         replacementLedger: PendingReplacementLedger = PendingReplacementLedger(),
         replacementJournal: (any EditReplacementJournaling)? = nil,
         now: @Sendable @escaping () -> Date = { Date() }

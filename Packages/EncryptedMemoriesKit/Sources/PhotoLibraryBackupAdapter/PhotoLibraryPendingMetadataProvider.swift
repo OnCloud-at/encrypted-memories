@@ -5,9 +5,9 @@ import UploadCore
 public struct PhotoLibraryPendingMetadataProvider: PendingSourceMetadataProviding {
     private static let pageSize = 500
 
-    private let catalog: PhotoLibraryCatalogManifestStore
+    private let catalog: any PhotoLibraryCatalogStore
 
-    public init(catalog: PhotoLibraryCatalogManifestStore) {
+    public init(catalog: any PhotoLibraryCatalogStore) {
         self.catalog = catalog
     }
 

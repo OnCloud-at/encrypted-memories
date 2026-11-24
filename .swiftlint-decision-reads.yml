@@ -76,9 +76,8 @@
 # The rule does not see a type alias of a concrete store, a same-type requirement (`where Wrapped == Store`), a type
 # that a closure or a local variable infers, a store passed as `Any`, a metatype after `=`, or a declaration after a
 # `//` inside a string earlier on the same line.
-# The baseline lists the sites that exist and can only shrink. A queue, catalog or settlement site moves to the
-# protocol of its store. The pending backup store has no decision protocol yet (#1154): its sites stay until it has
-# one, and the rule keeps new ones out. Sites that create, own or test a store stay as exceptions that the baseline
+# The baseline lists the sites that exist and can only shrink. A queue, catalog, settlement or pending store site
+# moves to the protocol of its store. Sites that create, own or test a store stay as exceptions that the baseline
 # names.
 #
 # Each rule starts at fixed text (`StoreLookup`, `try?`, a read method) and checks what precedes it with bounded
