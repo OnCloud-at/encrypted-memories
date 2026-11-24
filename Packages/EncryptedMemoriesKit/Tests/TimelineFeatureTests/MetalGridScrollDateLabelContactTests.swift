@@ -102,7 +102,7 @@ struct MetalGridScrollDateLabelContactTests {
             let slide = try #require(label.slideView.layer?.animation(forKey: "transform") as? CABasicAnimation)
             #expect(slide.duration == TimelineScrollDateLabelMotion.indicatorSlideBack, "\(name) eases back")
             #expect(label.controller.policy.hideDeadline != nil, "\(name) starts the usual linger")
-            #expect(!observer.isHoldingContact)
+            #expect(!observer.isHoldingContactForTesting)
         }
     }
 
@@ -114,10 +114,10 @@ struct MetalGridScrollDateLabelContactTests {
         #expect(label.controller.policy.isIndicatorDragging, "SETUP: held")
         fixture.host.retireScrollDateLabel()
         #expect(!label.contactObserver.isEnabled)
-        #expect(!label.contactObserver.isHoldingContact)
+        #expect(!label.contactObserver.isHoldingContactForTesting)
         #expect(!label.controller.policy.isIndicatorDragging)
         label.contactObserver.contactBegan(at: CGPoint(x: knob.midX, y: knob.midY))
-        #expect(!label.contactObserver.isHoldingContact, "a retired observer takes no contact")
+        #expect(!label.contactObserver.isHoldingContactForTesting, "a retired observer takes no contact")
     }
 
     @Test func reduceMotionSlidesAndReturnsAtOnce() async throws {
@@ -247,7 +247,7 @@ struct MetalGridScrollDateLabelContactTests {
         try fixture.setKnobOpacity(0)
         let moved = try fixture.dragKnob(of: label, by: 40, fingerFirst: true)
         #expect(label.controller.policy.isIndicatorDragging, "the knob faded, the finger still holds it")
-        #expect(label.contactObserver.isHoldingContact)
+        #expect(label.contactObserver.isHoldingContactForTesting)
         #expect(moved > 0)
         label.contactObserver.finishContact()
     }
@@ -263,7 +263,7 @@ struct MetalGridScrollDateLabelContactTests {
         var travelled: CGFloat = 0
         for _ in 0..<4 {
             travelled += try fixture.dragKnob(of: label, by: 60, fingerFirst: fingerFirst)
-            #expect(label.contactObserver.isHoldingContact, "finger first: \(fingerFirst)")
+            #expect(label.contactObserver.isHoldingContactForTesting, "finger first: \(fingerFirst)")
         }
         #expect(travelled > 60, "SETUP: the knob travelled")
         #expect(label.controller.policy.isIndicatorDragging)
@@ -291,9 +291,9 @@ struct MetalGridScrollDateLabelContactTests {
         }
         label.contactObserver.contactBegan(at: CGPoint(x: knob.midX, y: knob.midY))
         label.contactObserver.contactMoved(at: CGPoint(x: knob.midX, y: knob.midY + 100))
-        #expect(label.contactObserver.isHoldingContact, "one sample may precede the knob")
+        #expect(label.contactObserver.isHoldingContactForTesting, "one sample may precede the knob")
         label.contactObserver.contactMoved(at: CGPoint(x: knob.midX, y: knob.midY + 110))
-        #expect(!label.contactObserver.isHoldingContact, "the knob did not follow: an ordinary pan")
+        #expect(!label.contactObserver.isHoldingContactForTesting, "the knob did not follow: an ordinary pan")
         #expect(!label.controller.policy.isIndicatorDragging)
         #expect(label.dragOffset == 0)
         let count = forwarded
@@ -316,9 +316,9 @@ struct MetalGridScrollDateLabelContactTests {
             label.contactObserver.contactMoved(at: CGPoint(x: knob.midX, y: beyond))
             label.contactObserver.contactMoved(at: CGPoint(x: knob.midX, y: beyond * 1.5))
             fixture.scrollClip(toY: y)  // The clamped knob does not move.
-            #expect(label.contactObserver.isHoldingContact, "beyond the \(name) end")
+            #expect(label.contactObserver.isHoldingContactForTesting, "beyond the \(name) end")
             label.contactObserver.contactMoved(at: CGPoint(x: knob.midX, y: knob.midY))
-            #expect(label.contactObserver.isHoldingContact, "the finger returns from beyond the \(name) end")
+            #expect(label.contactObserver.isHoldingContactForTesting, "the finger returns from beyond the \(name) end")
             #expect(label.controller.policy.isIndicatorDragging)
             label.contactObserver.finishContact()
             #expect(label.dragOffset == 0, "release at the \(name) end returns the label")
@@ -328,7 +328,7 @@ struct MetalGridScrollDateLabelContactTests {
             let opposite: CGFloat = name == "top" ? 2_000 : -200
             label.contactObserver.contactMoved(at: CGPoint(x: knob.midX, y: opposite))
             label.contactObserver.contactMoved(at: CGPoint(x: knob.midX, y: opposite * 1.5))
-            #expect(!label.contactObserver.isHoldingContact, "the side opposite the \(name) end stays closed")
+            #expect(!label.contactObserver.isHoldingContactForTesting, "the side opposite the \(name) end stays closed")
         }
     }
 
@@ -410,7 +410,7 @@ struct MetalGridScrollDateLabelContactTests {
             case .leftMouseDragged: observer.mouseDragged(with: event)
             default: observer.mouseUp(with: event)
             }
-            #expect(!observer.isHoldingContact, "a mouse \(type) on the knob is not a finger")
+            #expect(!observer.isHoldingContactForTesting, "a mouse \(type) on the knob is not a finger")
             #expect(!label.controller.policy.isIndicatorDragging)
         }
         // A trackpad scroll over the visible knob is the ordinary label path.
@@ -452,18 +452,20 @@ struct MetalGridScrollDateLabelContactTests {
         let label = try await fixture.enabledLabel()
         let knob = try fixture.visibleKnob(of: label)
         label.contactObserver.contactBegan(at: CGPoint(x: knob.midX, y: knob.midY))
-        #expect(label.contactObserver.isHoldingContact, "SETUP: the finger holds the knob")
+        #expect(label.contactObserver.isHoldingContactForTesting, "SETUP: the finger holds the knob")
         let travel = knob.height + Self.fallback * 2 + 4
         let track = label.overlay.bounds.height - knob.height
         fixture.scrollClip(toY: fixture.clipView.bounds.origin.y + travel / max(track, 1) * fixture.maxScrollY)
         let moved = try #require(label.contactObserver.thumbRect)
         #expect(moved.minY > knob.maxY + Self.fallback, "SETUP: the knob moved away from the finger")
-        #expect(label.contactObserver.isHoldingContact, "SETUP: the previous knob still aligns with the finger")
+        #expect(
+            label.contactObserver.isHoldingContactForTesting,
+            "SETUP: the previous knob still aligns with the finger")
         label.scrollersReflected()
         fixture.layoutHost()
-        #expect(label.contactObserver.isHoldingContact, "a repeated report of the same knob keeps the hold")
+        #expect(label.contactObserver.isHoldingContactForTesting, "a repeated report of the same knob keeps the hold")
         label.contactObserver.contactMoved(at: CGPoint(x: moved.midX, y: moved.midY))
-        #expect(label.contactObserver.isHoldingContact, "the finger catches up with the knob")
+        #expect(label.contactObserver.isHoldingContactForTesting, "the finger catches up with the knob")
         label.contactObserver.finishContact()
     }
 

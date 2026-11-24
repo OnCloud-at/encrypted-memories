@@ -316,10 +316,8 @@ final class MetalGridIndicatorContactObserver: NSGestureRecognizer {
 
     /// The knob snapshot in the overlay's coordinates that the label also uses.
     var thumbRect: CGRect? { contact.thumbRect }
-    #if DEBUG
-        /// Whether the observer holds a touch. Test seam only; production reads no such state.
-        var isHoldingContact: Bool { contact.isHeld }
-    #endif
+    /// Whether the observer holds a touch. Test seam only; production reads no such state.
+    var isHoldingContactForTesting: Bool { contact.isHeld }
 
     init() {
         super.init(target: nil, action: nil)
