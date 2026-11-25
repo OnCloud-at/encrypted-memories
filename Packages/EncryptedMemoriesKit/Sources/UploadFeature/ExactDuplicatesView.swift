@@ -50,7 +50,7 @@ public struct ExactDuplicatesView<Cover: View>: View {
     public var body: some View {
         content
             .alert(model.mergeAllTitle, isPresented: $confirmsMergeAll) {
-                Button(model.mergeAllConfirmTitle) {
+                Button(model.mergeAllConfirmTitle, role: .destructive) {
                     Task { await model.mergeAll() }
                 }
                 .disabled(!model.canMerge)
