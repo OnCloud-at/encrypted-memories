@@ -31,7 +31,14 @@ final class MobileDuplicatesUITests: XCTestCase {
         let collectionsReady = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in collectionsButton.exists || collectionsCell.exists }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [collectionsReady], timeout: 60), .completed)
-        (collectionsButton.exists ? collectionsButton : collectionsCell).tap()
+        // On iOS 26.5 in a landscape iPad window, XCTest reports the sidebar cell as not hittable, although its
+        // frame lies in the window, so its own tap fails. The centre tap by coordinate opens the same page.
+        let collectionsEntry = collectionsButton.exists ? collectionsButton : collectionsCell
+        if collectionsEntry.isHittable {
+            collectionsEntry.tap()
+        } else {
+            app.tapOnScreen(collectionsEntry)
+        }
 
         // The list creates rows lazily; Utilities follows the Library rows below the fold on a phone.
         app.openCollectionsRow(app.buttons["duplicates.entry"])
