@@ -245,7 +245,8 @@ final class MobileDuplicatesUITests: XCTestCase {
     func testLandscapeIPadCheckKeepsItsPercentageCenteredAndCapped() throws {
         try XCTSkipUnless(UIDevice.current.userInterfaceIdiom == .pad, "this probe covers a landscape iPad window")
         XCUIDevice.shared.orientation = .landscapeLeft
-        defer { XCUIDevice.shared.orientation = .portrait }
+        // A teardown block also runs after a failed assertion, so later tests never start in landscape.
+        addTeardownBlock { @MainActor in XCUIDevice.shared.orientation = .portrait }
         openDuplicates(
             fixture: "-EncryptedMemoriesDuplicatesLargeFixture", extra: ["-EncryptedMemoriesDuplicatesSlowCheck"])
         XCTAssertGreaterThan(app.windows.firstMatch.frame.width, app.windows.firstMatch.frame.height)
