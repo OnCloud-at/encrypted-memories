@@ -471,7 +471,7 @@ extension DriveSession {
                 shareID: shareID, linkIDs: chunk, retryOnRateLimit: retryOnRateLimit)
             if requiresCompleteResponse {
                 guard response.code == 1000, response.envelope.isComplete else {
-                    throw UploadError.backend("The link visibility response is incomplete")
+                    throw UploadError.internalFailure(.linkVisibilityIncomplete)
                 }
             }
             for link in response.links {

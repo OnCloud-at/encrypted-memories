@@ -60,7 +60,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
             if UpgradeTestProbe.isRequested { return try await UpgradeTestPhotoLibrary.resolve(entry) }
         #endif
         guard entry.source.kind == .photoLibraryAsset else {
-            throw UploadError.backend("photo resolver received source kind \(entry.source.kind.rawValue)")
+            throw UploadError.internalFailure(.photoResolverUnexpectedSource(kind: entry.source.kind))
         }
         let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [entry.source.identifier], options: nil)
         guard let asset = fetch.firstObject else {
@@ -603,7 +603,7 @@ public struct PhotoLibraryResourceResolver: BackupResourceResolving {
         let partialURL = try tempStore.reserve(filename: uploadFilename, expectedBytes: expectedBytes)
         do {
             guard FileManager.default.createFile(atPath: partialURL.path, contents: nil) else {
-                throw UploadError.backend("PhotoKit export file could not be created")
+                throw UploadError.internalFailure(.photoKitExportFileNotCreated)
             }
             let handle = try FileHandle(forWritingTo: partialURL)
             defer { try? handle.close() }

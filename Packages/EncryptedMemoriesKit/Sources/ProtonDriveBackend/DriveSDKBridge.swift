@@ -2933,7 +2933,7 @@ extension DriveSDKBridge: PhotoUploading {
             uploadNetworkAdmission.issued(reservation),
             reservation.allowsExpensiveNetwork == request.allowsExpensiveNetwork
         else {
-            throw UploadError.backend("The upload started without its network reservation")
+            throw UploadError.internalFailure(.networkReservationMissing)
         }
         expensiveUploadAccess.begin(allowsExpensiveNetwork: request.allowsExpensiveNetwork)
         defer { expensiveUploadAccess.end(allowsExpensiveNetwork: request.allowsExpensiveNetwork) }

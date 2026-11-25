@@ -277,7 +277,7 @@ public struct FileBackupResourceResolver: BackupResourceResolving {
 
     public func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
         guard entry.source.kind == .fileURL else {
-            throw UploadError.backend("unsupported backup source kind \(entry.source.kind.rawValue)")
+            throw UploadError.internalFailure(.backupResolverUnsupportedSource(kind: entry.source.kind))
         }
         let url = URL(fileURLWithPath: entry.source.identifier)
         let attributes: [FileAttributeKey: Any]

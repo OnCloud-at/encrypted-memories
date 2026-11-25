@@ -66,7 +66,7 @@
         static func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
             guard let id = Int(entry.source.identifier.dropFirst(6)), (0..<8).contains(id),
                 let candidate = PhotoBackupAssetPlanner.candidate(for: info(id))
-            else { throw UploadError.backend("Unexpected synthetic photo") }
+            else { throw UploadError.internalFailure(.syntheticPhotoUnknown) }
             let bytes = try await UpgradeTestProbe.request("thumbnail/asset-\(id)")
             let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("UpgradeFixtureExports", isDirectory: true)
