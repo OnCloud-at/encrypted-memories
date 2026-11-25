@@ -262,7 +262,7 @@ public struct PhotoViewerView: View {
             L10n.string("viewer.revert_original_title"),
             isPresented: Binding(get: { model.revert.isConfirming }, set: { _ in })
         ) {
-            Button(L10n.string("viewer.revert_original_confirm")) {
+            Button(L10n.string("viewer.revert_original_confirm"), role: .destructive) {
                 model.confirmRevertToOriginal(onSuccess: { onClose() })
             }
             Button(L10n.string("action.cancel"), role: .cancel) { model.revert.cancel() }

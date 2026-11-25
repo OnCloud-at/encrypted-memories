@@ -345,7 +345,7 @@ struct MobilePhotoViewer: View {
             L10n.string("viewer.revert_original_title"),
             isPresented: Binding(get: { revert.isConfirming }, set: { _ in })
         ) {
-            Button(L10n.string("viewer.revert_original_confirm")) { confirmRevertToOriginal() }
+            Button(L10n.string("viewer.revert_original_confirm"), role: .destructive) { confirmRevertToOriginal() }
             Button(L10n.string("action.cancel"), role: .cancel) { revert.cancel() }
         } message: {
             Text(L10n.string("viewer.revert_original_message"))
