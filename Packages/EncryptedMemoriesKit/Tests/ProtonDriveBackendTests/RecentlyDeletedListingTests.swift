@@ -336,6 +336,43 @@ struct RecentlyDeletedListingTests {
         #expect(!identities.hasPhotosAwaitingLibrary)
     }
 
+    @Test func aSeedingReadAnswersUnknownForAFileItCannotOpenAndKeepsThatFileFromASave() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // A real saved listing first, so the unreadable blob below holds state that a save must not lose.
+        let listed = Self.item("listed", at: 1)
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        store.save(.init(listing: [listed]))
+        // Bytes that no key can open: the seeding read must answer unknown, never absent.
+        try Data("not a listing".utf8)
+            .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+
+        let seeded = store.seeding()
+
+        #expect(seeded == .unknown, "a file that cannot be opened proves nothing about the stored listing")
+        // Unknown proves nothing, so no save may replace the file that the store could not open.
+        store.save(RecentlyDeletedIdentities.Persisted())
+        #expect(
+            store.seeding() == .unknown,
+            "the failed save kept the unreadable file: a later seeding read answers unknown again")
+    }
+
+    @Test func aSeedingReadAnswersAbsentWhenThereIsNoFileAndFoundForAReadableOne() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+
+        #expect(store.seeding() == .absent, "no file yet proves that no state is stored")
+
+        let listed = Self.item("listed", at: 1)
+        store.save(RecentlyDeletedIdentities.Persisted(listing: [listed]))
+        guard case .found(let persisted) = store.seeding() else {
+            Issue.record("a readable file answers found, not \(store.seeding())")
+            return
+        }
+        #expect(persisted.listing == [listed], "the found answer carries the stored state")
+    }
+
     @Test func aFileOfAnEarlierBuildOpensWithoutPhotosAwaitingTheLibrary() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }

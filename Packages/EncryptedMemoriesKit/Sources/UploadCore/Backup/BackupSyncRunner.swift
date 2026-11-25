@@ -433,8 +433,11 @@ public actor BackupSyncRunner {
                 // Nothing is due now or later. A parked draft whose re-check is due later can still start an index
                 // build, and a failed read proves nothing. The controller reports the rest once its scan has finished.
                 progress.isRunning = false
+                // The draft read is typed, so an unreadable queue answers unknown. Unknown never reads as absent:
+                // it refuses the claim that no upload work is left. `nil` marks the read that found no draft row.
                 progress.leavesNoUploadWork =
-                    (try? queue.containsAny(in: [.blockedByDraft])) == false && isQueueOperational()
+                    StoreLookup(catching: { try queue.containsAny(in: [.blockedByDraft]) ? true : nil }) == .absent
+                    && isQueueOperational()
                 return progress
             }
             guard nextRunnableDate <= now() else {

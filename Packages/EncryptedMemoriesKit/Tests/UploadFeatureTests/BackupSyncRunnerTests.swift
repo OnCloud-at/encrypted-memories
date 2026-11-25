@@ -567,6 +567,9 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     private let lock = NSLock()
     private var readFailed = false
     private var unknownEntryReads: Int
+    /// How many `containsAny` reads answer unknown before the spy forwards to the store again. The spy stays
+    /// operational and records no store failure, so a test can tell an unknown read from a broken store.
+    private var unknownContainsAnyReads: Int
     var refusesMissingRemoval = false
     /// True: the removal of the settled earlier revisions of a replaced photo fails, as a failed write does.
     var refusesSettledRevisionRemoval = false
@@ -578,6 +581,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     /// True: hint writes to the claim list report success, although the spy's claims still answer `unknown` (#274).
     var acceptsLocalReadFailureHints = false
     private var unknownEntryReadCount = 0
+    private var unknownContainsAnyReadCount = 0
     /// An error other than a failed read, which the keyed read throws once it is set.
     var entryReadFailure: (any Error)? {
         get { lock.withLock { foreignEntryReadFailure } }
@@ -585,6 +589,7 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
     private var foreignEntryReadFailure: (any Error)?
     var failedEntryReads: Int { lock.withLock { unknownEntryReadCount } }
+    var failedContainsAnyReads: Int { lock.withLock { unknownContainsAnyReadCount } }
     private var reconciliationHook: (@Sendable (UploadRemoteCommitReconciliation) -> Bool)?
     private var stateWriteHook: (@Sendable (UploadSourceIdentity, UploadBackupSyncQueueState) -> Bool)?
 
@@ -605,12 +610,13 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     /// and leaves the store not operational.
     init(
         inner: UploadBackupSyncQueueManifestStore, log: BackupEventLog, failsRunnableDateRead: Bool = false,
-        unknownEntryReads: Int = 0
+        unknownEntryReads: Int = 0, unknownContainsAnyReads: Int = 0
     ) {
         self.inner = inner
         self.log = log
         self.failsRunnableDateRead = failsRunnableDateRead
         self.unknownEntryReads = unknownEntryReads
+        self.unknownContainsAnyReads = unknownContainsAnyReads
     }
 
     func isOperational() -> Bool { lock.withLock { !readFailed } }
@@ -639,7 +645,14 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     }
 
     func containsAny(in states: [UploadBackupSyncQueueState]) throws -> Bool {
-        try inner.containsAny(in: states)
+        let unknown = lock.withLock {
+            guard unknownContainsAnyReads > 0 else { return false }
+            unknownContainsAnyReads -= 1
+            unknownContainsAnyReadCount += 1
+            return true
+        }
+        if unknown { throw SQLiteStoreUnknownReadError() }
+        return try inner.containsAny(in: states)
     }
 
     /// A read of the spy proves its result by the health of the spy after the read, as the store does.
@@ -2659,6 +2672,17 @@ final class BackupSyncRunnerTests: XCTestCase {
         XCTAssertTrue(fault.fired)
         XCTAssertTrue(queue.isOperational())
         XCTAssertFalse(result.leavesNoUploadWork, "An unknown draft read cannot certify a completed queue")
+    }
+
+    func testB1AnUnknownDraftReadOnAnOperationalQueueCannotCertifyNoUploadWork() async throws {
+        // The spy answers the draft read unknown without touching the store, so the health guards of
+        // `isQueueOperational()` cannot mask the typed read: the unknown alone must refuse the claim.
+        let inner = try XCTUnwrap(queueStore)
+        let queue = SpyQueueStore(inner: inner, log: BackupEventLog(), unknownContainsAnyReads: 1)
+        let result = await makeRunner(queue: queue).runUntilDrained(mode: .eligibleOnly)
+        XCTAssertEqual(queue.failedContainsAnyReads, 1)
+        XCTAssertTrue(queue.isOperational())
+        XCTAssertFalse(result.leavesNoUploadWork, "an unknown draft read cannot certify no upload work")
     }
 
     func testAPassWithNothingQueuedLeavesNoUploadWork() async {
