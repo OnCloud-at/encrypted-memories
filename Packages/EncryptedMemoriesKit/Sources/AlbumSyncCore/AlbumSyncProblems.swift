@@ -105,8 +105,9 @@ public final class AlbumSyncLastRunStore {
     private var isLoaded = false
     private var lastWrite: Task<Void, Never>?
 
-    public init(directory: URL) {
-        file = AlbumSyncLastRunFile(url: directory.appendingPathComponent(Self.fileName, isDirectory: false))
+    public init(directory: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem()) {
+        file = AlbumSyncLastRunFile(
+            url: directory.appendingPathComponent(Self.fileName, isDirectory: false), fileSystem: fileSystem)
     }
 
     /// Reads the file once. A list that a run recorded meanwhile wins, and the file then gets it.
@@ -198,9 +199,12 @@ actor AlbumSyncLastRunFile {
     }
 
     private let url: URL
+    /// The last-run file keeps the seam of #1149, so a test can fail each of its writes (#1155).
+    private let fileSystem: any DurableFileSystem
 
-    init(url: URL) {
+    init(url: URL, fileSystem: any DurableFileSystem = LocalDurableFileSystem()) {
         self.url = url
+        self.fileSystem = fileSystem
     }
 
     func read() -> [String: [BackupFailedItem]] {
@@ -228,10 +232,14 @@ actor AlbumSyncLastRunFile {
                     isRetryable: item.isRetryable, source: item.source)
             }
         }
-        if stored.isEmpty {
-            try? FileManager.default.removeItem(at: url)
-        } else {
-            try? JSONEncoder().encode(stored).write(to: url, options: .atomic)
+        do {
+            if stored.isEmpty {
+                try fileSystem.remove(url)
+            } else {
+                try fileSystem.replace(url, with: JSONEncoder().encode(stored))
+            }
+        } catch {
+            // A failed write keeps the previous file; the store tolerates it on purpose (a rebuildable cache).
         }
     }
 }

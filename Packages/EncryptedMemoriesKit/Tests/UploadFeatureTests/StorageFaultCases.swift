@@ -3,6 +3,7 @@ import Foundation
 import PhotosCore
 import XCTest
 
+@testable import AlbumSyncCore
 @testable import DeviceRootAppleAdapter
 @testable import PhotoLibraryBackupAdapter
 @testable import ProtonDriveBackend
@@ -53,6 +54,9 @@ let storageFaultCases: [any StorageFaultCase] = [
     ManualUploadCase(),
     PendingTrashCase(),
     AlbumSyncRefusalWriteBackCase(),
+    AlbumSyncMappingUpsertCase(),
+    AlbumSyncSelectionWriteCase(),
+    AlbumSyncLastRunWriteCase(),
 ]
 
 /// A deletion decision on the real queue and journal, by its production operations. By `start`:
@@ -1169,5 +1173,286 @@ struct AlbumSyncRefusalWriteBackCase: StorageFaultCase {
         case .unknown(let replaceable): state.tables["refusals"] = ["unknown replaceable=\(replaceable)"]
         }
         return state
+    }
+}
+
+/// The runner's persistence of one synced album (`AlbumSyncRunner.sync`): it reads the stored mapping row, moves the
+/// synced-at time and the run's counts onto it, and writes the row back with one upsert. The mapping store is
+/// authoritative, not a rebuildable cache: a lost mapping sends the next sync through the name-conflict flow again.
+/// A faulted read (point 1) still reports success: the fresh-mapping fallback writes the row, and the state converges
+/// exactly, because the conflict clause never updates `created_at` and every other written field takes the same
+/// value. A faulted upsert (point 2) fails and leaves the row unchanged; the next sync's read-plus-upsert writes the
+/// row again (converging restart). A maintainer who adds a conflict-updated field that differs between the stored and
+/// the fresh mapping (for example a fresh `createdAt`) turns point 1 into an honest-outcome failure on purpose: the
+/// sweep then demands a real refusal or an unchanged convergence.
+struct AlbumSyncMappingUpsertCase: StorageFaultCase {
+    struct World {
+        let url: URL
+        let store: AlbumSyncMappingStore
+    }
+
+    let id = "albumSync.mapping.upsert"
+    let atomicity = StorageFaultAtomicity.allOrNothing
+    private static let date = Date(timeIntervalSince1970: 1_700_000_000)
+    private static let localID = "album-trip"
+    private static let remoteID = "remote-trip"
+
+    private static func url(in directory: URL) -> URL {
+        directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)
+    }
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let store = try XCTUnwrap(AlbumSyncMappingStore(url: Self.url(in: directory)))
+        defer { store.close() }
+        XCTAssertTrue(
+            store.upsert(
+                AlbumSyncMapping(
+                    localAlbumID: Self.localID, remoteAlbumID: Self.remoteID, title: "Trip", mode: .additive,
+                    createdAt: Self.date, lastSyncedAt: Self.date.addingTimeInterval(-3_600),
+                    lastAttachedCount: 2, lastFailedCount: 1)))
+        XCTAssertTrue(
+            store.addSelection(
+                AlbumSyncSelection(localAlbumID: Self.localID, title: "Trip", addedAt: Self.date)))
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        World(
+            url: Self.url(in: directory),
+            store: try XCTUnwrap(AlbumSyncMappingStore(url: Self.url(in: directory))))
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.store] }
+
+    func run(_ world: World) async -> Bool {
+        // The runner's own shape: the stored row, or a fresh mapping when none answers, then one upsert.
+        var mapping =
+            world.store.mapping(localAlbumID: Self.localID)
+            ?? AlbumSyncMapping(
+                localAlbumID: Self.localID, remoteAlbumID: Self.remoteID, title: "Trip",
+                createdAt: Self.date)
+        mapping.title = "Trip"
+        mapping.lastSyncedAt = Self.date
+        mapping.lastAttachedCount = 5
+        mapping.lastFailedCount = 0
+        return world.store.upsert(mapping)
+    }
+
+    func close(_ world: World) { world.store.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: Self.url(in: directory))
+        try state.addRecords(
+            "mapping", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_mapping;")
+        try state.addRecords(
+            "selection", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_selection;")
+        return state
+    }
+}
+
+/// The controller's application of one picker result (`AlbumSyncController.applySelection`): the availability probe,
+/// then one `addSelection` per added album, then one `removeSelection` per deselected album — and, exactly as
+/// production, a failed add breaks only the adds loop, so the removals still run. Deselecting keeps the mapping row,
+/// so a later re-selection reuses the same Proton album without a name-conflict round. The writes are separate
+/// transactions: a fault between them leaves a partially applied selection, and applying the picker again completes it
+/// (both writes are idempotent), so the restart converges. A faulted probe stops every write: the controller reports
+/// the store unavailable, which is the fail-closed answer the store documents.
+struct AlbumSyncSelectionWriteCase: StorageFaultCase {
+    struct World {
+        let url: URL
+        let store: AlbumSyncMappingStore
+    }
+
+    let id = "albumSync.selections.write"
+    let atomicity = StorageFaultAtomicity.convergesAfterRestart
+    private static let date = Date(timeIntervalSince1970: 1_700_000_000)
+    private static let deselected = "album-trip"
+    private static let added = "album-sun"
+
+    private static func url(in directory: URL) -> URL {
+        directory.appendingPathComponent(AlbumSyncMappingStore.databaseFileName)
+    }
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        let store = try XCTUnwrap(AlbumSyncMappingStore(url: Self.url(in: directory)))
+        defer { store.close() }
+        XCTAssertTrue(
+            store.upsert(
+                AlbumSyncMapping(
+                    localAlbumID: Self.deselected, remoteAlbumID: "remote-trip", title: "Trip",
+                    createdAt: Self.date)))
+        XCTAssertTrue(
+            store.addSelection(
+                AlbumSyncSelection(localAlbumID: Self.deselected, title: "Trip", addedAt: Self.date)))
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        World(
+            url: Self.url(in: directory),
+            store: try XCTUnwrap(AlbumSyncMappingStore(url: Self.url(in: directory))))
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.store] }
+
+    func run(_ world: World) async -> Bool {
+        guard world.store.isOperational() else { return false }
+        var added = true
+        let selection =
+            AlbumSyncSelection(localAlbumID: Self.added, title: "Sunny", addedAt: Self.date)
+        if !world.store.addSelection(selection) {
+            added = false
+            // Production keeps going after a failed add: `applySelection` breaks only the adds loop.
+        }
+        if !world.store.removeSelection(localAlbumID: Self.deselected) {
+            return false
+        }
+        return added
+    }
+
+    func close(_ world: World) { world.store.close() }
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        var state = StorageFaultState()
+        try state.addSQLiteTables(of: Self.url(in: directory))
+        try state.addRecords(
+            "mapping", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_mapping;")
+        try state.addRecords(
+            "selection", of: Self.url(in: directory), sql: "SELECT local_album_id FROM album_sync_selection;")
+        return state
+    }
+}
+
+/// The last finished run's per-photo list file (`album-sync-last-run-v1.json`): after each finished sync the runner
+/// rewrites one album's list through the last-run store. The file is a rebuildable cache: a missing, unreadable or
+/// failed file keeps the previous lists, and the next finished run writes again. The case drives the store's file
+/// actor (`AlbumSyncLastRunFile.write`) through the `DurableFileSystem` seam (#1149); the store's `record`/`load`
+/// gating above the file is covered by the last-run store's own tests. The one acceptance is the honest-outcome
+/// violation of the write: the write tolerates its own failure on purpose, so the operation reports success while
+/// the file keeps the previous lists until the next finished run rewrites them (#1155).
+struct AlbumSyncLastRunWriteCase: StorageFaultCase {
+    struct World {
+        let files: StorageFaultFiles
+        let file: AlbumSyncLastRunFile
+    }
+
+    let id = "albumSync.lastRun.write"
+    let atomicity = StorageFaultAtomicity.convergesAfterRestart
+    private static let date = Date(timeIntervalSince1970: 1_700_000_000)
+    /// `AlbumSyncLastRunStore.fileName`; the store's own constant is main-actor isolated, so the case keeps its
+    /// own copy of the stable name.
+    private static let fileName = "album-sync-last-run-v1.json"
+
+    private static func url(in directory: URL) -> URL {
+        directory.appendingPathComponent(Self.fileName)
+    }
+
+    private static func item(_ identifier: String, reason: String) -> BackupFailedItem {
+        BackupFailedItem(
+            id: "album/\(identifier)", filename: "\(identifier).heic", reason: reason, isPermanent: false,
+            isRetryable: true,
+            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: identifier),
+            category: .userResolvable)
+    }
+
+    private static var seededLists: [String: [BackupFailedItem]] {
+        ["album-trip": [item("asset-1", reason: "Not backed up.")]]
+    }
+
+    /// The finished run that this case writes: one album's changed list plus a newly finished album's list.
+    private static var writtenLists: [String: [BackupFailedItem]] {
+        [
+            "album-trip": [item("asset-1", reason: "Not backed up."), item("asset-2", reason: "Too large.")],
+            "album-sun": [item("asset-3", reason: "Not backed up.")],
+        ]
+    }
+
+    func seed(in directory: URL, remote: StorageFaultRemote) async throws {
+        await AlbumSyncLastRunFile(url: Self.url(in: directory)).write(Self.seededLists)
+    }
+
+    func open(_ directory: URL, remote: StorageFaultRemote) throws -> World {
+        let files = StorageFaultFiles()
+        return World(files: files, file: AlbumSyncLastRunFile(url: Self.url(in: directory), fileSystem: files))
+    }
+
+    func faultTargets(of world: World) -> [Any] { [world.files] }
+
+    /// True: a failed write is tolerated on purpose; the case reports the violation through its acceptance.
+    func run(_ world: World) async -> Bool {
+        await world.file.write(Self.writtenLists)
+        return true
+    }
+
+    func close(_ world: World) {}
+
+    func state(in directory: URL) throws -> StorageFaultState {
+        var state = StorageFaultState()
+        state.tables["last-run"] = Self.readLists(at: Self.url(in: directory))
+        state.records["last-run album"] = Set(Self.readRawLists(at: Self.url(in: directory)).keys)
+        return state
+    }
+
+    /// The stored rows of one state, decoded and canonicalized by the test; `JSONEncoder` writes keys in no fixed
+    /// order, so the file itself does not compare byte-wise.
+    private static func readLists(at url: URL) -> [String] {
+        let lists = Self.readRawLists(at: url)
+        let rendered: [String] = lists.map { album, items in
+            let rows = items.map { item in
+                "\(item.id)#\(item.filename)#\(item.reason)#\(item.isPermanent)#\(item.isRetryable)#"
+                    + "\(item.category ?? "-")#\(item.issue)#\(item.source ?? "none")"
+            }.sorted().joined(separator: "|")
+            return album + ": " + rows
+        }
+        return rendered.sorted()
+    }
+
+    /// Reads as the store itself reads it: a missing, unreadable or undecodable file answers empty, and a row whose
+    /// `source` no longer decodes keeps the row with its source read as none (AlbumSyncLastRunFile.read).
+    private static func readRawLists(at url: URL) -> [String: [StoredLastRunItem]] {
+        guard let data = try? Data(contentsOf: url) else { return [:] }
+        guard let lists = try? JSONDecoder().decode([String: [StoredLastRunItem]].self, from: data) else {
+            return [:]
+        }
+        return lists
+    }
+
+    /// The read side of the state comparison.
+    private struct StoredLastRunItem: Codable {
+        let id: String
+        let filename: String
+        let reason: String
+        let category: String?
+        let isPermanent: Bool
+        let isRetryable: Bool
+        let issue: String
+        let source: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case id, filename, reason, category, isPermanent, isRetryable, issue, source
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            filename = try container.decode(String.self, forKey: .filename)
+            reason = try container.decode(String.self, forKey: .reason)
+            category = try container.decodeIfPresent(String.self, forKey: .category)
+            isPermanent = try container.decode(Bool.self, forKey: .isPermanent)
+            isRetryable = try container.decode(Bool.self, forKey: .isRetryable)
+            issue = try container.decodeIfPresent(String.self, forKey: .issue) ?? "unknown"
+            // A source value that no longer decodes keeps the row alive, exactly as the store keeps it.
+            source = try? container.decodeIfPresent(String.self, forKey: .source)
+        }
+    }
+
+    var acceptances: [StorageFaultAcceptance] {
+        [
+            StorageFaultAcceptance(
+                rule: .honestOutcome, phase: .failedRun,
+                point: "replace album-sync-last-run-v1.json",
+                reason:
+                    "a failed write keeps the previous lists on purpose; the file is a rebuildable cache and the "
+                    + "next finished run writes again (#1155)")
+        ]
     }
 }
