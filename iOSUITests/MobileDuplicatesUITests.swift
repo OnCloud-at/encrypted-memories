@@ -31,14 +31,17 @@ final class MobileDuplicatesUITests: XCTestCase {
         let collectionsReady = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in collectionsButton.exists || collectionsCell.exists }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [collectionsReady], timeout: 60), .completed)
-        // On iOS 26.5 in a landscape iPad window, XCTest reports the sidebar cell as not hittable, although its
-        // frame lies in the window, so its own tap fails. The centre tap by coordinate opens the same page.
+        // The entry is a tab button or a sidebar cell. On iOS 26.5 XCTest reports the same element sometimes as
+        // hittable and sometimes not, although its frame always lies in the window. The centre tap by coordinate
+        // opens the same page everywhere and needs no hit test.
         let collectionsEntry = collectionsButton.exists ? collectionsButton : collectionsCell
-        if collectionsEntry.isHittable {
-            collectionsEntry.tap()
-        } else {
-            app.tapOnScreen(collectionsEntry)
-        }
+        XCTAssertTrue(
+            collectionsEntry.waitForExistence(timeout: 10), "the Collections entry exists",
+            file: #filePath, line: #line)
+        XCTAssertTrue(
+            app.windows.firstMatch.frame.contains(collectionsEntry.frame),
+            "the Collections entry lies in the window", file: #filePath, line: #line)
+        collectionsEntry.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
 
         // The list creates rows lazily; Utilities follows the Library rows below the fold on a phone.
         app.openCollectionsRow(app.buttons["duplicates.entry"])
@@ -46,6 +49,20 @@ final class MobileDuplicatesUITests: XCTestCase {
 
     private func group(_ index: Int) -> XCUIElement {
         app.scrollViews["duplicates.group.\(index)"].firstMatch
+    }
+
+    /// A pull from the summary row at the top of the list that scans the library again on every device. The drag
+    /// starts at the row the person sees first, runs for half of the window height and ends slowly with a hold,
+    /// so the refresh control also engages on the tall iPad window, where a faster drag from the window centre
+    /// reached no refresh.
+    private func pullToRefresh() {
+        let summary = app.staticTexts["duplicates.copyCount"].firstMatch
+        XCTAssertTrue(summary.waitForExistence(timeout: 10), "the summary row lists the copies")
+        let start = summary.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        let distance = max(400, app.windows.firstMatch.frame.height / 2)
+        start.press(
+            forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: distance)),
+            withVelocity: XCUIGestureVelocity(200), thenHoldForDuration: 0.3)
     }
 
     private func waitUntilGone(_ element: XCUIElement, _ message: String) {
@@ -482,8 +499,7 @@ final class MobileDuplicatesUITests: XCTestCase {
         XCTAssertFalse(row.exists, "no differing copies are left")
 
         // The fixture lists the deleted copy again on the next scan; the list stays closed until the person opens it.
-        let top = app.staticTexts["duplicates.copyCount"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-        top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 400)))
+        pullToRefresh()
         XCTAssertTrue(row.waitForExistence(timeout: 20), "the rescan lists the differing copies again")
         XCTAssertEqual(message.wait(until: "exists == true", timeout: 4), .timedOut, "the list does not open by itself")
     }
@@ -702,8 +718,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesFixture", extra: ["-EncryptedMemoriesDuplicatesRescanDropsGroup"])
         XCTAssertTrue(group(1).waitForExistence(timeout: 10))
 
-        let top = app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
-        top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 400)))
+        pullToRefresh()
 
         waitUntilGone(group(1), "a refresh scans again and the fixture drops the last group")
     }
@@ -713,8 +728,7 @@ final class MobileDuplicatesUITests: XCTestCase {
             fixture: "-EncryptedMemoriesDuplicatesFixture",
             extra: ["-EncryptedMemoriesDuplicatesRescanDropsGroup", "-EncryptedMemoriesDuplicatesSlowScan"])
         XCTAssertTrue(group(1).waitForExistence(timeout: 15))
-        let top = app.staticTexts["duplicates.copyCount"].coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-        top.press(forDuration: 0.05, thenDragTo: top.withOffset(CGVector(dx: 0, dy: 400)))
+        pullToRefresh()
 
         let progress = app.activityIndicators["duplicates.loading"].firstMatch
         XCTAssertTrue(progress.waitForExistence(timeout: 3), "the refresh replaces the list while scanning")
