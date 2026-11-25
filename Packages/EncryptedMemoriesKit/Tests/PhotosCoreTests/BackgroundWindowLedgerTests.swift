@@ -66,18 +66,19 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         let started = ledger.begin(.smartSearch, at: minute(0))
 
         XCTAssertEqual(
-            ledger.records(), [BackgroundWindowRecord(kind: .smartSearch, outcome: .unfinished, startedAt: minute(0))],
+            ledger.displayRecords(),
+            [BackgroundWindowRecord(kind: .smartSearch, outcome: .unfinished, startedAt: minute(0))],
             "a process that iOS ends during the window leaves an unfinished window, not none")
         ledger.end(started, with: .ran)
         XCTAssertEqual(
-            ledger.records(), [BackgroundWindowRecord(kind: .smartSearch, outcome: .ran, startedAt: minute(0))])
+            ledger.displayRecords(), [BackgroundWindowRecord(kind: .smartSearch, outcome: .ran, startedAt: minute(0))])
     }
 
     func testTheRecordHoldsOnlyTheKindTheOutcomeAndTheMinute() throws {
         let ledger = makeLedger()
         record(ledger, .ran, at: minute(3).addingTimeInterval(59.9))
 
-        XCTAssertEqual(ledger.records().first?.startedAt, minute(3), "the time is rounded down to the minute")
+        XCTAssertEqual(ledger.displayRecords().first?.startedAt, minute(3), "the time is rounded down to the minute")
         let file = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any])
         let records = try XCTUnwrap(file["records"] as? [[String: Any]])
@@ -93,7 +94,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
             record(ledger, .ran, at: minute(index))
         }
 
-        let records = ledger.records()
+        let records = ledger.displayRecords()
         XCTAssertEqual(BackgroundWindowLedger.limit, 200)
         XCTAssertEqual(records.count, 200)
         XCTAssertEqual(records.first?.startedAt, minute(1), "the oldest window goes first")
@@ -109,7 +110,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
 
         ledger.end(early, with: .expired)
 
-        let records = ledger.records()
+        let records = ledger.displayRecords()
         XCTAssertEqual(records.count, 200)
         XCTAssertEqual(records.first?.startedAt, minute(2))
         XCTAssertEqual(
@@ -125,7 +126,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         ledger.end(first, with: .expired)
 
         XCTAssertEqual(
-            ledger.records(),
+            ledger.displayRecords(),
             [
                 BackgroundWindowRecord(kind: .smartSearch, outcome: .ran, startedAt: minute(1)),
                 BackgroundWindowRecord(kind: .photoBackup, outcome: .expired, startedAt: minute(0)),
@@ -142,7 +143,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
 
         record(ledger, .ran, at: minute(BackgroundWindowLedger.limit))
 
-        let records = ledger.records()
+        let records = ledger.displayRecords()
         XCTAssertEqual(records.count, 200)
         XCTAssertEqual(records.first?.startedAt, minute(2), "the window that ended first goes first")
         XCTAssertTrue(
@@ -159,7 +160,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         ledger.end(first, with: .failed)
 
         XCTAssertEqual(
-            ledger.records(),
+            ledger.displayRecords(),
             [
                 BackgroundWindowRecord(kind: .photoBackup, outcome: .failed, startedAt: minute(0)),
                 later.record,
@@ -178,7 +179,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         ledger.end(later, with: .ran)
 
         XCTAssertEqual(
-            ledger.records(),
+            ledger.displayRecords(),
             [
                 first.record,
                 BackgroundWindowRecord(kind: .smartSearch, outcome: .ran, startedAt: minute(0)),
@@ -195,7 +196,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         ledger.end(started, with: .expired)
 
         XCTAssertEqual(
-            ledger.records(), [BackgroundWindowRecord(kind: .photoBackup, outcome: .ran, startedAt: minute(0))])
+            ledger.displayRecords(), [BackgroundWindowRecord(kind: .photoBackup, outcome: .ran, startedAt: minute(0))])
     }
 
     func testAStartWhoseWriteFailedWritesNothingAtItsEnd() throws {
@@ -228,7 +229,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         ledger.end(second, with: .ran)
         ledger.end(first, with: .expired)
 
-        XCTAssertEqual(ledger.records().map(\.outcome).sorted { $0.rawValue < $1.rawValue }, [.expired, .ran])
+        XCTAssertEqual(ledger.displayRecords().map(\.outcome).sorted { $0.rawValue < $1.rawValue }, [.expired, .ran])
     }
 
     // MARK: - The file
@@ -237,7 +238,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         record(makeLedger(), .notNeeded, kind: .smartSearch, at: minute(0))
 
         XCTAssertEqual(
-            makeLedger().records(),
+            makeLedger().displayRecords(),
             [BackgroundWindowRecord(kind: .smartSearch, outcome: .notNeeded, startedAt: minute(0))])
     }
 
@@ -251,7 +252,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         record(ledger, .ran, at: minute(0))
 
         XCTAssertEqual(
-            ledger.records(), [BackgroundWindowRecord(kind: .photoBackup, outcome: .ran, startedAt: minute(0))])
+            ledger.displayRecords(), [BackgroundWindowRecord(kind: .photoBackup, outcome: .ran, startedAt: minute(0))])
         XCTAssertEqual(diagnostics.supportSnapshot().counters, ["backgroundWindows.ledgerReset": 1])
     }
 
@@ -265,9 +266,9 @@ final class BackgroundWindowLedgerTests: XCTestCase {
 
         record(ledger, .ran, at: minute(1))
 
-        XCTAssertEqual(ledger.records(), [], "the report shows nothing it cannot read")
+        XCTAssertEqual(ledger.displayRecords(), [], "the report shows nothing it cannot read")
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-        XCTAssertEqual(ledger.records(), [earlier], "the unreadable file keeps its records")
+        XCTAssertEqual(ledger.displayRecords(), [earlier], "the unreadable file keeps its records")
         XCTAssertEqual(diagnostics.supportSnapshot().counters, [:], "an unreadable file is not a damaged file")
     }
 
@@ -283,7 +284,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         record(ledger, .ran, at: minute(0))
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
-        XCTAssertEqual(ledger.records(), [])
+        XCTAssertEqual(ledger.displayRecords(), [])
     }
 
     // MARK: - Sign-out
@@ -324,7 +325,8 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         BackupLocalDataPurge.requestPurgeOnSignOut(defaults: defaults)
         ledger.end(started, with: .ran)
 
-        XCTAssertEqual(ledger.records(), [started.record], "the start stays unfinished until the purge removes it")
+        XCTAssertEqual(
+            ledger.displayRecords(), [started.record], "the start stays unfinished until the purge removes it")
         XCTAssertTrue(BackupLocalDataPurge.purgeIfSignOutRequested(defaults: defaults, roots: purge.roots))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
     }
@@ -397,13 +399,14 @@ final class BackgroundWindowLedgerTests: XCTestCase {
             success in reports.set((reports.value ?? []) + [success])
         }
 
-        XCTAssertEqual(ledger.records().map(\.outcome), [.unfinished], "the window is recorded when it starts")
+        XCTAssertEqual(ledger.displayRecords().map(\.outcome), [.unfinished], "the window is recorded when it starts")
         completion.finish(.notNeeded)
         completion.finish(.expired)
 
         XCTAssertEqual(reports.value, [true])
         XCTAssertEqual(
-            ledger.records(), [BackgroundWindowRecord(kind: .photoBackup, outcome: .notNeeded, startedAt: minute(0))])
+            ledger.displayRecords(),
+            [BackgroundWindowRecord(kind: .photoBackup, outcome: .notNeeded, startedAt: minute(0))])
     }
 
     /// A continued backup task records its own kind in the photo backup log, and its result can differ from the
@@ -421,7 +424,8 @@ final class BackgroundWindowLedgerTests: XCTestCase {
 
         XCTAssertEqual(reports.value, [false])
         XCTAssertEqual(
-            ledger.records(), [BackgroundWindowRecord(kind: .continuedBackup, outcome: .ran, startedAt: minute(0))])
+            ledger.displayRecords(),
+            [BackgroundWindowRecord(kind: .continuedBackup, outcome: .ran, startedAt: minute(0))])
         XCTAssertEqual(
             lines.values,
             [
@@ -444,7 +448,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         completion.finish(.expired)
 
         XCTAssertEqual(reports.value, [false])
-        XCTAssertEqual(ledger.records().map(\.outcome), [.expired])
+        XCTAssertEqual(ledger.displayRecords().map(\.outcome), [.expired])
     }
 
     func testAWindowEndsOnlyAfterItsWaitReturned() async {
@@ -467,12 +471,12 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         }
         await awaitWindowEvent(waiting, "the wait")
         XCTAssertEqual(reports.value, [], "the OS hears nothing while the wait runs")
-        XCTAssertEqual(ledger.records().map(\.outcome), [.unfinished])
+        XCTAssertEqual(ledger.displayRecords().map(\.outcome), [.unfinished])
         release.fire()
         await finishing.value
 
         XCTAssertEqual(reports.value, [true])
-        XCTAssertEqual(ledger.records().map(\.outcome), [.ran])
+        XCTAssertEqual(ledger.displayRecords().map(\.outcome), [.ran])
     }
 
     func testAnExpiryDuringTheEndWaitIsRecordedWhileTheEarlierSuccessStays() async {
@@ -488,7 +492,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
             after: { completion.markExpired() },
             deciding: { (BackgroundWindowOutcome.ran.afterTheEndWait(didExpire: completion.didExpire), true) })
 
-        XCTAssertEqual(ledger.records().map(\.outcome), [.expired], "the ledger records the expiry")
+        XCTAssertEqual(ledger.displayRecords().map(\.outcome), [.expired], "the ledger records the expiry")
         XCTAssertEqual(reports.value, [true], "the OS hears the success of the finished work")
     }
 
@@ -511,7 +515,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
         completion.finish(.expired, reportsSuccess: true)
 
         XCTAssertEqual(reports.value, [true])
-        XCTAssertEqual(ledger.records().map(\.outcome), [.expired])
+        XCTAssertEqual(ledger.displayRecords().map(\.outcome), [.expired])
     }
 
     // MARK: - The support report
@@ -532,7 +536,7 @@ final class BackgroundWindowLedgerTests: XCTestCase {
                 .init(kind: .photoBackup, outcome: .ran, count: 2),
                 .init(kind: .smartSearch, outcome: .ran, count: 1),
             ])
-        XCTAssertEqual(snapshot.records, ledger.records())
+        XCTAssertEqual(snapshot.records, ledger.displayRecords())
     }
 
     func testTheSupportReportHasTheBackgroundWindowSection() async throws {

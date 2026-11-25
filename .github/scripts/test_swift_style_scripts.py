@@ -464,15 +464,17 @@ echo "Done linting!"
         self.assertNotIn('Notice:', result.stdout)
 
     def test_the_checked_in_baseline_has_no_slack_for_its_existing_core_site(self):
-        self.FILE = 'Packages/EncryptedMemoriesKit/Sources/ProtonDriveBackend/DriveSDKBridge.swift'
-        rule = 'no_default_for_store_read_in_decision_code'
+        self.FILE = 'Packages/EncryptedMemoriesKit/Sources/AlbumSyncCore/AlbumSyncBackupReport.swift'
+        rule = 'decision_code_receives_store_protocol'
         source = self.repo / self.FILE
         source.parent.mkdir(parents=True)
         source.write_text('let reader = 1\n')
         baseline = '.swiftlint-decision-reads-baseline'
         (self.repo / baseline).write_bytes((ROOT / baseline).read_bytes())
-        # The real full lint reports one current site in this bridge file. Use the checked-in allowance, not the scratch
-        # baseline. The file must stay a site that the checked-in baseline still lists with one allowed read.
+        # The real full lint reports one current site in this file. Use the checked-in allowance, not the scratch
+        # baseline. The file must stay a site that the checked-in baseline still lists with one allowed read; when a
+        # change removes the site, it lowers the baseline line and updates this test in the same commit (#1140 did both
+        # for its four store-read sites).
         for sites, status in [(1, 0), (2, 1)]:
             with self.subTest(sites=sites):
                 result = self.lint(self.swiftlint(sites, rule=rule), self.FILE)

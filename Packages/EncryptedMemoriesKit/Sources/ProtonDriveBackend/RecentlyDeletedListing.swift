@@ -20,7 +20,9 @@ enum RecentlyDeletedItem {
 /// A trashed photo left every inventory, and only a listing proves that the user may read it. Without the
 /// stored listing, Recently Deleted could not open offline, and the first cache sweep after a launch removed
 /// the thumbnails of every trashed photo. The sign-out purge removes the account directory and with it this file.
-struct RecentlyDeletedListingStore: Sendable {
+/// The Recently Deleted listing as the app stores it: the last listing, the photos trashed here, and the photos
+/// that wait for the library to confirm their removal. An instance holds the file and its key.
+final class RecentlyDeletedListingStore: @unchecked Sendable {
     static let fileName = "recently-deleted-v1.enc"
 
     private struct Record: Codable {
@@ -68,6 +70,12 @@ struct RecentlyDeletedListingStore: Sendable {
 
     private let url: URL
     private let key: SymmetricKey
+    private let lock = NSLock()
+    /// True after a seeding read answered unknown, until a read opens the file again. While it is set, no save
+    /// may replace the file: a file that the store cannot open proves nothing, and overwriting it would turn the
+    /// unknown into a loss of the stored state. The bridge seeds once per instance, so the block in practice ends
+    /// only with a relaunch whose seeding read opens the file, or with the sign-out purge.
+    private var seedingAnsweredUnknown = false
 
     init(directory: URL, accountUID: String, keyPassword: String) {
         url = directory.appendingPathComponent(Self.fileName)
@@ -77,13 +85,32 @@ struct RecentlyDeletedListingStore: Sendable {
         key = HKDF<SHA256>.deriveKey(inputKeyMaterial: input, salt: salt, info: info, outputByteCount: 32)
     }
 
+    /// The stored state as a typed answer for the code that decides from it: found, absent, or unknown. A file
+    /// that exists but cannot be opened (another key, corruption) answers unknown, never absent (#1140).
+    func seeding() -> StoreLookup<RecentlyDeletedIdentities.Persisted> {
+        guard let contents = readContents() else {
+            if FileManager.default.fileExists(atPath: url.path) {
+                lock.withLock { seedingAnsweredUnknown = true }
+                return .unknown
+            }
+            return .absent
+        }
+        lock.withLock { seedingAnsweredUnknown = false }
+        return .found(
+            RecentlyDeletedIdentities.Persisted(
+                listing: contents.listing?.map(\.item),
+                trashedHere: contents.trashedHere.map {
+                    .init(
+                        uid: PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID), item: $0.item?.item,
+                        misses: $0.misses)
+                },
+                trashedAwaitingLibrary: Self.waits(contents.awaitingLibrary),
+                removedElsewhereAwaitingLibrary: Self.waits(contents.removedElsewhere)))
+    }
+
     /// The stored state, or nil when there is none or it cannot be opened (another key, corruption).
     func load() -> RecentlyDeletedIdentities.Persisted? {
-        guard let blob = try? Data(contentsOf: url),
-            let box = try? AES.GCM.SealedBox(combined: blob),
-            let plaintext = try? AES.GCM.open(box, using: key),
-            let contents = try? JSONDecoder().decode(Contents.self, from: plaintext)
-        else { return nil }
+        guard let contents = readContents() else { return nil }
         return RecentlyDeletedIdentities.Persisted(
             listing: contents.listing?.map(\.item),
             trashedHere: contents.trashedHere.map {
@@ -93,6 +120,16 @@ struct RecentlyDeletedListingStore: Sendable {
             },
             trashedAwaitingLibrary: Self.waits(contents.awaitingLibrary),
             removedElsewhereAwaitingLibrary: Self.waits(contents.removedElsewhere))
+    }
+
+    /// Opens and decodes the stored file. Nil when there is no readable state.
+    private func readContents() -> Contents? {
+        guard let blob = try? Data(contentsOf: url),
+            let box = try? AES.GCM.SealedBox(combined: blob),
+            let plaintext = try? AES.GCM.open(box, using: key),
+            let contents = try? JSONDecoder().decode(Contents.self, from: plaintext)
+        else { return nil }
+        return contents
     }
 
     private static func waits(_ records: [AwaitingLibraryRecord]?) -> [PhotoUID: Date] {
@@ -110,8 +147,11 @@ struct RecentlyDeletedListingStore: Sendable {
         }
     }
 
-    /// Best effort: a failed write only means that the next offline launch shows an older listing.
+    /// Best effort: a failed write only means that the next offline launch shows an older listing. A seeding read
+    /// that answered unknown blocks the write instead: overwriting a file that the store cannot open would trade
+    /// an unknown for a loss of the stored state.
     func save(_ persisted: RecentlyDeletedIdentities.Persisted) {
+        if lock.withLock({ seedingAnsweredUnknown }) { return }
         let contents = Contents(
             listing: persisted.listing?.map(Record.init),
             trashedHere: persisted.trashedHere.map {

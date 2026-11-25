@@ -308,7 +308,16 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
             directory: libraryDirectory, accountUID: session.uid, keyPassword: session.keyPassword,
             policy: policy.libraryDatabasePolicy)
         Task { @MainActor in photoNames?.registerForMemoryPressure(.shared) }
-        let recentlyDeleted = RecentlyDeletedIdentities(persisted: recentlyDeletedStore.load() ?? .init())
+        // The seeding read answers found, absent or unknown. Unknown never reads as absent: an unreadable
+        // file seeds nothing and blocks every save below, so the unreadable state stays for a repair instead
+        // of being overwritten with the state of an empty session.
+        let recentlyDeletedSeed: RecentlyDeletedIdentities.Persisted
+        switch recentlyDeletedStore.seeding() {
+        case .found(let persisted): recentlyDeletedSeed = persisted
+        case .absent: recentlyDeletedSeed = .init()
+        case .unknown: recentlyDeletedSeed = .init()
+        }
+        let recentlyDeleted = RecentlyDeletedIdentities(persisted: recentlyDeletedSeed)
         // Keep the optional native SDK cache in memory. SDK 0.31.1 only frees the managed client handle;
         // it does not deterministically dispose its SQLite repository. A persistent native cache can therefore
         // still own WAL files after shutdown and makes the required same-process sign-out purge unsafe.
@@ -673,7 +682,8 @@ actor DriveSDKBridge: PhotosRepository, LibraryChangeTokenProvider, ThumbnailPro
                     }
                 }
                 // This load moves the event cursor past these events, while the next listing can still return the
-                // removed files. The waits are saved before the cursor moves, so a relaunch keeps them.
+                // removed files. The waits are saved before the cursor moves, so a relaunch keeps them. A seeding
+                // read that answered unknown blocks the save instead, and then the waits stay unknown like the file.
                 let removalsChanged =
                     if let remoteChanges {
                         recentlyDeleted.eventsRead(remoteChanges, volumeID: root.volumeID, at: listingReadAt)

@@ -210,14 +210,20 @@ public final class BackgroundWindowLedger: @unchecked Sendable {
             [(.init("kind"), .name(ended.kind)), (.init("outcome"), .name(outcome))])
     }
 
-    /// The kept records, oldest first.
-    public func records() -> [BackgroundWindowRecord] {
+    /// The kept records, oldest first, as the support report shows them.
+    ///
+    /// This read feeds only the support report and other drawing. It never answers a decision: a decision
+    /// reads the file itself and stops when that read fails. Here a file that cannot be read shows as empty.
+    public func displayRecords() -> [BackgroundWindowRecord] {
         guard let fileURL else { return [] }
-        return Self.lock.withLock { load(fileURL, replacesDamagedFile: false) ?? [] }
+        return Self.lock.withLock {
+            guard let stored = load(fileURL, replacesDamagedFile: false) else { return [] }
+            return stored
+        }
     }
 
     public func supportSnapshot() -> BackgroundWindowSupportSnapshot {
-        let records = records()
+        let records = displayRecords()
         var counts: [BackgroundWindowKind: [BackgroundWindowOutcome: Int]] = [:]
         for record in records {
             counts[record.kind, default: [:]][record.outcome, default: 0] += 1

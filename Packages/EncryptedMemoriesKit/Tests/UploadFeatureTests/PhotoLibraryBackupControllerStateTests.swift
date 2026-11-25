@@ -3743,7 +3743,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertEqual(probe.settledAtResult, [true], "the result is chosen after the pass settled")
             XCTAssertEqual(manual.fixture.scan.starts.count, 1, "a pass without backed-up photos starts no next pass")
             XCTAssertFalse(probe.protection.isProtected(owner: controller, runID: manual.runID), "protection released")
-            XCTAssertEqual(probe.ledger.records().map(\.kind), [.continuedBackup])
+            XCTAssertEqual(probe.ledger.displayRecords().map(\.kind), [.continuedBackup])
             probe.task?.cancel()
             await controller.shutdown()
         }
@@ -3765,7 +3765,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             manual.fixture.scan.open.value = true
             await probe.task?.value
             XCTAssertEqual(probe.results, [false], "work was left: a stop, reported once")
-            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.expired])
+            XCTAssertEqual(probe.ledger.displayRecords().map(\.outcome), [.expired])
             let endLogged = await waitUntil { probe.events.contains("continued.end") }
             XCTAssertTrue(endLogged)
             XCTAssertLessThan(
@@ -3815,7 +3815,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             manual.fixture.scan.open.value = true
             await probe.task?.value
             XCTAssertEqual(probe.results, [false])
-            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.notNeeded], "a paused backup ends the task")
+            XCTAssertEqual(probe.ledger.displayRecords().map(\.outcome), [.notNeeded], "a paused backup ends the task")
             XCTAssertEqual(manual.fixture.scan.starts.count, 1, "no further pass starts")
             await controller.shutdown()
         }
@@ -3888,7 +3888,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
             XCTAssertTrue(ended)
             XCTAssertEqual(probe.results, [false])
-            XCTAssertEqual(probe.ledger.records().map(\.outcome), [.notNeeded], "a sign-out ends the task")
+            XCTAssertEqual(probe.ledger.displayRecords().map(\.outcome), [.notNeeded], "a sign-out ends the task")
             XCTAssertTrue(
                 try XCTUnwrap(probe.cards.last).hasPrefix(L10n.string("backup.phase_waiting")),
                 "the card says that the backup is incomplete")
@@ -5245,7 +5245,7 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             let heard = LockedFlag(true)
             let completion = PhotoLibraryRefreshWindow.begin(ledger: ledger) { heard.value = $0 }
             await completion.finish(.notNeeded, after: {})
-            XCTAssertEqual(ledger.records().map(\.kind), [.libraryRefresh])
+            XCTAssertEqual(ledger.displayRecords().map(\.kind), [.libraryRefresh])
             XCTAssertEqual(ledger.supportSnapshot().counts.map(\.kind), [.libraryRefresh])
         }
 

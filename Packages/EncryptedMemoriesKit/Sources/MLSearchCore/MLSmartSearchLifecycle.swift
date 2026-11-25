@@ -364,7 +364,9 @@ public actor MLSmartSearchLifecycle {
 
     private func restorePersistentState() -> Bool {
         do {
-            persistent = try deps.stateStore.load() ?? MLSmartSearchPersistentState()
+            // The read throws when the stored state cannot be read; nil means that no state file exists yet.
+            let stored = try deps.stateStore.load()
+            persistent = stored ?? MLSmartSearchPersistentState()
             stateLoadFailed = false
             return true
         } catch {
