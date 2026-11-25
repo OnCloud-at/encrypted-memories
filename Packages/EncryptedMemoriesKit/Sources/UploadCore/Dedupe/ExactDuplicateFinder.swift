@@ -336,7 +336,7 @@ public struct ExactDuplicateFinder: Sendable {
         let coverage = coverage(hashKeyEpoch: epoch)
         // Known related files, such as Live Photo videos and originals, never are members.
         guard let candidates = index.remoteContentDuplicateGroups(hashKeyEpoch: epoch) else {
-            throw UploadError.backend("Upload identity manifest could not be read")
+            throw UploadError.internalFailure(.identityManifestNotRead)
         }
         guard !candidates.isEmpty else { return ExactDuplicateScan(groups: [], coverage: coverage) }
         let volumeID = try await remote.ownPhotosVolumeID()
@@ -1308,7 +1308,7 @@ public struct ExactDuplicateFinder: Sendable {
         case .ready: break
         case .replacedUnreadable: log("[Duplicates] the unreadable merge journal moved aside; a new one starts")
         case .unavailable:
-            let error = UploadError.backend("Duplicate merge journal could not be updated")
+            let error = UploadError.internalFailure(.duplicateMergeJournalNotUpdated)
             for (index, _) in writes { results[index] = .failure(error) }
             return
         }
@@ -1348,7 +1348,7 @@ public struct ExactDuplicateFinder: Sendable {
                     continue
                 }
                 guard identities.rebindRemoteLinks(plan.moves, hashKeyEpoch: plan.epoch) else {
-                    throw UploadError.backend("Upload identity manifest could not be updated")
+                    throw UploadError.internalFailure(.identityManifestNotUpdated)
                 }
                 trashing.append((index, plan))
             } catch {
@@ -1382,7 +1382,7 @@ public struct ExactDuplicateFinder: Sendable {
         mergesInFlight.insert(intents)
         defer { mergesInFlight.remove(intents) }
         guard mergeJournal.record(intents) else {
-            let error = UploadError.backend("Duplicate merge journal could not be updated")
+            let error = UploadError.internalFailure(.duplicateMergeJournalNotUpdated)
             for (index, _) in trashing { results[index] = .failure(error) }
             return
         }
@@ -1429,7 +1429,7 @@ public struct ExactDuplicateFinder: Sendable {
                 results[index] = trashError.flatMap { duplicatesLeft ? .failure($0) : nil } ?? .success(merged)
             case .success(.gone):
                 results[index] = .failure(
-                    trashError ?? UploadError.backend("No copy of the merged duplicates is on the server"))
+                    trashError ?? UploadError.internalFailure(.mergedDuplicateServerCopyMissing))
             case .failure(let error):
                 results[index] = .failure(trashError ?? error)
             }
@@ -1570,7 +1570,7 @@ public struct ExactDuplicateFinder: Sendable {
             // No duplicate came back, for example after its deletion from the trash: the kept photo is the last copy.
             try await restore([kept], volumeID: intent.volumeID)
             guard try await readAfterTrash([kept])[kept]?.isActiveMain == true else {
-                throw UploadError.backend("No copy of the merged duplicates is in the library")
+                throw UploadError.internalFailure(.mergedDuplicateLibraryCopyMissing)
             }
             return .kept(duplicatesLeft: false)
         }
@@ -1582,7 +1582,7 @@ public struct ExactDuplicateFinder: Sendable {
             UploadRemoteLinkMove(from: $0.to, to: $0.from, contentHash: $0.contentHash)
         }
         guard identities.rebindRemoteLinks(movesBack, hashKeyEpoch: intent.hashKeyEpoch) else {
-            throw UploadError.backend("Upload identity manifest could not be updated")
+            throw UploadError.internalFailure(.identityManifestNotUpdated)
         }
         return .restored
     }

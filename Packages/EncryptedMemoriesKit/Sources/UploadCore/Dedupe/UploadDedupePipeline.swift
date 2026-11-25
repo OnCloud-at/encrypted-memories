@@ -241,7 +241,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             sha1Digest = digest
         } else if let digest = descriptor.precomputedSHA1Digest {
             guard digest.count == 20 else {
-                throw UploadError.backend("Invalid precomputed SHA-1 digest")
+                throw UploadError.internalFailure(.invalidPrecomputedDigest)
             }
             sha1Digest = digest
         } else {
@@ -863,7 +863,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                     }
                     let stated = toProve.filter { relatedReads.visibility[$0]?.hasExplicitPhotoState == true }
                     guard toProve.subtracting(stated).isSubset(of: trashedToProve) else {
-                        throw UploadError.backend("The role of a copy with these bytes is unavailable")
+                        throw UploadError.internalFailure(.copyRoleUnavailable)
                     }
                     relatedLinkIDs = stated.filter { relatedReads.visibility[$0]?.mainPhotoLinkID == mainLinkID }
                 }
@@ -1359,7 +1359,7 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
             carriesReadLink
             ? store.upsert(record, keepingRemoteLinkChangedFrom: cached?.remoteLinkID) : store.upsert(record)
         guard written else {
-            throw UploadError.backend("Upload identity manifest could not be updated")
+            throw UploadError.internalFailure(.identityManifestNotUpdated)
         }
     }
 

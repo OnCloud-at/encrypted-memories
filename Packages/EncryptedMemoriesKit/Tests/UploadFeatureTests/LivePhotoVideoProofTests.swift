@@ -319,7 +319,7 @@ final class LivePhotoVideoProofPipelineTests: XCTestCase {
             let result = try await pipeline.resolve(video())
             XCTFail("an active copy without a stated role must fail: \(result.decision)")
         } catch let error as UploadError {
-            XCTAssertEqual(error, .backend("The role of a copy with these bytes is unavailable"))
+            XCTAssertEqual(error, .internalFailure(.copyRoleUnavailable))
         }
         XCTAssertNil(store.record(for: video().source)?.outcome)
         try await assertTheClaimsOfTheVideoAreReleased()

@@ -687,6 +687,25 @@ public enum UploadError: LocalizedError, Equatable {
         case deletionCheckPending
         case remoteDraftExists
         case remoteInconsistent
+        /// The cases of the dedupe stage (#1159). They keep the fixed text of the backend error that each one
+        /// replaces, so the stored detail of a row and the text that a person sees do not change.
+        case relatedPhotosUnavailable
+        case duplicateIndexUnavailable
+        case duplicateIndexCheckpointNotSaved
+        case duplicateIndexNotSaved
+        case duplicateIndexChangesNotSaved
+        case identityManifestNotRead
+        case duplicateMergeJournalNotUpdated
+        case mergedDuplicateServerCopyMissing
+        case mergedDuplicateLibraryCopyMissing
+        case invalidPrecomputedDigest
+        case restoredCompoundCheckingUnavailable
+        case noUploadDecisionReceivedRemoteCommit
+        case uploadDecisionWithoutReceipt
+        case copyRoleUnavailable
+        /// The case of the resolver that fails closed when the identity manifest cannot be opened. It keeps the
+        /// fixed text of the backend error that it replaces.
+        case dedupeProtectionUnavailable
 
         /// The localized local-state message of the app. The one place that names its key.
         public static var localStateMessage: String { L10n.string("backup.error_local_state_unavailable") }
@@ -721,6 +740,22 @@ public enum UploadError: LocalizedError, Equatable {
             case .deletionCheckPending: L10n.string("backup.issue_deletion_check")
             case .remoteDraftExists: L10n.string("upload.error_remote_draft")
             case .remoteInconsistent: L10n.string("upload.error_remote_inconsistent")
+            case .relatedPhotosUnavailable: "Related photos of the main photo are unavailable"
+            case .duplicateIndexUnavailable: "Remote duplicate index is unavailable"
+            case .duplicateIndexCheckpointNotSaved: "Remote duplicate index checkpoint could not be saved"
+            case .duplicateIndexNotSaved: "Remote duplicate index could not be saved"
+            case .duplicateIndexChangesNotSaved: "Remote duplicate index changes could not be saved"
+            case .identityManifestNotRead: "Upload identity manifest could not be read"
+            case .duplicateMergeJournalNotUpdated: "Duplicate merge journal could not be updated"
+            case .mergedDuplicateServerCopyMissing: "No copy of the merged duplicates is on the server"
+            case .mergedDuplicateLibraryCopyMissing: "No copy of the merged duplicates is in the library"
+            case .invalidPrecomputedDigest: "Invalid precomputed SHA-1 digest"
+            case .restoredCompoundCheckingUnavailable: "Restored compound checking is unavailable"
+            case .noUploadDecisionReceivedRemoteCommit:
+                "Upload decision scope received a remote commit for a no-upload decision"
+            case .uploadDecisionWithoutReceipt: "Upload decision scope ended without a remote commit receipt"
+            case .copyRoleUnavailable: "The role of a copy with these bytes is unavailable"
+            case .dedupeProtectionUnavailable: "Duplicate protection is unavailable; upload cannot start safely."
             }
         }
 
@@ -741,6 +776,14 @@ public enum UploadError: LocalizedError, Equatable {
                 .managerReleased, .identityResolverUnavailable, .deletionJournalUnavailable,
                 .uploadDecisionWithoutTransport:
                 .unknown
+            case .relatedPhotosUnavailable, .duplicateIndexUnavailable, .restoredCompoundCheckingUnavailable,
+                .copyRoleUnavailable, .noUploadDecisionReceivedRemoteCommit, .uploadDecisionWithoutReceipt,
+                .mergedDuplicateServerCopyMissing, .mergedDuplicateLibraryCopyMissing:
+                .unknown
+            case .identityManifestNotRead, .duplicateMergeJournalNotUpdated, .duplicateIndexCheckpointNotSaved,
+                .duplicateIndexNotSaved, .duplicateIndexChangesNotSaved, .invalidPrecomputedDigest:
+                .localState
+            case .dedupeProtectionUnavailable: .unknown
             }
         }
     }

@@ -48,6 +48,22 @@ final class InternalFailurePersistedRecordTests: XCTestCase {
         .deletionCheckPending: L10n.string("backup.issue_deletion_check"),
         .remoteDraftExists: L10n.string("upload.error_remote_draft"),
         .remoteInconsistent: L10n.string("upload.error_remote_inconsistent"),
+        .relatedPhotosUnavailable: "Related photos of the main photo are unavailable",
+        .duplicateIndexUnavailable: "Remote duplicate index is unavailable",
+        .duplicateIndexCheckpointNotSaved: "Remote duplicate index checkpoint could not be saved",
+        .duplicateIndexNotSaved: "Remote duplicate index could not be saved",
+        .duplicateIndexChangesNotSaved: "Remote duplicate index changes could not be saved",
+        .identityManifestNotRead: "Upload identity manifest could not be read",
+        .duplicateMergeJournalNotUpdated: "Duplicate merge journal could not be updated",
+        .mergedDuplicateServerCopyMissing: "No copy of the merged duplicates is on the server",
+        .mergedDuplicateLibraryCopyMissing: "No copy of the merged duplicates is in the library",
+        .invalidPrecomputedDigest: "Invalid precomputed SHA-1 digest",
+        .restoredCompoundCheckingUnavailable: "Restored compound checking is unavailable",
+        .noUploadDecisionReceivedRemoteCommit:
+            "Upload decision scope received a remote commit for a no-upload decision",
+        .uploadDecisionWithoutReceipt: "Upload decision scope ended without a remote commit receipt",
+        .copyRoleUnavailable: "The role of a copy with these bytes is unavailable",
+        .dedupeProtectionUnavailable: "Duplicate protection is unavailable; upload cannot start safely.",
     ]
 
     /// The class of every case, written out: a failed read or write of a store or file is a local state; a refusal, a
@@ -80,6 +96,21 @@ final class InternalFailurePersistedRecordTests: XCTestCase {
         .deletionCheckPending: .unknown,
         .remoteDraftExists: .unknown,
         .remoteInconsistent: .unknown,
+        .relatedPhotosUnavailable: .unknown,
+        .duplicateIndexUnavailable: .unknown,
+        .duplicateIndexCheckpointNotSaved: .localState,
+        .duplicateIndexNotSaved: .localState,
+        .duplicateIndexChangesNotSaved: .localState,
+        .identityManifestNotRead: .localState,
+        .duplicateMergeJournalNotUpdated: .localState,
+        .mergedDuplicateServerCopyMissing: .unknown,
+        .mergedDuplicateLibraryCopyMissing: .unknown,
+        .invalidPrecomputedDigest: .localState,
+        .restoredCompoundCheckingUnavailable: .unknown,
+        .noUploadDecisionReceivedRemoteCommit: .unknown,
+        .uploadDecisionWithoutReceipt: .unknown,
+        .copyRoleUnavailable: .unknown,
+        .dedupeProtectionUnavailable: .unknown,
     ]
 
     func testEveryInternalFailureKeepsTheTextOfTheBackendErrorItReplaces() {

@@ -236,7 +236,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         guard let main = metadata.first(where: { $0.link.linkID == mainLinkID }),
             main.photo?.hasCompleteRelatedPhotoLinkIDs == true
         else {
-            throw UploadError.backend("Related photos of the main photo are unavailable")
+            throw UploadError.internalFailure(.relatedPhotosUnavailable)
         }
         return Set(main.relatedPhotoLinkIDs)
     }
@@ -332,7 +332,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         try await refreshRemoteContentIndex(material: material)
         let health = contentIndexStore.remoteContentIndexHealth(hashKeyEpoch: material.epoch)
         guard health != .unavailable else {
-            throw UploadError.backend("Remote duplicate index is unavailable")
+            throw UploadError.internalFailure(.duplicateIndexUnavailable)
         }
         return health
     }
@@ -415,7 +415,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
         // A failed rebuild throws above and runs again with the next preparation.
         if rebuildsLineage { rebuiltLineageEpochs.insert(material.epoch) }
         guard contentIndexStore.remoteContentIndexHealth(hashKeyEpoch: material.epoch) != .unavailable else {
-            throw UploadError.backend("Remote duplicate index is unavailable")
+            throw UploadError.internalFailure(.duplicateIndexUnavailable)
         }
         await progress(.init(phase: .ready))
     }
@@ -688,7 +688,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 updatedAt: Date()
             )
         else {
-            throw UploadError.backend("Remote duplicate index checkpoint could not be saved")
+            throw UploadError.internalFailure(.duplicateIndexCheckpointNotSaved)
         }
         var lineageBuildReady = lineageStore?.prepareBuild(build, hashKeyEpoch: material.epoch) == true
         await progress(.init(phase: .indexing, completed: build.cursor, total: ids.count))
@@ -736,7 +736,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     updatedAt: Date()
                 )
             else {
-                throw UploadError.backend("Remote duplicate index checkpoint could not be saved")
+                throw UploadError.internalFailure(.duplicateIndexCheckpointNotSaved)
             }
             await progress(.init(phase: .indexing, completed: end, total: ids.count))
         }
@@ -766,7 +766,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                 checkpoint: checkpoint
             )
         else {
-            throw UploadError.backend("Remote duplicate index could not be saved")
+            throw UploadError.internalFailure(.duplicateIndexNotSaved)
         }
         if let lineageStore {
             if !lineageBuildReady || !lineageStore.finishBuild(build, hashKeyEpoch: material.epoch) {
@@ -875,7 +875,7 @@ actor ProtonUploadDedupeService: UploadDuplicateChecking {
                     checkpoint: next
                 )
             else {
-                throw UploadError.backend("Remote duplicate index changes could not be saved")
+                throw UploadError.internalFailure(.duplicateIndexChangesNotSaved)
             }
             if let eventLineageStore,
                 !eventLineageStore.applyChanges(
@@ -1243,7 +1243,7 @@ enum ProtonRemoteContentIndexLookup {
         health: UploadRemoteContentIndexHealth
     ) throws -> [RemotePhotoDuplicate] {
         guard !records.isEmpty || health != .unavailable else {
-            throw UploadError.backend("Remote duplicate index is unavailable")
+            throw UploadError.internalFailure(.duplicateIndexUnavailable)
         }
         return records.map { record in
             RemotePhotoDuplicate(

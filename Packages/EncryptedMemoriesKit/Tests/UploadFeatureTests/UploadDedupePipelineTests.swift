@@ -1151,12 +1151,12 @@ final class UploadDedupePipelineTests: XCTestCase {
     }
 
     func testDedupeUnavailableResolverFailsBeforeUploadDecision() async {
-        let resolver = DedupeUnavailableIdentityResolver(message: "dedupe unavailable")
+        let resolver = DedupeUnavailableIdentityResolver()
         do {
             _ = try await resolver.resolve(descriptor())
             XCTFail("expected fail-closed resolver to throw")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("dedupe unavailable"))
+            XCTAssertTrue(error.localizedDescription.contains("Duplicate protection is unavailable"))
         }
     }
 
