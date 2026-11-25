@@ -30,7 +30,7 @@ struct SDKPhotoTagAdder: Sendable {
         let result = try collector.collected().first {
             $0.nodeUid.sdkCompatibleIdentifier == uid.sdkCompatibleIdentifier
         }
-        guard let result else { throw UploadError.backend("SDK omitted the photo tag result") }
+        guard let result else { throw UploadError.internalFailure(.photoTagResultOmitted) }
         if let error = result.error { throw UploadError.backend(error.localizedDescription) }
     }
 }

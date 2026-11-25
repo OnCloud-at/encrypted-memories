@@ -113,7 +113,7 @@ enum TrashedRelatedPhotos {
         return result
     }
 
-    private static var incomplete: UploadError { .backend("The link visibility response is incomplete") }
+    private static var incomplete: UploadError { .internalFailure(.linkVisibilityIncomplete) }
 
     private static func checkedMetadata(
         session: DriveSession, shareID: String, ids: [String], retryOnRateLimit: Bool
@@ -212,7 +212,7 @@ enum TrashedRelatedPhotos {
         }
         let links = try await readLinks((mains + related).map(\.nodeID))
         guard (mains + related).allSatisfy({ links[$0.nodeID]?.hasExplicitPhotoState == true }) else {
-            throw UploadError.backend("The link visibility response is incomplete")
+            throw UploadError.internalFailure(.linkVisibilityIncomplete)
         }
         let frames = restoredWith(mains, candidates: candidates, links: links)
         // A cancel during the read stops the restore before any photo changes.

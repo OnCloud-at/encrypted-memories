@@ -64,6 +64,16 @@ final class InternalFailurePersistedRecordTests: XCTestCase {
         .uploadDecisionWithoutReceipt: "Upload decision scope ended without a remote commit receipt",
         .copyRoleUnavailable: "The role of a copy with these bytes is unavailable",
         .dedupeProtectionUnavailable: "Duplicate protection is unavailable; upload cannot start safely.",
+        .linkVisibilityIncomplete: "The link visibility response is incomplete",
+        .photoTagResultOmitted: "SDK omitted the photo tag result",
+        .networkReservationMissing: "The upload started without its network reservation",
+        .upgradeIdentityStoreNotOpened: "The upgrade identity store did not open",
+        .syntheticPhotoUnknown: "Unexpected synthetic photo",
+        .photoKitExportFileNotCreated: "PhotoKit export file could not be created",
+        .photoResolverUnexpectedSource(kind: .fileURL):
+            "photo resolver received source kind \(UploadSourceIdentity.Kind.fileURL.rawValue)",
+        .backupResolverUnsupportedSource(kind: .fileURL):
+            "unsupported backup source kind \(UploadSourceIdentity.Kind.fileURL.rawValue)",
     ]
 
     /// The class of every case, written out: a failed read or write of a store or file is a local state; a refusal, a
@@ -111,6 +121,14 @@ final class InternalFailurePersistedRecordTests: XCTestCase {
         .uploadDecisionWithoutReceipt: .unknown,
         .copyRoleUnavailable: .unknown,
         .dedupeProtectionUnavailable: .unknown,
+        .linkVisibilityIncomplete: .unknown,
+        .photoTagResultOmitted: .unknown,
+        .networkReservationMissing: .unknown,
+        .upgradeIdentityStoreNotOpened: .localState,
+        .syntheticPhotoUnknown: .unknown,
+        .photoKitExportFileNotCreated: .localState,
+        .photoResolverUnexpectedSource(kind: .fileURL): .unknown,
+        .backupResolverUnsupportedSource(kind: .fileURL): .unknown,
     ]
 
     func testEveryInternalFailureKeepsTheTextOfTheBackendErrorItReplaces() {

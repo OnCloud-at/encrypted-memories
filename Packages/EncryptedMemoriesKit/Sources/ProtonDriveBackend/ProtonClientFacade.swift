@@ -261,7 +261,7 @@ public final class ProtonClientFacade {
                 let identities = UploadIdentityManifestStore(
                     url: directory.appendingPathComponent(UploadIdentityManifestStore.databaseFileName),
                     policy: policy.libraryDatabasePolicy)
-            else { throw UploadError.backend("The upgrade identity store did not open") }
+            else { throw UploadError.internalFailure(.upgradeIdentityStoreNotOpened) }
             let sources = LibrarySourceCoordinator(
                 remote: backend, thumbnailLoader: backend,
                 inventoryStore: LibrarySourceInventoryStore(

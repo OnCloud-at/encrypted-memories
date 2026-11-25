@@ -463,7 +463,8 @@ extension DriveSessionStubSuite {
                     "An incomplete visibility response must throw before returning an upload: \(result.decision)")
                 await pipeline.uploadDidFail(descriptor)
             } catch {
-                #expect(error as? UploadCore.UploadError == .backend("The link visibility response is incomplete"))
+                #expect(
+                    error as? UploadCore.UploadError == .internalFailure(.linkVisibilityIncomplete))
             }
 
             #expect(store.record(for: descriptor.source)?.remoteLinkID == nil)
@@ -846,7 +847,7 @@ extension DriveSessionStubSuite {
 
             do {
                 await #expect(
-                    throws: UploadCore.UploadError.backend("The link visibility response is incomplete")
+                    throws: UploadCore.UploadError.internalFailure(.linkVisibilityIncomplete)
                 ) {
                     _ = try await bridge.memberRoles(of: [PhotoUID(volumeID: "own-volume", nodeID: "m2")])
                 }

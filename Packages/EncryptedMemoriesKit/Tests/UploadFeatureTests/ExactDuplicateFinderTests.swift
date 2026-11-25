@@ -5416,7 +5416,7 @@ private struct CopyBoundaryChecker: UploadDuplicateChecking {
     ) async throws -> [String: RemoteLinkVisibility] {
         visibilityRead?(linkIDs)
         if answersIncompletely && requiresCompleteResponse {
-            throw UploadError.backend("The link visibility response is incomplete")
+            throw UploadError.internalFailure(.linkVisibilityIncomplete)
         }
         let answer = try await base.linkVisibility(of: linkIDs)
         return visibilityRewrite.map { $0(linkIDs, answer) } ?? answer

@@ -654,7 +654,7 @@ public enum UploadError: LocalizedError, Equatable {
     }
 
     /// The internal failures that carry a fixed text instead of a free string.
-    public enum InternalFailure: Equatable, Sendable, CaseIterable {
+    public enum InternalFailure: Equatable, Hashable, Sendable, CaseIterable {
         /// A store of the app cannot answer. The person sees the localized local-state message.
         case localStateUnavailable
         /// The cases below keep the fixed text of the backend error that each one replaces (#1159), so the stored
@@ -706,6 +706,42 @@ public enum UploadError: LocalizedError, Equatable {
         /// The case of the resolver that fails closed when the identity manifest cannot be opened. It keeps the
         /// fixed text of the backend error that it replaces.
         case dedupeProtectionUnavailable
+        /// The remaining cases of #1159. They keep the fixed text of the backend error that each one replaces,
+        /// so the stored detail of a row and the text that a person sees do not change.
+        case linkVisibilityIncomplete
+        case photoTagResultOmitted
+        case networkReservationMissing
+        case upgradeIdentityStoreNotOpened
+        case syntheticPhotoUnknown
+        case photoKitExportFileNotCreated
+        /// A resolver received a source outside its vocabulary. The payload is the typed source kind; the text
+        /// names the kind as the backend error did. It is the only payload: no free text rides on a case.
+        case photoResolverUnexpectedSource(kind: UploadSourceIdentity.Kind)
+        case backupResolverUnsupportedSource(kind: UploadSourceIdentity.Kind)
+
+        /// The payload cases stop Swift's automatic synthesis, so the list is manual. The table tests of
+        /// `InternalFailurePersistedRecordTests` compare this list with their dictionaries, so a missing
+        /// entry fails a test. The payload cases appear once, with one example kind.
+        public static var allCases: [InternalFailure] {
+            [
+                .localStateUnavailable, .sourceRecoveryUnavailable, .preflightClassificationIncomplete,
+                .exclusionsUnavailable, .stateNotRead, .stateBatchNotRead, .stateNotSaved, .stateNotUpdated,
+                .completionStateNotSaved, .identityManifestNotUpdated, .editJournalNotWritten, .pendingHandoffNotSaved,
+                .remoteCommitReconciliationNotSaved, .secondaryReconciliationNotSaved, .queueNotUploading,
+                .queueNotUpdated, .deletionJournalUnavailable, .uploadDecisionWithoutTransport,
+                .manualSettlementUnavailable, .identityResolverUnavailable, .receiptBacksTheUpload,
+                .byteUploadBlocked, .manualReceiptNotPersisted, .managerReleased, .deletionCheckPending,
+                .remoteDraftExists, .remoteInconsistent, .relatedPhotosUnavailable, .duplicateIndexUnavailable,
+                .duplicateIndexCheckpointNotSaved, .duplicateIndexNotSaved, .duplicateIndexChangesNotSaved,
+                .identityManifestNotRead, .duplicateMergeJournalNotUpdated, .mergedDuplicateServerCopyMissing,
+                .mergedDuplicateLibraryCopyMissing, .invalidPrecomputedDigest, .restoredCompoundCheckingUnavailable,
+                .noUploadDecisionReceivedRemoteCommit, .uploadDecisionWithoutReceipt, .copyRoleUnavailable,
+                .dedupeProtectionUnavailable, .linkVisibilityIncomplete, .photoTagResultOmitted,
+                .networkReservationMissing, .upgradeIdentityStoreNotOpened, .syntheticPhotoUnknown,
+                .photoKitExportFileNotCreated, .photoResolverUnexpectedSource(kind: .fileURL),
+                .backupResolverUnsupportedSource(kind: .fileURL),
+            ]
+        }
 
         /// The localized local-state message of the app. The one place that names its key.
         public static var localStateMessage: String { L10n.string("backup.error_local_state_unavailable") }
@@ -756,6 +792,15 @@ public enum UploadError: LocalizedError, Equatable {
             case .uploadDecisionWithoutReceipt: "Upload decision scope ended without a remote commit receipt"
             case .copyRoleUnavailable: "The role of a copy with these bytes is unavailable"
             case .dedupeProtectionUnavailable: "Duplicate protection is unavailable; upload cannot start safely."
+            case .linkVisibilityIncomplete: "The link visibility response is incomplete"
+            case .photoTagResultOmitted: "SDK omitted the photo tag result"
+            case .networkReservationMissing: "The upload started without its network reservation"
+            case .upgradeIdentityStoreNotOpened: "The upgrade identity store did not open"
+            case .syntheticPhotoUnknown: "Unexpected synthetic photo"
+            case .photoKitExportFileNotCreated: "PhotoKit export file could not be created"
+            case .photoResolverUnexpectedSource(let kind): "photo resolver received source kind \(kind.rawValue)"
+            case .backupResolverUnsupportedSource(let kind):
+                "unsupported backup source kind \(kind.rawValue)"
             }
         }
 
@@ -774,7 +819,9 @@ public enum UploadError: LocalizedError, Equatable {
                 .localState
             case .receiptBacksTheUpload, .deletionCheckPending, .remoteDraftExists, .remoteInconsistent,
                 .managerReleased, .identityResolverUnavailable, .deletionJournalUnavailable,
-                .uploadDecisionWithoutTransport:
+                .uploadDecisionWithoutTransport, .linkVisibilityIncomplete, .photoTagResultOmitted,
+                .networkReservationMissing, .syntheticPhotoUnknown, .photoResolverUnexpectedSource,
+                .backupResolverUnsupportedSource:
                 .unknown
             case .relatedPhotosUnavailable, .duplicateIndexUnavailable, .restoredCompoundCheckingUnavailable,
                 .copyRoleUnavailable, .noUploadDecisionReceivedRemoteCommit, .uploadDecisionWithoutReceipt,
@@ -784,6 +831,8 @@ public enum UploadError: LocalizedError, Equatable {
                 .duplicateIndexNotSaved, .duplicateIndexChangesNotSaved, .invalidPrecomputedDigest:
                 .localState
             case .dedupeProtectionUnavailable: .unknown
+            case .upgradeIdentityStoreNotOpened, .photoKitExportFileNotCreated:
+                .localState
             }
         }
     }
