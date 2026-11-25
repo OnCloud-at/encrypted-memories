@@ -56,7 +56,7 @@ public struct UploadQueuePanel: View {
             if let error = coordinator.latestFolderEnumerationError {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(ProtonColor.warning)
                     Text(folderErrorMessage(error))
                         .font(.footnote)
                         .fixedSize(horizontal: false, vertical: true)
@@ -144,7 +144,7 @@ public struct UploadQueuePanel: View {
                 .foregroundStyle(reason.countsAsBackedUp ? .green : .secondary)
         case .failed:
             Image(systemName: item.partialSuccess ? "exclamationmark.triangle.fill" : "xmark.circle.fill")
-                .foregroundStyle(item.partialSuccess ? .yellow : .red)
+                .foregroundStyle(item.partialSuccess ? ProtonColor.warning : ProtonColor.danger)
         case .cancelled:
             Image(systemName: "slash.circle").foregroundStyle(.secondary)
         case .paused:
@@ -177,7 +177,7 @@ public struct UploadQueuePanel: View {
     private func color(for state: UploadItemState) -> Color {
         switch state {
         case .completed: .green
-        case .failed: .red
+        case .failed: ProtonColor.danger
         default: .secondary
         }
     }

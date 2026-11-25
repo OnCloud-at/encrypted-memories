@@ -35,7 +35,7 @@ public struct BackupStatusIcon: View {
     static func color(for accessory: BackupStatusPresentation.Accessory) -> Color {
         switch accessory {
         case .activity, .success: ProtonColor.primary
-        case .attention: .orange
+        case .attention: ProtonColor.warning
         case .paused, .waiting, .waitingForWiFi, .notice, .idle: ProtonColor.textWeak
         }
     }

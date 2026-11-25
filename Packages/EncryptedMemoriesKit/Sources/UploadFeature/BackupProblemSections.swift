@@ -44,7 +44,7 @@ public struct BackupProblemActionArea<Controls: View>: View {
             controls
             if let message {
                 Text(message)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(ProtonColor.danger)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal)
@@ -85,7 +85,7 @@ public struct BackupProblemRow<Actions: View>: View {
                 await previews?.thumbnail(for: uid)
             }
             Image(systemName: item.category.symbolName)
-                .foregroundStyle(item.isPermanent ? detailColor : .orange)
+                .foregroundStyle(item.isPermanent ? detailColor : ProtonColor.warning)
                 #if os(iOS)
                     .font(.body)
                 #endif
