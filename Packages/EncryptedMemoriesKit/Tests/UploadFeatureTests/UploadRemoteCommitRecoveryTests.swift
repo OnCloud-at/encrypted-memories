@@ -795,14 +795,13 @@ final class UploadRemoteCommitRecoveryTests: XCTestCase {
             _ = try await UploadRemoteCommitRecovery(
                 queue: store,
                 resolver: RecoveryResourceResolver(.failure(UploadError.backend("must not resolve"))),
-                identityResolver: DedupeUnavailableIdentityResolver(message: "manifest unavailable")
+                identityResolver: DedupeUnavailableIdentityResolver()
             ).settleAll()
             XCTFail("unavailable manifest settlement must fail closed")
         } catch let error as UploadError {
-            guard case .backend(let message) = error else {
+            guard case .internalFailure(.dedupeProtectionUnavailable) = error else {
                 return XCTFail("unexpected upload error: \(error)")
             }
-            XCTAssertEqual(message, "manifest unavailable")
         }
         XCTAssertNotNil(try store.entry(for: entry.source, revision: entry.revision)?.remoteCommitReconciliation)
     }

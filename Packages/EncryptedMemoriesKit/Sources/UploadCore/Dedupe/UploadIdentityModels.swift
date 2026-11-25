@@ -789,7 +789,7 @@ public struct UploadFileHasher: UploadHashing {
     public func sha1(of descriptor: UploadResourceDescriptor) async throws -> Data {
         if let digest = descriptor.precomputedSHA1Digest {
             guard digest.count == 20 else {
-                throw UploadError.backend("Invalid precomputed SHA-1 digest")
+                throw UploadError.internalFailure(.invalidPrecomputedDigest)
             }
             return digest
         }
@@ -992,21 +992,17 @@ public extension UploadDuplicateChecking {
 /// without duplicate checks would violate the "same bytes upload once" contract, so every resolve
 /// fails before any media bytes can leave the device.
 public struct DedupeUnavailableIdentityResolver: UploadIdentityResolving {
-    private let message: String
-
-    public init(message: String = "Duplicate protection is unavailable; upload cannot start safely.") {
-        self.message = message
-    }
+    public init() {}
 
     public func resolve(_ descriptor: UploadResourceDescriptor) async throws -> UploadPreflightResult {
-        throw UploadError.backend(message)
+        throw UploadError.internalFailure(.dedupeProtectionUnavailable)
     }
 
     public func prime(_ descriptors: [UploadResourceDescriptor]) async {}
     public func recordUploaded(
         _ descriptor: UploadResourceDescriptor, identity: UploadIdentity, remoteVolumeID: String, remoteLinkID: String
     ) async throws {
-        throw UploadError.backend(message)
+        throw UploadError.internalFailure(.dedupeProtectionUnavailable)
     }
     public func invalidateCachedRemoteState() async {}
     public func uploadDidFail(_ descriptor: UploadResourceDescriptor) async {}
@@ -1068,7 +1064,7 @@ public extension UploadIdentityResolving {
     func prepareRestoredCompound(
         _ context: UploadRestoredCompoundContext, isCurrent: @escaping @Sendable () -> Bool
     ) async throws {
-        throw UploadError.backend("Restored compound checking is unavailable")
+        throw UploadError.internalFailure(.restoredCompoundCheckingUnavailable)
     }
     func restoredPhotoOutcome(_ context: UploadRestoredCompoundContext) async throws -> PendingBackupReturnOutcome {
         .unreadable
@@ -1187,14 +1183,14 @@ public extension UploadIdentityResolving {
             case .noUpload(let value):
                 return value
             case .remoteCommitted:
-                throw UploadError.backend("Upload decision scope received a remote commit for a no-upload decision")
+                throw UploadError.internalFailure(.noUploadDecisionReceivedRemoteCommit)
             }
         }
 
         do {
             let outcome = try await operation(preflight)
             guard case .remoteCommitted(let value, let receipt) = outcome else {
-                throw UploadError.backend("Upload decision scope ended without a remote commit receipt")
+                throw UploadError.internalFailure(.uploadDecisionWithoutReceipt)
             }
             if let onRemoteCommit {
                 do {
