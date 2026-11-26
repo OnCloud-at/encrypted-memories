@@ -187,8 +187,9 @@ struct RecentlyDeletedListingTests {
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
         store.save(identities.persisted)
 
-        guard case .found(let loaded) = store.seeding() else {
-            Issue.record("a saved wait must answer found, not \(store.seeding())")
+        let seeded = store.seeding()
+        guard case .found(let loaded) = seeded else {
+            Issue.record("a saved wait must answer found, not \(seeded)")
             return
         }
         #expect(loaded == identities.persisted)
@@ -275,8 +276,9 @@ struct RecentlyDeletedListingTests {
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
         store.save(identities.persisted)
 
-        guard case .found(let saved) = store.seeding() else {
-            Issue.record("a saved removal wait must answer found, not \(store.seeding())")
+        let seeded = store.seeding()
+        guard case .found(let saved) = seeded else {
+            Issue.record("a saved removal wait must answer found, not \(seeded)")
             return
         }
         var relaunched = RecentlyDeletedIdentities(persisted: saved)
@@ -373,8 +375,9 @@ struct RecentlyDeletedListingTests {
 
         let listed = Self.item("listed", at: 1)
         store.save(RecentlyDeletedIdentities.Persisted(listing: [listed]))
-        guard case .found(let persisted) = store.seeding() else {
-            Issue.record("a readable file answers found, not \(store.seeding())")
+        let seeded = store.seeding()
+        guard case .found(let persisted) = seeded else {
+            Issue.record("a readable file answers found, not \(seeded)")
             return
         }
         #expect(persisted.listing == [listed], "the found answer carries the stored state")
@@ -397,8 +400,9 @@ struct RecentlyDeletedListingTests {
             .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
 
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
-        guard case .found(let loaded) = store.seeding() else {
-            Issue.record("a file of an earlier build must answer found, not \(store.seeding())")
+        let seeded = store.seeding()
+        guard case .found(let loaded) = seeded else {
+            Issue.record("a file of an earlier build must answer found, not \(seeded)")
             return
         }
 
@@ -540,8 +544,9 @@ struct RecentlyDeletedListingTests {
         beforeRelaunch.trashed([trashedHere.uid], items: [trashedHere])
         store.save(beforeRelaunch.persisted)
 
-        guard case .found(let saved) = store.seeding() else {
-            Issue.record("a saved trashed-here photo must answer found, not \(store.seeding())")
+        let seeded = store.seeding()
+        guard case .found(let saved) = seeded else {
+            Issue.record("a saved trashed-here photo must answer found, not \(seeded)")
             return
         }
         var afterRelaunch = RecentlyDeletedIdentities(persisted: saved)
@@ -565,8 +570,9 @@ struct RecentlyDeletedListingTests {
         receive([], into: &beforeRelaunch)
         store.save(beforeRelaunch.persisted)
 
-        guard case .found(let loaded) = store.seeding() else {
-            Issue.record("saved misses must answer found, not \(store.seeding())")
+        let seeded = store.seeding()
+        guard case .found(let loaded) = seeded else {
+            Issue.record("saved misses must answer found, not \(seeded)")
             return
         }
         #expect(loaded == beforeRelaunch.persisted, "misses and photos without library data must survive")
