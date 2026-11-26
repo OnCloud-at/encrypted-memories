@@ -25,6 +25,10 @@ enum RecentlyDeletedItem {
 final class RecentlyDeletedListingStore: @unchecked Sendable {
     static let fileName = "recently-deleted-v1.enc"
 
+    /// The kept copy of a provably corrupt listing file, next to the normal name. Only a later provably corrupt
+    /// file replaces it. It lives in the account directory, so the sign-out purge removes it with the account.
+    static let keptCorruptName = "recently-deleted-v1.corrupt"
+
     private struct Record: Codable {
         let volumeID: String
         let nodeID: String
@@ -69,15 +73,18 @@ final class RecentlyDeletedListingStore: @unchecked Sendable {
     }
 
     private let url: URL
+    private let directory: URL
     private let key: SymmetricKey
     private let lock = NSLock()
-    /// True after a seeding read answered unknown, until a read opens the file again. While it is set, no save
-    /// may replace the file: a file that the store cannot open proves nothing, and overwriting it would turn the
-    /// unknown into a loss of the stored state. The bridge seeds once per instance, so the block in practice ends
-    /// only with a relaunch whose seeding read opens the file, or with the sign-out purge.
+    /// True after a seeding read answered unknown, until a read opens the file again or the repair moves a
+    /// provably corrupt file aside. While it is set, no save may replace the file: a file that the store
+    /// cannot open proves nothing, and overwriting it would turn the unknown into a loss of the stored state.
+    /// The bridge seeds once per instance, so the block in practice ends only with a relaunch whose seeding
+    /// read opens the file, with the repair of a provably corrupt file, or with the sign-out purge.
     private var seedingAnsweredUnknown = false
 
     init(directory: URL, accountUID: String, keyPassword: String) {
+        self.directory = directory
         url = directory.appendingPathComponent(Self.fileName)
         let input = SymmetricKey(data: Data(keyPassword.utf8))
         let salt = Data("EncryptedMemories.recently-deleted.v1.\(accountUID)".utf8)
@@ -86,36 +93,95 @@ final class RecentlyDeletedListingStore: @unchecked Sendable {
     }
 
     /// The stored state as a typed answer for the code that decides from it: found, absent, or unknown. A file
-    /// that exists but cannot be opened (another key, corruption) answers unknown, never absent (#1140).
+    /// that exists but cannot be opened (another key, corruption, unreadable bytes) answers unknown, never
+    /// absent (#1140). A file that the held key opens but that does not decode proves its own corruption: the
+    /// repair moves it aside and the store answers absent, as for an empty store (#1578). The kept copy keeps
+    /// the corrupt bytes.
     func seeding() -> StoreLookup<RecentlyDeletedIdentities.Persisted> {
-        guard let contents = readContents() else {
-            if FileManager.default.fileExists(atPath: url.path) {
-                lock.withLock { seedingAnsweredUnknown = true }
+        // One critical section covers the read, the classification, the move aside, and the answer. A save that
+        // interleaves with a seeding read could otherwise write between the read and its repair, and the repair
+        // would move the fresh saved state aside instead of the corrupt file.
+        lock.withLock {
+            switch readContents() {
+            case .decodable(let contents):
+                seedingAnsweredUnknown = false
+                return .found(
+                    RecentlyDeletedIdentities.Persisted(
+                        listing: contents.listing?.map(\.item),
+                        trashedHere: contents.trashedHere.map {
+                            .init(
+                                uid: PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID), item: $0.item?.item,
+                                misses: $0.misses)
+                        },
+                        trashedAwaitingLibrary: Self.waits(contents.awaitingLibrary),
+                        removedElsewhereAwaitingLibrary: Self.waits(contents.removedElsewhere)))
+            case .undecodablePlaintext:
+                // The held key opened the seal, so the file belongs to this account and no other key can rescue
+                // it; the plaintext does not decode, so the bytes prove their own corruption. The move aside must
+                // succeed before anything changes: when it fails, the unknown answer and the save block stay.
+                // The rename replaces the destination in one step, so an existing kept copy stays whole until
+                // the corrupt bytes take its place, and a failed rename changes nothing at either name: the
+                // original keeps its bytes and the kept copy keeps the earlier corrupt bytes. Only a corrupt
+                // file replaces the kept copy, and normal saves never touch it.
+                seedingAnsweredUnknown = true
+                let kept = directory.appendingPathComponent(Self.keptCorruptName)
+                guard rename(url.path, kept.path) == 0 else { return .unknown }
+                seedingAnsweredUnknown = false
+                return .absent
+            case .noFile:
+                return .absent
+            case .unreadable:
+                // The path exists, but its bytes cannot be read: permissions, protection, an I/O error, or a
+                // symlink that points nowhere prove nothing about the stored state, and no save replaces a
+                // file that the store could not read.
+                seedingAnsweredUnknown = true
+                return .unknown
+            case .sealedBlobUnopenable:
+                // Another key or unreadable bytes prove nothing about the stored state: unknown, and no save
+                // replaces a file that the store could not open.
+                seedingAnsweredUnknown = true
                 return .unknown
             }
-            return .absent
         }
-        lock.withLock { seedingAnsweredUnknown = false }
-        return .found(
-            RecentlyDeletedIdentities.Persisted(
-                listing: contents.listing?.map(\.item),
-                trashedHere: contents.trashedHere.map {
-                    .init(
-                        uid: PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID), item: $0.item?.item,
-                        misses: $0.misses)
-                },
-                trashedAwaitingLibrary: Self.waits(contents.awaitingLibrary),
-                removedElsewhereAwaitingLibrary: Self.waits(contents.removedElsewhere)))
     }
 
-    /// Opens and decodes the stored file. Nil when there is no readable state.
-    private func readContents() -> Contents? {
-        guard let blob = try? Data(contentsOf: url),
-            let box = try? AES.GCM.SealedBox(combined: blob),
-            let plaintext = try? AES.GCM.open(box, using: key),
-            let contents = try? JSONDecoder().decode(Contents.self, from: plaintext)
-        else { return nil }
-        return contents
+    /// The answer of opening the stored file: a readable state, an opened seal whose plaintext does not decode,
+    /// a path proven missing, an existing path whose bytes cannot be read, or a seal that this store cannot
+    /// open. Only undecodablePlaintext repairs. Only undecodablePlaintext proves content corruption: the held
+    /// key opened the file, so no other key can rescue it, and the plaintext is not a stored state. A missing
+    /// path is proven only by the open error ENOENT and lstat's ENOENT together: every other path answers
+    /// unknown, because a store that cannot read its file knows nothing about the stored state.
+    private enum StoredContents {
+        case decodable(Contents)
+        case undecodablePlaintext
+        case noFile
+        case unreadable
+        case sealedBlobUnopenable
+    }
+
+    private func readContents() -> StoredContents {
+        do {
+            let blob = try Data(contentsOf: url)
+            guard let box = try? AES.GCM.SealedBox(combined: blob),
+                let plaintext = try? AES.GCM.open(box, using: key)
+            else { return .sealedBlobUnopenable }
+            guard let contents = try? JSONDecoder().decode(Contents.self, from: plaintext)
+            else { return .undecodablePlaintext }
+            return .decodable(contents)
+        } catch {
+            // Only the proven absence of the path answers noFile. An open failure is not enough: a dangling
+            // symlink fails with the same ENOENT as a missing path, so the path itself is checked with lstat,
+            // and any other open error (permissions, protection, I/O) proves nothing either (#1578).
+            let nsError = error as NSError
+            let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+            let openHitENOENT =
+                nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoSuchFileError
+                || (underlying?.domain == NSPOSIXErrorDomain && underlying?.code == Int(ENOENT))
+            guard openHitENOENT else { return .unreadable }
+            var status = stat()
+            guard lstat(url.path, &status) != 0 else { return .unreadable }
+            return errno == ENOENT ? .noFile : .unreadable
+        }
     }
 
     private static func waits(_ records: [AwaitingLibraryRecord]?) -> [PhotoUID: Date] {
@@ -137,23 +203,28 @@ final class RecentlyDeletedListingStore: @unchecked Sendable {
     /// that answered unknown blocks the write instead: overwriting a file that the store cannot open would trade
     /// an unknown for a loss of the stored state.
     func save(_ persisted: RecentlyDeletedIdentities.Persisted) {
-        if lock.withLock({ seedingAnsweredUnknown }) { return }
-        let contents = Contents(
-            listing: persisted.listing?.map(Record.init),
-            trashedHere: persisted.trashedHere.map {
-                TrashedHereRecord(
-                    volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, item: $0.item.map(Record.init),
-                    misses: $0.misses)
-            },
-            awaitingLibrary: Self.records(persisted.trashedAwaitingLibrary),
-            removedElsewhere: Self.records(persisted.removedElsewhereAwaitingLibrary))
-        guard let plaintext = try? JSONEncoder().encode(contents),
-            let sealed = try? AES.GCM.seal(plaintext, using: key).combined
-        else { return }
-        do {
-            try sealed.write(to: url, options: .atomic)
-        } catch {
-            PhotoDiagnostics.shared.increment("recentlyDeleted.cacheWriteFailed")
+        // The block check and the write share the critical section with the seeding read and its repair: a
+        // save that checked the block outside the lock could write between a seeding read and its move aside,
+        // and the repair would move the fresh saved state away as if it were the corrupt file.
+        lock.withLock {
+            guard !seedingAnsweredUnknown else { return }
+            let contents = Contents(
+                listing: persisted.listing?.map(Record.init),
+                trashedHere: persisted.trashedHere.map {
+                    TrashedHereRecord(
+                        volumeID: $0.uid.volumeID, nodeID: $0.uid.nodeID, item: $0.item.map(Record.init),
+                        misses: $0.misses)
+                },
+                awaitingLibrary: Self.records(persisted.trashedAwaitingLibrary),
+                removedElsewhere: Self.records(persisted.removedElsewhereAwaitingLibrary))
+            guard let plaintext = try? JSONEncoder().encode(contents),
+                let sealed = try? AES.GCM.seal(plaintext, using: key).combined
+            else { return }
+            do {
+                try sealed.write(to: url, options: .atomic)
+            } catch {
+                PhotoDiagnostics.shared.increment("recentlyDeleted.cacheWriteFailed")
+            }
         }
     }
 }

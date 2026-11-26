@@ -366,6 +366,292 @@ struct RecentlyDeletedListingTests {
             "the failed save kept the unreadable file: a later seeding read answers unknown again")
     }
 
+    private static func corruptFileURL(_ directory: URL) -> URL {
+        directory.appendingPathComponent("recently-deleted-v1.corrupt")
+    }
+
+    /// The key opens the seal and the plaintext does not decode: the file proves its own corruption,
+    /// so the repair moves it aside and the store answers absent, as an empty store does (#1578).
+    @Test func aSeedingReadRepairsAFileThatOpensWithTheKeyButDoesNotDecode() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Plaintext that this build cannot decode, sealed with the right key.
+        try #require(try AES.GCM.seal(Data("{\"listing\": 3}".utf8), using: Self.listingKey).combined)
+            .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+
+        let seeded = store.seeding()
+
+        #expect(seeded == .absent, "a file that no key can rescue proves its own corruption: the store starts fresh")
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(
+                    RecentlyDeletedListingStore.fileName
+                ).path),
+            "the repair moved the corrupt file away from the normal name")
+        let kept = try Data(contentsOf: Self.corruptFileURL(directory))
+        #expect(
+            try AES.GCM.open(AES.GCM.SealedBox(combined: kept), using: Self.listingKey)
+                == Data("{\"listing\": 3}".utf8),
+            "the kept copy holds the corrupt bytes for inspection")
+
+        // The fresh state holds nothing from the corrupt file, and saves go through again.
+        store.save(RecentlyDeletedIdentities.Persisted())
+        let seededAfterSave = store.seeding()
+        guard case .found(let fresh) = seededAfterSave else {
+            Issue.record("after the repair a save must answer found, not \(seededAfterSave)")
+            return
+        }
+        #expect(fresh == RecentlyDeletedIdentities.Persisted(), "the fresh state holds nothing from the corrupt file")
+        // The fresh state settles a listing normally.
+        var identities = RecentlyDeletedIdentities(persisted: fresh)
+        let listed = Self.item("listed", at: 1)
+        let outcome = identities.received([listed], ticket: identities.beginListing())
+        #expect(outcome == .applied, "a fresh listing settles the repaired store normally")
+        #expect(identities.listing == [listed], "the settled listing holds only the new listing")
+    }
+
+    /// A move aside that fails leaves the store untouched: unknown answer, save block, original bytes, and the
+    /// earlier kept copy. Only the move fails here: a non-empty directory at the kept-copy name denies the
+    /// rename, while the original, the account directory, and a probe save all stay writable. A probe save that
+    /// would wrongly succeed proves a missing save block, and the surviving original bytes prove that it did
+    /// not run (#1578).
+    @Test func aRepairThatCannotMoveTheFileAsideChangesNothing() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let originalURL = directory.appendingPathComponent(RecentlyDeletedListingStore.fileName)
+        try #require(try AES.GCM.seal(Data("{\"listing\": 3}".utf8), using: Self.listingKey).combined)
+            .write(to: originalURL)
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        // A non-empty directory at the kept-copy name denies only the rename: rename(2) refuses to replace a
+        // directory with a file (EISDIR), so nothing else is denied.
+        let kept = Self.corruptFileURL(directory)
+        try FileManager.default.createDirectory(at: kept, withIntermediateDirectories: false)
+        try Data("inner".utf8).write(to: kept.appendingPathComponent("inner.txt"))
+
+        let seeded = store.seeding()
+
+        #expect(seeded == .unknown, "when the move aside fails the store still proves nothing about the file")
+        // The probe save must be able to write (everything but the rename is writable), so a fresh write over
+        // the original name would succeed if the save block were missing.
+        store.save(RecentlyDeletedIdentities.Persisted())
+        #expect(
+            store.seeding() == .unknown,
+            "the failed repair keeps the save block: no fresh write over the original name")
+        let original = try Data(contentsOf: originalURL)
+        #expect(
+            try AES.GCM.open(AES.GCM.SealedBox(combined: original), using: Self.listingKey)
+                == Data("{\"listing\": 3}".utf8),
+            "the original file keeps its bytes")
+        #expect(
+            FileManager.default.fileExists(atPath: kept.appendingPathComponent("inner.txt").path),
+            "the non-empty directory stays: the rename did not replace it")
+    }
+
+    /// A rename that fails leaves the earlier kept copy whole: the original cannot be renamed away (here it is
+    /// immutable, EPERM), so the kept bytes stay at their name. An implementation that removes the kept copy
+    /// before a move that fails destroys it in the gap between removal and move (#1578).
+    @Test func theMoveAsideFailureKeepsTheEarlierKeptCopyWhole() throws {
+        let directory = try Self.directory()
+        let originalURL = directory.appendingPathComponent(RecentlyDeletedListingStore.fileName)
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: originalURL.path)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        try #require(try AES.GCM.seal(Data("{\"listing\": 3}".utf8), using: Self.listingKey).combined)
+            .write(to: originalURL)
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: originalURL.path)
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        try Data("kept bytes of an earlier repair".utf8).write(to: Self.corruptFileURL(directory))
+
+        let seeded = store.seeding()
+
+        #expect(seeded == .unknown, "when the move aside fails the store still proves nothing about the file")
+        #expect(
+            try Data(contentsOf: Self.corruptFileURL(directory)) == Data("kept bytes of an earlier repair".utf8),
+            "the earlier kept copy survives the failed move: no gap destroys it")
+    }
+
+    /// Reads and saves never interleave: one critical section covers the seeding read with its classification
+    /// and move aside, and another covers the save block check with its write. Without it, a save that lands
+    /// between a read and its repair is moved aside as if it were the corrupt file: the kept copy would hold
+    /// fresh valid bytes and the store would answer absent with the saved state lost (#1578).
+    @Test func concurrentReadsAndSavesNeverMoveFreshStateAside() throws {
+        // A large undecodable plaintext widens the classification window, so the racy interleaving of the old
+        // shape is likely to fire within the iterations instead of relying on luck.
+        let corruptPlaintext = Data(count: 512 * 1024)
+        let corruptBlob = try AES.GCM.seal(corruptPlaintext, using: Self.listingKey).combined!
+        let valid = RecentlyDeletedIdentities.Persisted(listing: [Self.item("listed", at: 1)])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recently-deleted-concurrency-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for _ in 0..<400 {
+            let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try corruptBlob.write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+            let store = RecentlyDeletedListingStore(
+                directory: directory, accountUID: "account", keyPassword: "secret")
+            DispatchQueue.concurrentPerform(iterations: 3) { index in
+                switch index {
+                case 0, 1: _ = store.seeding()
+                default: store.save(valid)
+                }
+            }
+            // The invariant: only corrupt bytes ever sit at the kept-copy name. A save that slipped between a
+            // read and its repair moved fresh valid bytes aside instead of the corrupt file.
+            let kept = Self.corruptFileURL(directory)
+            if FileManager.default.fileExists(atPath: kept.path) {
+                #expect(
+                    (try? Data(contentsOf: kept)) == corruptBlob,
+                    "the kept copy must hold the corrupt bytes, never a fresh saved state")
+            }
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    /// Only a corrupt file replaces the kept copy; a normal save never touches it.
+    @Test func aNormalSaveNeverTouchesTheKeptCopyOfACorruptFile() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try #require(try AES.GCM.seal(Data("{\"listing\": 3}".utf8), using: Self.listingKey).combined)
+            .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        _ = store.seeding()
+        let keptAfterRepair = try Data(contentsOf: Self.corruptFileURL(directory))
+
+        let listed = Self.item("listed", at: 1)
+        store.save(RecentlyDeletedIdentities.Persisted(listing: [listed]))
+
+        let keptAfterSave = try Data(contentsOf: Self.corruptFileURL(directory))
+        #expect(keptAfterSave == keptAfterRepair, "a save of the fresh state keeps the corrupt bytes aside")
+        // The repair of another corrupt file replaces the kept copy, because only corrupt bytes may replace it.
+        try #require(try AES.GCM.seal(Data("{\"other\": true}".utf8), using: Self.listingKey).combined)
+            .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        let reopened = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        _ = reopened.seeding()
+        let keptAfterSecondRepair = try Data(contentsOf: Self.corruptFileURL(directory))
+        #expect(
+            try AES.GCM.open(AES.GCM.SealedBox(combined: keptAfterSecondRepair), using: Self.listingKey)
+                == Data("{\"other\": true}".utf8),
+            "a later corrupt file replaces the kept copy")
+    }
+
+    /// The kept copy lives in the account directory, so the real sign-out purge removes it with the account.
+    /// The account directory carries the backup exclusion, so everything in it, the kept copy included, stays
+    /// out of backups; the kept copy itself needs no own flag.
+    @Test func theSignOutPurgeRemovesTheKeptCopyWithTheAccountDirectory() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("recently-deleted-purge-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let directory = LibraryDatabaseLocation.prepareAccountDirectory(uid: "account", in: base)
+        try #require(try AES.GCM.seal(Data("{\"listing\": 3}".utf8), using: Self.listingKey).combined)
+            .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        _ = store.seeding()
+        let kept = Self.corruptFileURL(directory)
+        #expect(FileManager.default.fileExists(atPath: kept.path))
+        #expect(kept.deletingLastPathComponent() == directory, "the kept copy lives in the account directory")
+        #expect(
+            try directory.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup == true,
+            "the account directory is excluded from backups, so the kept copy inherits the exclusion")
+
+        #expect(LibraryDatabaseLocation.purgeAccountData(uid: "account", in: base))
+
+        #expect(!FileManager.default.fileExists(atPath: kept.path))
+    }
+
+    /// A regular file that exists but whose bytes cannot be read (here: permission bits) proves nothing about
+    /// the stored state: unknown, never absent, and the save block holds (#1578, trap of the journal fixtures:
+    /// the unreadable fixture must stay a regular file).
+    @Test func anUnreadableRegularFileBlocksSavesLikeAnUnopenableFile() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("bytes no account can read now".utf8)
+            .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName).path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName).path)
+        }
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+
+        let seeded = store.seeding()
+
+        #expect(seeded == .unknown, "an existing file that cannot be read proves nothing: unknown, never absent")
+        store.save(RecentlyDeletedIdentities.Persisted())
+        #expect(
+            store.seeding() == .unknown,
+            "the unreadable file keeps the save block: no save replaces the bytes that may still open")
+        #expect(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName).path),
+            "the unreadable file keeps its place")
+    }
+
+    /// A path at the store name that points nowhere proves nothing about the stored state: the open fails with
+    /// the same ENOENT as a missing path, so absence is proven only when the path itself is missing too.
+    /// A dangling symlink answers unknown, never absent, and the save block holds (#1578).
+    @Test func aDanglingSymlinkBlocksSavesLikeAnUnreadableFile() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent(RecentlyDeletedListingStore.fileName)
+        try FileManager.default.createSymbolicLink(
+            at: url, withDestinationURL: directory.appendingPathComponent("no-such-target"))
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+
+        let seeded = store.seeding()
+
+        #expect(seeded == .unknown, "a path that points nowhere proves nothing: unknown, never absent")
+        store.save(RecentlyDeletedIdentities.Persisted())
+        #expect(
+            store.seeding() == .unknown,
+            "the dangling path keeps the save block: no save replaces what may still resolve")
+        #expect(
+            (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil,
+            "the store never wrote over the dangling path")
+    }
+
+    /// A well-formed sealed box of another key and a box with a flipped bit both fail to open: they stay
+    /// unknown with the save block, and the bytes stay untouched. The key distinction guards the repair.
+    @Test func aFileOfAnotherKeyOrWithFlippedBitsNeverEntersTheRepair() throws {
+        let directory = try Self.directory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // A valid seal of a different key.
+        let otherKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: Data("secret".utf8)),
+            salt: Data("EncryptedMemories.recently-deleted.v1.other-account".utf8),
+            info: Data("recently-deleted-listing".utf8), outputByteCount: 32)
+        let wrongKeyBlob = try AES.GCM.seal(Data("{\"listing\": []}".utf8), using: otherKey).combined!
+        try wrongKeyBlob.write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+        #expect(store.seeding() == .unknown, "another key proves nothing: unknown, no repair")
+        let writtenWrongKey = try Data(
+            contentsOf: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        #expect(wrongKeyBlob == writtenWrongKey, "another key's bytes stay untouched")
+
+        // A valid seal of the held key with one flipped bit in the ciphertext body.
+        let own = try AES.GCM.seal(
+            Data("{\"listing\": [], \"trashedHere\": []}".utf8), using: Self.listingKey
+        ).combined!
+        var corrupted = [UInt8](own)
+        corrupted[corrupted.count / 2] ^= 0xFF
+        try Data(corrupted).write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        #expect(store.seeding() == .unknown, "flipped bits prove nothing: unknown, no repair")
+        let writtenFlipped = try Data(
+            contentsOf: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
+        #expect(Data(corrupted) == writtenFlipped, "the flipped bytes stay untouched")
+        store.save(RecentlyDeletedIdentities.Persisted())
+        #expect(
+            store.seeding() == .unknown,
+            "the flipped bytes keep the save block: no save replaces what may still open elsewhere")
+    }
+
     @Test func aSeedingReadAnswersAbsentWhenThereIsNoFileAndFoundForAReadableOne() throws {
         let directory = try Self.directory()
         defer { try? FileManager.default.removeItem(at: directory) }
