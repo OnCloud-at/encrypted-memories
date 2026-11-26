@@ -603,7 +603,7 @@ with SigningIdentity(root) as signer:
         with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, environment), \
                 patch.object(run_journey, 'output', return_value=json.dumps({'runtimes': [runtime]})) as output, \
                 patch.object(run_journey, 'command') as command:
-            with self.assertRaisesRegex(JourneyError, 'differs from the pin'):
+            with self.assertRaisesRegex(JourneyError, 'differs from the accepted builds'):
                 run_journey.InstalledApp('iOS', Path(root))
             self.assertEqual(output.call_count, 1)
             command.assert_not_called()
@@ -728,7 +728,8 @@ with SigningIdentity(root) as signer:
     def pinned_runtime(os_version):
         pin = run_journey.PINS[('iOS', os_version, 'iPhone')]
         return {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-' + pin['runtime_version'].replace('.', '-'),
-                'version': pin['runtime_version'], 'buildversion': pin['runtime_build']}
+                'version': pin['runtime_version'], 'buildversion': pin['runtime_build'],
+                'buildversions': sorted({pin['runtime_build'], *pin.get('runtime_build_alternatives', [])})}
 
     def test_the_second_ios_27_2_entry_of_the_hosted_image_is_never_selected_and_does_not_block_the_pin(self):
         expected = self.pinned_runtime('27')
@@ -741,11 +742,13 @@ with SigningIdentity(root) as signer:
         variant_3 = dict(runtimes[3], version='27.3', identifier='com.apple.CoreSimulator.SimRuntime.iOS-27-3-iPhone19-4')
         with self.assertRaisesRegex(JourneyError, 'newest'):
             run_journey.select_ios_runtime(runtimes + [variant_3], expected, require_newest=True)
-        # Pinning the variant's build under the identifier of the release runtime is a different build and fails.
-        with self.assertRaisesRegex(JourneyError, 'differs from the pin'):
-            run_journey.select_ios_runtime(runtimes, dict(expected, buildversion='24B91016s'), require_newest=True)
+        # A build outside the accepted set fails even under the release runtime's identifier.
+        with self.assertRaisesRegex(JourneyError, 'differs from the accepted builds'):
+            run_journey.select_ios_runtime(runtimes, dict(expected, buildversion='24B91016s',
+                                                          buildversions=['24B91016s']), require_newest=True)
         # The iOS 27.0 runtime of the image stays selectable without the newest rule, but not with it.
-        old = {'identifier': runtimes[0]['identifier'], 'version': '27.0', 'buildversion': '24A434'}
+        old = {'identifier': runtimes[0]['identifier'], 'version': '27.0', 'buildversion': '24A434',
+               'buildversions': ['24A434']}
         self.assertEqual(run_journey.select_ios_runtime(runtimes, old)['buildversion'], '24A434')
         with self.assertRaisesRegex(JourneyError, 'newest'):
             run_journey.select_ios_runtime(runtimes, old, require_newest=True)
@@ -834,16 +837,30 @@ with SigningIdentity(root) as signer:
                 run_journey.verify_macos_host(expected, actual)
 
     def test_ambiguous_selected_runtime_fails_before_creating_a_simulator(self):
+        # Two accepted builds, neither canonical: the pin cannot pick a build and stops before
+        # any device exists.
+        expected = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5', 'version': '26.5',
+                    'buildversion': '23F77', 'buildversions': ['23F73', '23F79']}
+        runtimes = [
+            {'isAvailable': True, 'identifier': expected['identifier'], 'version': '26.5',
+             'buildversion': build}
+            for build in ['23F73', '23F79']
+        ]
+        with self.assertRaisesRegex(JourneyError, 'Ambiguous Simulator runtime identifier: ' + re.escape(expected['identifier'])):
+            run_journey.select_ios_runtime(runtimes, expected)
+
+    def test_a_second_runtime_of_a_build_outside_the_pin_does_not_block_selection(self):
         runtimes = {'runtimes': [
-            {'isAvailable': True, 'identifier': run_journey.IOS_RUNTIME['identifier'], 'version': run_journey.IOS_RUNTIME['version'], 'buildversion': build}
-            for build in ['first', 'second']
+            {'isAvailable': True, 'identifier': run_journey.IOS_RUNTIME['identifier'],
+             'version': run_journey.IOS_RUNTIME['version'], 'buildversion': 'OTHER'},
+            dict(run_journey.IOS_RUNTIME, isAvailable=True),
         ]}
         replies = [json.dumps(runtimes), json.dumps({'devicetypes': [{'name': 'iPhone 17', 'identifier': 'phone'}]}), 'OWN-DEVICE']
         with tempfile.TemporaryDirectory() as root, patch.object(run_journey, 'output', side_effect=replies) as output, \
                 patch.object(run_journey, 'command'):
-            with self.assertRaisesRegex(JourneyError, 'Ambiguous Simulator runtime identifier: ' + re.escape(run_journey.IOS_RUNTIME['identifier'])):
-                run_journey.InstalledApp('iOS', Path(root))
-            self.assertFalse(any(call.args[0][2] == 'create' for call in output.call_args_list))
+            run_journey.InstalledApp('iOS', Path(root))
+            create = next(call.args[0] for call in output.call_args_list if call.args[0][2] == 'create')
+            self.assertEqual(create[-1], run_journey.IOS_RUNTIME['identifier'])
 
     def test_pinned_runtime_failures_name_the_expected_and_installed_runtime_before_creating_a_simulator(self):
         pinned = dict(run_journey.IOS_RUNTIME, isAvailable=True)
@@ -853,11 +870,10 @@ with SigningIdentity(root) as signer:
         cases = [
             ('missing', [newer],
              'not installed: expected .*build ' + expected + r'\), installed .*iOS-27-1 \(27\.1, build NEWER, available\)'),
-            ('other version', [dict(pinned, version='27.0.1')], r'differs from the pin: .*installed 27\.0\.1, build'),
+            ('other version', [dict(pinned, version='27.0.1')], r'differs from the accepted builds: .*installed 27\.0\.1, build'),
             ('other build', [dict(pinned, buildversion='OTHER')],
-             'differs from the pin: expected .*build ' + expected + r'\), installed ' + re.escape(run_journey.IOS_RUNTIME['version']) + ', build OTHER'),
+             'differs from the accepted builds: expected .*build ' + expected + r'\), installed ' + re.escape(run_journey.IOS_RUNTIME['version']) + ', build OTHER'),
             ('unavailable', [dict(pinned, isAvailable=False)], 'installed but unavailable'),
-            ('duplicate', [pinned, dict(pinned, buildversion='OTHER')], 'Ambiguous .* 2 times with builds'),
             ('duplicate with the same build', [pinned, dict(pinned)], 'Ambiguous .* 2 times with builds'),
         ]
         for name, runtimes, message in cases:

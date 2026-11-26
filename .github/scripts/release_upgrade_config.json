@@ -7,6 +7,8 @@
       "runner": "xcode-27",
       "runtime_version": "26.5",
       "runtime_build": "23F77",
+      "runtime_build_alternatives": ["23F73"],
+      "pin_evidence": "Run 45890080546 (Apple release): xcodebuild -downloadPlatform iOS -buildVersion 26.5 served 23F77 to shards 2 and 3 and 23F73 to shards 1 and 4 of the same run; 23F73 failed the single-build check. Both builds identify as com.apple.CoreSimulator.SimRuntime.iOS-26-5 (26.5), so the pin accepts a set of builds for one version.",
       "capacity": {
         "provision_minutes": 6,
         "available_gib": 32,

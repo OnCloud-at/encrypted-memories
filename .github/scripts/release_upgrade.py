@@ -35,11 +35,23 @@ PINS = {(item["platform"], item["os"], item["device"]): item for item in CONFIG[
 def validate_pins(pins):
     """Every iOS configuration states `newest_runtime`; exactly one sets it. That one is the local default pin and the
     only job that must run on the newest runtime of its major version. A new configuration without the field fails
-    when this module loads."""
+    when this module loads. `runtime_build_alternatives` names the other builds that Apple serves for the same
+    `runtime_version`; a pin with alternatives records its evidence in `pin_evidence`."""
     ios = [key for key in pins if key[0] == "iOS"]
     for key in ios:
         if not isinstance(pins[key].get("newest_runtime"), bool):
             raise UpgradeError(f"newest_runtime must be true or false for {key} in release_upgrade_config.json")
+        alternatives = pins[key].get("runtime_build_alternatives", [])
+        build = pins[key]["runtime_build"]
+        if (not isinstance(alternatives, list) or
+                any(not isinstance(value, str) or not value.strip() or value != value.strip()
+                    for value in alternatives) or
+                len(set(alternatives)) != len(alternatives)):
+            raise UpgradeError(f"runtime_build_alternatives must list distinct non-empty builds for {key}")
+        if build in alternatives:
+            raise UpgradeError(f"runtime_build_alternatives must not repeat the canonical build for {key}")
+        if alternatives and not str(pins[key].get("pin_evidence", "")).strip():
+            raise UpgradeError(f"runtime_build_alternatives requires pin_evidence for {key}")
     if sum(pins[key]["newest_runtime"] for key in ios) != 1:
         raise UpgradeError("Exactly one iOS configuration must set newest_runtime in release_upgrade_config.json")
 

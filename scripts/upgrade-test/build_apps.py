@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import subprocess
 import tarfile
@@ -101,6 +102,54 @@ def harness_digest(automation):
     return digest.hexdigest()
 
 
+def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
+    """Return the candidate test-entry names that this release's sources cannot provide.
+
+    A source without its own test entry receives the candidate's five payload files. A
+    name compiles only when the release defines it, another payload file declares it, or
+    a framework supplies it. The hosted failures of run 45890080546 came from names
+    added after v1.0.5 shipped. Comments and string literals carry no compiler meaning.
+    Call this after the overlay installed the payload files. `git_repo` is the git
+    checkout whose history holds the tagged release; the extracted source has none.
+    """
+    framework_roots = {'FileManager', 'ProcessInfo', 'URLProtocol', 'URLSession', 'JSONSerialization',
+                       'Task', 'Insecure', 'SHA1', 'SHA256', 'Data', 'Int', 'Int64', 'Double', 'Bool', 'URL'}
+    framework_members = {'registerClass'}
+    exemptions = {'self', 'init', 'some', 'utf8'}
+
+    def strip(text):
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        text = re.sub(r'//[^\n]*', '', text)
+        text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
+        return text
+
+    def grep(word):
+        result = subprocess.run(['git', 'grep', '-qw', '-e', word, tag, '--',
+                                 'Packages/EncryptedMemoriesKit/Sources'],
+                                cwd=git_repo or source, capture_output=True)
+        return result.returncode == 0
+
+    texts = {}
+    declared = set()
+    for relative in payload:
+        path = source / 'Packages/EncryptedMemoriesKit/Sources' / relative
+        if not path.is_file():
+            continue
+        text = strip(path.read_text())
+        texts[relative] = text
+        declared |= set(re.findall(r'\b(?:func|var|let|case|associatedtype|class|struct|enum|protocol|actor|typealias)\s+(\w+)', text))
+    unknown = {}
+    for relative, text in texts.items():
+        roots = set(re.findall(r'\b([A-Z]\w*)\s*\.', text))
+        members = set(re.findall(r'(?:\b[A-Z]\w*|\))\s*\.\s*([a-z]\w*)', text))
+        bad_roots = {root for root in roots if root not in framework_roots and root not in declared and not grep(root)}
+        bad_members = {member for member in members if member not in exemptions
+                       and member not in framework_members and member not in declared and not grep(member)}
+        if bad_roots or bad_members:
+            unknown[relative] = sorted(bad_roots) + sorted(bad_members)
+    return unknown
+
+
 def source_tree(repo, sha, destination, working_copy=False):
     destination.mkdir(parents=True)
     archive = destination.parent / 'source.tar'
@@ -148,6 +197,11 @@ def apply_overlay(source, automation, tag, sha):
         target = source / 'Packages/EncryptedMemoriesKit/Sources' / relative
         candidate = automation / 'Packages/EncryptedMemoriesKit/Sources' / relative
         shutil.copy2(pinned / relative if (pinned / relative).is_file() else candidate, target)
+    unbuildable = unbuildable_names(source, tag, git_repo=automation)
+    if unbuildable:
+        listed = '; '.join(f'{relative}: {", ".join(names)}' for relative, names in sorted(unbuildable.items()))
+        raise JourneyError(f'{tag}: candidate test files use names that this release does not provide. '
+                           f'Pin the named files to the commit whose bytes they must keep: {listed}')
 
 
 def test_project(source, automation, platform):
