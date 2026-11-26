@@ -108,20 +108,6 @@ final class RecentlyDeletedListingStore: @unchecked Sendable {
                 removedElsewhereAwaitingLibrary: Self.waits(contents.removedElsewhere)))
     }
 
-    /// The stored state, or nil when there is none or it cannot be opened (another key, corruption).
-    func load() -> RecentlyDeletedIdentities.Persisted? {
-        guard let contents = readContents() else { return nil }
-        return RecentlyDeletedIdentities.Persisted(
-            listing: contents.listing?.map(\.item),
-            trashedHere: contents.trashedHere.map {
-                .init(
-                    uid: PhotoUID(volumeID: $0.volumeID, nodeID: $0.nodeID), item: $0.item?.item,
-                    misses: $0.misses)
-            },
-            trashedAwaitingLibrary: Self.waits(contents.awaitingLibrary),
-            removedElsewhereAwaitingLibrary: Self.waits(contents.removedElsewhere))
-    }
-
     /// Opens and decodes the stored file. Nil when there is no readable state.
     private func readContents() -> Contents? {
         guard let blob = try? Data(contentsOf: url),
