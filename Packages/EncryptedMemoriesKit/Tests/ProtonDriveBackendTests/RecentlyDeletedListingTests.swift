@@ -28,7 +28,7 @@ struct RecentlyDeletedListingTests {
 
         let reopened = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
 
-        #expect(reopened.load() == .init(listing: listing))
+        #expect(reopened.seeding() == .found(.init(listing: listing)))
         let blob = try Data(contentsOf: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
         #expect(blob.range(of: Data("photo".utf8)) == nil, "the listing is encrypted at rest")
     }
@@ -40,11 +40,11 @@ struct RecentlyDeletedListingTests {
             .save(.init(listing: [Self.item("photo", at: 1)]))
 
         #expect(
-            RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "other").load()
-                == nil)
+            RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "other")
+                .seeding() == .unknown)
         #expect(
-            RecentlyDeletedListingStore(directory: directory, accountUID: "other", keyPassword: "secret").load()
-                == nil)
+            RecentlyDeletedListingStore(directory: directory, accountUID: "other", keyPassword: "secret")
+                .seeding() == .unknown)
     }
 
     @Test func withoutAStoredListingThereIsNothingToShow() throws {
@@ -52,8 +52,8 @@ struct RecentlyDeletedListingTests {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         #expect(
-            RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret").load()
-                == nil)
+            RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
+                .seeding() == .absent)
     }
 
     // MARK: - Library listings that lag behind a trash
@@ -187,7 +187,10 @@ struct RecentlyDeletedListingTests {
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
         store.save(identities.persisted)
 
-        let loaded = try #require(store.load())
+        guard case .found(let loaded) = store.seeding() else {
+            Issue.record("a saved wait must answer found, not \(store.seeding())")
+            return
+        }
         #expect(loaded == identities.persisted)
         let relaunched = RecentlyDeletedIdentities(persisted: loaded)
         let listed = Self.read([photo], after: 30)
@@ -272,7 +275,11 @@ struct RecentlyDeletedListingTests {
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
         store.save(identities.persisted)
 
-        var relaunched = RecentlyDeletedIdentities(persisted: try #require(store.load()))
+        guard case .found(let saved) = store.seeding() else {
+            Issue.record("a saved removal wait must answer found, not \(store.seeding())")
+            return
+        }
+        var relaunched = RecentlyDeletedIdentities(persisted: saved)
         _ = relaunched.eventsRead(.init(), volumeID: "volume", at: Self.trashTime.addingTimeInterval(60))
         let lagging = Self.read([photo], after: 60)
         #expect(relaunched.lagging(in: lagging, now: lagging.readAt) == [photo])
@@ -390,7 +397,10 @@ struct RecentlyDeletedListingTests {
             .write(to: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
 
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
-        let loaded = try #require(store.load())
+        guard case .found(let loaded) = store.seeding() else {
+            Issue.record("a file of an earlier build must answer found, not \(store.seeding())")
+            return
+        }
 
         #expect(loaded.listing == [listed])
         #expect(loaded.trashedHere.map(\.uid.nodeID) == ["moved", "unknown"])
@@ -410,7 +420,8 @@ struct RecentlyDeletedListingTests {
             trashedAwaitingLibrary: [moved.uid: Self.trashTime])
         let store = RecentlyDeletedListingStore(directory: directory, accountUID: "account", keyPassword: "secret")
         store.save(state)
-        #expect(store.load() == state, "The file must contain a nonempty wait before the old reader opens it")
+        #expect(
+            store.seeding() == .found(state), "The file must contain a nonempty wait before the old reader opens it")
         let blob = try Data(contentsOf: directory.appendingPathComponent(RecentlyDeletedListingStore.fileName))
         let plaintext = try AES.GCM.open(AES.GCM.SealedBox(combined: blob), using: Self.listingKey)
 
@@ -529,7 +540,11 @@ struct RecentlyDeletedListingTests {
         beforeRelaunch.trashed([trashedHere.uid], items: [trashedHere])
         store.save(beforeRelaunch.persisted)
 
-        var afterRelaunch = RecentlyDeletedIdentities(persisted: try #require(store.load()))
+        guard case .found(let saved) = store.seeding() else {
+            Issue.record("a saved trashed-here photo must answer found, not \(store.seeding())")
+            return
+        }
+        var afterRelaunch = RecentlyDeletedIdentities(persisted: saved)
         #expect(afterRelaunch.ordered == [trashedHere.uid, listed.uid])
         #expect(afterRelaunch.listing == [listed, trashedHere], "offline, the photo trashed here still shows")
 
@@ -550,7 +565,10 @@ struct RecentlyDeletedListingTests {
         receive([], into: &beforeRelaunch)
         store.save(beforeRelaunch.persisted)
 
-        let loaded = try #require(store.load())
+        guard case .found(let loaded) = store.seeding() else {
+            Issue.record("saved misses must answer found, not \(store.seeding())")
+            return
+        }
         #expect(loaded == beforeRelaunch.persisted, "misses and photos without library data must survive")
         #expect(loaded.trashedHere.map(\.misses) == [1, 1])
 
