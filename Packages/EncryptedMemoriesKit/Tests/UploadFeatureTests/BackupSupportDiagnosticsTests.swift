@@ -321,6 +321,42 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
         XCTAssertEqual(events.first?.resourceKind, .primary)
     }
 
+    /// A dismissal that takes effect enters the trail once as a parked row; one that changes nothing enters nothing
+    /// (#1583).
+    func testADismissalEntersTheTrailOnceAndARefusedOneNotAtAll() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let trail = SupportEventTrail()
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent("queue.sqlite"), supportTrail: trail))
+        defer { queue.close() }
+        let issue = BackupIssueRecord(kind: .unsupported, detail: "private detail").persistedValue
+        let final = UploadBackupSyncQueueEntry(
+            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "final"),
+            revision: UploadBackupRevision(rawValue: 1), originalFilename: "final.jpg", state: .failedPermanent,
+            lastError: issue, updatedAt: Date(timeIntervalSince1970: 100))
+        var done = final
+        done.source = UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "done")
+        done.state = .completed
+        done.lastError = nil
+        XCTAssertTrue(queue.upsertBatch([final, done]))
+
+        XCTAssertFalse(
+            queue.dismissPermanentFailure(
+                source: done.source, revision: done.revision, updatedAt: Date(timeIntervalSince1970: 200)))
+        XCTAssertTrue(trail.export(hashingWith: SupportReportIdentifierHasher()).events.isEmpty)
+        XCTAssertTrue(
+            queue.dismissPermanentFailure(
+                source: final.source, revision: final.revision, updatedAt: Date(timeIntervalSince1970: 200)))
+        let hasher = SupportReportIdentifierHasher()
+        let events = trail.export(hashingWith: hasher).events
+        XCTAssertEqual(events.map(\.kind), [.backupRowParked])
+        XCTAssertEqual(events.map(\.reason), [.unsupported])
+        XCTAssertEqual(events.map(\.subject), [hasher.hash("final")])
+    }
+
     func testEveryEditOutcomeHasItsOwnTrailEvent() {
         XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .replaced(retiredAny: true)), .editReplaced)
         XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .waiting), .editWaiting)

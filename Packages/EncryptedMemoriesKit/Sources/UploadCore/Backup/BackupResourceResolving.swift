@@ -268,26 +268,43 @@ public extension BackupResourceResolving {
     }
 }
 
+/// A file whose watched folder the app cannot reach now, for example on a drive that is not mounted. A missing file
+/// there proves nothing, so the backup keeps its row and tries it again in a later pass (#1583).
+public struct BackupSourceLocationUnavailableError: Error, Sendable, Equatable {
+    public init() {}
+}
+
 /// The file-URL resolver shared by every platform's folder/file backup path. Reads current
 /// attributes so a file edited after the scan is backed up as it exists now. Security-scoped
 /// access (macOS sandbox bookmarks) is session-scoped by the platform layer around the whole
 /// sync pass - this resolver only touches the file system.
 public struct FileBackupResourceResolver: BackupResourceResolving {
-    public init() {}
+    /// The watched folders now. Without it every missing file counts as deleted.
+    private let scope: (@Sendable () -> WatchedFolderScope)?
+
+    public init(scope: (@Sendable () -> WatchedFolderScope)? = nil) {
+        self.scope = scope
+    }
 
     public func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
         guard entry.source.kind == .fileURL else {
             throw UploadError.internalFailure(.backupResolverUnsupportedSource(kind: entry.source.kind))
         }
         let url = URL(fileURLWithPath: entry.source.identifier)
+        let watched = scope?()
+        // A file that may lie in a folder the app cannot reach now is not read at all (#1227).
+        if watched?.location(ofPath: url.path) == .unavailable { throw BackupSourceLocationUnavailableError() }
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         } catch let error as NSError
-            where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError
+            where (error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError)
+            || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
         {
-            return nil
-        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            // A missing file proves a deletion only while its folder is still there.
+            if let root = watched?.readableRoot(forPath: url.path), !FileManager.default.fileExists(atPath: root.path) {
+                throw BackupSourceLocationUnavailableError()
+            }
             return nil
         }
 

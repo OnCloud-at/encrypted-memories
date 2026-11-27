@@ -622,6 +622,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
         guard let changed else { return nil }
         if changed > 0 {
+            // A transition enters the support trail as one through `updateState` does, a dismissal for example.
+            recordSupportEvent(source: entry.source, state: entry.state, lastError: entry.lastError)
             notify(
                 UploadBackupSyncQueueChange(
                     sources: [entry.source], enqueued: Self.runnableStates.contains(entry.state.rawValue)))
@@ -1038,15 +1040,19 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         connection.withLock { removeLocked(source: source, revision: revision) }
     }
 
-    private func removeLocked(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
+    /// `keepingReceipt` leaves a row that holds an upload receipt in place.
+    private func removeLocked(
+        source: UploadSourceIdentity, revision: UploadBackupRevision, keepingReceipt: Bool = false
+    ) -> Bool {
         var stmt: OpaquePointer?
+        let receiptClause = keepingReceipt ? " AND remote_commit_reconciliation IS NULL" : ""
         guard
             requireOperational(
                 sqlite3_prepare_v2(
                     db,
                     """
                     DELETE FROM backup_sync_queue
-                    WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
+                    WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?\(receiptClause);
                     """,
                     -1, &stmt, nil
                 ) == SQLITE_OK)
@@ -1537,7 +1543,12 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     public func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
-        guard source.kind == .photoLibraryAsset else { return remove(source: source, revision: revision) }
+        guard source.kind == .photoLibraryAsset else {
+            // A missing folder file never takes a saved upload receipt with it (#1583).
+            let removed = connection.withLock { removeLocked(source: source, revision: revision, keepingReceipt: true) }
+            if removed { notify(UploadBackupSyncQueueChange(sources: [source])) }
+            return removed
+        }
         let result = connection.withLock { () -> Bool in
             let committed =
                 withDurableCommitsRecordingSetup { () -> Bool in

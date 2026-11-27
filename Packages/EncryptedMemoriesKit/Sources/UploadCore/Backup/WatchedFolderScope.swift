@@ -33,11 +33,11 @@ public struct WatchedFolderScope: Sendable, Equatable {
         self.init(readableRoots: readable.map { Self.root($0.path) }, registeredRoots: registeredRoots)
     }
 
-    /// The registered folder bookmarks in a stored value. No stored value is a known empty list. A
-    /// value of another type is damaged and gives nil, so no registered folder is known.
+    /// The registered folder bookmarks in a stored value. Only a saved list is known; the app saves an empty list
+    /// when the person removes the last folder. No stored value, for example after the settings were reset, and a
+    /// value of another type give nil, so no registered folder is known (#1583).
     public static func registeredBookmarks(storedValue: Any?) -> [Data]? {
-        guard let storedValue else { return [] }
-        return storedValue as? [Data]
+        storedValue as? [Data]
     }
 
     private init(readableRoots: [String], registeredRoots: [String]?) {
@@ -45,10 +45,14 @@ public struct WatchedFolderScope: Sendable, Equatable {
         self.registeredRoots = registeredRoots
     }
 
+    /// The folder that the app can read now and that holds the path.
+    func readableRoot(forPath path: String) -> URL? {
+        readableRoots.first { path.hasPrefix($0) }.map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
+
     /// The file behind a path, when it lies in a folder the app can read now.
     public func readableURL(forPath path: String) -> URL? {
-        guard readableRoots.contains(where: { path.hasPrefix($0) }) else { return nil }
-        return URL(fileURLWithPath: path)
+        readableRoot(forPath: path).map { _ in URL(fileURLWithPath: path) }
     }
 
     /// Only a path outside every known registered folder counts as outside.

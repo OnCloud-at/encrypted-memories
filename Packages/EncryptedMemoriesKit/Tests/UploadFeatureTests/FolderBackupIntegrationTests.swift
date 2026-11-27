@@ -49,14 +49,120 @@ final class FolderBackupIntegrationTests: XCTestCase {
         try? FileManager.default.removeItem(at: tempDir)
     }
 
-    private func makeRunner() -> BackupSyncRunner {
+    private func makeRunner(scope: ScopeBox? = nil) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queueStore,
             preflight: preflight,
-            resolver: FileBackupResourceResolver(),
+            resolver: scope.map { box in FileBackupResourceResolver(scope: { box.scope }) }
+                ?? FileBackupResourceResolver(),
             identityResolver: pipeline,
             uploader: uploader
         )
+    }
+
+    /// The watched folders as the Mac app sees them now; a test changes them between passes.
+    private final class ScopeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var current: WatchedFolderScope
+        init(_ scope: WatchedFolderScope) { current = scope }
+        var scope: WatchedFolderScope {
+            get { lock.withLock { current } }
+            set { lock.withLock { current = newValue } }
+        }
+    }
+
+    private func receipt(for source: UploadSourceIdentity) -> UploadRemoteCommitReconciliation {
+        UploadRemoteCommitReconciliation(
+            source: source,
+            identity: UploadIdentity(
+                correctedName: "sent.jpg", nameHash: "name-hash", sha1Hex: String(repeating: "ab", count: 20),
+                sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+    }
+
+    /// Scans `new.jpg` and `sent.jpg`, and saves an upload receipt for `sent.jpg` as an upload that reached Proton
+    /// before the app ended. Returns both rows as stored.
+    private func queueNewAndSentFiles() async throws -> (
+        new: UploadBackupSyncQueueEntry, sent: UploadBackupSyncQueueEntry
+    ) {
+        for name in ["new.jpg", "sent.jpg"] {
+            try Data("bytes-\(name)".utf8).write(to: folder.appendingPathComponent(name))
+        }
+        _ = try await engine.scan(FolderBackupCatalog(folder: folder))
+        let newSource = UploadSourceIdentity.file(folder.appendingPathComponent("new.jpg"))
+        let sentSource = UploadSourceIdentity.file(folder.appendingPathComponent("sent.jpg"))
+        let rows = try queueStore.decisionRows(
+            kind: .fileURL, identifiers: [newSource.identifier, sentSource.identifier])
+        XCTAssertEqual(rows.count, 2)
+        let sentRow = try XCTUnwrap(rows.first { $0.source == sentSource })
+        XCTAssertTrue(
+            queueStore.markNeedsRemoteReconciliation(
+                source: sentSource, revision: sentRow.revision, reconciliation: receipt(for: sentSource),
+                lastError: nil, updatedAt: Date(timeIntervalSince1970: 100)))
+        let newRow = try XCTUnwrap(rows.first { $0.source == newSource })
+        return (
+            try XCTUnwrap(queueStore.entry(for: newSource, revision: newRow.revision)),
+            try XCTUnwrap(queueStore.entry(for: sentSource, revision: sentRow.revision))
+        )
+    }
+
+    /// The drive of a watched folder is not mounted: its bookmark gave no path at launch, so the scope cannot place
+    /// the files, and every path reads as missing. A pass keeps every row as it was, receipts included, burns no
+    /// attempt and uploads nothing. Once the drive is back, the new file uploads once and the file with a receipt
+    /// never uploads (#1583).
+    func testAFolderOnADriveThatIsNotMountedKeepsItsRowsUntilTheDriveIsBack() async throws {
+        let (new, sent) = try await queueNewAndSentFiles()
+        let away = tempDir.appendingPathComponent("Unmounted", isDirectory: true)
+        try FileManager.default.moveItem(at: folder, to: away)
+        let scope = ScopeBox(WatchedFolderScope(readable: [], registered: ["?"]))
+
+        _ = await makeRunner(scope: scope).runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision), new)
+        XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
+
+        try FileManager.default.moveItem(at: away, to: folder)
+        scope.scope = WatchedFolderScope(readable: [folder], registered: [folder.path])
+        _ = await makeRunner(scope: scope).runUntilDrained()
+
+        XCTAssertEqual(uploader.requests.map(\.name), ["new.jpg"], "the file with a receipt never uploads again")
+        XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision)?.state, .completed)
+        let settled = try XCTUnwrap(try queueStore.entry(for: sent.source, revision: sent.revision))
+        XCTAssertTrue(
+            settled.state.isTerminalSuccess || settled.remoteCommitReconciliation == sent.remoteCommitReconciliation,
+            "the receipt is settled or still kept: \(settled.state)")
+    }
+
+    /// The drive goes away while its folder is still open: the folder itself is gone, so a missing file in it is no
+    /// proof that the file was deleted (#1583).
+    func testAFolderWhoseDriveGoesAwayDuringAPassKeepsItsRows() async throws {
+        let (new, sent) = try await queueNewAndSentFiles()
+        let scope = ScopeBox(WatchedFolderScope(readable: [folder], registered: [folder.path]))
+        try FileManager.default.moveItem(at: folder, to: tempDir.appendingPathComponent("Unmounted", isDirectory: true))
+
+        _ = await makeRunner(scope: scope).runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision), new)
+        XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
+    }
+
+    /// A file that was deleted from a folder that is still there leaves the queue, as before. A file with a saved
+    /// upload receipt keeps its row and its receipt (#1583).
+    func testADeletedFileLeavesTheQueueButAFileWithAReceiptKeepsIt() async throws {
+        let (new, sent) = try await queueNewAndSentFiles()
+        let scope = ScopeBox(WatchedFolderScope(readable: [folder], registered: [folder.path]))
+        try FileManager.default.removeItem(at: folder.appendingPathComponent("new.jpg"))
+        try FileManager.default.removeItem(at: folder.appendingPathComponent("sent.jpg"))
+
+        _ = await makeRunner(scope: scope).runUntilDrained()
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertNil(try queueStore.entry(for: new.source, revision: new.revision))
+        let kept = try XCTUnwrap(try queueStore.entry(for: sent.source, revision: sent.revision))
+        XCTAssertEqual(kept.state, .needsRemoteReconciliation)
+        XCTAssertEqual(kept.remoteCommitReconciliation, sent.remoteCommitReconciliation)
     }
 
     func testScanRunRescanBacksUpOnceAndOnlyOnce() async throws {

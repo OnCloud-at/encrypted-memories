@@ -33,12 +33,13 @@ final class FolderBackupController {
         runner != nil && (!requiresPendingStore || pendingStore?.isOperational() == true)
     }
 
-    /// Watched folders the pending grid may read; kept accessible while they are registered.
-    let pendingAccess = PendingFolderAccess()
+    /// Watched folders the pending grid and the backup may read; kept accessible while they are registered.
+    let pendingAccess: PendingFolderAccess
     @ObservationIgnored private let pendingStore: PendingBackupManifestStore?
     @ObservationIgnored private let requiresPendingStore: Bool
     @ObservationIgnored private var accessedFolders: [BackupFolder.ID: URL] = [:]
-    /// False when the saved folder list could not be read, so no path counts as outside the watched folders.
+    /// False when the saved folder list is missing or could not be read, so no path counts as outside the watched
+    /// folders. Saving the list makes it known.
     @ObservationIgnored private var registeredFoldersAreKnown = false
 
     private let engine: UploadBackupSyncEngine?
@@ -75,6 +76,8 @@ final class FolderBackupController {
     ) {
         self.pendingStore = pendingStore
         self.requiresPendingStore = requiresPendingStore
+        let pendingAccess = PendingFolderAccess()
+        self.pendingAccess = pendingAccess
         let directory = facade.accountDataDirectory
         let policy = facade.accountDatabasePolicy
         let queueStore = UploadBackupSyncQueueManifestStore(
@@ -101,7 +104,8 @@ final class FolderBackupController {
             runner = BackupSyncRunner(
                 queue: queueStore,
                 preflight: preflight,
-                resolver: FileBackupResourceResolver(),
+                // A file in a folder that the app cannot reach now waits instead of counting as deleted.
+                resolver: FileBackupResourceResolver(scope: { pendingAccess.scope }),
                 identityResolver: identityResolver,
                 uploader: facade.photoUploader,
                 throttleInputs: BackupRuntimeSignalSource.apple.current,
@@ -190,6 +194,8 @@ final class FolderBackupController {
                     bookmarkDataIsStale: &stale
                 )
             else {
+                // "?" is no absolute path, so `WatchedFolderScope` treats this folder as one whose location is
+                // unknown: none of its rows count as outside or as deleted.
                 return BackupFolder(id: UUID(), bookmark: bookmark, displayPath: "?", needsRenewal: true)
             }
             return BackupFolder(id: UUID(), bookmark: bookmark, displayPath: url.path, needsRenewal: stale)
@@ -261,6 +267,8 @@ final class FolderBackupController {
 
     private func persistFolders() {
         UserDefaults.standard.set(folders.map(\.bookmark), forKey: Self.foldersDefaultsKey)
+        // The saved list is now the registry, also an empty one after the last folder was removed.
+        registeredFoldersAreKnown = true
     }
 
     /// The queue is a derived work index. The core removes only the rows that no registered folder

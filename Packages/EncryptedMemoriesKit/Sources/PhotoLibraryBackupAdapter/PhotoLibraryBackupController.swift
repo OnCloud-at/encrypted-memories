@@ -952,7 +952,8 @@ public final class PhotoLibraryBackupController {
             refreshFromQueue()
             return false
         case .found:
-            // The store checks the stored row by the same rule, so a stale item never dismisses a row that moved on.
+            // The store dismisses only a stored row that the list would show as dismissable, and only while the row is
+            // unchanged since that read and holds no receipt.
             guard queueStore.dismissPermanentFailure(source: source, revision: revision, updatedAt: Date()) else {
                 return false
             }

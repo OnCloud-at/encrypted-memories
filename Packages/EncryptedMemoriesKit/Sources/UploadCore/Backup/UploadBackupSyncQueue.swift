@@ -441,9 +441,10 @@ public extension UploadBackupSyncQueueStore {
         sourcesWithEntries(sources, outside: [])
     }
 
-    /// Dismisses one permanent failure, never a deletion decision: the stored row itself must be dismissable by the rule
-    /// of the problem list. The write applies only while the row still has the state and record that this read saw and
-    /// holds no upload receipt, so a stale problem list row never changes a row that moved on (#1583).
+    /// Dismisses one permanent failure, never a deletion decision. The stored row itself must be dismissable by the
+    /// rule of the problem list, and it must be a row the list shows: not one that the runner holds now and not a
+    /// dismissed photo whose check runs again. The write applies only while the row still has the state and record
+    /// that this read saw and holds no upload receipt (#1583).
     @discardableResult
     func dismissPermanentFailure(
         source: UploadSourceIdentity,
@@ -454,7 +455,9 @@ public extension UploadBackupSyncQueueStore {
         // row that could not be read is not dismissed, so a failed read never writes an empty record (#1004 B2).
         let lookup: StoreLookup<UploadBackupSyncQueueEntry>
         do { lookup = try decisionEntry(for: source, revision: revision) } catch { return false }
-        guard case .found(let current) = lookup, BackupFailedItem(entry: current).isDismissable else { return false }
+        guard case .found(let current) = lookup, !current.state.isActive, !current.isDismissedSourceRecheck,
+            BackupFailedItem(entry: current).isDismissable
+        else { return false }
         var dismissed = current
         dismissed.state = .dismissedFailure
         dismissed.updatedAt = updatedAt

@@ -1138,6 +1138,9 @@ public actor BackupSyncRunner {
         } catch is BackupWorkDeferredError {
             putBack(checkingEntry, from: persistedState, isSourceRecheck: isSourceRecheck)
             return
+        } catch is BackupSourceLocationUnavailableError {
+            waitForUnavailableLocation(checkingEntry, from: persistedState)
+            return
         } catch {
             if recordCancellation(error, for: checkingEntry) {
                 putBack(checkingEntry, from: persistedState, isSourceRecheck: isSourceRecheck)
@@ -1204,6 +1207,11 @@ public actor BackupSyncRunner {
             checkingEntry = released
         }
         guard let resolved else {
+            // A folder file whose upload reached Proton keeps its receipt: the row waits instead of going (#1583).
+            if checkingEntry.source.kind == .fileURL, let reconciliation = checkingEntry.remoteCommitReconciliation {
+                keepSavedReceipt(checkingEntry, reconciliation: reconciliation, from: persistedState)
+                return
+            }
             // The source has no backup work of its own now: the library no longer lists it, or it belongs to another
             // photo. The catalog hook decides which.
             discardMissingSource(checkingEntry, from: persistedState, sourceIsUnavailable: true)
@@ -2716,6 +2724,20 @@ public actor BackupSyncRunner {
 
     /// Stop/cancel path: put the row back where the next pass picks it up, without burning an
     /// attempt (stopping the app is not a failure of the item).
+    /// A file in a folder that the app cannot reach now waits for a later pass exactly as it was stored: same state,
+    /// record, attempts and date, so it spends no attempt, shows no new problem and keeps a saved receipt. This pass
+    /// does not claim it again (#1583).
+    private func waitForUnavailableLocation(
+        _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState
+    ) {
+        rememberDeferredSource(entry)
+        endActiveExecution(key: Self.key(entry), publish: false)
+        if sourceWasRemoved(entry) { return }
+        persist(
+            entry, from: oldState, to: entry.state, attempts: entry.attempts, lastError: entry.lastError,
+            updatedAt: entry.updatedAt)
+    }
+
     private func revert(_ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }

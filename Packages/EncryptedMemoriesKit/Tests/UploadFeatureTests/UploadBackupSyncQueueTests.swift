@@ -853,10 +853,15 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         let decision = BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue
         var finalWithReceipt = row("final-receipt", .failedPermanent, "kept")
         finalWithReceipt.remoteCommitReconciliation = receipt
+        // A dismissed photo whose check runs again, and a row that the runner holds, are not the item the person saw.
+        let missing = BackupIssueRecord(kind: .sourceMissing, detail: "missing").persistedValue
+        let unsupported = BackupIssueRecord(kind: .unsupported, detail: "unsupported").persistedValue
         let unchanged = [
             row("completed", .completed, nil), row("retryable", .failed, "network"),
             row("waiting", .discovered, "network"), row("decision", .failedPermanent, decision),
             row("dismissed", .dismissedFailure, "kept"), finalWithReceipt,
+            row("recheck-waiting", .discovered, missing), row("recheck-claimed", .checking, missing),
+            row("claimed", .checking, unsupported),
         ]
         XCTAssertTrue(store.upsertBatch(unchanged))
         let storedReceiptRow = try XCTUnwrap(try store.entry(for: receiptRow.source, revision: receiptRow.revision))
@@ -872,7 +877,6 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         }
 
         // A permanent failure is dismissed by the rule of the problem list and keeps its record, also when it has none.
-        let unsupported = BackupIssueRecord(kind: .unsupported, detail: "unsupported").persistedValue
         for permanent in [
             row("final", .failedPermanent, nil), row("missing", .sourceMissing, "missing reason"),
             row("unsupported", .failed, unsupported),
@@ -888,6 +892,39 @@ final class UploadBackupSyncQueueTests: XCTestCase {
             XCTAssertEqual(dismissed.attempts, permanent.attempts)
             XCTAssertEqual(dismissed.updatedAt, Date(timeIntervalSince1970: 200))
         }
+    }
+
+    /// A folder file that is reported missing keeps its row while the row holds an upload receipt: the receipt proves
+    /// that the bytes reached Proton (#1583). A row without a receipt goes, as before.
+    func testAMissingFolderFileKeepsARowThatHoldsAnUploadReceipt() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let plain = UploadSourceIdentity.file(tempDir.appendingPathComponent("plain.jpg"))
+        let committed = UploadSourceIdentity.file(tempDir.appendingPathComponent("committed.jpg"))
+        for source in [plain, committed] {
+            XCTAssertTrue(
+                store.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: source, revision: revision(1), originalFilename: source.identifier,
+                        updatedAt: Date(timeIntervalSince1970: 100))))
+        }
+        let receipt = UploadRemoteCommitReconciliation(
+            source: committed,
+            identity: UploadIdentity(
+                correctedName: "committed.jpg", nameHash: "name-hash", sha1Hex: String(repeating: "ab", count: 20),
+                sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+        XCTAssertTrue(
+            store.markNeedsRemoteReconciliation(
+                source: committed, revision: revision(1), reconciliation: receipt, lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 101)))
+        let stored = try XCTUnwrap(try store.entry(for: committed, revision: revision(1)))
+
+        XCTAssertTrue(store.removeMissingSource(source: plain, revision: revision(1)))
+        XCTAssertNil(try store.entry(for: plain, revision: revision(1)))
+        XCTAssertFalse(store.removeMissingSource(source: committed, revision: revision(1)))
+        XCTAssertEqual(try store.entry(for: committed, revision: revision(1)), stored)
+        XCTAssertTrue(store.isOperational())
     }
 
     func testSQLiteQueueListsEntriesInOneStateOldestFirst() throws {
