@@ -191,6 +191,12 @@ public final class AccessGate {
     /// The entry check for a route, a command or a view.
     public func admits(_ scope: ProtectedScope) -> Bool { state(of: scope) == .unlocked }
 
+    /// Returns once `scope` is open, at once when it is open already, or when the task is cancelled. The wait follows
+    /// the gate's own admission changes instead of asking again on a timer.
+    public func waitUntilAdmitted(_ scope: ProtectedScope) async {
+        for await admitted in Observations({ self.admits(scope) }) where admitted { return }
+    }
+
     /// Without a device lock nothing can be protected, so no area is enabled.
     public func isEnabled(_ scope: ProtectedScope) -> Bool {
         register(scope)

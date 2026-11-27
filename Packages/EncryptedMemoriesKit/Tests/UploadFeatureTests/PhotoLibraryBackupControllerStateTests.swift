@@ -3859,8 +3859,16 @@ final class PhotoLibraryBackupControllerStateTests: XCTestCase {
             XCTAssertTrue(secondRound, "the task starts the next pass itself")
             XCTAssertEqual(fixture.scan.owners.values, [.iOSContinuedTask])
 
-            // The last photo was deleted in Proton Drive: its deletion is respected, so no work is owed.
-            XCTAssertTrue(queue.upsertBatch([row("second-photo", .skippedRemoteDeletion)]))
+            // The last photo was deleted in Proton Drive: its deletion is respected, so no work is owed. The pass
+            // drains next to its scan, and a row that it holds keeps its state on a write; the deletion is stored once
+            // the pass lets the row go.
+            let deleted = row("second-photo", .skippedRemoteDeletion)
+            let stored = await waitUntil {
+                XCTAssertTrue(queue.upsertBatch([deleted]))
+                return queueEntryForTesting(in: queue, source: deleted.source, revision: deleted.revision)?.state
+                    == .skippedRemoteDeletion
+            }
+            XCTAssertTrue(stored, "the deletion is stored")
             fixture.scan.open.value = true
             let ended = await waitUntil(timeout: .seconds(5)) { !probe.results.isEmpty }
             XCTAssertTrue(ended)

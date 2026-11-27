@@ -332,6 +332,15 @@ public final class TimelineViewModel {
     /// Moves with every write of the whole-library snapshot or its authority: a load, a refresh, a trash or restore
     /// projection, a settled result. An equal result counts too, so it overtakes an older reader.
     @ObservationIgnored private var wholeLibraryWriteCount: UInt64 = 0
+    /// Moves with every route entry that a filtered load, a refresh or an emptied trash stores: a trash or restore
+    /// projection that computed meanwhile runs again instead of writing its older routes over the newer entry.
+    @ObservationIgnored private var routeStoreCount: UInt64 = 0
+
+    /// Stores `sections` as the newest entry of the filtered `route`.
+    private func storeRoute(_ sections: [TimelineSection], for route: PhotoFilter) {
+        routeStoreCount &+= 1
+        filterCache.insert(sections, for: route, activeRoute: filter)
+    }
 
     /// `change` compares `projection` with the current whole-library snapshot. Without it, the comparison runs here.
     private func updateAllRouteSnapshot(
@@ -480,7 +489,7 @@ public final class TimelineViewModel {
         do {
             let sections = await normalizeOffMain(try await (library?.timeline(filter: f) ?? []), for: f).sections
             guard filter == f else { return }
-            filterCache.insert(sections, for: f, activeRoute: filter)
+            storeRoute(sections, for: f)
             let items = sections.flatMap(\.items)
             // Only swap the grid if the content actually changed - otherwise keep the instant view (and the
             // user's scroll position) untouched.
@@ -516,6 +525,9 @@ public final class TimelineViewModel {
         }
         /// Runs after a trash or restore projection computed its result and before it writes it.
         @ObservationIgnored var afterProjectionComputedForTesting: (@MainActor () async -> Void)?
+
+        /// The cached routes, which a trash projection must not overwrite with older content. Debug builds only.
+        var filterCacheForTesting: TimelineFilterCache { filterCache }
 
         /// Shows `sections` as the current, drawn whole library, as after a completed first load, without a read. The
         /// offline fixture account of the app tests uses it. Debug builds only.
@@ -774,8 +786,10 @@ public final class TimelineViewModel {
     }
 
     private func projectTrash(_ items: [PhotoItem], uids: Set<PhotoUID>) async {
-        // Another write of the whole-library snapshot during the projection leaves it outdated. It never overwrites
-        // that write: it runs again on the newer state.
+        // Another write of the whole-library snapshot during the projection leaves it outdated, and so does a route
+        // that a load, a refresh or an emptied trash stored meanwhile. It never overwrites either write: it runs again
+        // on the newer state. A rerun needs another such write during its own computation, so it cannot repeat
+        // without a new listing or person action each time.
         while true {
             let written = wholeLibraryWriteCount
             if await projectTrashOnce(items, uids: uids, whileWriteCountIs: written) { return }
@@ -790,6 +804,7 @@ public final class TimelineViewModel {
         let all = allRouteSnapshot
         let caches = filterCache
         let cachedRoutes = caches.routesByRecency
+        let routeStores = routeStoreCount
         let activeFilter = filter
         let activeSections = currentSections
         let result = await Task.detached(priority: .userInitiated) {
@@ -811,7 +826,7 @@ public final class TimelineViewModel {
         #if DEBUG
             await afterProjectionComputedForTesting?()
         #endif
-        guard written == wholeLibraryWriteCount else { return false }
+        guard written == wholeLibraryWriteCount, routeStores == routeStoreCount else { return false }
 
         var updatedCache = TimelineFilterCache(maximumEntries: filterCache.maximumEntries)
         for route in cachedRoutes {
@@ -849,6 +864,7 @@ public final class TimelineViewModel {
     {
         let all = allRouteSnapshot
         let trash = filterCache.snapshot(for: .trash)
+        let routeStores = routeStoreCount
         let result = await Task.detached(priority: .userInitiated) {
             let all = all.map { TimelineContentProjection(sections: $0).inserting(items) }
             let trash = trash.map { TimelineContentProjection(sections: $0).removing(uids).sections }
@@ -857,7 +873,7 @@ public final class TimelineViewModel {
         #if DEBUG
             await afterProjectionComputedForTesting?()
         #endif
-        guard written == wholeLibraryWriteCount else { return false }
+        guard written == wholeLibraryWriteCount, routeStores == routeStoreCount else { return false }
 
         filterCache.removeAll()
         if let trash = result.1 {
@@ -898,7 +914,7 @@ public final class TimelineViewModel {
     public func commitEmptyTrash(_ uids: Set<PhotoUID>) {
         guard !uids.isEmpty else { return }
         removals.trashEmptied(uids)
-        filterCache.insert([], for: .trash, activeRoute: filter)
+        storeRoute([], for: .trash)
         if filter == .trash { publish([]) }
     }
 
@@ -1280,7 +1296,7 @@ public final class TimelineViewModel {
                 updateAllRouteSnapshot(projection, change: wholeLibraryChange)
                 settleFirstLoadAfterRefresh(count: projection.snapshot.count, requiresNewFrame: identitiesChanged)
             } else {
-                filterCache.insert(sections, for: f, activeRoute: filter)
+                storeRoute(sections, for: f)
             }  // keep the route's instant-revisit view fresh
             noteRefresh("applied")
             if f != .all {

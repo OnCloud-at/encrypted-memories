@@ -1049,11 +1049,7 @@
             // An unmeasurable scope bar means no bar sits above this grid (the system placed the search
             // field elsewhere, for example at the bottom). The steady state is no clearance at all: the
             // pre-#944 position the grid held before any picker existed.
-            guard scopeBarGap > 0, let window else {
-                if scopeBarClearance != 0 { applyScopeBarClearance(0) }
-                return
-            }
-            guard let scopeBarBottom = searchScopeBarBottom(in: window) else {
+            guard scopeBarGap > 0, window != nil, let scopeBarBottom = searchScopeBarBottom() else {
                 if scopeBarClearance != 0 { applyScopeBarClearance(0) }
                 return
             }
@@ -1072,23 +1068,29 @@
             }
         }
 
-        /// Bottom edge of a system search scope bar presented above this grid, in window coordinates. The
-        /// scope bar hangs below the navigation bar without extending the safe area, so the safe area alone
-        /// can't describe it. Like `visibleTabBarFrames` measures the real tab bar chrome, this measures the
-        /// scope picker's segmented control instead of hard-coding its height. Only the grid's own subtree
-        /// is skipped; views outside it that start just below the safe-area top and are wider than tall are
-        /// scope-picker segments.
-        private func searchScopeBarBottom(in window: UIWindow) -> CGFloat? {
+        /// Bottom edge of a system search scope bar presented above this grid, in this view's coordinates, the space
+        /// of `safeAreaInsets`. The scope bar hangs below the navigation bar without extending the safe area, so the
+        /// safe area alone can't describe it. Like `visibleTabBarFrames` measures the real tab bar chrome, this
+        /// measures the scope picker's segmented control instead of hard-coding its height. The picker belongs to
+        /// the search field of a navigation bar, so only the navigation bars of the controllers that contain this
+        /// grid are walked, not the whole window. A segmented control there that starts just below the safe-area top
+        /// and is wider than tall is a scope-picker segment.
+        private func searchScopeBarBottom() -> CGFloat? {
             let safeTop = safeAreaInsets.top
             var result: CGFloat?
-            var views: [(UIView, Int)] = [(window, 0)]
+            var views: [(UIView, Int)] = []
+            var responder: UIResponder? = self
+            while let next = responder?.next {
+                responder = next
+                if let bar = (next as? UINavigationController)?.navigationBar { views.append((bar, 0)) }
+            }
             var index = 0
             while index < views.count && index < 400 {
                 let (view, depth) = views[index]
                 index += 1
-                guard depth <= 40, !view.isHidden, view.alpha > 0, view !== self else { continue }
+                guard depth <= 40, !view.isHidden, view.alpha > 0 else { continue }
                 if let control = view as? UISegmentedControl {
-                    let frame = control.convert(control.bounds, to: window)
+                    let frame = control.convert(control.bounds, to: self)
                     if frame.minY >= safeTop - 1, frame.minY < safeTop + 120,
                         frame.width > frame.height, frame.height > 8
                     {

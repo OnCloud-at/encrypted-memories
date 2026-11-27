@@ -463,6 +463,58 @@ import Testing
         await lifecycle.shutdown()
     }
 
+    /// A host may clear the semantic query twice in one update, once before and once inside its commit. The second
+    /// clear changes nothing that a host reads, and no answer of the cancelled query arrives afterwards.
+    @Test @MainActor func aSecondClearOfTheQueryCoordinatorChangesNothing() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ml-coordinator-clear-twice-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let expected = PhotoUID(volumeID: "volume", nodeID: "invoice-result")
+        let catalogProvider = BlockingCatalogProvider(.init(entries: []))
+        let lifecycle = try makeColdStartLifecycle(
+            root: root,
+            state: MLSmartSearchPersistentState(isEnabled: true),
+            catalogProvider: catalogProvider,
+            assetInventory: .authoritative([expected]),
+            nativeSearchFactory: { RestoredNativeSearch(results: [expected]) }
+        )
+        let controller = MLSmartSearchController(lifecycle: lifecycle)
+        #expect(await waitUntilMainActor { controller.availableSearchScopes == [.all, .text] })
+
+        let coordinator = MLSmartSearchQueryCoordinator(
+            lifecycle: lifecycle, initialScope: .text, debounce: .milliseconds(1))
+        coordinator.update(query: "invoice")
+        #expect(await waitUntilMainActor { !coordinator.isSearching })
+        coordinator.update(query: "receipt")
+
+        struct Read: Equatable {
+            let rankedUIDs: [PhotoUID]?
+            let isSearching: Bool
+            let requestedQuery: String?
+            let resolvedQuery: String?
+            let scope: MLSearchScope
+        }
+        func read() -> Read {
+            Read(
+                rankedUIDs: coordinator.rankedUIDs, isSearching: coordinator.isSearching,
+                requestedQuery: coordinator.requestedQuery, resolvedQuery: coordinator.resolvedQuery,
+                scope: coordinator.scope)
+        }
+        coordinator.clear()
+        let once = read()
+        coordinator.clear()
+        #expect(read() == once)
+        #expect(
+            once == Read(rankedUIDs: nil, isSearching: false, requestedQuery: nil, resolvedQuery: nil, scope: .text))
+
+        // The cancelled query never answers later.
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(read() == once)
+
+        await catalogProvider.release()
+        await lifecycle.shutdown()
+    }
+
     @Test @MainActor func developerImportHoldsTheSecurityScopeUntilInstallCompletes() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ml-controller-scope-\(UUID().uuidString)", isDirectory: true)

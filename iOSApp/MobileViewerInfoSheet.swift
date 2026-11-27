@@ -192,8 +192,8 @@ struct MobileViewerInfoSheet: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(albumTitles, id: \.self) { title in
-                        Label(title, systemImage: "rectangle.stack")
+                    ForEach(ViewerChipIdentity.forTitles(albumTitles), id: \.id) { chip in
+                        Label(chip.title, systemImage: "rectangle.stack")
                             .font(.subheadline)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -273,8 +273,8 @@ struct MobileViewerDetailsSummary: View {
     }
 
     private func chips(singleLine: Bool) -> some View {
-        ForEach(albumTitles, id: \.self) { title in
-            Label(title, systemImage: "rectangle.stack")
+        ForEach(ViewerChipIdentity.forTitles(albumTitles), id: \.id) { chip in
+            Label(chip.title, systemImage: "rectangle.stack")
                 .font(.footnote.weight(.medium))
                 .lineLimit(singleLine ? 1 : nil)
                 .modifier(CappedWidth(maximum: singleLine ? details.albumChipMaxWidth : nil))

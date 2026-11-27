@@ -36,6 +36,13 @@ public struct UploadRefreshSignalTracker: Sendable, Equatable {
             } else {
                 nil
             }
-        return Outcome(refresh: refresh, passEnded: passWasRunning && !passIsRunning)
+        return Outcome(
+            refresh: refresh, passEnded: Self.passEnded(wasRunning: passWasRunning, isRunning: passIsRunning))
+    }
+
+    /// The end of a backup pass, for every host: a pass that ran no longer runs. A host that follows the running state
+    /// on its own, without the upload revisions, asks this instead of deciding it again.
+    public static func passEnded(wasRunning: Bool, isRunning: Bool) -> Bool {
+        wasRunning && !isRunning
     }
 }
