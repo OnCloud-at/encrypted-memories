@@ -346,15 +346,21 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                state, attempts, last_error, updated_at, remote_commit_reconciliation
         """
 
-    private static func earliestEntrySQL(forState state: String) -> String {
-        "SELECT \(entryColumns) FROM backup_sync_queue WHERE state='\(state)' ORDER BY updated_at ASC LIMIT 1"
+    private static func earliestEntrySQL(forState state: String, filter: String = "") -> String {
+        "SELECT \(entryColumns) FROM backup_sync_queue WHERE state='\(state)'\(filter) ORDER BY updated_at ASC LIMIT 1"
     }
 
-    public func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
+    public func decisionEarliestRunnableEntry(
+        admittingFiles files: BackupFileClaimFilter?
+    ) throws -> UploadBackupSyncQueueEntry? {
+        let exclusion = SourceExclusion([], admittingFiles: files)
         let perState = Self.runnableStates
-            .map { "SELECT * FROM (\(Self.earliestEntrySQL(forState: $0)))" }
+            .map { "SELECT * FROM (\(Self.earliestEntrySQL(forState: $0, filter: exclusion.clause)))" }
             .joined(separator: " UNION ALL ")
-        return try earliestEntry(sql: "SELECT * FROM (\(perState)) ORDER BY updated_at ASC LIMIT 1;")
+        return try earliestEntry(sql: "SELECT * FROM (\(perState)) ORDER BY updated_at ASC LIMIT 1;") { stmt in
+            var parameter: Int32 = 1
+            for _ in Self.runnableStates { parameter = try bind(exclusion, to: stmt, from: parameter) }
+        }
     }
 
     /// True when any row carries one of `states`. False is a real answer only after a successful read; a read that
@@ -637,7 +643,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return changed > 0
     }
 
-    public func restoreClaimed(_ entry: UploadBackupSyncQueueEntry) -> Bool? {
+    public func restoreClaimed(
+        _ entry: UploadBackupSyncQueueEntry, whileIn state: UploadBackupSyncQueueState
+    ) -> Bool? {
         let changed: Int? = connection.withLock {
             let changed =
                 withDurableCommitsRecordingSetup { () -> Int? in
@@ -650,7 +658,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                 UPDATE backup_sync_queue
                                 SET state=?, attempts=?, last_error=?, updated_at=?
                                 WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
-                                  AND state='checking';
+                                  AND state=?;
                                 """, -1, &stmt, nil) == SQLITE_OK)
                     else { return nil }
                     defer { sqlite3_finalize(stmt) }
@@ -663,6 +671,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                             throw SQLiteStoreUnknownReadError()
                         }
                         sqlite3_bind_int64(stmt, 8, entry.revision.rawValue)
+                        try connection.bindText(stmt, 9, state.rawValue)
                     } catch {
                         return nil
                     }
@@ -1804,7 +1813,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return UploadSourceIdentity(kind: kind, identifier: id, resource: resource)
     }
 
-    private func earliestEntry(sql: String) throws -> UploadBackupSyncQueueEntry? {
+    /// A failed bind throws before the step (#1194).
+    private func earliestEntry(
+        sql: String, bind: (OpaquePointer?) throws -> Void = { _ in }
+    ) throws -> UploadBackupSyncQueueEntry? {
         try connection.withLock {
             try beginReadLocked()
             var stmt: OpaquePointer?
@@ -1812,6 +1824,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                 throw SQLiteStoreUnknownReadError()
             }
             defer { sqlite3_finalize(stmt) }
+            try bind(stmt)
             let result = sqlite3_step(stmt)
             guard result == SQLITE_ROW else {
                 if result != SQLITE_DONE {

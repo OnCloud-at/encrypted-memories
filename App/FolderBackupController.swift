@@ -5,22 +5,15 @@ import PhotosCore
 import ProtonDriveBackend
 import UploadCore
 
-/// One folder the user chose to keep backed up, persisted as a security-scoped bookmark so the
-/// sandboxed app can reach it across launches.
-struct BackupFolder: Identifiable, Equatable {
-    let id: UUID
-    var bookmark: Data
-    var displayPath: String
-    /// True when the bookmark no longer resolves cleanly - the user must re-pick the folder.
-    var needsRenewal: Bool
-}
-
 /// macOS composition of the shared backup sync stack. This type owns security-scoped folder access
 /// and lifecycle; UploadCore owns synchronization and recovery.
 @MainActor
 @Observable
 final class FolderBackupController {
-    private(set) var folders: [BackupFolder] = []
+    /// The folders the user chose to keep backed up, each persisted as a security-scoped bookmark so the sandboxed app
+    /// can reach it across launches. The core decides the list from the bookmark resolutions of this host.
+    private(set) var registry = WatchedFolderRegistry(savedBookmarks: nil, resolve: { _ in .unresolved })
+    var folders: [WatchedFolder] { registry.folders }
     /// The user-facing state surface shared by both platform settings views. Raw runner progress stays internal.
     private(set) var status = BackupStatus()
     private(set) var isSyncing = false
@@ -37,10 +30,7 @@ final class FolderBackupController {
     let pendingAccess: PendingFolderAccess
     @ObservationIgnored private let pendingStore: PendingBackupManifestStore?
     @ObservationIgnored private let requiresPendingStore: Bool
-    @ObservationIgnored private var accessedFolders: [BackupFolder.ID: URL] = [:]
-    /// False when the saved folder list is missing or could not be read, so no path counts as outside the watched
-    /// folders. Saving the list makes it known.
-    @ObservationIgnored private var registeredFoldersAreKnown = false
+    @ObservationIgnored private var accessedFolders: [WatchedFolder.ID: URL] = [:]
 
     private let engine: UploadBackupSyncEngine?
     private let runner: BackupSyncRunner?
@@ -90,7 +80,12 @@ final class FolderBackupController {
         )
         self.queueStore = queueStore
         self.stateStore = stateStore
-        statusProjector = queueStore.map { BackupStatusProjector(queue: $0) }
+        // A file in a folder that the app cannot reach now waits instead of counting as deleted, and its row sets no
+        // time in the status.
+        let resolver = FileBackupResourceResolver(scope: { pendingAccess.scope })
+        statusProjector = queueStore.map {
+            BackupStatusProjector(queue: $0, fileClaimFilter: { resolver.fileClaimFilter() })
+        }
 
         // The shared dedupe pipeline prevents each sync pass from re-uploading existing files.
         if let queueStore, let stateStore, let identityResolver = facade.uploadIdentityResolver {
@@ -104,8 +99,7 @@ final class FolderBackupController {
             runner = BackupSyncRunner(
                 queue: queueStore,
                 preflight: preflight,
-                // A file in a folder that the app cannot reach now waits instead of counting as deleted.
-                resolver: FileBackupResourceResolver(scope: { pendingAccess.scope }),
+                resolver: resolver,
                 identityResolver: identityResolver,
                 uploader: facade.photoUploader,
                 throttleInputs: BackupRuntimeSignalSource.apple.current,
@@ -160,10 +154,8 @@ final class FolderBackupController {
         }
         switch registered {
         case .success(let bookmark):
-            let folder = BackupFolder(id: UUID(), bookmark: bookmark, displayPath: url.path, needsRenewal: false)
-            folders.removeAll { $0.displayPath == folder.displayPath }
-            folders.append(folder)
-            folders.sort { $0.displayPath.localizedCaseInsensitiveCompare($1.displayPath) == .orderedAscending }
+            // The same folder added again replaces its entry, also a "?" entry of a drive that was away.
+            registry.add(bookmark: bookmark, path: url.path, lastKnownPath: Self.lastKnownPath(of:))
             persistFolders()
             refreshFolderAccess()
             lastMessage = BackupFolderRegistration.messageAfterSuccessfulAdd(current: lastMessage)
@@ -172,8 +164,8 @@ final class FolderBackupController {
         }
     }
 
-    func removeFolder(_ id: BackupFolder.ID) {
-        folders.removeAll { $0.id == id }
+    func removeFolder(_ id: WatchedFolder.ID) {
+        registry.remove(id)
         persistFolders()
         refreshFolderAccess()
         reconcileQueueWithRegisteredFolders()
@@ -181,32 +173,40 @@ final class FolderBackupController {
     }
 
     private func loadFolders() {
-        let stored = WatchedFolderScope.registeredBookmarks(
-            storedValue: UserDefaults.standard.object(forKey: Self.foldersDefaultsKey))
-        registeredFoldersAreKnown = stored != nil
-        folders = (stored ?? []).compactMap { bookmark in
-            var stale = false
-            guard
-                let url = try? URL(
-                    resolvingBookmarkData: bookmark,
-                    options: [.withSecurityScope, .withoutUI],
-                    relativeTo: nil,
-                    bookmarkDataIsStale: &stale
-                )
-            else {
-                // "?" is no absolute path, so `WatchedFolderScope` treats this folder as one whose location is
-                // unknown: none of its rows count as outside or as deleted.
-                return BackupFolder(id: UUID(), bookmark: bookmark, displayPath: "?", needsRenewal: true)
-            }
-            return BackupFolder(id: UUID(), bookmark: bookmark, displayPath: url.path, needsRenewal: stale)
-        }
-        .sorted { $0.displayPath.localizedCaseInsensitiveCompare($1.displayPath) == .orderedAscending }
+        registry = WatchedFolderRegistry(
+            savedBookmarks: WatchedFolderScope.registeredBookmarks(
+                storedValue: UserDefaults.standard.object(forKey: Self.foldersDefaultsKey)),
+            resolve: Self.resolve(bookmark:))
         refreshFolderAccess()
+    }
+
+    /// Resolves every bookmark again before a pass: a folder whose drive was mounted meanwhile becomes readable before
+    /// the reconcile and the claims, and one that no longer resolves is marked (#1583).
+    private func refreshFolders() {
+        if registry.refresh(resolve: Self.resolve(bookmark:)) { refreshFolderAccess() }
+    }
+
+    private static func resolve(bookmark: Data) -> WatchedFolderBookmarkResolution {
+        var stale = false
+        guard
+            let url = try? URL(
+                resolvingBookmarkData: bookmark,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            )
+        else { return .unresolved }
+        return .resolved(path: url.path, isStale: stale)
+    }
+
+    /// The path that a bookmark recorded, also while its drive is not mounted.
+    private static func lastKnownPath(of bookmark: Data) -> String? {
+        URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
     }
 
     /// Keeps every registered folder readable, for pending thumbnails, the viewer and export.
     private func refreshFolderAccess() {
-        let registered = Set(folders.filter { !$0.needsRenewal }.map(\.id))
+        let registered = Set(registry.readableFolders.map(\.id))
         for (id, url) in accessedFolders where !registered.contains(id) {
             url.stopAccessingSecurityScopedResource()
             accessedFolders[id] = nil
@@ -223,10 +223,7 @@ final class FolderBackupController {
             else { continue }
             accessedFolders[folder.id] = url
         }
-        pendingAccess.setScope(
-            WatchedFolderScope(
-                readable: Array(accessedFolders.values),
-                registered: registeredFoldersAreKnown ? folders.map(\.displayPath) : nil))
+        pendingAccess.setScope(registry.scope(readable: Array(accessedFolders.values)))
     }
 
     // MARK: - Pending grid
@@ -266,9 +263,8 @@ final class FolderBackupController {
     }
 
     private func persistFolders() {
-        UserDefaults.standard.set(folders.map(\.bookmark), forKey: Self.foldersDefaultsKey)
         // The saved list is now the registry, also an empty one after the last folder was removed.
-        registeredFoldersAreKnown = true
+        UserDefaults.standard.set(registry.bookmarks, forKey: Self.foldersDefaultsKey)
     }
 
     /// The queue is a derived work index. The core removes only the rows that no registered folder
@@ -281,6 +277,7 @@ final class FolderBackupController {
 
     func syncNow() {
         guard !isShuttingDown, !isSyncing, runnerStopTask == nil, isAvailable, let engine, let runner else { return }
+        refreshFolders()
         reconcileQueueWithRegisteredFolders()
         let runID = UUID()
         activeRunID = runID
@@ -317,7 +314,7 @@ final class FolderBackupController {
                         bookmarkDataIsStale: &stale
                     ), !stale, url.startAccessingSecurityScopedResource()
                 else {
-                    self?.markFolderNeedsRenewal(folder.id)
+                    self?.applyResolution(.unresolved, to: folder.id)
                     self?.recordFolderEnumerationFailure(
                         Self.localizedFolderError(
                             failureClass: .missing,
@@ -327,6 +324,8 @@ final class FolderBackupController {
                     continue
                 }
                 accessedURLs.append(url)
+                // A folder that resolves cleanly is readable again, before the pass claims its rows.
+                self?.applyResolution(.resolved(path: url.path, isStale: false), to: folder.id)
                 do {
                     _ = try await engine.scan(FolderBackupCatalog(folder: url, skippedFiles: skippedFiles))
                 } catch is CancellationError {
@@ -390,22 +389,19 @@ final class FolderBackupController {
         pendingAccess.setScope(.unavailable)
     }
 
-    private func markFolderNeedsRenewal(_ id: BackupFolder.ID) {
-        if let index = folders.firstIndex(where: { $0.id == id }) {
-            folders[index].needsRenewal = true
-            persistFolders()
-        }
-        // A folder that must be picked again is no longer readable for the pending grid either.
-        refreshFolderAccess()
+    /// A folder that must be picked again is no longer readable for the pending grid or the backup either; one that
+    /// resolves again is readable for both.
+    private func applyResolution(_ resolution: WatchedFolderBookmarkResolution, to id: WatchedFolder.ID) {
+        if registry.apply(resolution, to: id) { refreshFolderAccess() }
     }
 
     private func reportFolderEnumerationError(
         _ error: FolderEnumerationError,
-        folder: BackupFolder,
+        folder: WatchedFolder,
         root: URL
     ) {
         if error.requiresRootAccessRenewal(for: root) {
-            markFolderNeedsRenewal(folder.id)
+            applyResolution(.unresolved, to: folder.id)
         }
         let name = error.url.lastPathComponent.isEmpty ? folder.displayPath : error.url.lastPathComponent
         recordFolderEnumerationFailure(

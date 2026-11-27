@@ -297,11 +297,11 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func updateDismissedSourceRecheck(
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
     ) -> Bool?
-    /// Puts a claimed row back exactly as `entry` was stored before the claim, while the row is still `checking`: same
-    /// state, attempts, record and date, and its receipt stays. Observers hear of it as of the claim; the support trail
-    /// records nothing, because nothing changed for the person (#1583). Nil means a failed write; false means the row
-    /// is no longer claimed.
-    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry) -> Bool?
+    /// Puts a claimed row back exactly as `entry` was stored before the claim, while the row is still in `state`, the
+    /// active state of its run: same state, attempts, record and date, and its receipt stays. Observers hear of it as of
+    /// the claim; the support trail records nothing, because nothing changed for the person (#1583). Nil means a failed
+    /// write; false means the row moved on.
+    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry, whileIn state: UploadBackupSyncQueueState) -> Bool?
     /// The keyed read for a decision: found, absent, or unknown. A read that could not run (a closed store, a failed
     /// bind or statement, a row that does not decode) answers unknown and never proves the row absent (#1004). The
     /// store itself does not throw. A test double may throw a foreign error, a cancellation for example, and the
@@ -423,7 +423,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     ) throws -> Date?
     /// Earliest eligible or backoff row for status and scheduling. Unlike `claimRunnable`, this is ordered by
     /// eligibility rather than newest-photo execution priority.
-    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry?
+    /// With `files`, only rows that a claim with the same filter can take count (#1583).
+    func decisionEarliestRunnableEntry(
+        admittingFiles files: BackupFileClaimFilter?
+    ) throws -> UploadBackupSyncQueueEntry?
     func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry?
     /// Rows currently in `state` whose `updatedAt` is older than `updatedBefore`, newest revision first and, for equal
     /// revisions, oldest update first. The runner uses this to find parked `blockedByDraft` rows whose re-check
@@ -466,6 +469,10 @@ public extension UploadBackupSyncQueueStore {
 
     func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
         try decisionNextRunnableDate(excludingSourcesOf: excludedSources, admittingFiles: nil)
+    }
+
+    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
+        try decisionEarliestRunnableEntry(admittingFiles: nil)
     }
 
     /// Dismisses one permanent failure, never a deletion decision. The stored row itself must be dismissable by the

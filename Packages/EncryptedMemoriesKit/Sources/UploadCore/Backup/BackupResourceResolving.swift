@@ -300,9 +300,9 @@ public struct FileBackupResourceResolver: BackupResourceResolving {
             throw UploadError.internalFailure(.backupResolverUnsupportedSource(kind: entry.source.kind))
         }
         let url = URL(fileURLWithPath: entry.source.identifier)
-        let watched = scope?()
-        // A file that may lie in a folder the app cannot reach now is not read at all (#1227).
-        if watched?.location(ofPath: url.path) == .unavailable { throw BackupSourceLocationUnavailableError() }
+        // A file that may lie in a folder the app cannot reach now is not read at all (#1227). The rule is the one of
+        // the claim, so a claim and this read never disagree.
+        if fileClaimFilter()?.admits(path: url.path) == false { throw BackupSourceLocationUnavailableError() }
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: url.path)
@@ -310,10 +310,9 @@ public struct FileBackupResourceResolver: BackupResourceResolving {
             where (error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError)
             || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
         {
-            // A missing file proves a deletion only while its folder is still there.
-            if let root = watched?.readableRoot(forPath: url.path), !FileManager.default.fileExists(atPath: root.path) {
-                throw BackupSourceLocationUnavailableError()
-            }
+            // A missing file proves a deletion only while its folder is still there: the drive can go away during the
+            // read.
+            if fileClaimFilter()?.admits(path: url.path) == false { throw BackupSourceLocationUnavailableError() }
             return nil
         }
 

@@ -15,7 +15,7 @@ public struct WatchedFolderScope: Sendable, Equatable {
     }
 
     /// Root paths of the folders the app can read now, each with a trailing slash.
-    let readableRoots: [String]
+    private let readableRoots: [String]
     /// Root paths of every registered folder, each with a trailing slash. Nil when a registered
     /// folder has no known path or the registry is not loaded, so no path is proven outside.
     let registeredRoots: [String]?
@@ -45,14 +45,10 @@ public struct WatchedFolderScope: Sendable, Equatable {
         self.registeredRoots = registeredRoots
     }
 
-    /// The folder that the app can read now and that holds the path.
-    func readableRoot(forPath path: String) -> URL? {
-        readableRoots.first { path.hasPrefix($0) }.map { URL(fileURLWithPath: $0, isDirectory: true) }
-    }
-
     /// The file behind a path, when it lies in a folder the app can read now.
     public func readableURL(forPath path: String) -> URL? {
-        readableRoot(forPath: path).map { _ in URL(fileURLWithPath: path) }
+        guard readableRoots.contains(where: { path.hasPrefix($0) }) else { return nil }
+        return URL(fileURLWithPath: path)
     }
 
     /// Only a path outside every known registered folder counts as outside.
@@ -80,8 +76,9 @@ public struct WatchedFolderScope: Sendable, Equatable {
 
 /// The folder files that a backup pass may claim: a file in a readable folder that is still there, and a file that no
 /// registered folder holds. Every other folder file may lie in a folder that the app cannot reach now, for example on a
-/// drive that is not mounted: it stays unclaimed and unchanged until its folder is back (#1583). The rule mirrors the
-/// one of `FileBackupResourceResolver`, which refuses the same files. Other source kinds are not affected.
+/// drive that is not mounted: it stays unclaimed and unchanged until its folder is back (#1583). The claim in SQL mirrors
+/// `admits(path:)`, and `FileBackupResourceResolver` refuses exactly the files that it does not admit. With nested
+/// folders, any readable folder that holds the path and is still there admits it. Other source kinds are not affected.
 public struct BackupFileClaimFilter: Sendable, Equatable {
     /// Readable roots that exist now, each with a trailing slash.
     let presentRoots: [String]

@@ -57,15 +57,14 @@ final class FolderBackupIntegrationTests: XCTestCase {
     /// `usesClaimFilter: false` makes a runner whose claims take every row, as if the claim filter and the read of a
     /// file disagreed.
     private func makeRunner(scope: ScopeBox? = nil, usesClaimFilter: Bool = true) -> BackupSyncRunner {
-        let resolver: any BackupResourceResolving
-        if let scope {
-            reads = CountingResolver(
-                inner: FileBackupResourceResolver(scope: { scope.scope }), usesClaimFilter: usesClaimFilter)
-            resolver = reads
-        } else {
-            resolver = FileBackupResourceResolver()
-        }
-        return BackupSyncRunner(
+        guard let scope else { return makeRunner(resolver: FileBackupResourceResolver()) }
+        reads = CountingResolver(
+            inner: FileBackupResourceResolver(scope: { scope.scope }), usesClaimFilter: usesClaimFilter)
+        return makeRunner(resolver: reads)
+    }
+
+    private func makeRunner(resolver: any BackupResourceResolving) -> BackupSyncRunner {
+        BackupSyncRunner(
             queue: queueStore,
             preflight: preflight,
             resolver: resolver,
@@ -126,6 +125,26 @@ final class FolderBackupIntegrationTests: XCTestCase {
         func mark() { lock.withLock { ended = true } }
     }
 
+    /// Reads a file, then runs `afterRead` once: a drive that is unplugged, or a file that is deleted, after the read
+    /// and before the hash.
+    private struct AfterReadResolver: BackupResourceResolving {
+        let inner: FileBackupResourceResolver
+        let afterRead: @Sendable () -> Void
+
+        func fileClaimFilter() -> BackupFileClaimFilter? { inner.fileClaimFilter() }
+
+        func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
+            let resolved = try await inner.resolve(entry)
+            afterRead()
+            return resolved
+        }
+    }
+
+    /// The scope as the Mac app derives it from its folder list: it holds access to every folder that it may read.
+    private func registryScope(_ registry: WatchedFolderRegistry) -> WatchedFolderScope {
+        registry.scope(readable: registry.readableFolders.compactMap { $0.path.map(URL.init(fileURLWithPath:)) })
+    }
+
     /// The kind and time of each support trail event of the files in `sources`. Each export salts the subjects anew.
     private func trailEvents(of sources: [UploadSourceIdentity]) -> [String] {
         let hasher = SupportReportIdentifierHasher()
@@ -183,13 +202,16 @@ final class FolderBackupIntegrationTests: XCTestCase {
 
     /// The drive of a watched folder is not mounted: its bookmark gave no path at launch, so the scope cannot place
     /// the files, and every path reads as missing. A pass keeps every row as it was, receipts included, burns no
-    /// attempt and uploads nothing. Once the drive is back, the new file uploads once and the file with a receipt
-    /// never uploads (#1583).
+    /// attempt and uploads nothing. The drive is mounted while the app runs: the next pass resolves the bookmark again
+    /// as the app does before its claims, and then the waiting file and a new file of the drive upload once, and the
+    /// file with a receipt never uploads (#1583).
     func testAFolderOnADriveThatIsNotMountedKeepsItsRowsUntilTheDriveIsBack() async throws {
         let (new, sent) = try await queueNewAndSentFiles()
         let away = tempDir.appendingPathComponent("Unmounted", isDirectory: true)
         try FileManager.default.moveItem(at: folder, to: away)
-        let scope = ScopeBox(WatchedFolderScope(readable: [], registered: ["?"]))
+        let bookmark = Data("folder".utf8)
+        var registry = WatchedFolderRegistry(savedBookmarks: [bookmark]) { _ in .unresolved }
+        let scope = ScopeBox(registryScope(registry))
         let trailBefore = trailEvents(of: [new.source, sent.source])
 
         await runBounded(makeRunner(scope: scope))
@@ -201,15 +223,52 @@ final class FolderBackupIntegrationTests: XCTestCase {
         XCTAssertEqual(trailEvents(of: [new.source, sent.source]), trailBefore)
 
         try FileManager.default.moveItem(at: away, to: folder)
-        scope.scope = WatchedFolderScope(readable: [folder], registered: [folder.path])
+        try Data("later".utf8).write(to: folder.appendingPathComponent("later.jpg"))
+        XCTAssertTrue(registry.refresh { _ in .resolved(path: self.folder.path, isStale: false) })
+        scope.scope = registryScope(registry)
+        _ = try await engine.scan(FolderBackupCatalog(folder: folder))
         await runBounded(makeRunner(scope: scope))
 
-        XCTAssertEqual(uploader.requests.map(\.name), ["new.jpg"], "the file with a receipt never uploads again")
+        XCTAssertEqual(
+            uploader.requests.map(\.name).sorted(), ["later.jpg", "new.jpg"],
+            "the file with a receipt never uploads again")
         XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision)?.state, .completed)
         let settled = try XCTUnwrap(try queueStore.entry(for: sent.source, revision: sent.revision))
         XCTAssertTrue(
             settled.state.isTerminalSuccess || settled.remoteCommitReconciliation == sent.remoteCommitReconciliation,
             "the receipt is settled or still kept: \(settled.state)")
+    }
+
+    /// The drive is unplugged before a pass: its scan cannot resolve the bookmark and marks the folder, as the app does,
+    /// and the pass leaves the rows alone. Plugged in again, the next pass resolves the bookmark before its claims and
+    /// backs up the waiting file and a new one (#1583).
+    func testAFolderUnpluggedForAPassBacksUpOnceItIsPluggedInAgain() async throws {
+        let (new, sent) = try await queueNewAndSentFiles()
+        let bookmark = Data("folder".utf8)
+        var registry = WatchedFolderRegistry(savedBookmarks: [bookmark]) { _ in
+            .resolved(path: self.folder.path, isStale: false)
+        }
+        let id = try XCTUnwrap(registry.folders.first?.id)
+        let away = tempDir.appendingPathComponent("Unplugged", isDirectory: true)
+        try FileManager.default.moveItem(at: folder, to: away)
+        XCTAssertTrue(registry.apply(.unresolved, to: id))
+        let scope = ScopeBox(registryScope(registry))
+
+        await runBounded(makeRunner(scope: scope))
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision), new)
+        XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
+        XCTAssertEqual([reads.reads(of: new.source), reads.reads(of: sent.source)], [0, 0])
+
+        try FileManager.default.moveItem(at: away, to: folder)
+        try Data("later".utf8).write(to: folder.appendingPathComponent("later.jpg"))
+        XCTAssertTrue(registry.refresh { _ in .resolved(path: self.folder.path, isStale: false) })
+        scope.scope = registryScope(registry)
+        _ = try await engine.scan(FolderBackupCatalog(folder: folder))
+        await runBounded(makeRunner(scope: scope))
+
+        XCTAssertEqual(uploader.requests.map(\.name).sorted(), ["later.jpg", "new.jpg"])
     }
 
     /// The drive goes away while its folder is still open: the folder itself is gone, so a missing file in it is no
@@ -232,7 +291,8 @@ final class FolderBackupIntegrationTests: XCTestCase {
     func testAFileWhoseFolderGoesAwayAfterItsClaimIsReadOnceAndKeptAsStored() async throws {
         let (new, sent) = try await queueNewAndSentFiles()
         let scope = ScopeBox(WatchedFolderScope(readable: [folder], registered: [folder.path]))
-        try FileManager.default.moveItem(at: folder, to: tempDir.appendingPathComponent("Unmounted", isDirectory: true))
+        let away = tempDir.appendingPathComponent("Unmounted", isDirectory: true)
+        try FileManager.default.moveItem(at: folder, to: away)
         let trailBefore = trailEvents(of: [new.source, sent.source])
 
         await runBounded(makeRunner(scope: scope, usesClaimFilter: false))
@@ -243,15 +303,121 @@ final class FolderBackupIntegrationTests: XCTestCase {
         XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
         XCTAssertEqual(trailEvents(of: [new.source, sent.source]), trailBefore)
 
-        // The same after a launch that found no path for the folder.
-        scope.scope = WatchedFolderScope(readable: [], registered: ["?"])
-        await runBounded(makeRunner(scope: scope, usesClaimFilter: false))
+        // The same after a launch that found no path for the folder, and for a folder that is there but that the app
+        // may not read now: its files are not read.
+        for current in [
+            WatchedFolderScope(readable: [], registered: ["?"]),
+            WatchedFolderScope(readable: [], registered: [folder.path]),
+        ] {
+            if current.registeredRoots != nil { try FileManager.default.moveItem(at: away, to: folder) }
+            scope.scope = current
+            await runBounded(makeRunner(scope: scope, usesClaimFilter: false))
 
-        XCTAssertTrue(uploader.requests.isEmpty)
-        XCTAssertEqual([reads.reads(of: new.source), reads.reads(of: sent.source)], [1, 1])
-        XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision), new)
-        XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
-        XCTAssertEqual(trailEvents(of: [new.source, sent.source]), trailBefore)
+            XCTAssertTrue(uploader.requests.isEmpty)
+            XCTAssertEqual([reads.reads(of: new.source), reads.reads(of: sent.source)], [1, 1])
+            XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision), new)
+            XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
+            XCTAssertEqual(trailEvents(of: [new.source, sent.source]), trailBefore)
+        }
+    }
+
+    /// The folder list changes between the check before the read and the missing file, for example because a scan found
+    /// the drive gone: the missing file proves nothing then (#1583).
+    func testAMissingFileCountsAsDeletedOnlyWhileItsFolderIsStillReachable() async throws {
+        let gone = tempDir.appendingPathComponent("Gone", isDirectory: true)
+        let source = UploadSourceIdentity.file(gone.appendingPathComponent("IMG.jpg"))
+        let entry = UploadBackupSyncQueueEntry(
+            source: source, revision: UploadBackupRevision(rawValue: 1), originalFilename: "IMG.jpg",
+            updatedAt: Date(timeIntervalSince1970: 100))
+        let checks = PassEnd()
+        let resolver = FileBackupResourceResolver(scope: {
+            defer { checks.mark() }
+            // First the folder is no registered folder, then it is a readable folder whose drive is gone.
+            return checks.value
+                ? WatchedFolderScope(readable: [gone], registered: [gone.path])
+                : WatchedFolderScope(readable: [], registered: [])
+        })
+
+        do {
+            _ = try await resolver.resolve(entry)
+            XCTFail("the missing file proves nothing while its folder is gone")
+        } catch is BackupSourceLocationUnavailableError {}
+    }
+
+    /// The drive is unplugged after the read of a file and before its hash: the missing file proves nothing while its
+    /// folder is gone, so the row returns as it was stored. A file that is deleted at the same point while its folder
+    /// stays leaves the queue, as in 1.1.0 (#1583).
+    func testAFileThatGoesMissingWhileItIsHashedLeavesTheQueueOnlyWhileItsFolderIsThere() async throws {
+        let file = folder.appendingPathComponent("hashed.jpg")
+        let scope = WatchedFolderScope(readable: [folder], registered: [folder.path])
+        let away = tempDir.appendingPathComponent("Unplugged", isDirectory: true)
+        for unplugs in [true, false] {
+            try Data("hashed".utf8).write(to: file)
+            _ = try await engine.scan(FolderBackupCatalog(folder: folder))
+            let source = UploadSourceIdentity.file(file)
+            let row = try XCTUnwrap(
+                try queueStore.decisionRows(kind: .fileURL, identifiers: [source.identifier]).first)
+            let stored = try XCTUnwrap(try queueStore.entry(for: source, revision: row.revision))
+            let folder = self.folder!
+            let resolver = AfterReadResolver(inner: FileBackupResourceResolver(scope: { scope })) {
+                if unplugs {
+                    try? FileManager.default.moveItem(at: folder, to: away)
+                } else {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }
+
+            await runBounded(makeRunner(resolver: resolver))
+
+            XCTAssertTrue(uploader.requests.isEmpty)
+            if unplugs {
+                XCTAssertEqual(try queueStore.entry(for: source, revision: stored.revision), stored)
+                try FileManager.default.moveItem(at: away, to: folder)
+                try FileManager.default.removeItem(at: file)
+                XCTAssertTrue(queueStore.remove(source: source, revision: stored.revision))
+            } else {
+                XCTAssertNil(try queueStore.entry(for: source, revision: stored.revision))
+            }
+        }
+    }
+
+    /// A row of a drive that is away sets no time in the waiting status: its wait ends only when the drive is back
+    /// (#1583).
+    func testARowOfADriveThatIsAwaySetsNoTimeInTheWaitingStatus() async throws {
+        let driveRow = UploadBackupSyncQueueEntry(
+            source: .file(URL(fileURLWithPath: "/Volumes/Away-1583/IMG_1.jpg")),
+            revision: UploadBackupRevision(rawValue: 1),
+            originalFilename: "IMG_1.jpg",
+            lastError: BackupIssueRecord(
+                kind: .network, detail: "drive", nextAttemptAt: Date(timeIntervalSince1970: 1_000)
+            ).persistedValue,
+            updatedAt: Date(timeIntervalSince1970: 1_000))
+        var diskRow = driveRow
+        diskRow.source = .file(folder.appendingPathComponent("IMG_2.jpg"))
+        diskRow.lastError =
+            BackupIssueRecord(
+                kind: .network, detail: "disk", nextAttemptAt: Date(timeIntervalSince1970: 2_000)
+            ).persistedValue
+        diskRow.updatedAt = Date(timeIntervalSince1970: 2_000)
+        XCTAssertTrue(queueStore.upsertBatch([driveRow, diskRow]))
+        let scope = WatchedFolderScope(readable: [folder], registered: [folder.path, "?"])
+
+        let filter: @Sendable () -> BackupFileClaimFilter? = { scope.claimFilter() }
+        let queue: UploadBackupSyncQueueManifestStore = queueStore
+        func nextAttempt(filtered: Bool) async throws -> Date? {
+            let projector = BackupStatusProjector(queue: queue, fileClaimFilter: filtered ? filter : nil)
+            let generation = UUID()
+            await projector.start(generation: generation, context: .init(), handler: { _ in })
+            let projected = await projector.projectNow(context: .init(), generation: generation, revision: 1)
+            let projection = try XCTUnwrap(projected)
+            await projector.stop()
+            return projection.progress.outstanding.nextAttemptAt
+        }
+
+        let unfiltered = try await nextAttempt(filtered: false)
+        let filtered = try await nextAttempt(filtered: true)
+        XCTAssertEqual(unfiltered, Date(timeIntervalSince1970: 1_000), "the fixture holds the earlier row of the drive")
+        XCTAssertEqual(filtered, Date(timeIntervalSince1970: 2_000))
     }
 
     /// More waiting rows of a drive that is away than a pass may set aside (64) plus one full claim (32), all newer than

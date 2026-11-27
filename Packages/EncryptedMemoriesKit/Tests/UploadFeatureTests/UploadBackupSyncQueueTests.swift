@@ -895,9 +895,11 @@ final class UploadBackupSyncQueueTests: XCTestCase {
     }
 
     /// A claim with a folder filter takes a folder file only in a readable folder that is still there, or outside every
-    /// registered folder; the date of the next runnable row counts only those rows. Photo-library rows are not affected
-    /// (#1583).
-    func testAClaimTakesOnlyTheFolderFilesThatItsFilterAdmits() throws {
+    /// registered folder; the date of the next runnable row and the earliest runnable row count only those rows.
+    /// Photo-library rows are not affected. The SQL claim, `admits(path:)` and the file read give the same answer for
+    /// every case, nested folders included: the read refuses a missing file that the filter does not admit, and reads a
+    /// missing admitted file as deleted (#1583).
+    func testAClaimTakesOnlyTheFolderFilesThatItsFilterAdmits() async throws {
         let present = tempDir.appendingPathComponent("present", isDirectory: true)
         try FileManager.default.createDirectory(at: present, withIntermediateDirectories: true)
         let vanished = tempDir.appendingPathComponent("vanished", isDirectory: true)
@@ -906,26 +908,36 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         let gone = UploadSourceIdentity.file(vanished.appendingPathComponent("b.jpg"))
         let unreadable = UploadSourceIdentity.file(locked.appendingPathComponent("c.jpg"))
         let outside = UploadSourceIdentity.file(tempDir.appendingPathComponent("elsewhere/d.jpg"))
+        // A nested watched folder that was deleted while the folder around it stays.
+        let presentInner = present.appendingPathComponent("inner", isDirectory: true)
+        let inner = UploadSourceIdentity.file(presentInner.appendingPathComponent("e.jpg"))
         let photoLibrarySource = source("photo-library")
         let dates: [UploadSourceIdentity: TimeInterval] = [
-            gone: 50, unreadable: 60, outside: 95, readable: 100, photoLibrarySource: 130,
+            gone: 50, unreadable: 60, outside: 95, readable: 100, inner: 110, photoLibrarySource: 130,
         ]
         let cases: [(String, WatchedFolderScope, [UploadSourceIdentity], TimeInterval)] = [
             (
                 "every folder known",
                 WatchedFolderScope(
                     readable: [present, vanished], registered: [present.path, vanished.path, locked.path]),
-                [outside, readable, photoLibrarySource], 95
+                [outside, readable, inner, photoLibrarySource], 95
             ),
             (
                 "a folder without a known path",
                 WatchedFolderScope(readable: [present, vanished], registered: [present.path, vanished.path, "?"]),
-                [readable, photoLibrarySource], 100
+                [readable, inner, photoLibrarySource], 100
             ),
             (
                 "a readable folder that the folder list does not hold",
                 WatchedFolderScope(readable: [present, vanished], registered: [present.path, locked.path]),
-                [outside, readable, photoLibrarySource], 95
+                [outside, readable, inner, photoLibrarySource], 95
+            ),
+            (
+                "nested folders",
+                WatchedFolderScope(
+                    readable: [present, presentInner, vanished],
+                    registered: [present.path, presentInner.path, vanished.path, locked.path]),
+                [outside, readable, inner, photoLibrarySource], 95
             ),
         ]
         for (index, (name, scope, expected, nextDate)) in cases.enumerated() {
@@ -940,9 +952,21 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                             updatedAt: Date(timeIntervalSince1970: date))
                     }))
             let filter = scope.claimFilter()
+            let resolver = FileBackupResourceResolver(scope: { scope })
             for source in dates.keys where source.kind == .fileURL {
                 XCTAssertEqual(filter.admits(path: source.identifier), expected.contains(source), name)
+                let entry = try XCTUnwrap(try store.entry(for: source, revision: revision(1)))
+                do {
+                    let read = try await resolver.resolve(entry)
+                    XCTAssertNil(read, "\(name): \(source.identifier)")
+                    XCTAssertTrue(expected.contains(source), "\(name): the read takes \(source.identifier) as deleted")
+                } catch is BackupSourceLocationUnavailableError {
+                    XCTAssertFalse(expected.contains(source), "\(name): the read refuses \(source.identifier)")
+                }
             }
+            XCTAssertEqual(
+                try store.decisionEarliestRunnableEntry(admittingFiles: filter)?.updatedAt,
+                Date(timeIntervalSince1970: nextDate), name)
 
             XCTAssertEqual(
                 try store.decisionNextRunnableDate(excludingSourcesOf: [], admittingFiles: filter),
@@ -977,9 +1001,10 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         let stored = try XCTUnwrap(try store.entry(for: committed, revision: revision(1)))
         XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 200))?.count, 1)
 
-        XCTAssertEqual(store.restoreClaimed(stored), true)
+        XCTAssertEqual(store.restoreClaimed(stored, whileIn: .checking), true)
         XCTAssertEqual(try store.entry(for: committed, revision: revision(1)), stored)
-        XCTAssertEqual(store.restoreClaimed(stored), false, "a row that is not claimed stays as it is")
+        XCTAssertEqual(
+            store.restoreClaimed(stored, whileIn: .checking), false, "a row that is not claimed stays as it is")
         XCTAssertEqual(try store.entry(for: committed, revision: revision(1)), stored)
     }
 

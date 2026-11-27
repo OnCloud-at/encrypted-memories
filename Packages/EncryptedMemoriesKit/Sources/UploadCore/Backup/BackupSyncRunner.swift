@@ -422,6 +422,8 @@ public actor BackupSyncRunner {
         if mode == .eligibleOnly {
             let nextRunnableDate: Date?
             do {
+                // Only the photo library drains in this mode, and its resolver gives no folder filter, so this read
+                // takes none.
                 nextRunnableDate = try queue.decisionNextRunnableDate(excludingSourcesOf: [])
             } catch {
                 // An unknown date proves neither due work nor an empty queue.
@@ -580,12 +582,16 @@ public actor BackupSyncRunner {
                     startsSincePrime = 0
                 }
 
+                // Checked once per round, off this actor: a stalled network volume must not block it (#1583).
+                let files = await fileClaimFilterOffActor()
                 if runningSources.count < limit {
                     // A failed claim changed nothing. A later health check can pass again, so only the claim's own
                     // result shows it; the pass ends as unknown instead of retrying the claim at once (#1004). The pass
                     // count guard would also end the pass; this guard stays so the result of the call itself is never
                     // taken as empty.
-                    guard let claimed = claimEligible(limit: limit - runningSources.count, workIntent: workIntent)
+                    guard
+                        let claimed = claimEligible(
+                            limit: limit - runningSources.count, workIntent: workIntent, files: files)
                     else {
                         queueReadUnknown = true
                         storeFailed = true
@@ -621,7 +627,7 @@ public actor BackupSyncRunner {
                     }
                     let idleWait: TimeInterval?
                     do {
-                        idleWait = try shortestPendingWait(policy: .idleScheduledRetries)
+                        idleWait = try shortestPendingWait(policy: .idleScheduledRetries, files: files)
                     } catch {
                         // An unknown date ends the pass as unknown: it is not drained.
                         queueReadUnknown = true
@@ -645,7 +651,8 @@ public actor BackupSyncRunner {
                 let wait =
                     runningSources.count < limit
                     ? (try? shortestPendingWait(
-                        policy: .freeUploadSlots, excludingSourcesOf: runningSources.values.map(\.source))) ?? nil
+                        policy: .freeUploadSlots, files: files,
+                        excludingSourcesOf: runningSources.values.map(\.source))) ?? nil
                     : nil
                 await waitForSchedulerWake(orAfter: wait)
             }
@@ -744,11 +751,18 @@ public actor BackupSyncRunner {
         publishActiveExecutionProgress(emit: false)
     }
 
-    private func claimEligible(limit: Int, workIntent: LibraryWorkIntent) -> [UploadBackupClaimedEntry]? {
+    /// The folder files that a claim may take now. It runs off this actor, because it checks that each readable folder
+    /// still exists.
+    private nonisolated func fileClaimFilterOffActor() async -> BackupFileClaimFilter? {
+        resolver.fileClaimFilter()
+    }
+
+    /// `files`: a folder file whose folder the app cannot reach now stays unclaimed and unchanged (#1583).
+    private func claimEligible(
+        limit: Int, workIntent: LibraryWorkIntent, files: BackupFileClaimFilter?
+    ) -> [UploadBackupClaimedEntry]? {
         let claimLimit = min(configuration.batchSize, max(1, limit))
         let excluded = runningSources.values.map(\.source) + Array(deferredSources.values)
-        // A folder file whose folder the app cannot reach now stays unclaimed and unchanged (#1583).
-        let files = resolver.fileClaimFilter()
         // Eligibility is persisted in `updatedAt` and enforced inside the same transaction that
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
@@ -910,16 +924,17 @@ public actor BackupSyncRunner {
 
     /// Both policies use persisted dates. Free slots ignore due, unclaimable rows and long parks to avoid spinning;
     /// an idle drain keeps its minimum retry wait and lets the caller decide whether a long park ends the pass.
+    /// `files` is the filter of the claim: a row that no claim may take now never wakes the pass, for example a folder
+    /// file on a drive that is away (#1583).
     private func shortestPendingWait(
         policy: PendingWaitPolicy,
+        files: BackupFileClaimFilter?,
         excludingSourcesOf excludedSources: [UploadSourceIdentity] = []
     ) throws -> TimeInterval? {
         let currentTime = now()
-        // A row that no claim may take now never wakes the pass: a folder file on a drive that is away waits (#1583).
         var dates = [
             try queue.decisionNextRunnableDate(
-                excludingSourcesOf: excludedSources + Array(deferredSources.values),
-                admittingFiles: resolver.fileClaimFilter())
+                excludingSourcesOf: excludedSources + Array(deferredSources.values), admittingFiles: files)
         ]
         if policy == .freeUploadSlots {
             dates.append(try queue.decisionEarliestEntry(in: .blockedByDraft)?.updatedAt)
@@ -1004,7 +1019,7 @@ public actor BackupSyncRunner {
         if peek.count < Self.primeBatch {
             peek += rows(in: .queuedForUpload, limit: Self.primeBatch - peek.count)
         }
-        let files = resolver.fileClaimFilter()
+        let files = await fileClaimFilterOffActor()
         peek.removeAll {
             $0.isDismissedSourceRecheck
                 || deferredSources[Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)] != nil
@@ -2534,6 +2549,15 @@ public actor BackupSyncRunner {
     ) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
+        // A folder file whose read failed while its folder is gone, for example a drive unplugged during the hash,
+        // proves neither a deletion nor a failure: the row waits as it was stored (#1583). The file system just
+        // answered the read, so this check of the folders returns at once.
+        if entry.source.kind == .fileURL, Self.isLocalReadFailure(error),
+            resolver.fileClaimFilter()?.admits(path: entry.source.identifier) == false
+        {
+            waitForUnavailableLocation(entry, from: oldState)
+            return
+        }
         // Not a failure of this photo: this build cannot read its pending row. It waits without an attempt and
         // without a problem; its rows stay (#982).
         if error is PendingSourceUnreadableError {
@@ -2726,6 +2750,13 @@ public actor BackupSyncRunner {
         }
     }
 
+    /// A read of a local file failed: the file system answered for it.
+    private static func isLocalReadFailure(_ error: any Error) -> Bool {
+        if case UploadError.fileMissing = error { return true }
+        let domain = (error as NSError).domain
+        return domain == NSCocoaErrorDomain || domain == NSPOSIXErrorDomain
+    }
+
     /// A file whose folder went away after its claim, for example a drive that was unplugged during the pass, waits for
     /// a later pass exactly as it was stored: same state, record, attempts, date and receipt. It spends no attempt, shows
     /// no new problem and enters no support trail. The claim filter keeps its later claims away while the folder is
@@ -2736,7 +2767,7 @@ public actor BackupSyncRunner {
         rememberDeferredSource(entry)
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
-        guard let restored = queue.restoreClaimed(entry) else {
+        guard let restored = queue.restoreClaimed(entry, whileIn: oldState) else {
             stopRequested = true
             return
         }

@@ -664,8 +664,10 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         return value
     }
 
-    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
-        try healthy { try inner.decisionEarliestRunnableEntry() }
+    func decisionEarliestRunnableEntry(
+        admittingFiles files: BackupFileClaimFilter?
+    ) throws -> UploadBackupSyncQueueEntry? {
+        try healthy { try inner.decisionEarliestRunnableEntry(admittingFiles: files) }
     }
 
     func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
@@ -722,6 +724,10 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         return inner.updateState(
             source: source, revision: revision, state: state,
             attempts: attempts, lastError: lastError, updatedAt: updatedAt)
+    }
+
+    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry, whileIn state: UploadBackupSyncQueueState) -> Bool? {
+        inner.restoreClaimed(entry, whileIn: state)
     }
 
     func updateDismissedSourceRecheck(
@@ -815,8 +821,10 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
         try inner.containsAny(in: states)
     }
 
-    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
-        try inner.decisionEarliestRunnableEntry()
+    func decisionEarliestRunnableEntry(
+        admittingFiles files: BackupFileClaimFilter?
+    ) throws -> UploadBackupSyncQueueEntry? {
+        try inner.decisionEarliestRunnableEntry(admittingFiles: files)
     }
     func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
         try inner.decisionEarliestEntry(in: state)
@@ -840,6 +848,9 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
     func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int? {
         inner.requeueStaleActive(before: cutoff, updatedAt: updatedAt)
+    }
+    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry, whileIn state: UploadBackupSyncQueueState) -> Bool? {
+        inner.restoreClaimed(entry, whileIn: state)
     }
     func updateState(
         source: UploadSourceIdentity,
