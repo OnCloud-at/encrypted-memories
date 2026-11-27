@@ -116,9 +116,12 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                        'Task', 'Insecure', 'SHA1', 'SHA256', 'Data', 'Int', 'Int64', 'Double', 'Bool', 'URL'}
     framework_members = {'registerClass'}
     exemptions = {'self', 'init', 'some', 'utf8'}
+    # Preprocessor conditions are not Swift names: strip directive lines before scanning.
+    compile_conditions = {'ENCRYPTED_MEMORIES_UPGRADE_TEST'}
 
     def strip(text):
         text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        text = re.sub(r'/#[^\n]*', '', text)
         text = re.sub(r'//[^\n]*', '', text)
         text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
         return text
@@ -127,7 +130,11 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
         result = subprocess.run(['git', 'grep', '-qw', '-e', word, tag, '--',
                                  'Packages/EncryptedMemoriesKit/Sources'],
                                 cwd=git_repo or source, capture_output=True)
-        return result.returncode == 0
+        if result.returncode in (0, 1):
+            return result.returncode == 0
+        detail = result.stderr.decode('utf-8', 'replace').strip() or f'exit {result.returncode}'
+        raise JourneyError(f'Cannot read the tagged sources of {tag} for the test-entry guard: {detail}. '
+                           f'The git history that holds {tag} must be reachable from the automation checkout.')
 
     texts = {}
     declared = set()
@@ -141,12 +148,19 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
     unknown = {}
     for relative, text in texts.items():
         roots = set(re.findall(r'\b([A-Z]\w*)\s*\.', text))
+        # A bare capitalized name (constructor, cast, conformance, metatype) compiles only
+        # when the release defines it too. The run 45890080546 failure class includes names
+        # that never take a member.
+        bare = set(re.findall(r'(?<![\w.])\b([A-Z]\w*)\b(?!\s*\.)', text))
         members = set(re.findall(r'(?:\b[A-Z]\w*|\))\s*\.\s*([a-z]\w*)', text))
         bad_roots = {root for root in roots if root not in framework_roots and root not in declared and not grep(root)}
+        bad_bare = {word for word in bare if word not in framework_roots and word not in compile_conditions
+                    and word not in declared and not grep(word)}
         bad_members = {member for member in members if member not in exemptions
                        and member not in framework_members and member not in declared and not grep(member)}
-        if bad_roots or bad_members:
-            unknown[relative] = sorted(bad_roots) + sorted(bad_members)
+        bad = bad_roots | bad_bare | bad_members
+        if bad:
+            unknown[relative] = sorted(bad)
     return unknown
 
 

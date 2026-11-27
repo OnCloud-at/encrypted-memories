@@ -21,7 +21,6 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import re
 import subprocess
 import sys
 import tarfile
@@ -31,14 +30,6 @@ import unittest
 REPO = Path(__file__).resolve().parents[2]
 OVERLAYS = REPO / 'scripts/upgrade-test/overlays'
 KIT = 'Packages/EncryptedMemoriesKit/Sources'
-FRAMEWORK_ROOTS = frozenset({
-    'FileManager', 'ProcessInfo', 'URLProtocol', 'URLSession', 'JSONSerialization', 'Task',
-    'Insecure', 'SHA1', 'SHA256', 'Data', 'Int', 'Int64', 'Double', 'Bool', 'URL',
-})
-# Foundation member names that no historical kit source mentions. Extend only with a
-# framework member and the release that needs it.
-FRAMEWORK_MEMBERS = frozenset({'registerClass'})
-MEMBER_EXEMPTIONS = frozenset({'self', 'init', 'some', 'utf8'})
 
 sys.path.insert(0, str(REPO / 'scripts/upgrade-test'))
 sys.path.insert(0, str(REPO / '.github/scripts'))
@@ -60,14 +51,6 @@ def source_has_own_test_entry(tag):
     sentinel = 'Packages/EncryptedMemoriesKit/Sources/PhotosCore/UpgradeTestProbe.swift'
     return subprocess.run(['git', 'cat-file', '-e', f'{tag}:{sentinel}'], cwd=REPO,
                           capture_output=True).returncode == 0
-
-
-def stripped_swift(text):
-    """Comments and string literals hide words that no compiler sees. Remove both."""
-    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-    text = re.sub(r'//[^\n]*', '', text)
-    text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
-    return text
 
 
 class PayloadProvenanceTests(unittest.TestCase):
@@ -100,6 +83,8 @@ class CandidateCompatibilityTests(unittest.TestCase):
     manifest = json.loads((OVERLAYS / 'versions.json').read_text())
 
     def test_unpinned_candidate_files_use_only_names_the_source_defines(self):
+        # The production scanner decides; this test only feeds it the candidate's payload
+        # files at HEAD and requires an empty result against every earlier release.
         for tag in sorted(self.manifest):
             if source_has_own_test_entry(tag):
                 continue
@@ -107,36 +92,15 @@ class CandidateCompatibilityTests(unittest.TestCase):
                       for path in (OVERLAYS / (tag + '.payload')).rglob('*') if path.is_file()}
             scanned = [name for name in build_apps.PAYLOAD if name not in pinned]
             self.assertTrue(scanned, msg=f'{tag}: every payload file is pinned, none to check')
-            texts = {}
-            declared = set()
-            for name in scanned:
-                text = stripped_swift(subprocess.check_output(
-                    ['git', 'show', f'HEAD:{KIT}/{name}'], cwd=REPO, text=True))
-                texts[name] = text
-                declared |= set(re.findall(
-                    r'\b(?:func|var|let|case|associatedvalue|class|struct|enum|protocol|actor|typealias)\s+(\w+)',
-                    text))
-                declared |= set(re.findall(
-                    r'\b(?:class|struct|enum|protocol|actor|typealias)\s+([A-Z]\w*)', text))
-
-            def in_source(word):
-                return subprocess.run(['git', 'grep', '-qw', '-e', word, tag, '--', KIT],
-                                      cwd=REPO, capture_output=True).returncode == 0
-
-            for name, text in texts.items():
-                with self.subTest(tag=tag, file=name):
-                    roots = sorted(set(re.findall(r'\b([A-Z]\w*)\s*\.', text)))
-                    members = sorted(set(re.findall(r'(?:\b[A-Z]\w*|\))\s*\.\s*([a-z]\w*)', text)))
-                    unknown_roots = [root for root in roots if root not in FRAMEWORK_ROOTS
-                                     and root not in declared and not in_source(root)]
-                    unknown_members = [member for member in members
-                                        if member not in MEMBER_EXEMPTIONS
-                                        and member not in FRAMEWORK_MEMBERS
-                                        and member not in declared and not in_source(member)]
-                    self.assertEqual([], unknown_roots,
-                                     msg=f'{tag}: {name} uses names the source never defines')
-                    self.assertEqual([], unknown_members,
-                                     msg=f'{tag}: {name} uses members the source never defines')
+            with tempfile.TemporaryDirectory() as scratch:
+                source = Path(scratch)
+                for name in scanned:
+                    target = source / KIT / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(git_bytes('HEAD', KIT + '/' + name))
+                unknown = build_apps.unbuildable_names(source, tag, payload=scanned, git_repo=REPO)
+                self.assertEqual({}, unknown,
+                                 msg=f'{tag}: candidate test-entry files use names the source never defines')
 
 
 class OverlayApplicationTests(unittest.TestCase):
@@ -152,6 +116,13 @@ class OverlayApplicationTests(unittest.TestCase):
         build_apps.apply_overlay(source, automation, tag, commit)
         return source
 
+    def history_sharing_automation(self, root):
+        # The real automation checkout is a git checkout whose history holds the release tag;
+        # a shared clone gives the test the same discrimination instead of a bare file copy.
+        automation = Path(root) / 'automation'
+        subprocess.run(['git', 'clone', '--quiet', '--shared', str(REPO), str(automation)], check=True)
+        return automation
+
     def test_apply_overlay_installs_the_pinned_files_into_a_v1_0_5_source(self):
         with tempfile.TemporaryDirectory() as scratch:
             source = self.apply_v1_0_5(scratch, REPO)
@@ -163,15 +134,37 @@ class OverlayApplicationTests(unittest.TestCase):
 
     def test_apply_overlay_fails_when_a_test_file_uses_an_unknown_name(self):
         with tempfile.TemporaryDirectory() as scratch:
-            automation = Path(scratch) / 'automation'
-            automation.mkdir()
-            for item in ('scripts', KIT.split('/')[0]):
-                subprocess.run(['cp', '-R', str(REPO / item), str(automation / item)])
+            automation = self.history_sharing_automation(scratch)
             pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
                 'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
             text = pinned.read_text().replace('SHA256.hash(data: payload)', 'UnknownType.hash(data: payload)')
             pinned.write_text(text)
-            with self.assertRaisesRegex(Exception, 'UnknownType'):
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_fails_when_a_test_file_mentions_an_unknown_type_without_a_member(self):
+        # A bare type reference (constructor, cast, conformance) compiles only when the release
+        # defines it. The run 45890080546 failure class includes names that never take a member.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\nlet evidence = MysteryFreeType()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'MysteryFreeType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_fails_loudly_when_the_automation_history_cannot_read_the_tag(self):
+        # A checkout without git history once made git grep fail for every word, so every
+        # name looked unknown and the guard blocked for the wrong reason. That state must
+        # now fail as an infrastructure error instead of impersonating an unknown name.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = Path(scratch) / 'automation'
+            automation.mkdir()
+            for item in ('scripts', KIT.split('/')[0]):
+                subprocess.run(['cp', '-R', str(REPO / item), str(automation / item)])
+            with self.assertRaisesRegex(JourneyError, 'Cannot read the tagged sources of v1.0.5'):
                 self.apply_v1_0_5(scratch, automation)
 
 
@@ -292,6 +285,30 @@ class RuntimePinTests(unittest.TestCase):
         pins[('iOS', '26', 'iPhone')]['runtime_build_alternatives'] = ['23F73', '23F73']
         with self.assertRaisesRegex(release_upgrade.UpgradeError, 'distinct non-empty builds'):
             release_upgrade.validate_pins(pins)
+
+    def test_each_invalid_alternative_shape_fails_the_planner(self):
+        key = ('iOS', '26', 'iPhone')
+        shapes = [
+            ('empty', [''], 'distinct non-empty builds'),
+            ('whitespace', [' 23F73 '], 'distinct non-empty builds'),
+            ('canonical repeat', ['23F77'], 'must not repeat the canonical build'),
+            ('no evidence', None, 'requires pin_evidence'),
+        ]
+        for name, alternatives, message in shapes:
+            with self.subTest(name):
+                pins = {k: dict(v) for k, v in run_journey.PINS.items()}
+                if alternatives is None:
+                    del pins[key]['pin_evidence']
+                else:
+                    pins[key]['runtime_build_alternatives'] = alternatives
+                with self.assertRaisesRegex(release_upgrade.UpgradeError, message):
+                    release_upgrade.validate_pins(pins)
+
+    def test_a_pin_without_alternatives_needs_no_evidence(self):
+        pins = {key: dict(value) for key, value in run_journey.PINS.items()}
+        del pins[('iOS', '26', 'iPhone')]['runtime_build_alternatives']
+        del pins[('iOS', '26', 'iPhone')]['pin_evidence']
+        release_upgrade.validate_pins(pins)
 
 
 if __name__ == '__main__':
