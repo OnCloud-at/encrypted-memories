@@ -102,6 +102,121 @@ def harness_digest(automation):
     return digest.hexdigest()
 
 
+def _take_interpolation(text, index):
+    """Return `(expression, end_index)` for the interpolation at `index` (which must point
+    at the backslash of `\\(`). The expression can contain nested strings, raw strings,
+    comments and balanced parentheses. `end_index` is None when the interpolation never
+    closes: the caller reports the file as unscannable."""
+    cursor = index + 2
+    depth = 1
+    block_depth = 0
+    length = len(text)
+    while cursor < length:
+        char = text[cursor]
+        nxt = text[cursor + 1] if cursor + 1 < length else ''
+        if block_depth:
+            if char == '/' and nxt == '*':
+                block_depth += 1
+                cursor += 2
+            elif char == '*' and nxt == '/':
+                block_depth -= 1
+                cursor += 2
+            else:
+                cursor += 1
+            continue
+        if char == '/' and nxt == '*':
+            block_depth = 1
+            cursor += 2
+            continue
+        if char == '/' and nxt == '/':
+            cursor = text.find('\n', cursor)
+            if cursor < 0:
+                return '', None
+            continue
+        if char == '"':
+            hashes = 0
+            while cursor + hashes < length and text[cursor + hashes] == '#':
+                hashes += 1
+            # Nested raw strings inside the interpolation: only their own quotes matter.
+            if hashes and text[cursor + hashes:cursor + hashes + 1] == '"':
+                inner = _take_raw_string(text, cursor + hashes, hashes)
+                if inner is None:
+                    return '', None
+                cursor = inner
+                continue
+            if text.startswith('"""', cursor):
+                cursor = _take_multiline_string(text, cursor)
+                if cursor is None:
+                    return '', None
+                continue
+            inner_end = _take_simple_string(text, cursor)
+            if inner_end is None:
+                return '', None
+            cursor = inner_end
+            continue
+        if char == '(':
+            depth += 1
+            cursor += 1
+            continue
+        if char == ')':
+            depth -= 1
+            if depth == 0:
+                return text[index + 2:cursor], cursor + 1
+            cursor += 1
+            continue
+        cursor += 1
+    return '', None
+
+
+def _take_simple_string(text, index):
+    """Consume a double-quoted string starting at `index`; return the end index (past the
+    closing quote) or None when unterminated."""
+    cursor = index + 1
+    length = len(text)
+    while cursor < length and text[cursor] != '"':
+        if text[cursor] == '\\' and cursor + 1 < length:
+            cursor += 2
+        else:
+            cursor += 1
+    if cursor >= length:
+        return None
+    return cursor + 1
+
+
+def _take_multiline_string(text, index):
+    """Consume a triple-quoted string starting at `index`; return the end index (past the
+    closing triple quote) or None when unterminated."""
+    cursor = index + 3
+    length = len(text)
+    while cursor < length and not text.startswith('"""', cursor):
+        cursor += 1
+    if cursor >= length:
+        return None
+    return cursor + 3
+
+
+def _take_raw_string(text, quote_index, hashes):
+    """Consume a raw string whose opening quote sits at `quote_index` with `hashes` leading
+    '#'; return the end index (past the closing hashes) or None when unterminated."""
+    cursor = quote_index + 1
+    length = len(text)
+    while cursor < length:
+        if text[cursor] == '"':
+            run = 0
+            while cursor + run < length and text[cursor + run] == '"':
+                run += 1
+            # A raw delimiter is one quote followed by the opening hash count. More
+            # adjacent quotes can never close the literal; a bare quote inside a raw
+            # string is ordinary content.
+            suffix = text[cursor + 1:cursor + 1 + hashes]
+            if suffix == '#' * hashes and run == 1:
+                return cursor + 1 + hashes
+            cursor += run
+            continue
+        cursor += 1
+    return None
+
+
 def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
     """Return the candidate test-entry names that this release's sources cannot provide.
 
@@ -116,7 +231,10 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
     lowercase receiver, or argument labels; a payload file can still fail to compile
     through those. The local rehearsal is the proof that a release builds, not this
     scan. Comments and string literals carry no compiler meaning; interpolated
-    expressions inside strings are code and are scanned.
+    expressions inside strings are scanned (including strings nested inside an
+    interpolation). Raw strings, multi-line strings, nested block comments and directive
+    lines are handled. A file the lexer cannot tokenize (unterminated string,
+    interpolation or block comment) is an error naming that file, never a silent pass.
     Call this after the overlay installed the payload files. `git_repo` is the git
     checkout whose history holds the tagged release; the extracted source has none.
     """
@@ -128,44 +246,113 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
     compile_conditions = {'ENCRYPTED_MEMORIES_UPGRADE_TEST'}
 
     def strip(text):
-        # Conditional-compilation lines are directives; a macro call such as #expect(...)
-        # is code and stays. The keyword must end at a word boundary: #if(...) is a macro call.
-        text = re.sub(r'(?m)^[ \t]*#(?:if|elseif|else|endif)\b[^\n]*', '', text)
-        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-        # String literals carry no names; their interpolated \(expressions) are code and
-        # are collected for the scan. Line comments go last: a "//" inside a string must
-        # not cut the rest of the line out of the scan.
-        interpolated = []
+        """One left-to-right pass over the file; every state below either keeps code or
+        drops non-code. Returns the scan text plus the interpolated expressions.
 
-        def take_literals(match):
-            body = match.group(0)
-            index = 0
-            while index < len(body):
-                if body[index] == '\\' and index + 1 < len(body):
-                    if body[index + 1] == '(':
-                        depth, cursor = 1, index + 2
-                        while cursor < len(body) and depth:
-                            if body[cursor] == '(':
-                                depth += 1
-                            elif body[cursor] == ')':
-                                depth -= 1
-                            cursor += 1
-                        if depth:
-                            break
-                        interpolated.append(body[index + 2:cursor - 1])
-                        index = cursor
-                    else:
-                        index += 2
+        States: code, line comment (ends at newline), block comment (nesting counted),
+        string (double-quoted), multi-line string, raw string (#"-quoted, # count must
+        match). Backslash escapes are consumed inside strings; interpolation opens a
+        parenthesised expression that can itself hold strings and comments. Unterminated
+        strings, unterminated interpolations and unterminated block comments are not Swift
+        compilable input; strip returns None so the caller reports that file as unscannable.
+        """
+        code = []
+        interpolated = []
+        index, length = 0, len(text)
+        block_depth = 0
+        hash_run = 0  # Number of '#' before an opening quote of a raw string.
+        while index < length:
+            char = text[index]
+            nxt = text[index + 1] if index + 1 < length else ''
+            if block_depth:
+                if char == '/' and nxt == '*':
+                    block_depth += 1
+                    index += 2
+                elif char == '*' and nxt == '/':
+                    block_depth -= 1
+                    index += 2
                 else:
                     index += 1
-            return ''
-
-        text = re.sub(r'"""(?:[^"\\]|\\.|"(?!""))*"""', take_literals, text, flags=re.S)
-        text = re.sub(r'"(?:[^"\\\n]|\\.)*"', take_literals, text)
-        text = re.sub(r'//[^\n]*', '', text)
-        if interpolated:
-            text += '\n' + '\n'.join(interpolated)
-        return text
+                continue
+            if char == '/' and nxt == '*':
+                block_depth = 1
+                index += 2
+                continue
+            if char == '/' and nxt == '/':
+                index = text.find('\n', index)
+                if index < 0:
+                    break
+                continue
+            hash_run = hash_run + 1 if char == '#' else 0
+            if hash_run and nxt == '"':
+                # Raw string literal: '#'*'"' ... '"'*'#' with the same counts. Inside it,
+                # only the closing sequence matters; backslash escapes do not apply, but
+                # interpolation \( ... ) is still Swift code.
+                hashes = hash_run
+                index += hashes + 1
+                while index < length:
+                    if text.startswith('\\(', index):
+                        close = None
+                        expression, close = _take_interpolation(text, index)
+                        if close is None:
+                            return None, None
+                        interpolated.append(expression)
+                        index = close
+                        continue
+                    if text[index] == '"':
+                        # A raw delimiter is one quote followed by the opening hash count;
+                        # other quotes are content.
+                        if (index + 1 + hashes <= length
+                                and text[index + 1:index + 1 + hashes] == '#' * hashes):
+                            index += 1 + hashes
+                            break
+                        index += 1
+                        continue
+                    index += 1
+                else:
+                    return None, None
+                code.append(' ')
+                continue
+            if char == '"':
+                # Regular string or multi-line string; both consume escapes and collect
+                # interpolations. A lone """ on one line is multi-line opening.
+                if text.startswith('"""', index):
+                    index += 3
+                    while index < length and not text.startswith('"""', index):
+                        if text.startswith('\\(', index):
+                            expression, close = _take_interpolation(text, index)
+                            if close is None:
+                                return None, None
+                            interpolated.append(expression)
+                            index = close
+                        else:
+                            index += 1
+                    if index >= length:
+                        return None, None
+                    index += 3
+                else:
+                    index += 1
+                    while index < length and text[index] != '"':
+                        if text.startswith('\\(', index):
+                            expression, close = _take_interpolation(text, index)
+                            if close is None:
+                                return None, None
+                            interpolated.append(expression)
+                            index = close
+                        elif text[index] == '\\' and index + 1 < length:
+                            index += 2
+                        else:
+                            index += 1
+                    if index >= length:
+                        return None, None
+                    index += 1
+                code.append(' ')
+                continue
+            code.append(char)
+            index += 1
+        if block_depth:
+            return None, None
+        return ''.join(code), interpolated
 
     def grep(word):
         result = subprocess.run(['git', 'grep', '-qw', '-e', word, tag, '--',
@@ -177,15 +364,29 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
         raise JourneyError(f'Cannot read the tagged sources of {tag} for the test-entry guard: {detail}. '
                            f'The git history that holds {tag} must be reachable from the automation checkout.')
 
+    # Conditional-compilation directive lines are not code and are dropped before the
+    # lexer runs; only the directive spellings #if/#elseif/#else/#endif at the start of a
+    # line are dropped. A macro call such as #expect(...) is code and stays. A line like
+    # "#if(" is the directive spelling and is dropped too.
+    def keep_directives(text):
+        return '\n'.join(line for line in text.split('\n')
+                         if not re.match(r'^[ \t]*#(?:if|elseif|else|endif)\b', line))
+
     texts = {}
     declared = set()
     for relative in payload:
         path = source / 'Packages/EncryptedMemoriesKit/Sources' / relative
         if not path.is_file():
             continue
-        text = strip(path.read_text())
-        texts[relative] = text
-        declared |= set(re.findall(r'\b(?:func|var|let|case|associatedtype|class|struct|enum|protocol|actor|typealias)\s+(\w+)', text))
+        stripped, interpolated = strip(keep_directives(path.read_text()))
+        if stripped is None:
+            raise JourneyError(
+                f'{tag}: {relative} is not valid Swift the test-entry guard can scan '
+                '(an unterminated string, interpolation or block comment). '
+                'Pin the file to the commit whose bytes it must keep.')
+        code = stripped + ('' if not interpolated else '\n' + '\n'.join(interpolated))
+        texts[relative] = code
+        declared |= set(re.findall(r'\b(?:func|var|let|case|associatedtype|class|struct|enum|protocol|actor|typealias)\s+(\w+)', code))
     unknown = {}
     for relative, text in texts.items():
         roots = set(re.findall(r'\b([A-Z]\w*)\s*\.', text))

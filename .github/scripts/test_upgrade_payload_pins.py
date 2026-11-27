@@ -230,6 +230,126 @@ class OverlayApplicationTests(unittest.TestCase):
             with self.assertRaisesRegex(JourneyError, 'UnknownType'):
                 self.apply_v1_0_5(scratch, automation)
 
+    def test_apply_overlay_scans_a_string_nested_inside_an_interpolation(self):
+        # An interpolation can itself contain string literals; the lexer must keep the
+        # interpolated expression and drop only its string pieces.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let joined = "\\(ZzMissingB.join(\", \"))"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzMissingB'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_code_after_a_string_that_contains_a_line_comment_marker(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let cut = "text // not a comment"; ZzHiddenRoot.tick()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzHiddenRoot'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_a_block_comment_marker_inside_a_string(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let wrapped = "/* not a comment */"; ZzStarRoot.tick()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzStarRoot'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_drops_a_line_comment_that_ends_the_line(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '// ZzCommentRoot.tick() is a comment\n'
+                                              'let plain = 1')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_strips_raw_string_literals_and_keeps_their_interpolations(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace(
+                'import CryptoKit',
+                'import CryptoKit\n'
+                'let raw = #"say "ZzRawText""#\n'
+                'let rawHit = #"\\(ZzRawLiteral) keeps its interpolation"#\n'
+                'let second = ##"also "ZzDeepRaw" here"##')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzRawLiteral'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_keeps_a_macro_line_and_ignores_its_string_arguments(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let config = "literal \\(ZzMacroInString) here"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzMacroInString'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_ignores_an_interpolation_inside_a_line_comment(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '// "\(ZzInComment)" never runs')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_fails_closed_on_an_unterminated_string(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let broken = "unterminated')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_fails_closed_on_an_unterminated_interpolation(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let broken = "\\(ZzUnterminated.foo"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_handles_an_empty_file(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            pinned.write_text('')
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
     def test_apply_overlay_fails_loudly_when_the_automation_history_cannot_read_the_tag(self):
         # A checkout without git history once made git grep fail for every word, so every
         # name looked unknown and the guard blocked for the wrong reason. That state must
@@ -364,7 +484,10 @@ class RuntimePinTests(unittest.TestCase):
     def test_each_invalid_alternative_shape_fails_the_planner(self):
         key = ('iOS', '26', 'iPhone')
         shapes = [
-            ('not a list', '23F73', 'distinct non-empty builds'),
+            # A dict passes the string-element, whitespace, duplicate and canonical-repeat
+            # checks (key iteration yields one clean string that is not the build); only the
+            # list guard rejects it.
+            ('not a list', {'23F73': 1}, 'distinct non-empty builds'),
             ('element not a string', [23], 'distinct non-empty builds'),
             ('empty', [''], 'distinct non-empty builds'),
             ('whitespace', [' 23F73 '], 'distinct non-empty builds'),

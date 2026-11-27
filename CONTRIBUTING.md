@@ -346,12 +346,14 @@ Each source runs its own `scripts/update-proton-sdk.sh` in separate source and S
 The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
 A source without its own test entry also receives the candidate's five test-entry files. Each of these files must compile
 against that source's protocols. When a candidate file needs a type that the source lacks, pin the older file as
-`scripts/upgrade-test/overlays/<tag>.payload/<path below Sources>`. `v1.0.5` pins `UpgradeTestBackend.swift` from before #711.
-After the overlay applies, a guard scans the candidate test files against that source and names every symbol the old release
-cannot provide, so the failure names the missing symbol instead of breaking the build. The scan is a heuristic: it covers
-capitalized names, bare capitalized identifiers, and `Capitalized.member` / `).member` forms. Implicit members, lowercase
-receivers, and argument labels are not covered; a payload file can still fail to compile through them. The local rehearsal,
-which builds every source, is the proof that a release builds.
+`scripts/upgrade-test/overlays/<tag>.payload/<path below Sources>`. `v1.0.5` pins `ProtonDriveBackend/UpgradeTestBackend.swift`,
+`MLSearchAppleAdapter/UpgradeTestSmartSearch.swift` and `PhotoLibraryBackupAdapter/UpgradeTestPhotoLibrary.swift`, byte-exact
+from their recorded commits.
+After the overlay applies, a guard scans all five installed test-entry files (the pinned ones too) against that source and
+names the symbols of the recognized forms that the old release cannot provide, so the failure names the missing symbol instead
+of breaking the build. The scan is a heuristic: it covers capitalized names, bare capitalized identifiers, and
+`Capitalized.member` / `).member` forms. Implicit members, lowercase receivers, and argument labels are not covered; a payload
+file can still fail to compile through them. The local rehearsal, which builds every source, is the proof that a release builds.
 The build fails for a pinned file outside the five paths and for a pin on a release with its own test entry.
 Later releases carry their inactive test entry and require no overlay, with one exception:
 `v1.1.0-beta.3` predates the hosted Metal admission, so its pinned overlay adds only that test-only admission.
@@ -441,7 +443,8 @@ The release matrix supplies an exact Simulator runtime identifier, version and b
 Without a supplied pin, a local journey uses `IOS_RUNTIME` in `run_journey.py`, the iOS 27 pin of the configuration file (iOS 27.2, build 24B8117).
 A missing, ambiguous, unavailable, or different runtime fails before a device exists; the message names the expected and the installed build.
 The pin names an accepted build set: the canonical build plus the recorded sibling builds Apple serves for the same OS version.
-When several accepted builds are installed, the canonical build is selected; that preference is deterministic.
+When the canonical build is installed, it is selected; that preference is deterministic. When the canonical build is absent and
+two installed entries carry the same accepted sibling build, the journey fails as ambiguous before a device exists.
 Any installed runtime entry that shares the pinned identifier but carries a build outside the accepted set fails the journey
 before a device exists. `simctl create` follows the system runtime policy and cannot prove which build a created device boots,
 so a device may never be created while such a sibling is installed.
