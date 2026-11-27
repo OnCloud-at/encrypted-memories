@@ -443,9 +443,9 @@ The release matrix supplies an exact Simulator runtime identifier, version and b
 Without a supplied pin, a local journey uses `IOS_RUNTIME` in `run_journey.py`, the iOS 27 pin of the configuration file (iOS 27.2, build 24B8117).
 A missing, ambiguous, unavailable, or different runtime fails before a device exists; the message names the expected and the installed build.
 The pin names an accepted build set: the canonical build plus the recorded sibling builds Apple serves for the same OS version.
-When the canonical build is installed, it is selected; that preference is deterministic. Without a canonical entry, two
-installed entries carrying the same accepted sibling build, or two entries carrying two different accepted sibling builds,
-fail as ambiguous before a device exists.
+When the canonical build is installed exactly once, it is selected; that preference is deterministic. Two installed entries
+carrying the canonical build fail as ambiguous, as do two entries carrying the same non-canonical accepted sibling build or
+two entries carrying two different accepted sibling builds: every ambiguity fails before a device exists.
 Any installed runtime entry that shares the pinned identifier but carries a build outside the accepted set fails the journey
 before a device exists. `simctl create` follows the system runtime policy and cannot prove which build a created device boots,
 so a device may never be created while such a sibling is installed.
