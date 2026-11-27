@@ -776,14 +776,8 @@ public struct ExactDuplicateFinder: Sendable {
             var copied = [[CopiedRelatedFiles]](repeating: [], count: plans.count)
             var settled: Set<Int> = []
             let settle = { (position: Int, error: any Error) in
-                let plan = plans[position].plan
                 settled.insert(position)
-                if error as? ExactDuplicateRelatedFileTransferError == .copyFailed(.cleanup) {
-                    results[plans[position].index] = .success(
-                        .merged(kept: plan.kept, trashed: [], keptDuplicates: plan.keptDuplicates))
-                } else {
-                    results[plans[position].index] = .failure(error)
-                }
+                results[plans[position].index] = .failure(error)
             }
             for position in plans.indices {
                 do {
@@ -1128,20 +1122,13 @@ public struct ExactDuplicateFinder: Sendable {
         }
     }
 
-    /// A failed or stopped copy keeps its source active; a cancelled task ends the merge.
+    /// A failed or stopped copy keeps its source active; a cancelled task ends the merge, also when the cleanup of its
+    /// staging failed.
     private func keepSource(
         _ member: PhotoUID, after error: any Error, in plan: inout PlannedMerge, run: ExactDuplicateMergeRun
     ) throws {
-        let transferError = error as? ExactDuplicateRelatedFileTransferError
-        if transferError == .copyFailed(.cleanup) {
-            plan.keptDuplicates[member] = .copyFailed
-            if Task.isCancelled { throw error }
-        } else {
-            if Task.isCancelled || (error is CancellationError && !run.copiesStopped) {
-                throw CancellationError()
-            }
-            plan.keptDuplicates[member] = Self.keepReason(for: transferError)
-        }
+        if Task.isCancelled || (error is CancellationError && !run.copiesStopped) { throw CancellationError() }
+        plan.keptDuplicates[member] = Self.keepReason(for: error as? ExactDuplicateRelatedFileTransferError)
     }
 
     /// Only a typed transfer failure names its cause; every other failure is a plain copy failure.
@@ -1302,7 +1289,6 @@ public struct ExactDuplicateFinder: Sendable {
         _ writes: [(index: Int, plan: PlannedMerge)], favorites: Set<PhotoUID>, covers: [String: String],
         run: ExactDuplicateMergeRun, into results: inout [Result<ExactDuplicateMergeOutcome, any Error>?]
     ) async {
-        let writes = writes.map { (index: $0.index, plan: $0.plan.excludingStoppedCopies(in: run)) }
         // The trash needs its record, so the merge writes nothing while the journal cannot take one.
         switch mergeJournal.prepareForWrites() {
         case .ready: break
@@ -1336,7 +1322,6 @@ public struct ExactDuplicateFinder: Sendable {
                 for (albumID, cover) in covers.sorted(by: { $0.key < $1.key }) where trashedLinks.contains(cover) {
                     try Task.checkCancellation()
                     try await albums.setCover(plan.kept, ofOwnAlbum: albumID)
-                    plan = plan.excludingStoppedCopies(in: run)
                     run.noteCover(plan.kept.nodeID, ofOwnAlbum: albumID)
                 }
                 // The rows move before the trash: the kept photo holds the same bytes, and after the trash only the
@@ -1363,10 +1348,7 @@ public struct ExactDuplicateFinder: Sendable {
         guard !trashing.isEmpty, !Task.isCancelled else { return }
         // The edits that replaced a kept photo before the trash, so the check counts only a later edit.
         var known: [[String]?] = []
-        for position in trashing.indices {
-            known.append(await successors(of: trashing[position].plan.kept.nodeID))
-            trashing[position].plan = trashing[position].plan.excludingStoppedCopies(in: run)
-        }
+        for (_, plan) in trashing { known.append(await successors(of: plan.kept.nodeID)) }
         guard !Task.isCancelled else { return }
         trashing = trashing.map { (index: $0.index, plan: $0.plan.excludingStoppedCopies(in: run)) }
         // The record survives a failed answer and the end of the process, so a later scan or merge restores a copy of
@@ -1714,12 +1696,14 @@ final class ExactDuplicateTurns: @unchecked Sendable {
 
     /// The callers that wait for their turn.
     var waiting: Int { lock.withLock { waiters.count } }
-    /// Runs as the turn passes to a waiter, before the waiter resumes. Tests use it to cancel the waiter in that moment.
-    var onHandOver: (@Sendable () -> Void)? {
-        get { lock.withLock { handOver } }
-        set { lock.withLock { handOver = newValue } }
-    }
-    private var handOver: (@Sendable () -> Void)?
+    #if DEBUG
+        /// Test hook: runs as the turn passes to a waiter, before the waiter resumes, to cancel it in that moment.
+        var onHandOverForTesting: (@Sendable () -> Void)? {
+            get { lock.withLock { handOverForTesting } }
+            set { lock.withLock { handOverForTesting = newValue } }
+        }
+        private var handOverForTesting: (@Sendable () -> Void)?
+    #endif
 
     /// Runs `check` once no earlier caller runs. A task that is cancelled while it waits leaves the queue and runs no
     /// check. A cancellation that arrives as the turn passes to it can still start the check, which then stops before
@@ -1770,7 +1754,9 @@ final class ExactDuplicateTurns: @unchecked Sendable {
             }
             return waiters.removeFirst().continuation
         }
-        if next != nil { onHandOver?() }
+        #if DEBUG
+            if next != nil { onHandOverForTesting?() }
+        #endif
         next?.resume(returning: true)
     }
 }

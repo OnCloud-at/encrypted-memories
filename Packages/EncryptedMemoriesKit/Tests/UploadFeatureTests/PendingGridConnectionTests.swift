@@ -8,6 +8,22 @@ import UploadCore
 @testable import PhotoLibraryBackupAdapter
 
 @Suite @MainActor struct PendingGridConnectionTests {
+    @Test func joinedMetadataAnswersKeepTheFirstAnswerOfAKeyThatBothList() {
+        let listed = PendingSourceKey(kind: .fileURL, identifier: "listed")
+        let failed = PendingSourceKey(kind: .fileURL, identifier: "failed")
+        let onlyOther = PendingSourceKey(kind: .fileURL, identifier: "only-other")
+        let first = PendingPresentationMetadata(
+            captureTime: Date(timeIntervalSince1970: 1), mediaType: "a", displayName: "a")
+        let second = PendingPresentationMetadata(
+            captureTime: Date(timeIntervalSince1970: 2), mediaType: "b", displayName: "b")
+        var answer = PendingSourceMetadataAnswer(metadata: [listed: first], unknown: [failed])
+        answer.merge(
+            PendingSourceMetadataAnswer(metadata: [failed: second, onlyOther: second], unknown: [listed]))
+        // The first answer decides each key that it lists, as metadata or as a failed read.
+        #expect(answer.metadata == [listed: first, onlyOther: second])
+        #expect(answer.unknown == [failed])
+    }
+
     @Test func missingFileAdapterKeepsQueueSyncDuty() async throws {
         try await assertFileReturnDuty(adapterResult: nil)
     }

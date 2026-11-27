@@ -803,6 +803,10 @@ final class ExactDuplicateFinderTests: XCTestCase {
 
     func testStopDuringJournalRecordingKeepsTheCopySourceAndReconcilesTheIntent() async throws {
         let setup = try copyingScenario()
+        let mainHash = try XCTUnwrap(server.links.first { $0.linkID == setup.source.nodeID }?.contentHash)
+        let relatedHash = try XCTUnwrap(server.links.first { $0.linkID == setup.related.nodeID }?.contentHash)
+        let mainRow = row("stopped-main", names: setup.source.nodeID, contentHash: mainHash)
+        let relatedRow = row("stopped-original", names: setup.related.nodeID, contentHash: relatedHash)
         let group = try await onlyGroup()
         let run = ExactDuplicateMergeRun(members: group.members)
         let journal = CopyStoppingJournal(base: mergeJournal, onRecord: { run.stopCopies() })
@@ -817,8 +821,26 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(setup.remote.trashes, [])
         XCTAssertEqual(state(of: setup.source), .active)
         XCTAssertEqual(mergeJournal.pendingMerges()?.flatMap(\.members).map(\.link), [setup.source.nodeID])
+        // Stop came after the rows moved and before the trash: every row names an active copy with its bytes, the
+        // kept photo and the verified twin under it.
+        let read = try await server.compound(ofMainLink: setup.kept.nodeID)
+        let twin = try XCTUnwrap(read?.related.first { $0.contentHash == relatedHash })
+        let assertRows = { (moment: String) in
+            for (source, link, hash) in [
+                (mainRow, setup.kept.nodeID, mainHash), (relatedRow, twin.linkID, relatedHash),
+            ] {
+                let record = self.store.record(for: source)
+                XCTAssertEqual(record?.remoteLinkID, link, moment)
+                XCTAssertEqual(record?.contentHash, hash, moment)
+                XCTAssertEqual(record?.provesUpload, true, moment)
+                XCTAssertEqual(
+                    self.state(of: PhotoUID(volumeID: setup.kept.volumeID, nodeID: link)), .active, moment)
+            }
+        }
+        assertRows("after Stop")
         await real.resolvePendingMerges()
         XCTAssertEqual(mergeJournal.pendingMerges(), [], "Normal reconciliation retires the undispatched intent")
+        assertRows("after the reconciliation")
         XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
     }
 
@@ -1088,7 +1110,19 @@ final class ExactDuplicateFinderTests: XCTestCase {
     }
 
     func testAnOwnedCleanupFailureKeepsTheSourceAndReportsOnlyCopyFailure() async throws {
-        let transfer = ExactDuplicateRelatedFileTransfer(
+        let setup = try copyingScenario(uploads: 0, transfer: failingCleanupTransfer)
+        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
+        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
+        XCTAssertEqual(state(of: setup.related), .active)
+        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    /// Staging whose writes and close both fail, so the copy can only end with a failed cleanup.
+    private var failingCleanupTransfer: ExactDuplicateRelatedFileTransfer {
+        ExactDuplicateRelatedFileTransfer(
             temporaryDirectory: FileManager.default.temporaryDirectory,
             availableCapacity: { _ in Int64.max }, networkState: { LibraryNetworkState() },
             stagingIO: .init(
@@ -1097,14 +1131,54 @@ final class ExactDuplicateFinderTests: XCTestCase {
                     try handle.close()
                     throw POSIXError(.EIO)
                 }))
-        let setup = try copyingScenario(uploads: 0, transfer: transfer)
-        let outcome = try await copyingFinder(setup.remote).merge(try await onlyGroup(), keeping: setup.kept)
-        XCTAssertEqual(outcome, .merged(kept: setup.kept, trashed: [], keptDuplicates: [setup.source: .copyFailed]))
+    }
+
+    func testACancelledCopyWhoseStagingCleanupFailsCancelsTheMerge() async throws {
+        let setup = try copyingScenario(uploads: 0, transfer: failingCleanupTransfer)
+        let group = try await onlyGroup()
+        let gate = FinderGate()
+        setup.remote.beforeStream = { await gate.pass() }
+        let copying = copyingFinder(setup.remote)
+        let requests = chosen([(group, setup.kept)])
+        let task = Task { await copying.merge(requests) }
+        defer { gate.open() }
+        await gate.waitForArrival()
+        task.cancel()
+        gate.open()
+        let results = await task.value
+
+        if case .failure(let error) = results.first {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        } else {
+            XCTFail("A cancelled merge whose cleanup failed must not report a merged group: \(results)")
+        }
         XCTAssertEqual(setup.remote.trashes, [])
         XCTAssertEqual(state(of: setup.source), .active)
         XCTAssertEqual(state(of: setup.related), .active)
-        XCTAssertTrue(setup.remote.downloads.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
         XCTAssertEqual(mergeJournal.pendingMerges(), [])
+    }
+
+    @MainActor
+    func testACancelledMergeAllWhoseStagingCleanupFailsCountsNoMergedGroup() async throws {
+        let setup = try copyingScenario(uploads: 0, transfer: failingCleanupTransfer)
+        _ = try setup.remote.seed(Data("kept original".utf8), under: setup.kept, in: directory)
+        server.setFavorite(true, of: setup.kept)
+        indexServer()
+        let gate = FinderGate()
+        setup.remote.beforeStream = { await gate.pass() }
+        defer { gate.open() }
+        let model = ExactDuplicatesModel(finder: copyingFinder(setup.remote))
+        await model.load(checkAllGroups: true)
+        let merge = Task { await model.mergeAll() }
+        await gate.waitForArrival()
+
+        merge.cancel()
+        gate.open()
+        await merge.value
+
+        XCTAssertEqual(model.notice, .stopped(merged: 0, total: 1), "A cancelled copy is not a merged group")
+        XCTAssertEqual(setup.remote.trashes, [])
+        XCTAssertEqual(state(of: setup.source), .active)
     }
 
     func testAnOfflineCopyPolicyKeepsTheSourceBeforeAnyDownload() async throws {
@@ -3161,36 +3235,39 @@ final class ExactDuplicateFinderTests: XCTestCase {
         XCTAssertEqual(finder.mergeTurns.waiting, 0)
     }
 
-    /// An emptying whose task is cancelled exactly as the merge hands the turn over deletes nothing.
-    func testAnEmptyingCancelledAsTheTurnPassesToItDeletesNothing() async throws {
-        let kept = server.seedLink(digest: digest("a"))
-        let duplicate = server.seedLink(digest: digest("a"))
-        indexServer()
-        let group = try await onlyGroup()
-        let remote = TrashStoppingRemote(base: server)
-        let finder = finder(remote: remote)
-        let merging = Task { try await finder.merge(group, keeping: kept) }
-        try await waitUntil { state(of: duplicate) == .trashed }
-        let trash = CountingTrash()
-        let emptying = Task { [directory] in
-            try await RecentlyDeletedEmptying.empty(trash, checkingMergesWith: finder, accountDataDirectory: directory)
-        }
-        try await waitUntil { finder.mergeTurns.waiting == 1 }
-        // The merge leaves the queue and hands the turn over; the cancellation lands before the emptying resumes.
-        finder.mergeTurns.onHandOver = { emptying.cancel() }
+    #if DEBUG
+        /// An emptying whose task is cancelled exactly as the merge hands the turn over deletes nothing.
+        func testAnEmptyingCancelledAsTheTurnPassesToItDeletesNothing() async throws {
+            let kept = server.seedLink(digest: digest("a"))
+            let duplicate = server.seedLink(digest: digest("a"))
+            indexServer()
+            let group = try await onlyGroup()
+            let remote = TrashStoppingRemote(base: server)
+            let finder = finder(remote: remote)
+            let merging = Task { try await finder.merge(group, keeping: kept) }
+            try await waitUntil { state(of: duplicate) == .trashed }
+            let trash = CountingTrash()
+            let emptying = Task { [directory] in
+                try await RecentlyDeletedEmptying.empty(
+                    trash, checkingMergesWith: finder, accountDataDirectory: directory)
+            }
+            try await waitUntil { finder.mergeTurns.waiting == 1 }
+            // The merge leaves the queue and hands the turn over; the cancellation lands before the emptying resumes.
+            finder.mergeTurns.onHandOverForTesting = { emptying.cancel() }
 
-        remote.gate.open()
-        _ = try await merging.value
-        do {
-            try await emptying.value
-            XCTFail("a cancelled emptying throws")
-        } catch {
-            XCTAssertTrue(error is CancellationError)
-        }
+            remote.gate.open()
+            _ = try await merging.value
+            do {
+                try await emptying.value
+                XCTFail("a cancelled emptying throws")
+            } catch {
+                XCTAssertTrue(error is CancellationError)
+            }
 
-        XCTAssertEqual(trash.emptied, 0, "a cancelled emptying deletes nothing")
-        XCTAssertEqual(finder.mergeTurns.waiting, 0)
-    }
+            XCTAssertEqual(trash.emptied, 0, "a cancelled emptying deletes nothing")
+            XCTAssertEqual(finder.mergeTurns.waiting, 0)
+        }
+    #endif
 
     /// A merge that is cancelled while Recently Deleted is emptied trashes nothing.
     func testAMergeCancelledWhileRecentlyDeletedIsEmptiedTrashesNothing() async throws {
