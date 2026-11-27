@@ -20,6 +20,9 @@ public struct BackupFailedItem: Identifiable, Sendable, Equatable {
     public let source: UploadSourceIdentity?
     public let revision: UploadBackupRevision?
 
+    /// The person can dismiss the item: retrying cannot help, and it is no deletion decision, which asks the person.
+    public var isDismissable: Bool { isPermanent && issue != .deletedElsewhere }
+
     /// Shared localized retry copy used by both native settings shells.
     public var retryDescription: String? {
         guard category == .automatic else { return nil }

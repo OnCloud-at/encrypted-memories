@@ -327,7 +327,7 @@ extension UploadBackupSyncQueueStore {
     var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? { nil }
 
     func updateDismissedSourceRecheck(
-        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
     ) -> Bool? { nil }
 
     func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {

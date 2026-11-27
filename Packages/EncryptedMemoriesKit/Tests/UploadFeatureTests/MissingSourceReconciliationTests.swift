@@ -1604,9 +1604,18 @@ final class MissingSourceReconciliationTests: XCTestCase {
                 source: candidate.snapshot.source, revision: candidate.snapshot.revision,
                 state: .sourceMissing, attempts: 0, lastError: issue?.persistedValue,
                 updatedAt: Date(timeIntervalSince1970: 300)))
+        // A deletion decision is never dismissed, so its fixture writes the dismissed row directly.
+        guard issue?.kind == .deletedElsewhere else {
+            XCTAssertTrue(
+                queue.dismissPermanentFailure(
+                    source: candidate.snapshot.source, revision: candidate.snapshot.revision,
+                    updatedAt: Date(timeIntervalSince1970: 301)))
+            return
+        }
         XCTAssertTrue(
-            queue.dismissPermanentFailure(
+            queue.updateState(
                 source: candidate.snapshot.source, revision: candidate.snapshot.revision,
+                state: .dismissedFailure, attempts: nil, lastError: issue?.persistedValue,
                 updatedAt: Date(timeIntervalSince1970: 301)))
     }
 

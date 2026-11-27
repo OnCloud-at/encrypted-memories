@@ -571,6 +571,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     /// operational and records no store failure, so a test can tell an unknown read from a broken store.
     private var unknownContainsAnyReads: Int
     var refusesMissingRemoval = false
+    /// Runs before a conditional write reaches the store, so a test can change the row between a read and the write.
+    var beforeConditionalWrite: (() -> Void)?
     /// True: the removal of the settled earlier revisions of a replaced photo fails, as a failed write does.
     var refusesSettledRevisionRemoval = false
     /// The bounded row reads of these states answer unknown, as a failed statement does.
@@ -714,6 +716,14 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         return inner.updateState(
             source: source, revision: revision, state: state,
             attempts: attempts, lastError: lastError, updatedAt: updatedAt)
+    }
+
+    func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
+    ) -> Bool? {
+        beforeConditionalWrite?()
+        return inner.updateDismissedSourceRecheck(
+            entry, matchingState: matchingState, matchingLastError: matchingLastError)
     }
 
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {

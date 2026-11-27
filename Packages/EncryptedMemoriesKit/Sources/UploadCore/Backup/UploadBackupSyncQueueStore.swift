@@ -280,6 +280,11 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                     connection.markFailed()
                     throw UploadRemoteCommitRecoveryError.malformedReceipt(source, revision)
                 }
+                // A state this build does not know is unknown, never a failed row (#1583).
+                guard let state = columnText(stmt, 6).flatMap(UploadBackupSyncQueueState.init(rawValue:)) else {
+                    connection.markFailed()
+                    throw UploadRemoteCommitRecoveryError.storeUnavailable
+                }
                 entries.append(
                     UploadBackupSyncQueueEntry(
                         source: source,
@@ -287,7 +292,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         originalFilename: columnText(stmt, 4) ?? "",
                         byteCount: sqlite3_column_type(stmt, 5) == SQLITE_NULL
                             ? nil : sqlite3_column_int64(stmt, 5),
-                        state: UploadBackupSyncQueueState(rawValue: columnText(stmt, 6) ?? "") ?? .failed,
+                        state: state,
                         attempts: Int(sqlite3_column_int(stmt, 7)),
                         lastError: columnText(stmt, 8),
                         remoteCommitReconciliation: reconciliation,
@@ -571,7 +576,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     public func updateDismissedSourceRecheck(
-        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
     ) -> Bool? {
         let changed: Int? = connection.withLock {
             let changed =
@@ -585,7 +590,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                 UPDATE backup_sync_queue
                                 SET original_filename=?, byte_count=?, state=?, attempts=?, last_error=?, updated_at=?
                                 WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
-                                  AND state=? AND last_error=? AND remote_commit_reconciliation IS NULL;
+                                  AND state=? AND last_error IS ? AND remote_commit_reconciliation IS NULL;
                                 """, -1, &stmt, nil) == SQLITE_OK)
                     else { return nil }
                     defer { sqlite3_finalize(stmt) }
@@ -1174,8 +1179,9 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    /// Removes folder-backup rows that no longer belong to any registered folder root.
-    /// Photo-library rows use a different source kind and are never affected.
+    /// Removes folder-backup rows outside every root, except rows that hold an upload receipt: the receipt proves that
+    /// the bytes reached Proton and must never upload again. Photo-library rows use a different source kind and are
+    /// never affected.
     @discardableResult
     private func removeFileSourcesUnobserved(outsideRootPaths rootPaths: [String]) -> Int {
         let roots = Array(
@@ -1186,7 +1192,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         if roots.contains("/") { return 0 }
 
         return connection.withLock {
-            var sql = "DELETE FROM backup_sync_queue WHERE source_kind=?"
+            var sql = "DELETE FROM backup_sync_queue WHERE source_kind=? AND remote_commit_reconciliation IS NULL"
             if !roots.isEmpty {
                 let retainedRootClauses = Array(
                     repeating: "(source_id=? OR substr(source_id, 1, length(?)+1)=? || '/')",
@@ -1711,7 +1717,11 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         let reconciliationColumn = offset + 6
         let hasReconciliation = sqlite3_column_type(stmt, reconciliationColumn) != SQLITE_NULL
         let decodedReconciliation = reconciliation(stmt, column: reconciliationColumn)
-        guard !hasReconciliation || decodedReconciliation != nil else {
+        // A receipt that does not decode and a state this build does not know make the row unknown, never a failed
+        // row (#1583), as in `summary()`.
+        guard !hasReconciliation || decodedReconciliation != nil,
+            let state = columnText(stmt, offset + 2).flatMap(UploadBackupSyncQueueState.init(rawValue:))
+        else {
             connection.markFailed()
             return nil
         }
@@ -1721,7 +1731,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
             originalFilename: columnText(stmt, offset) ?? "",
             byteCount: sqlite3_column_type(stmt, offset + 1) == SQLITE_NULL
                 ? nil : sqlite3_column_int64(stmt, offset + 1),
-            state: UploadBackupSyncQueueState(rawValue: columnText(stmt, offset + 2) ?? "") ?? .failed,
+            state: state,
             attempts: Int(sqlite3_column_int(stmt, offset + 3)),
             lastError: columnText(stmt, offset + 4),
             remoteCommitReconciliation: decodedReconciliation,
@@ -2014,9 +2024,13 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return removed
     }
 
+    /// Removes the folder-backup rows that no registered folder holds. A folder whose path is unknown, for example on
+    /// a drive that is not mounted, or a folder list that could not be read proves no row outside, so nothing is
+    /// removed (#1583). A row that holds an upload receipt always stays.
     @discardableResult
-    public func removeFileSources(outsideRootPaths rootPaths: [String]) -> Int {
-        let removed = removeFileSourcesUnobserved(outsideRootPaths: rootPaths)
+    public func removeFileSources(outside scope: WatchedFolderScope) -> Int {
+        guard let registeredRoots = scope.registeredRoots else { return 0 }
+        let removed = removeFileSourcesUnobserved(outsideRootPaths: registeredRoots)
         if removed > 0 { notify(.all) }
         return removed
     }

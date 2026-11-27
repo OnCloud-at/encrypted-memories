@@ -306,7 +306,7 @@ final class UploadBackupSyncQueueBindingFailureTests: XCTestCase {
             limit: Self.limit)
         XCTAssertEqual(fault.effectiveLimit, Self.limit, "The lowered length limit must apply")
         defer { fault.remove() }
-        XCTAssertEqual(store.removeFileSources(outsideRootPaths: [root]), 0)
+        XCTAssertEqual(store.removeFileSources(outside: WatchedFolderScope(readable: [], registered: [root])), 0)
         XCTAssertEqual(try storedRows(), before)
         XCTAssertFalse(fault.stepped, "A statement whose bind failed must not run")
         try assertBindFailureRecorded()

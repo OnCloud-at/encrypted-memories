@@ -290,10 +290,12 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// store reuses one statement and one transaction for the whole chunk.
     @discardableResult
     func upsertBatch(_ entries: [UploadBackupSyncQueueEntry]) -> Bool
-    /// Conditional durable transition for an acknowledged missing-source check. Nil means a failed write;
-    /// false means the row changed or gained a remote receipt. Only the runner can release the saved reason.
+    /// Conditional durable transition for an acknowledged missing-source check, and for the dismissal of a permanent
+    /// failure: it writes `entry` only while the row still has `matchingState` and `matchingLastError` and holds no
+    /// remote receipt. Nil means a failed write; false means the row changed or gained a remote receipt. Only the
+    /// runner can release the saved reason.
     func updateDismissedSourceRecheck(
-        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
     ) -> Bool?
     /// The keyed read for a decision: found, absent, or unknown. A read that could not run (a closed store, a failed
     /// bind or statement, a row that does not decode) answers unknown and never proves the row absent (#1004). The
@@ -439,6 +441,9 @@ public extension UploadBackupSyncQueueStore {
         sourcesWithEntries(sources, outside: [])
     }
 
+    /// Dismisses one permanent failure, never a deletion decision: the stored row itself must be dismissable by the rule
+    /// of the problem list. The write applies only while the row still has the state and record that this read saw and
+    /// holds no upload receipt, so a stale problem list row never changes a row that moved on (#1583).
     @discardableResult
     func dismissPermanentFailure(
         source: UploadSourceIdentity,
@@ -449,14 +454,11 @@ public extension UploadBackupSyncQueueStore {
         // row that could not be read is not dismissed, so a failed read never writes an empty record (#1004 B2).
         let lookup: StoreLookup<UploadBackupSyncQueueEntry>
         do { lookup = try decisionEntry(for: source, revision: revision) } catch { return false }
-        guard case .found(let current) = lookup else { return false }
-        return updateState(
-            source: source,
-            revision: revision,
-            state: .dismissedFailure,
-            attempts: nil,
-            lastError: current.lastError,
-            updatedAt: updatedAt
-        )
+        guard case .found(let current) = lookup, BackupFailedItem(entry: current).isDismissable else { return false }
+        var dismissed = current
+        dismissed.state = .dismissedFailure
+        dismissed.updatedAt = updatedAt
+        return updateDismissedSourceRecheck(
+            dismissed, matchingState: current.state, matchingLastError: current.lastError) == true
     }
 }

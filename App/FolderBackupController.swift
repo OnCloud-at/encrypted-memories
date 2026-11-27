@@ -263,14 +263,10 @@ final class FolderBackupController {
         UserDefaults.standard.set(folders.map(\.bookmark), forKey: Self.foldersDefaultsKey)
     }
 
-    /// The queue is a derived work index. Keep only rows that still belong to a folder the user
-    /// has registered; the separate backup-state manifest retains deduplication history.
+    /// The queue is a derived work index. The core removes only the rows that no registered folder
+    /// holds; the separate backup-state manifest retains deduplication history.
     private func reconcileQueueWithRegisteredFolders() {
-        let activeRootPaths =
-            folders
-            .map(\.displayPath)
-            .filter { $0.hasPrefix("/") }
-        queueStore?.removeFileSources(outsideRootPaths: activeRootPaths)
+        queueStore?.removeFileSources(outside: pendingAccess.scope)
     }
 
     // MARK: - Sync lifecycle

@@ -320,11 +320,10 @@ public actor BackupStatusProjector {
             isUserPaused: context.isUserPaused,
             executionOpportunityIssue: context.executionOpportunityIssue
         )
-        if Self.sendsBytes(rawStatus.phase) {
-            speedEstimator.record(bytes: event.progress.transferredByteCount, at: now())
-        } else {
-            speedEstimator.reset()
-        }
+        // The counter never goes back within one runner, so a sample while nothing is sent adds no speed. Only the
+        // published status, which follows the controller's run and not the end of one short runner pass, resets the
+        // speed (#1583).
+        speedEstimator.record(bytes: event.progress.transferredByteCount, at: now())
         let phaseChanged = rawStatus.phase != lastRawPhase
         lastRawPhase = rawStatus.phase
         let issueChanged =

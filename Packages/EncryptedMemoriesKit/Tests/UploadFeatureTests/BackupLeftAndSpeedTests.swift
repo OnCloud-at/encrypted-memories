@@ -165,10 +165,38 @@ final class BackupSpeedProjectorTests: XCTestCase {
         return condition()
     }
 
-    private func runnerProgress(bytes: Int64) -> BackupSyncProgress {
-        var progress = BackupSyncProgress(summary: queue.summary()!, isRunning: true)
+    private func runnerProgress(bytes: Int64, isRunning: Bool = true) -> BackupSyncProgress {
+        var progress = BackupSyncProgress(summary: queue.summary()!, isRunning: isRunning)
         progress.transferredByteCount = bytes
         return progress
+    }
+
+    /// A backup that keeps running drives the runner in short passes. The end of one pass is not a pause: the speed
+    /// keeps its history while the backup still sends (#1583).
+    func testTheEndOfAShortRunnerPassKeepsTheSpeedWhileTheBackupRuns() async throws {
+        let clock = Clock()
+        let projector = BackupStatusProjector(queue: queue, now: { clock.now })
+        let generation = UUID()
+        let recorder = Recorder()
+        let running = BackupStatusProjectionContext(isRunning: true)
+        await projector.start(generation: generation, context: running) { recorder.append($0) }
+
+        // One megabyte per second, then one pass ends and the next continues the same counter.
+        for (second, isRunning) in [(0.0, true), (1, true), (2, true), (3, true), (4, true), (4.5, false), (5, true)] {
+            clock.set(second)
+            let bytes = 1_000 + Int64(second * 1_000_000)
+            projector.submit(runnerProgress(bytes: bytes, isRunning: isRunning), generation: generation)
+            let seen = await waitUntil { recorder.last?.progress.transferredByteCount == bytes }
+            XCTAssertTrue(seen, "second \(second) was not published")
+            if !isRunning {
+                XCTAssertEqual(recorder.last?.status.phase, .uploading, "the backup still runs after the pass ended")
+            }
+        }
+        let projection = await projector.projectNow(context: running, generation: generation, revision: 1)
+        let status = try XCTUnwrap(projection).status
+        XCTAssertEqual(status.phase, .uploading)
+        XCTAssertEqual(try XCTUnwrap(status.uploadSpeedBytesPerSecond), 1_000_000, accuracy: 1)
+        await projector.stop()
     }
 
     func testSpeedAppearsFromTheCounterAndPauseHidesItAndAResumeStartsFresh() async throws {

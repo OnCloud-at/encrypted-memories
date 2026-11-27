@@ -18,7 +18,7 @@ public struct WatchedFolderScope: Sendable, Equatable {
     private let readableRoots: [String]
     /// Root paths of every registered folder, each with a trailing slash. Nil when a registered
     /// folder has no known path or the registry is not loaded, so no path is proven outside.
-    private let registeredRoots: [String]?
+    let registeredRoots: [String]?
 
     /// No folder is readable and no folder is known.
     public static let unavailable = WatchedFolderScope(readableRoots: [], registeredRoots: nil)
