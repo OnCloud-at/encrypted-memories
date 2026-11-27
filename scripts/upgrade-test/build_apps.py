@@ -108,7 +108,15 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
     A source without its own test entry receives the candidate's five payload files. A
     name compiles only when the release defines it, another payload file declares it, or
     a framework supplies it. The hosted failures of run 45890080546 came from names
-    added after v1.0.5 shipped. Comments and string literals carry no compiler meaning.
+    added after v1.0.5 shipped.
+
+    The scan is a heuristic: it sees capitalized root names, bare capitalized identifiers,
+    and members reached through a capitalized name or a closing parenthesis
+    (`Capitalized.member`, `).member`). It does not see implicit members, members of a
+    lowercase receiver, or argument labels; a payload file can still fail to compile
+    through those. The local rehearsal is the proof that a release builds, not this
+    scan. Comments and string literals carry no compiler meaning; interpolated
+    expressions inside strings are code and are scanned.
     Call this after the overlay installed the payload files. `git_repo` is the git
     checkout whose history holds the tagged release; the extracted source has none.
     """
@@ -120,11 +128,43 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
     compile_conditions = {'ENCRYPTED_MEMORIES_UPGRADE_TEST'}
 
     def strip(text):
+        # Conditional-compilation lines are directives; a macro call such as #expect(...)
+        # is code and stays. The keyword must end at a word boundary: #if(...) is a macro call.
+        text = re.sub(r'(?m)^[ \t]*#(?:if|elseif|else|endif)\b[^\n]*', '', text)
         text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-        text = re.sub(r'(?m)^[ \t]*#[^\n]*', '', text)
+        # String literals carry no names; their interpolated \(expressions) are code and
+        # are collected for the scan. Line comments go last: a "//" inside a string must
+        # not cut the rest of the line out of the scan.
+        interpolated = []
+
+        def take_literals(match):
+            body = match.group(0)
+            index = 0
+            while index < len(body):
+                if body[index] == '\\' and index + 1 < len(body):
+                    if body[index + 1] == '(':
+                        depth, cursor = 1, index + 2
+                        while cursor < len(body) and depth:
+                            if body[cursor] == '(':
+                                depth += 1
+                            elif body[cursor] == ')':
+                                depth -= 1
+                            cursor += 1
+                        if depth:
+                            break
+                        interpolated.append(body[index + 2:cursor - 1])
+                        index = cursor
+                    else:
+                        index += 2
+                else:
+                    index += 1
+            return ''
+
+        text = re.sub(r'"""(?:[^"\\]|\\.|"(?!""))*"""', take_literals, text, flags=re.S)
+        text = re.sub(r'"(?:[^"\\\n]|\\.)*"', take_literals, text)
         text = re.sub(r'//[^\n]*', '', text)
-        text = re.sub(r'"""(?:[^"\\]|\\.|"(?!""))*"""', '""', text, flags=re.S)
-        text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
+        if interpolated:
+            text += '\n' + '\n'.join(interpolated)
         return text
 
     def grep(word):

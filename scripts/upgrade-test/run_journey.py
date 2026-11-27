@@ -16,7 +16,6 @@ import uuid
 import time
 
 from build_apps import build_app, clean_environment, command, output, release_metadata, verify_bundle_metadata
-from runtime_pin import requested_runtime
 from journey import JourneyError, run_cases
 from server import FixtureServer
 
@@ -59,8 +58,11 @@ def select_ios_runtime(runtimes, expected=IOS_RUNTIME, require_newest=False):
     """Return the pinned runtime; fail before any device exists when it is missing, ambiguous or different.
 
     The accepted build set spans the canonical build and its alternatives: Apple serves
-    more than one build for the same iOS version, so the canonical build wins when more
-    than one accepted build is installed, and no other build passes."""
+    more than one build for the same iOS version. When an installed runtime entry shares
+    the pinned identifier but carries a build outside the accepted set, selection fails:
+    a device created for that identifier can boot a build outside the set, and create
+    cannot prove otherwise (simctl create has no verified build flag). The canonical
+    build wins among the accepted builds."""
     accepted = expected['buildversions']
     name = f"{expected['identifier']} ({expected['version']}, build {expected['buildversion']})"
     others = sorted(value for value in accepted if value != expected['buildversion'])
@@ -79,6 +81,16 @@ def select_ios_runtime(runtimes, expected=IOS_RUNTIME, require_newest=False):
         installed = f"{matches[0].get('version')}, build {matches[0].get('buildversion')}"
         raise JourneyError('The installed iOS Simulator runtime differs from the accepted builds: expected '
                            + name + ', installed ' + installed + '. Update the runtime pin deliberately.')
+    strays = sorted({str(r.get('buildversion')) for r in matches
+                     if r.get('buildversion') not in accepted})
+    if strays:
+        # simctl create without a build flag follows the system runtime policy, so a device
+        # created while a sibling build is installed can boot that build. The runtime set
+        # must contain only accepted builds, and the canonical build wins among them.
+        raise JourneyError('The installed iOS Simulator runtime ' + expected['identifier']
+                           + ' has build ' + ', build '.join(strays) + ' outside the accepted builds '
+                           + ', '.join(sorted(accepted)) + '. A device created for this runtime can boot '
+                           'that build. Update the runtime pin deliberately.')
     if len(candidates) > 1:
         canonical = [r for r in candidates if r.get('buildversion') == expected['buildversion']]
         if len(canonical) != 1:
@@ -117,10 +129,13 @@ def verify_selected_runtime(runtime, expected):
     """Stop before any device exists when the bundle on disk contradicts the accepted set.
 
     simctl create receives only a runtime argument, and one identifier can name two installed
-    builds (iOS 26.5 shipped as 23F73 and 23F77). The selected entry's bundle pins the device
-    to its build, so create passes the bundle path and the bundle's stated build must lie
-    inside the accepted set. A registered entry without a readable bundle cannot prove which
-    build a device would run, so it fails here instead of proceeding.
+    builds (iOS 26.5 shipped as 23F73 and 23F77). create receives the selected entry's
+    bundle path so the device uses that bundle's runtime contents; simctl does not promise,
+    and this check cannot prove, which build a created device boots. That proof comes from
+    selection refusing any sibling build outside the accepted set. The bundle's stated build
+    must still lie inside the accepted set: a registered entry whose bundle states a build
+    outside it proves the registry entry wrong for this pin, and a registered entry without a
+    readable bundle cannot prove which build a device would run. Both fail here.
     """
     bundle = runtime.get('bundlePath')
     stated = None

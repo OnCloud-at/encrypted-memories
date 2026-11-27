@@ -20,7 +20,7 @@ from release_upgrade import PINS  # noqa: E402
 ENVIRONMENT_KEYS = ('UPGRADE_RUNTIME_ID', 'UPGRADE_RUNTIME_VERSION', 'UPGRADE_RUNTIME_BUILD')
 
 
-def accepted_builds(version, build, alternatives):
+def accepted_builds(build, alternatives):
     """One canonical build plus the alternatives the same OS version resolves to."""
     builds = {build, *(alternatives or [])}
     if '' in builds:
@@ -49,11 +49,11 @@ def requested_runtime(environ=None):
         version, build = supplied[1], supplied[2]
         alternatives = _configured_alternatives(version, build)
         return {'identifier': supplied[0], 'version': version, 'buildversion': build,
-                'buildversions': accepted_builds(version, build, [] if alternatives is None else alternatives)}
+                'buildversions': accepted_builds(build, [] if alternatives is None else alternatives)}
     local = next(pin for key, pin in PINS.items() if key[0] == 'iOS' and pin.get('newest_runtime'))
     return {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-' + local['runtime_version'].replace('.', '-'),
             'version': local['runtime_version'], 'buildversion': local['runtime_build'],
-            'buildversions': accepted_builds(local['runtime_version'], local['runtime_build'],
+            'buildversions': accepted_builds(local['runtime_build'],
                                              local.get('runtime_build_alternatives', []))}
 
 

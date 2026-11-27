@@ -188,6 +188,48 @@ class OverlayApplicationTests(unittest.TestCase):
             pinned.write_text(text)
             build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
 
+    def test_apply_overlay_flags_a_name_hidden_behind_a_line_comment_marker_in_a_string(self):
+        # A "//" inside a string literal is text; the scan must not treat the rest of the
+        # line as a comment and drop the code after the string.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let url = "http://example.invalid"; UnknownType.register()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_names_inside_a_string_interpolation(self):
+        # Interpolated expressions are compiled code; hiding them inside a string literal
+        # must not hide them from the scan.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let label = "\\(UnknownType.title())"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_does_not_skip_macro_lines_like_expect(self):
+        # A line starting with # is only a directive when it is a conditional-compilation
+        # keyword; macro calls such as #expect(...) are code and must be scanned.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '#expect(UnknownType.exists == nil)')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
     def test_apply_overlay_fails_loudly_when_the_automation_history_cannot_read_the_tag(self):
         # A checkout without git history once made git grep fail for every word, so every
         # name looked unknown and the guard blocked for the wrong reason. That state must
@@ -215,9 +257,9 @@ class RuntimePinTests(unittest.TestCase):
         cls.runtime_pin = module
 
     def test_the_accepted_build_set_spans_pin_and_alternatives(self):
-        self.assertEqual(self.runtime_pin.accepted_builds('26.5', '23F77', ['23F73']),
+        self.assertEqual(self.runtime_pin.accepted_builds('23F77', ['23F73']),
                          ['23F73', '23F77'])
-        self.assertEqual(self.runtime_pin.accepted_builds('26.5', '23F77', []),
+        self.assertEqual(self.runtime_pin.accepted_builds('23F77', []),
                          ['23F77'])
 
     def test_exported_bundle_check_accepts_any_accepted_build(self):
@@ -322,6 +364,8 @@ class RuntimePinTests(unittest.TestCase):
     def test_each_invalid_alternative_shape_fails_the_planner(self):
         key = ('iOS', '26', 'iPhone')
         shapes = [
+            ('not a list', '23F73', 'distinct non-empty builds'),
+            ('element not a string', [23], 'distinct non-empty builds'),
             ('empty', [''], 'distinct non-empty builds'),
             ('whitespace', [' 23F73 '], 'distinct non-empty builds'),
             ('canonical repeat', ['23F77'], 'must not repeat the canonical build'),
