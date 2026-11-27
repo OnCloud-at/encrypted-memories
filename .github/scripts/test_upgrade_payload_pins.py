@@ -188,6 +188,41 @@ class OverlayApplicationTests(unittest.TestCase):
             pinned.write_text(text)
             build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
 
+    def test_apply_overlay_consumes_escapes_in_a_multiline_string(self):
+        # Inside """...""" a backslash starts an escape: \\ is a backslash (so \\( is not
+        # an interpolation), \" is a quote, \""" does not close the string; the capitalised
+        # text after them stays string content.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let prose = """\n'
+                                              'escaped quote \\" keeps going\n'
+                                              'doubled \\\\(ZzNotInterpolated) stays text\n'
+                                              'trio \\""" does not close\n'
+                                              'final ZzProseOnly words\n'
+                                              '"""')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_keeps_a_multiline_string_whose_last_line_starts_like_a_directive(self):
+        # The directive check runs only in code state: a string line that starts with
+        # #endif is string content, and the string closes on its triple quote.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let prose = """\n'
+                                              'text ZzProseOnly here\n'
+                                              '#endif"""\n'
+                                              'let after = 1')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
     def test_apply_overlay_flags_a_name_hidden_behind_a_line_comment_marker_in_a_string(self):
         # A "//" inside a string literal is text; the scan must not treat the rest of the
         # line as a comment and drop the code after the string.
@@ -231,8 +266,8 @@ class OverlayApplicationTests(unittest.TestCase):
                 self.apply_v1_0_5(scratch, automation)
 
     def test_apply_overlay_scans_a_string_nested_inside_an_interpolation(self):
-        # An interpolation can itself contain string literals; the lexer must keep the
-        # interpolated expression and drop only its string pieces.
+        # An interpolation can itself contain string literals: the string pieces carry no
+        # names, and the code parts of the expression stay in the scan.
         with tempfile.TemporaryDirectory() as scratch:
             automation = self.history_sharing_automation(scratch)
             pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
@@ -243,6 +278,32 @@ class OverlayApplicationTests(unittest.TestCase):
             pinned.write_text(text)
             with self.assertRaisesRegex(JourneyError, 'ZzMissingB'):
                 self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_ignores_string_contents_nested_inside_an_interpolation(self):
+        # Words inside a nested string literal of an interpolation are text: a fallback
+        # label must not make the guard report a missing symbol.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let shown = "\\(status ?? "Unknown Backup Failure")"')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_keeps_a_nested_raw_string_inside_an_interpolation_scannable(self):
+        # A raw string nested inside an interpolation must not terminate at its inner
+        # quotes: the file stays scannable.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let shown = "\\(pick ?? #"a"b"#)"')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
 
     def test_apply_overlay_scans_code_after_a_string_that_contains_a_line_comment_marker(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -280,7 +341,9 @@ class OverlayApplicationTests(unittest.TestCase):
             pinned.write_text(text)
             build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
 
-    def test_apply_overlay_strips_raw_string_literals_and_keeps_their_interpolations(self):
+    def test_apply_overlay_treats_a_plain_interpolation_marker_in_a_raw_string_as_text(self):
+        # SE-0200: inside a raw string only backslash-plus-hashes interpolates. A plain
+        # \( marker is literal text, and an empty raw literal must not swallow the file.
         with tempfile.TemporaryDirectory() as scratch:
             automation = self.history_sharing_automation(scratch)
             pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
@@ -288,11 +351,26 @@ class OverlayApplicationTests(unittest.TestCase):
             text = pinned.read_text().replace(
                 'import CryptoKit',
                 'import CryptoKit\n'
-                'let raw = #"say "ZzRawText""#\n'
-                'let rawHit = #"\\(ZzRawLiteral) keeps its interpolation"#\n'
+                'let raw = #"say \\(ZzRawText)" and "ZzQuoted" kept"#\n'
+                'let empty = ##""##\n'
                 'let second = ##"also "ZzDeepRaw" here"##')
             pinned.write_text(text)
-            with self.assertRaisesRegex(JourneyError, 'ZzRawLiteral'):
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_reports_only_hashed_interpolations_in_a_raw_string(self):
+        # The interpolation marker inside a raw string carries the delimiter hash count,
+        # so \\#( ... ) in #"..."# and \\##( ... ) in ##"..."## are code; a plain \\( is not.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace(
+                'import CryptoKit',
+                'import CryptoKit\n'
+                'let hit = #"\\#(ZzRawEscaped) kept"#\n'
+                'let deep = ##"\\##(ZzDeepEscaped) kept"##')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzRawEscaped'):
                 self.apply_v1_0_5(scratch, automation)
 
     def test_apply_overlay_keeps_a_macro_line_and_ignores_its_string_arguments(self):
@@ -314,7 +392,22 @@ class OverlayApplicationTests(unittest.TestCase):
                 'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
             text = pinned.read_text().replace('import CryptoKit',
                                               'import CryptoKit\n'
-                                              '// "\(ZzInComment)" never runs')
+                                              '// "\\(ZzInComment)" never runs')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_hides_names_inside_block_comments(self):
+        # Block comments are not code, and block comments nest in Swift: names in an
+        # outer comment stay hidden after an inner comment has closed.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '/* ZzHiddenBlock.tick() */\n'
+                                              '/* outer /* ZzHiddenNested.tick() */ ZzStillHidden here */\n'
+                                              'let plain = 1')
             pinned.write_text(text)
             build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
 
@@ -327,7 +420,7 @@ class OverlayApplicationTests(unittest.TestCase):
                                               'import CryptoKit\n'
                                               'let broken = "unterminated')
             pinned.write_text(text)
-            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift'):
+            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift is not valid Swift'):
                 self.apply_v1_0_5(scratch, automation)
 
     def test_apply_overlay_fails_closed_on_an_unterminated_interpolation(self):
@@ -339,7 +432,7 @@ class OverlayApplicationTests(unittest.TestCase):
                                               'import CryptoKit\n'
                                               'let broken = "\\(ZzUnterminated.foo"')
             pinned.write_text(text)
-            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift'):
+            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift is not valid Swift'):
                 self.apply_v1_0_5(scratch, automation)
 
     def test_apply_overlay_handles_an_empty_file(self):

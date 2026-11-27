@@ -102,12 +102,13 @@ def harness_digest(automation):
     return digest.hexdigest()
 
 
-def _take_interpolation(text, index):
-    """Return `(expression, end_index)` for the interpolation at `index` (which must point
-    at the backslash of `\\(`). The expression can contain nested strings, raw strings,
-    comments and balanced parentheses. `end_index` is None when the interpolation never
-    closes: the caller reports the file as unscannable."""
-    cursor = index + 2
+def _take_interpolation(text, paren_index):
+    """Return `(expression, end_index)` for the interpolation whose opening parenthesis
+    sits at `paren_index` (a '(' character). The expression can contain nested strings,
+    raw strings, comments and balanced parentheses; string contents are not code and the
+    caller drops them. `end_index` is None when the interpolation never closes: the
+    caller reports the file as unscannable."""
+    cursor = paren_index + 1
     depth = 1
     block_depth = 0
     length = len(text)
@@ -134,12 +135,12 @@ def _take_interpolation(text, index):
                 return '', None
             continue
         if char == '"':
+            # A raw string opens with the hashes that immediately precede the quote.
             hashes = 0
-            while cursor + hashes < length and text[cursor + hashes] == '#':
+            while cursor - 1 - hashes >= 0 and text[cursor - 1 - hashes] == '#':
                 hashes += 1
-            # Nested raw strings inside the interpolation: only their own quotes matter.
-            if hashes and text[cursor + hashes:cursor + hashes + 1] == '"':
-                inner = _take_raw_string(text, cursor + hashes, hashes)
+            if hashes:
+                inner = _take_raw_string(text, cursor, hashes)
                 if inner is None:
                     return '', None
                 cursor = inner
@@ -161,7 +162,7 @@ def _take_interpolation(text, index):
         if char == ')':
             depth -= 1
             if depth == 0:
-                return text[index + 2:cursor], cursor + 1
+                return text[paren_index + 1:cursor], cursor + 1
             cursor += 1
             continue
         cursor += 1
@@ -251,16 +252,36 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
 
         States: code, line comment (ends at newline), block comment (nesting counted),
         string (double-quoted), multi-line string, raw string (#"-quoted, # count must
-        match). Backslash escapes are consumed inside strings; interpolation opens a
-        parenthesised expression that can itself hold strings and comments. Unterminated
-        strings, unterminated interpolations and unterminated block comments are not Swift
-        compilable input; strip returns None so the caller reports that file as unscannable.
+        match). Conditional-compilation directive lines (#if/#elseif/#else/#endif) are
+        dropped only in code state, at the start of a line, so a directive-looking line
+        inside a multi-line string stays string content. Backslash escapes are consumed
+        inside strings. In a raw string with n delimiter hashes, only backslash plus n
+        hashes plus '(' interpolates (SE-0200); a plain \\( is literal text. An
+        interpolation holds balanced parentheses and can itself contain strings, raw
+        strings and comments; its collected expression is lexed again so nested string
+        contents carry no names. Unterminated strings, unterminated interpolations and
+        unterminated block comments are not Swift-compilable input; strip returns None so
+        the caller reports that file as unscannable. Regex literals that contain quote
+        characters are not covered: they read as string openings.
         """
         code = []
         interpolated = []
         index, length = 0, len(text)
         block_depth = 0
+        at_line_start = True
         hash_run = 0  # Number of '#' before an opening quote of a raw string.
+
+        def collect(expression, close):
+            # Lex the interpolation expression again: its string contents are text and
+            # its own interpolations stay in the scan. Returns `close`, or None when the
+            # expression is not scannable.
+            inner, inner_interpolated = strip(expression)
+            if inner is None:
+                return None
+            interpolated.append(inner)
+            interpolated.extend(inner_interpolated)
+            return close
+
         while index < length:
             char = text[index]
             nxt = text[index + 1] if index + 1 < length else ''
@@ -278,6 +299,15 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                 block_depth = 1
                 index += 2
                 continue
+            if at_line_start and re.match(r'#[ \t]*(?:if|elseif|else|endif)\b', text[index:]):
+                # Directive lines are not code. The check runs only in code state at the
+                # start of a line, so directive-looking lines inside comments or strings
+                # keep their meaning. The newline stays so line tracking holds.
+                skip_to = text.find('\n', index)
+                if skip_to < 0:
+                    break
+                index = skip_to
+                continue
             if char == '/' and nxt == '/':
                 index = text.find('\n', index)
                 if index < 0:
@@ -285,23 +315,23 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                 continue
             hash_run = hash_run + 1 if char == '#' else 0
             if hash_run and nxt == '"':
-                # Raw string literal: '#'*'"' ... '"'*'#' with the same counts. Inside it,
-                # only the closing sequence matters; backslash escapes do not apply, but
-                # interpolation \( ... ) is still Swift code.
+                # Raw string literal: '#'*'"' ... '"'*'#' with the same counts. Backslash
+                # escapes do not apply, and only backslash plus the same hash count
+                # interpolates (SE-0200); a plain \( marker is literal text.
                 hashes = hash_run
-                index += hashes + 1
+                index += 1  # Past the opening quote only; it is never escaped content.
                 while index < length:
-                    if text.startswith('\\(', index):
-                        close = None
-                        expression, close = _take_interpolation(text, index)
+                    if text.startswith('\\' + '#' * hashes + '(', index):
+                        expression, close = _take_interpolation(text, index + 1 + hashes)
                         if close is None:
                             return None, None
-                        interpolated.append(expression)
-                        index = close
+                        index = collect(expression, close)
+                        if index is None:
+                            return None, None
                         continue
                     if text[index] == '"':
-                        # A raw delimiter is one quote followed by the opening hash count;
-                        # other quotes are content.
+                        # The closing delimiter is one quote followed by the opening hash
+                        # count; other quotes are content.
                         if (index + 1 + hashes <= length
                                 and text[index + 1:index + 1 + hashes] == '#' * hashes):
                             index += 1 + hashes
@@ -320,11 +350,14 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                     index += 3
                     while index < length and not text.startswith('"""', index):
                         if text.startswith('\\(', index):
-                            expression, close = _take_interpolation(text, index)
+                            expression, close = _take_interpolation(text, index + 1)
                             if close is None:
                                 return None, None
-                            interpolated.append(expression)
-                            index = close
+                            index = collect(expression, close)
+                            if index is None:
+                                return None, None
+                        elif text[index] == '\\' and index + 1 < length:
+                            index += 2
                         else:
                             index += 1
                     if index >= length:
@@ -334,11 +367,12 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                     index += 1
                     while index < length and text[index] != '"':
                         if text.startswith('\\(', index):
-                            expression, close = _take_interpolation(text, index)
+                            expression, close = _take_interpolation(text, index + 1)
                             if close is None:
                                 return None, None
-                            interpolated.append(expression)
-                            index = close
+                            index = collect(expression, close)
+                            if index is None:
+                                return None, None
                         elif text[index] == '\\' and index + 1 < length:
                             index += 2
                         else:
@@ -350,6 +384,7 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                 continue
             code.append(char)
             index += 1
+            at_line_start = char == '\n'
         if block_depth:
             return None, None
         return ''.join(code), interpolated
@@ -364,21 +399,13 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
         raise JourneyError(f'Cannot read the tagged sources of {tag} for the test-entry guard: {detail}. '
                            f'The git history that holds {tag} must be reachable from the automation checkout.')
 
-    # Conditional-compilation directive lines are not code and are dropped before the
-    # lexer runs; only the directive spellings #if/#elseif/#else/#endif at the start of a
-    # line are dropped. A macro call such as #expect(...) is code and stays. A line like
-    # "#if(" is the directive spelling and is dropped too.
-    def keep_directives(text):
-        return '\n'.join(line for line in text.split('\n')
-                         if not re.match(r'^[ \t]*#(?:if|elseif|else|endif)\b', line))
-
     texts = {}
     declared = set()
     for relative in payload:
         path = source / 'Packages/EncryptedMemoriesKit/Sources' / relative
         if not path.is_file():
             continue
-        stripped, interpolated = strip(keep_directives(path.read_text()))
+        stripped, interpolated = strip(path.read_text())
         if stripped is None:
             raise JourneyError(
                 f'{tag}: {relative} is not valid Swift the test-entry guard can scan '

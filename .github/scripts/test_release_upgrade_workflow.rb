@@ -383,6 +383,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
 
   def test_runtime_provisioning_rejects_wrong_export_or_unavailable_runtime
     provision = @jobs.fetch("upgrade").fetch("steps").find { |step| step["id"] == "ios26-runtime" }.fetch("run")
+    root = File.expand_path("../..", __dir__)
     Dir.mktmpdir do |dir|
       bin = File.join(dir, "bin")
       Dir.mkdir(bin)
@@ -434,10 +435,10 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
       env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "RUNNER_TEMP" => dir, "HOME" => dir,
              "UPGRADE_RUNTIME_ID" => "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
              "UPGRADE_RUNTIME_VERSION" => "26.5", "UPGRADE_RUNTIME_BUILD" => "23F77"}
-      assert system(env, "bash", "-c", provision, out: File::NULL, err: File::NULL), "matching runtime must pass"
+      assert system(env, "bash", "-c", provision, chdir: root, out: File::NULL, err: File::NULL), "matching runtime must pass"
       %w[DOWNLOAD_FAIL BAD_BUILD BAD_EXPORT EXTRA_IMAGE EXTRA_BUNDLE IMPORT_FAIL BAD_RUNTIME].each do |failure|
         File.write(File.join(bin, "bad-runtime"), "") if failure == "BAD_RUNTIME"
-        refute system(env.merge(failure => "1"), "bash", "-c", provision, out: File::NULL, err: File::NULL),
+        refute system(env.merge(failure => "1"), "bash", "-c", provision, chdir: root, out: File::NULL, err: File::NULL),
                "#{failure} must block the journey"
       end
     end
