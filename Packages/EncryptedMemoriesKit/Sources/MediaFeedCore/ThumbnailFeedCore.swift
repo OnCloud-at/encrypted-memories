@@ -449,6 +449,10 @@ public actor ThumbnailFeedCore {
     private var withheldRetry: [PhotoUID] = []
     private var withheldRequeues: [PhotoUID: Int] = [:]
     private static let maxWithheldRequeues = 3
+    /// Photos that a growth added to the crawl since the coverage check last settled. At the settle, each
+    /// still-missing addition gets one further request: the known-state fast path settles well above its bar
+    /// when one newcomer failed among hundreds of cached photos, and no recrawl requests it on its own.
+    private var growthAddedSinceSettle: [PhotoUID] = []
     private var prefetchDiskHit = 0
     private var prefetchDownloadStarted = 0
     private var prefetchDownloadCompleted = 0
@@ -1604,6 +1608,7 @@ public actor ThumbnailFeedCore {
         unfetchable.removeAll()  // a fresh crawl retries backend-refused items exactly once
         withheldRetry.removeAll()
         withheldRequeues.removeAll()
+        growthAddedSinceSettle.removeAll()  // a fresh crawl covers the growth's additions by itself
         lastRepassPercent = -1.0
         coverageScanCursor = 0
         coverageSettled = false
@@ -1986,6 +1991,35 @@ public actor ThumbnailFeedCore {
         prefetchReportingUIDs = request.selectedScope.uids
         diskPresence.beginTracking(sequential, reporting: request.selectedScope.uids, knownPresent: [])
         guard !added.isEmpty else { return }
+        // The library grew, so photos that joined after the crawl settled would otherwise wait for the next full
+        // crawl for their end-of-crawl recheck. Reopen the coverage check for this crawl and measure the next pass
+        // against the floor it starts from, exactly as a fresh crawl does.
+        coverageSettled = false
+        lastRepassPercent = -1.0
+        // Remember what the growth added: at the settle, requeueGrowthAfterCoverageSettled gives each
+        // still-missing addition one further request, because a large library settles from the fast path
+        // above the recrawl bar and never asks for the newcomer on its own.
+        growthAddedSinceSettle.append(contentsOf: added)
+        if crawlWakeTask == nil { startWorkers() }
+    }
+
+    /// The coverage recheck reopens when a growth adds photos, but a large library still settles from the
+    /// known-state fast path: one newcomer that failed without a reported reason among hundreds of cached
+    /// photos leaves the coverage far above the 0.995 bar, so no recrawl requests it again - 1.1.0's fresh
+    /// crawl per scope change downloaded every missing thumbnail, this one must not sit on the newcomer.
+    /// At the settle, every addition that is still missing and carries no refusal or withheld answer gets
+    /// exactly one further request. Bounded: the additions are appended once, a photo that keeps failing
+    /// gets no second retry, and the refused and withheld paths keep governing their own photos.
+    private func requeueGrowthAfterCoverageSettled() {
+        guard prefetchEnabled, !growthAddedSinceSettle.isEmpty else { return }
+        let additions = growthAddedSinceSettle
+        growthAddedSinceSettle.removeAll()
+        let retry = additions.filter { uid in
+            !uid.isLocalPending && readAllowed(uid) && !unfetchable.contains(uid)
+                && !withheldRetry.contains(uid) && !diskPresence.isPresent(uid)
+        }
+        guard !retry.isEmpty else { return }
+        sequential.append(contentsOf: retry)
         if crawlWakeTask == nil { startWorkers() }
     }
 
@@ -2290,6 +2324,7 @@ public actor ThumbnailFeedCore {
                         try? await Task.sleep(for: .seconds(2))
                         continue
                     case .settled:
+                        requeueGrowthAfterCoverageSettled()
                         coverageSettled = true  // Coverage is settled; stop rescanning this crawl.
                         return
                     }
@@ -3668,6 +3703,9 @@ public actor ThumbnailFeedCore {
 
         /// Debug-only seam that reports end-of-crawl coverage refreshes started during this crawl.
         func coverageRefreshStartCountForTesting() -> Int { coverageRefreshStarts }
+
+        /// Debug-only seam that reports whether the current crawl's coverage check has settled.
+        func coverageSettledForTesting() -> Bool { coverageSettled }
 
         /// Debug-only seam for a synchronous gate after the last worker returned and before the feed records the stop.
         nonisolated func setWorkersStoppedHookForTesting(_ hook: (@Sendable () -> Void)?) {

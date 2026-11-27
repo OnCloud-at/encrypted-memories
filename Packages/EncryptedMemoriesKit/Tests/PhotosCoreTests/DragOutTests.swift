@@ -263,6 +263,113 @@ final class DragOutTests: XCTestCase {
         await stager.finishAndCleanup()
     }
 
+    /// A drag lifts the still of a Live Photo while its free-space preflight fails; the same still joins a later
+    /// staging call together with its motion, whose size is unknown so the preflight allows that call. The motion
+    /// must not then wait without limit for a still name that its still's failed preflight never records.
+    func testAMotionWhoseStillFailedThePreflightStagesUnderItsOwnNameInsteadOfWaiting() async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let items = OutboundMedia.files(for: [livePair("preflight")]).map(\.item)
+        let provider = PreflightSizedProvider(
+            oversizedStill: items[0].uid,
+            payloads: [items[1].uid: Data("motion".utf8)],
+            metadata: [
+                items[0].uid: PhotoMetadata(filename: "IMG_1.HEIC"),
+                items[1].uid: PhotoMetadata(filename: "FullSizeRender.mov"),
+            ])
+
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
+        let refused = await stager.beginPrefetch(items: [items[0]])
+        XCTAssertFalse(refused.isAllowed, "the known-oversized still alone must fail the preflight")
+        XCTAssertEqual(stagedFiles(in: directory), [])
+
+        // The still is already failed, so only the motion takes a new job; the motion pairs with its still.
+        let allowed = await stager.beginPrefetch(items: items)
+        XCTAssertTrue(allowed.isAllowed, "the motion's unknown size keeps the preflight open")
+
+        let staged = expectation(description: "the motion stages without waiting for its still")
+        Task {
+            let result = await stager.awaitStaged(uid: items[1].uid)
+            XCTAssertEqual(try? result.get().lastPathComponent, "FullSizeRender.mov")
+            staged.fulfill()
+        }
+        await fulfillment(of: [staged], timeout: 5)
+
+        guard case .failure(.diskSpaceInsufficient) = await stager.awaitStaged(uid: items[0].uid) else {
+            return XCTFail("the still keeps its preflight failure")
+        }
+        XCTAssertEqual(stagedFiles(in: directory), ["FullSizeRender.mov"])
+        await stager.finishAndCleanup()
+    }
+
+    /// The preflight-failed branch awaits the still-name recording for each failed item; a load handler that
+    /// beats the stager onto the actor while that loop runs must still observe the concrete disk-space
+    /// failure and never the bare cancelled failure of a registry gap.
+    func testAWaitingLoadHandlerGetsTheDiskSpaceFailureWhenEveryItemFailsThePreflight() async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Every item reports a known oversized size, so one preflight refuses the whole batch. The batch is
+        // long enough that the per-item still-name recording suspends the preflight loop many times, which is
+        // exactly the window a waiting load handler observes.
+        let items = (0..<20000).map { item($0) }
+        let watched = items[items.count - 1].uid
+        let provider = PreflightSizedProvider(
+            oversized: Set(items.map(\.uid)),
+            payloads: [:])
+
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
+        // The system's load handler can arrive before the preflight loop and waits through its pauses.
+        let watcher = Task {
+            await stager.awaitStaged(uid: watched)
+        }
+        let decision = await stager.beginPrefetch(items: items)
+        XCTAssertFalse(decision.isAllowed, "the oversized batch must fail the preflight")
+
+        let result = await watcher.value
+        guard case .failure(.diskSpaceInsufficient) = result else {
+            return XCTFail("the waiting load handler must see the disk-space failure, got \(result)")
+        }
+        await stager.finishAndCleanup()
+    }
+
+    /// A stager reused after its cleanup starts without the recorded still names of the ended session: the
+    /// nil a preflight-failed still recorded must not win over the name its restaged still gets.
+    func testACleanedUpStagerDoesNotCarryARecordedStillNameIntoItsNextSession() async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let items = OutboundMedia.files(for: [livePair("reuse")]).map(\.item)
+        let provider = PreflightSizedProvider(
+            oversizedStill: items[0].uid,
+            payloads: [items[0].uid: Data("still".utf8), items[1].uid: Data("motion".utf8)],
+            metadata: [
+                items[0].uid: PhotoMetadata(filename: "IMG_1.HEIC"),
+                items[1].uid: PhotoMetadata(filename: "FullSizeRender.mov"),
+            ])
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0,
+            removeLocationWhenSharing: { false })
+
+        let refused = await stager.beginPrefetch(items: [items[0]])
+        XCTAssertFalse(refused.isAllowed, "the known-oversized still alone must fail the preflight")
+        await stager.finishAndCleanup()
+
+        // The same stager stages the pair in its next session; the still now delivers and the motion
+        // pairs with its name.
+        let allowed = await stager.beginPrefetch(items: items)
+        XCTAssertTrue(allowed.isAllowed, "after the cleanup the pair passes the preflight again")
+        let still = await stager.awaitStaged(uid: items[0].uid)
+        XCTAssertEqual(try? still.get().lastPathComponent, "IMG_1.HEIC")
+        let motion = await stager.awaitStaged(uid: items[1].uid)
+        XCTAssertEqual(
+            try? motion.get().lastPathComponent, "IMG_1.mov",
+            "the motion takes the name of its restaged still")
+        await stager.finishAndCleanup()
+    }
+
     func testCancelAllEndsTheWaitOfAMotionWhoseStillIgnoresTheStop() async throws {
         try await assertAStopEndsTheWaitOfAMotion { await $0.cancelAll() }
     }
@@ -535,5 +642,44 @@ private final class HeldStillProvider: OriginalFileProvider, @unchecked Sendable
             return held
         }
         continuation?.resume()
+    }
+}
+
+/// One or more uids report a known oversized size, so a staging call holding only them fails the free-space
+/// preflight; every other uid is unsized, so a later call that adds them is allowed regardless of the disk.
+private final class PreflightSizedProvider: OriginalFileProvider, SizedOriginalFileProvider,
+    PhotoMetadataProvider, @unchecked Sendable
+{
+    private let oversized: Set<PhotoUID>
+    private let payloads: [PhotoUID: Data]
+    private let metadataByUID: [PhotoUID: PhotoMetadata]
+
+    init(oversizedStill: PhotoUID, payloads: [PhotoUID: Data], metadata: [PhotoUID: PhotoMetadata]) {
+        self.oversized = [oversizedStill]
+        self.payloads = payloads
+        self.metadataByUID = metadata
+    }
+
+    init(oversized: Set<PhotoUID>, payloads: [PhotoUID: Data], metadata: [PhotoUID: PhotoMetadata] = [:]) {
+        self.oversized = oversized
+        self.payloads = payloads
+        self.metadataByUID = metadata
+    }
+
+    func size(of uid: PhotoUID) -> Int? { oversized.contains(uid) ? 512 * 1024 * 1024 : nil }
+
+    func writeOriginal(
+        for uid: PhotoUID,
+        to destination: URL,
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        guard let payload = payloads[uid] else { throw CocoaError(.fileNoSuchFile) }
+        try payload.write(to: destination)
+        onProgress(1)
+    }
+
+    func metadata(for uid: PhotoUID) async throws -> PhotoMetadata {
+        guard let metadata = metadataByUID[uid] else { throw CocoaError(.fileNoSuchFile) }
+        return metadata
     }
 }

@@ -1317,12 +1317,6 @@ public final class LibrarySourceGraph {
         )
     }
 
-    private func selectedRecords() -> [Record] {
-        records.values.filter { $0.source.isIncluded && $0.accessState != .accessLost }.sorted { lhs, rhs in
-            Self.sourcePrecedes(lhs.source, rhs.source)
-        }
-    }
-
     private func retentionRecords() -> [Record] {
         records.values.filter { $0.accessState != .accessLost }.sorted { lhs, rhs in
             Self.sourcePrecedes(lhs.source, rhs.source)

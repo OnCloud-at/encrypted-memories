@@ -4,6 +4,20 @@ import XCTest
 @testable import PrivacyFeature
 
 final class AppLockCopyTests: XCTestCase {
+    /// The catalog language the duration units of the delay title resolve to, through the same
+    /// `durationLocale` selection `delayTitle` uses. The remaining app-lock copy resolves through
+    /// `String(localized:bundle: .module)`, which follows the process language of this test run against
+    /// the same module bundle, so every run checks the one process language, not both catalogs.
+    private var resolvedAppLanguage: String {
+        AppLockCopy.durationLocale(preferredLanguages: Locale.preferredLanguages).identifier
+    }
+
+    /// The one expected string for the resolved app language, so each language is tested against
+    /// its own copy instead of accepting either catalog entry.
+    private func expectedCopy(english: String, german: String) -> String {
+        resolvedAppLanguage == "de" ? german : english
+    }
+
     func testTheDisabledSwitchNamesThePlatformCredential() {
         #if os(macOS)
             XCTAssertEqual(
@@ -39,54 +53,59 @@ final class AppLockCopyTests: XCTestCase {
     }
 
     func testTheLabelsNameTheAvailableAuthenticationMethod() {
-        let choices: [(DeviceOwnerAuthMethod, [String], [String])] = [
-            (.faceID, ["Require Face ID", "Face ID anfordern"], ["Unlock with Face ID", "Mit Face ID entsperren"]),
+        let choices: [(DeviceOwnerAuthMethod, String, String, String, String)] = [
+            (.faceID, "Require Face ID", "Face ID anfordern", "Unlock with Face ID", "Mit Face ID entsperren"),
             (
-                .touchID, ["Require Touch ID", "Touch ID anfordern"],
-                ["Unlock with Touch ID", "Mit Touch ID entsperren"]
+                .touchID, "Require Touch ID", "Touch ID anfordern", "Unlock with Touch ID",
+                "Mit Touch ID entsperren"
             ),
+            (.devicePasscode, "Require Passcode", "Code anfordern", "Unlock with Passcode", "Mit Code entsperren"),
             (
-                .devicePasscode, ["Require Passcode", "Code anfordern"],
-                ["Unlock with Passcode", "Mit Code entsperren"]
-            ),
-            (
-                .accountPassword, ["Require Password", "Passwort anfordern"],
-                ["Unlock with Password", "Mit Passwort entsperren"]
+                .accountPassword, "Require Password", "Passwort anfordern", "Unlock with Password",
+                "Mit Passwort entsperren"
             ),
         ]
-        for (method, switches, unlocks) in choices {
-            XCTAssertTrue(switches.contains(AppLockCopy.switchTitle(for: .available(method))))
-            XCTAssertTrue(unlocks.contains(AppLockCopy.unlockTitle(for: .available(method))))
+        for (method, englishSwitch, germanSwitch, englishUnlock, germanUnlock) in choices {
+            XCTAssertEqual(
+                AppLockCopy.switchTitle(for: .available(method)),
+                expectedCopy(english: englishSwitch, german: germanSwitch))
+            XCTAssertEqual(
+                AppLockCopy.unlockTitle(for: .available(method)),
+                expectedCopy(english: englishUnlock, german: germanUnlock))
         }
     }
 
     func testTheDelayUsesNativeUnitsInASupportedAppLanguage() {
-        let choices: [(Duration, [String])] = [
-            (.zero, ["Immediately", "Sofort"]),
-            (.seconds(30), ["30 seconds", "30 Sekunden"]),
-            (.seconds(60), ["1 minute", "1 Minute"]),
-            (.seconds(300), ["5 minutes", "5 Minuten"]),
-            (.seconds(900), ["15 minutes", "15 Minuten"]),
+        let choices: [(Duration, String, String)] = [
+            (.zero, "Immediately", "Sofort"),
+            (.seconds(30), "30 seconds", "30 Sekunden"),
+            (.seconds(60), "1 minute", "1 Minute"),
+            (.seconds(300), "5 minutes", "5 Minuten"),
+            (.seconds(900), "15 minutes", "15 Minuten"),
         ]
-        for (duration, titles) in choices {
-            XCTAssertTrue(titles.contains(AppLockCopy.delayTitle(duration)), "\(duration)")
+        for (duration, english, german) in choices {
+            XCTAssertEqual(
+                AppLockCopy.delayTitle(duration), expectedCopy(english: english, german: german), "\(duration)")
         }
     }
 
     func testTheUnlockReasonAndAccessibilityLabelResolve() {
-        XCTAssertTrue(["Unlock your library.", "Entsperre deine Mediathek."].contains(AppLockCopy.unlockReason))
-        XCTAssertTrue(["Locked", "Gesperrt"].contains(AppLockCopy.lockedLabel))
+        XCTAssertEqual(
+            AppLockCopy.unlockReason,
+            expectedCopy(english: "Unlock your library.", german: "Entsperre deine Mediathek."))
+        XCTAssertEqual(AppLockCopy.lockedLabel, expectedCopy(english: "Locked", german: "Gesperrt"))
     }
 
     func testTheUnavailableReasonNamesTheDeviceLock() {
+        let english: String
+        let german: String
         #if os(macOS)
-            XCTAssertTrue(
-                ["Set a login password to use this.", "Lege ein Anmeldepasswort fest, um dies zu nutzen."].contains(
-                    AppLockCopy.noDeviceLockReason))
+            english = "Set a login password to use this."
+            german = "Lege ein Anmeldepasswort fest, um dies zu nutzen."
         #else
-            XCTAssertTrue(
-                ["Set a device passcode to use this.", "Lege einen Gerätecode fest, um dies zu nutzen."].contains(
-                    AppLockCopy.noDeviceLockReason))
+            english = "Set a device passcode to use this."
+            german = "Lege einen Gerätecode fest, um dies zu nutzen."
         #endif
+        XCTAssertEqual(AppLockCopy.noDeviceLockReason, expectedCopy(english: english, german: german))
     }
 }

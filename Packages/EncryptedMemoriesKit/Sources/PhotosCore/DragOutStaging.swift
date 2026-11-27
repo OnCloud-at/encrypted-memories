@@ -83,9 +83,9 @@ public actor DragOutStager {
     @discardableResult
     public func beginPrefetch(items: [PhotoItem]) async -> DragOutPreflightDecision {
         precondition(!items.isEmpty, "DragOutStager.beginPrefetch needs at least one item")
-        // Marks the session as started for `awaitStaged`'s pre-prefetch parking. The body
-        // below contains no suspension points, so once this flag is observable the job
-        // registry has already reached its final state for this call.
+        // Marks the session as started for `awaitStaged`'s pre-prefetch parking. Every job of this call is
+        // marked before the first await, so once this flag is observable each waiting load handler sees a
+        // final job state, never the half-filled registry of an in-progress call.
         didBeginPrefetch = true
         isCancelled = false
         var totalKnownBytes: Int64? = 0
@@ -104,8 +104,17 @@ public actor DragOutStager {
             safetyMarginBytes: safetyMarginBytes
         )
         if !decision.isAllowed, case .insufficientDiskSpace(let required, let available)? = decision.blockReason {
-            for item in items where jobs[item.uid] == nil {
+            // Mark every preflight-failed job before the first await: a load handler that beats this stager
+            // onto the actor while the still-name recording below suspends must observe the concrete
+            // disk-space failure, never a registry gap that reads as cancelled.
+            let refused = items.filter { jobs[$0.uid] == nil }
+            for item in refused {
                 jobs[item.uid] = .failed(.diskSpaceInsufficient(required: required, available: available))
+            }
+            // A preflight-failed item never stages, so no job ever records the result its Live Photo
+            // motion waits for. Record the nil result directly, as every other session item does.
+            for item in refused {
+                await stillNames.record(nil, for: item.uid)
             }
             return decision
         }
