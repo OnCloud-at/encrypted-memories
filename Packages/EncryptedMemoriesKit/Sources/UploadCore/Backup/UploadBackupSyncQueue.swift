@@ -297,6 +297,11 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     func updateDismissedSourceRecheck(
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
     ) -> Bool?
+    /// Puts a claimed row back exactly as `entry` was stored before the claim, while the row is still `checking`: same
+    /// state, attempts, record and date, and its receipt stays. Observers hear of it as of the claim; the support trail
+    /// records nothing, because nothing changed for the person (#1583). Nil means a failed write; false means the row
+    /// is no longer claimed.
+    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry) -> Bool?
     /// The keyed read for a decision: found, absent, or unknown. A read that could not run (a closed store, a failed
     /// bind or statement, a row that does not decode) answers unknown and never proves the row absent (#1004). The
     /// store itself does not throw. A test double may throw a foreign error, a cancellation for example, and the
@@ -316,15 +321,18 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     /// active rows back to runnable via `requeueStaleActive`. Rows of a source in `excludedSources` (same kind and
     /// identifier, any resource or revision) stay unclaimed: the runner passes the sources it processes, because
     /// their rows can be runnable for a moment, for example while the paired video of an uploaded photo uploads.
-    /// Nil means the claim failed and changed nothing; an empty claim is only an empty array.
+    /// Nil means the claim failed and changed nothing; an empty claim is only an empty array. With `files`, a folder
+    /// row that the filter does not admit stays unclaimed and unchanged (#1583).
     func claimRunnable(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupSyncQueueEntry]?
     /// The same claim for a background pass (#274): rows of photos in the loaded local read failure list come after all
     /// other runnable rows, and each claimed row says whether its photo is in that list. Without a loaded list the order
     /// is the one of `claimRunnable`, and every answer is `unknown`.
     func claimRunnableOrderingLocalReadFailuresLast(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupClaimedEntry]?
     /// Replaces the local read failure list that only background claims read. The list lives with this connection,
     /// never in the queue file. False leaves no list: the claims then keep the normal order.
@@ -409,8 +417,10 @@ public protocol UploadBackupSyncQueueStore: Sendable {
     ///
     /// Earliest persisted eligibility time for any runnable row outside `excludedSources` (same kind and identifier,
     /// as in `claimRunnable`). Retry delays survive process death, so a restarted runner can wait for due work
-    /// instead of declaring the queue drained.
-    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date?
+    /// instead of declaring the queue drained. With `files`, only rows that a claim with the same filter can take count.
+    func decisionNextRunnableDate(
+        excludingSourcesOf excludedSources: [UploadSourceIdentity], admittingFiles files: BackupFileClaimFilter?
+    ) throws -> Date?
     /// Earliest eligible or backoff row for status and scheduling. Unlike `claimRunnable`, this is ordered by
     /// eligibility rather than newest-photo execution priority.
     func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry?
@@ -439,6 +449,23 @@ public extension UploadBackupSyncQueueStore {
     /// Sources with any queue row, across resources and revisions. Nil means a failed read.
     func sourcesWithEntries(_ sources: [UploadSourceIdentity]) -> Set<UploadSourceIdentity>? {
         sourcesWithEntries(sources, outside: [])
+    }
+
+    func claimRunnable(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupSyncQueueEntry]? {
+        claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources, admittingFiles: nil)
+    }
+
+    func claimRunnableOrderingLocalReadFailuresLast(
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+    ) -> [UploadBackupClaimedEntry]? {
+        claimRunnableOrderingLocalReadFailuresLast(
+            limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources, admittingFiles: nil)
+    }
+
+    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
+        try decisionNextRunnableDate(excludingSourcesOf: excludedSources, admittingFiles: nil)
     }
 
     /// Dismisses one permanent failure, never a deletion decision. The stored row itself must be dismissable by the

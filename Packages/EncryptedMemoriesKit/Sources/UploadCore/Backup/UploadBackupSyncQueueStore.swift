@@ -307,8 +307,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    public func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
-        let exclusion = SourceExclusion(excludedSources)
+    public func decisionNextRunnableDate(
+        excludingSourcesOf excludedSources: [UploadSourceIdentity], admittingFiles files: BackupFileClaimFilter?
+    ) throws -> Date? {
+        let exclusion = SourceExclusion(excludedSources, admittingFiles: files)
         return try connection.withLock {
             try beginReadLocked()
             var stmt: OpaquePointer?
@@ -385,29 +387,30 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// list, rows of listed photos come last, and each row says whether its photo is listed; otherwise the order is the
     /// normal one, and every answer is `unknown`.
     private func claimRunnableUnobserved(
-        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], ordersLocalReadFailuresLast: Bool = false
+        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], files: BackupFileClaimFilter?,
+        ordersLocalReadFailuresLast: Bool = false
     ) -> [UploadBackupClaimedEntry]? {
-        connection.withLock {
+        let exclusion = SourceExclusion(excludedSources, admittingFiles: files)
+        return connection.withLock {
             guard ordersLocalReadFailuresLast, localReadFailureHintsLoaded else {
-                return claimRunnableLocked(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources).rows
+                return claimRunnableLocked(limit: limit, claimedAt: claimedAt, exclusion: exclusion).rows
             }
             let ordered = claimRunnableLocked(
-                limit: limit, claimedAt: claimedAt, excludedSources: excludedSources, readsList: true)
+                limit: limit, claimedAt: claimedAt, exclusion: exclusion, readsList: true)
             guard ordered.listReadFailed else { return ordered.rows }
             // The list is a cache of this connection: a failed read of it drops the list and never marks the queue
             // failed. The claim then runs again in a new transaction, in the normal order.
             localReadFailureHintsLoaded = false
-            return claimRunnableLocked(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources).rows
+            return claimRunnableLocked(limit: limit, claimedAt: claimedAt, exclusion: exclusion).rows
         }
     }
 
     /// Call inside `withLock`. One claim transaction. With `readsList`, a failed prepare or step of the select ends the
     /// transaction without a change and without marking the queue failed, and `listReadFailed` is true.
     private func claimRunnableLocked(
-        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], readsList: Bool = false
+        limit: Int, claimedAt: Date, exclusion: SourceExclusion, readsList: Bool = false
     ) -> (rows: [UploadBackupClaimedEntry]?, listReadFailed: Bool) {
         let clampedLimit = max(1, limit)
-        let exclusion = SourceExclusion(excludedSources)
         var claimed: [UploadBackupClaimedEntry] = []
         var listReadFailed = false
         var updateStmt: OpaquePointer?
@@ -622,12 +625,56 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
         guard let changed else { return nil }
         if changed > 0 {
-            // A transition enters the support trail as one through `updateState` does, a dismissal for example.
-            recordSupportEvent(source: entry.source, state: entry.state, lastError: entry.lastError)
+            // A dismissal enters the support trail as it did through `updateState`. The transitions of a dismissed
+            // photo's check stay out of it, as before (#1583).
+            if entry.state == .dismissedFailure {
+                recordSupportEvent(source: entry.source, state: entry.state, lastError: entry.lastError)
+            }
             notify(
                 UploadBackupSyncQueueChange(
                     sources: [entry.source], enqueued: Self.runnableStates.contains(entry.state.rawValue)))
         }
+        return changed > 0
+    }
+
+    public func restoreClaimed(_ entry: UploadBackupSyncQueueEntry) -> Bool? {
+        let changed: Int? = connection.withLock {
+            let changed =
+                withDurableCommitsRecordingSetup { () -> Int? in
+                    var stmt: OpaquePointer?
+                    guard
+                        requireOperational(
+                            sqlite3_prepare_v2(
+                                db,
+                                """
+                                UPDATE backup_sync_queue
+                                SET state=?, attempts=?, last_error=?, updated_at=?
+                                WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
+                                  AND state='checking';
+                                """, -1, &stmt, nil) == SQLITE_OK)
+                    else { return nil }
+                    defer { sqlite3_finalize(stmt) }
+                    do {
+                        try connection.bindText(stmt, 1, entry.state.rawValue)
+                        sqlite3_bind_int(stmt, 2, Int32(clamping: entry.attempts))
+                        try connection.bindText(stmt, 3, entry.lastError)
+                        sqlite3_bind_double(stmt, 4, entry.updatedAt.timeIntervalSince1970)
+                        guard connection.bindUploadSource(entry.source, to: stmt, from: 5) else {
+                            throw SQLiteStoreUnknownReadError()
+                        }
+                        sqlite3_bind_int64(stmt, 8, entry.revision.rawValue)
+                    } catch {
+                        return nil
+                    }
+                    guard requireOperational(sqlite3_step(stmt) == SQLITE_DONE) else { return nil }
+                    return Int(sqlite3_changes(db))
+                } ?? nil
+            if changed == nil { markFailedOnceUnrecorded() }
+            return changed
+        }
+        guard let changed else { return nil }
+        // The claim told observers that the row runs; they hear that it waits again. The trail records nothing.
+        if changed > 0 { notify(UploadBackupSyncQueueChange(sources: [entry.source])) }
         return changed > 0
     }
 
@@ -1040,19 +1087,15 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         connection.withLock { removeLocked(source: source, revision: revision) }
     }
 
-    /// `keepingReceipt` leaves a row that holds an upload receipt in place.
-    private func removeLocked(
-        source: UploadSourceIdentity, revision: UploadBackupRevision, keepingReceipt: Bool = false
-    ) -> Bool {
+    private func removeLocked(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
         var stmt: OpaquePointer?
-        let receiptClause = keepingReceipt ? " AND remote_commit_reconciliation IS NULL" : ""
         guard
             requireOperational(
                 sqlite3_prepare_v2(
                     db,
                     """
                     DELETE FROM backup_sync_queue
-                    WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?\(receiptClause);
+                    WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?;
                     """,
                     -1, &stmt, nil
                 ) == SQLITE_OK)
@@ -1185,9 +1228,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         }
     }
 
-    /// Removes folder-backup rows outside every root, except rows that hold an upload receipt: the receipt proves that
-    /// the bytes reached Proton and must never upload again. Photo-library rows use a different source kind and are
-    /// never affected.
+    /// Removes folder-backup rows that no longer belong to any registered folder root.
+    /// Photo-library rows use a different source kind and are never affected.
     @discardableResult
     private func removeFileSourcesUnobserved(outsideRootPaths rootPaths: [String]) -> Int {
         let roots = Array(
@@ -1198,7 +1240,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         if roots.contains("/") { return 0 }
 
         return connection.withLock {
-            var sql = "DELETE FROM backup_sync_queue WHERE source_kind=? AND remote_commit_reconciliation IS NULL"
+            var sql = "DELETE FROM backup_sync_queue WHERE source_kind=?"
             if !roots.isEmpty {
                 let retainedRootClauses = Array(
                     repeating: "(source_id=? OR substr(source_id, 1, length(?)+1)=? || '/')",
@@ -1543,12 +1585,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     public func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
-        guard source.kind == .photoLibraryAsset else {
-            // A missing folder file never takes a saved upload receipt with it (#1583).
-            let removed = connection.withLock { removeLocked(source: source, revision: revision, keepingReceipt: true) }
-            if removed { notify(UploadBackupSyncQueueChange(sources: [source])) }
-            return removed
-        }
+        guard source.kind == .photoLibraryAsset else { return remove(source: source, revision: revision) }
         let result = connection.withLock { () -> Bool in
             let committed =
                 withDurableCommitsRecordingSetup { () -> Bool in
@@ -1815,23 +1852,27 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     }
 
     public func claimRunnable(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupSyncQueueEntry]? {
-        claimNotifying(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources)?.map(\.entry)
+        claimNotifying(limit: limit, claimedAt: claimedAt, excludedSources: excludedSources, files: files)?.map(\.entry)
     }
 
     public func claimRunnableOrderingLocalReadFailuresLast(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupClaimedEntry]? {
         claimNotifying(
-            limit: limit, claimedAt: claimedAt, excludedSources: excludedSources, ordersLocalReadFailuresLast: true)
+            limit: limit, claimedAt: claimedAt, excludedSources: excludedSources, files: files,
+            ordersLocalReadFailuresLast: true)
     }
 
     private func claimNotifying(
-        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], ordersLocalReadFailuresLast: Bool = false
+        limit: Int, claimedAt: Date, excludedSources: [UploadSourceIdentity], files: BackupFileClaimFilter?,
+        ordersLocalReadFailuresLast: Bool = false
     ) -> [UploadBackupClaimedEntry]? {
         let claimed = claimRunnableUnobserved(
-            limit: limit, claimedAt: claimedAt, excludedSources: excludedSources,
+            limit: limit, claimedAt: claimedAt, excludedSources: excludedSources, files: files,
             ordersLocalReadFailuresLast: ordersLocalReadFailuresLast)
         if let claimed, !claimed.isEmpty { notify(UploadBackupSyncQueueChange(sources: claimed.map(\.entry.source))) }
         return claimed
@@ -2035,9 +2076,10 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         return removed
     }
 
-    /// Removes the folder-backup rows that no registered folder holds. A folder whose path is unknown, for example on
-    /// a drive that is not mounted, or a folder list that could not be read proves no row outside, so nothing is
-    /// removed (#1583). A row that holds an upload receipt always stays.
+    /// Removes the folder-backup rows that no registered folder holds, also a row with an upload receipt: the person
+    /// removed its folder, and the item already exists in Proton. A folder whose path is unknown, for example on a drive
+    /// that is not mounted, or a folder list that is missing or could not be read proves no row outside, so nothing is
+    /// removed, and every receipt stays (#1583).
     @discardableResult
     public func removeFileSources(outside scope: WatchedFolderScope) -> Int {
         guard let registeredRoots = scope.registeredRoots else { return 0 }
@@ -2054,15 +2096,40 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
     /// Rows of these sources (same kind and identifier, any resource or revision) stay out of a runnable-set query.
     private struct SourceExclusion {
         var keys: [(kind: String, identifier: String)] = []
+        /// Nil admits every folder row.
+        var files: BackupFileClaimFilter?
 
-        init(_ sources: [UploadSourceIdentity]) {
+        init(_ sources: [UploadSourceIdentity], admittingFiles files: BackupFileClaimFilter? = nil) {
             var seen: Set<String> = []
             for source in sources where seen.insert(source.kind.rawValue + "|" + source.identifier).inserted {
                 keys.append((source.kind.rawValue, source.identifier))
             }
+            self.files = files
         }
 
-        var clause: String { String(repeating: "\n  AND NOT (source_kind=? AND source_id=?)", count: keys.count) }
+        var clause: String {
+            String(repeating: "\n  AND NOT (source_kind=? AND source_id=?)", count: keys.count) + fileClause
+        }
+
+        /// The rule of `BackupFileClaimFilter.admits(path:)`: a folder row in a present readable folder, or one that no
+        /// readable or registered folder holds while every registered folder is known.
+        private var fileClause: String {
+            guard let files else { return "" }
+            func anyPrefix(_ count: Int) -> String {
+                count == 0
+                    ? "0"
+                    : Array(repeating: "substr(source_id, 1, length(?))=?", count: count).joined(separator: " OR ")
+            }
+            let outside =
+                files.registeredRoots.map { "NOT (\(anyPrefix(files.readableRoots.count + $0.count)))" } ?? "0"
+            return "\n  AND (source_kind<>? OR (\(anyPrefix(files.presentRoots.count))) OR (\(outside)))"
+        }
+
+        /// The roots in the order of `fileClause`, each bound twice.
+        var fileRoots: [String] {
+            guard let files else { return [] }
+            return files.presentRoots + (files.registeredRoots.map { files.readableRoots + $0 } ?? [])
+        }
     }
 
     /// Binds the exclusion's parameters from `first` on and returns the next free parameter index. A failed bind
@@ -2072,6 +2139,14 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
         for key in exclusion.keys {
             try connection.bindText(stmt, parameter, key.kind)
             try connection.bindText(stmt, parameter + 1, key.identifier)
+            parameter += 2
+        }
+        guard exclusion.files != nil else { return parameter }
+        try connection.bindText(stmt, parameter, UploadSourceIdentity.Kind.fileURL.rawValue)
+        parameter += 1
+        for root in exclusion.fileRoots {
+            try connection.bindText(stmt, parameter, root)
+            try connection.bindText(stmt, parameter + 1, root)
             parameter += 2
         }
         return parameter

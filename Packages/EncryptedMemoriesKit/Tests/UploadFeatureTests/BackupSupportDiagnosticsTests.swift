@@ -357,6 +357,34 @@ final class BackupSupportDiagnosticsTests: XCTestCase {
         XCTAssertEqual(events.map(\.subject), [hasher.hash("final")])
     }
 
+    /// The check of a dismissed photo moves its row through the conditional write on every retry; those transitions stay
+    /// out of the trail, as before the dismissal used that write (#1583).
+    func testTheCheckOfADismissedPhotoEntersNoTrail() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let trail = SupportEventTrail()
+        let queue = try XCTUnwrap(
+            UploadBackupSyncQueueManifestStore(
+                url: directory.appendingPathComponent("queue.sqlite"), supportTrail: trail))
+        defer { queue.close() }
+        let issue = BackupIssueRecord(kind: .sourceMissing, detail: "private detail").persistedValue
+        let dismissed = UploadBackupSyncQueueEntry(
+            source: UploadSourceIdentity(kind: .photoLibraryAsset, identifier: "dismissed"),
+            revision: UploadBackupRevision(rawValue: 1), originalFilename: "dismissed.jpg", state: .dismissedFailure,
+            lastError: issue, updatedAt: Date(timeIntervalSince1970: 100))
+        XCTAssertTrue(queue.upsertBatch([dismissed]))
+        var checking = dismissed
+        checking.state = .discovered
+        checking.updatedAt = Date(timeIntervalSince1970: 200)
+
+        XCTAssertEqual(
+            queue.updateDismissedSourceRecheck(checking, matchingState: .dismissedFailure, matchingLastError: issue),
+            true)
+        XCTAssertEqual(try queue.entry(for: dismissed.source, revision: dismissed.revision)?.state, .discovered)
+        XCTAssertTrue(trail.export(hashingWith: SupportReportIdentifierHasher()).events.isEmpty)
+    }
+
     func testEveryEditOutcomeHasItsOwnTrailEvent() {
         XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .replaced(retiredAny: true)), .editReplaced)
         XCTAssertEqual(BackupSyncRunner.supportEventKind(of: .waiting), .editWaiting)

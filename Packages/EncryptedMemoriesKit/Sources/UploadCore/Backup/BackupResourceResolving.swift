@@ -238,9 +238,14 @@ public protocol BackupResourceResolving: Sendable {
         readAdmission: @escaping BackupResourceReadAdmission,
         omittingMissingPairedVideo: Bool
     ) async throws -> BackupResolvedResource?
+    /// The folder files that a backup pass may claim now. Nil admits every row; only a resolver that refuses files of an
+    /// unreachable folder returns a filter, so that the pass never claims them (#1583).
+    func fileClaimFilter() -> BackupFileClaimFilter?
 }
 
 public extension BackupResourceResolving {
+    func fileClaimFilter() -> BackupFileClaimFilter? { nil }
+
     /// A resolver without Live Photo videos resolves the whole entry and never leaves anything out.
     func resolve(
         _ entry: UploadBackupSyncQueueEntry,
@@ -284,6 +289,10 @@ public struct FileBackupResourceResolver: BackupResourceResolving {
 
     public init(scope: (@Sendable () -> WatchedFolderScope)? = nil) {
         self.scope = scope
+    }
+
+    public func fileClaimFilter() -> BackupFileClaimFilter? {
+        scope?().claimFilter()
     }
 
     public func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {

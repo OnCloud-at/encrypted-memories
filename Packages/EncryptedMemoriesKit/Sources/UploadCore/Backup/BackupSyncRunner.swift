@@ -747,6 +747,8 @@ public actor BackupSyncRunner {
     private func claimEligible(limit: Int, workIntent: LibraryWorkIntent) -> [UploadBackupClaimedEntry]? {
         let claimLimit = min(configuration.batchSize, max(1, limit))
         let excluded = runningSources.values.map(\.source) + Array(deferredSources.values)
+        // A folder file whose folder the app cannot reach now stays unclaimed and unchanged (#1583).
+        let files = resolver.fileClaimFilter()
         // Eligibility is persisted in `updatedAt` and enforced inside the same transaction that
         // moves rows to `checking`. Never filter after claiming: a discarded claim has no worker
         // and would remain falsely active until crash recovery.
@@ -756,9 +758,11 @@ public actor BackupSyncRunner {
                 loadLocalReadFailureList()
             }
             return queue.claimRunnableOrderingLocalReadFailuresLast(
-                limit: claimLimit, claimedAt: now(), excludingSourcesOf: excluded)
+                limit: claimLimit, claimedAt: now(), excludingSourcesOf: excluded, admittingFiles: files)
         }
-        return queue.claimRunnable(limit: claimLimit, claimedAt: now(), excludingSourcesOf: excluded)?.map {
+        return queue.claimRunnable(
+            limit: claimLimit, claimedAt: now(), excludingSourcesOf: excluded, admittingFiles: files
+        )?.map {
             UploadBackupClaimedEntry(entry: $0, localReadFailure: .unknown)
         }
     }
@@ -911,8 +915,11 @@ public actor BackupSyncRunner {
         excludingSourcesOf excludedSources: [UploadSourceIdentity] = []
     ) throws -> TimeInterval? {
         let currentTime = now()
+        // A row that no claim may take now never wakes the pass: a folder file on a drive that is away waits (#1583).
         var dates = [
-            try queue.decisionNextRunnableDate(excludingSourcesOf: excludedSources + Array(deferredSources.values))
+            try queue.decisionNextRunnableDate(
+                excludingSourcesOf: excludedSources + Array(deferredSources.values),
+                admittingFiles: resolver.fileClaimFilter())
         ]
         if policy == .freeUploadSlots {
             dates.append(try queue.decisionEarliestEntry(in: .blockedByDraft)?.updatedAt)
@@ -997,9 +1004,11 @@ public actor BackupSyncRunner {
         if peek.count < Self.primeBatch {
             peek += rows(in: .queuedForUpload, limit: Self.primeBatch - peek.count)
         }
+        let files = resolver.fileClaimFilter()
         peek.removeAll {
             $0.isDismissedSourceRecheck
                 || deferredSources[Self.sourceKey(kind: $0.source.kind, identifier: $0.source.identifier)] != nil
+                || ($0.source.kind == .fileURL && files?.admits(path: $0.source.identifier) == false)
         }
         // A photo whose pending row this build cannot read waits at its claim; its name goes to Proton only once its
         // row reads again (#982).
@@ -1207,11 +1216,6 @@ public actor BackupSyncRunner {
             checkingEntry = released
         }
         guard let resolved else {
-            // A folder file whose upload reached Proton keeps its receipt: the row waits instead of going (#1583).
-            if checkingEntry.source.kind == .fileURL, let reconciliation = checkingEntry.remoteCommitReconciliation {
-                keepSavedReceipt(checkingEntry, reconciliation: reconciliation, from: persistedState)
-                return
-            }
             // The source has no backup work of its own now: the library no longer lists it, or it belongs to another
             // photo. The catalog hook decides which.
             discardMissingSource(checkingEntry, from: persistedState, sourceIsUnavailable: true)
@@ -2722,22 +2726,27 @@ public actor BackupSyncRunner {
         }
     }
 
-    /// Stop/cancel path: put the row back where the next pass picks it up, without burning an
-    /// attempt (stopping the app is not a failure of the item).
-    /// A file in a folder that the app cannot reach now waits for a later pass exactly as it was stored: same state,
-    /// record, attempts and date, so it spends no attempt, shows no new problem and keeps a saved receipt. This pass
-    /// does not claim it again (#1583).
+    /// A file whose folder went away after its claim, for example a drive that was unplugged during the pass, waits for
+    /// a later pass exactly as it was stored: same state, record, attempts, date and receipt. It spends no attempt, shows
+    /// no new problem and enters no support trail. The claim filter keeps its later claims away while the folder is
+    /// gone; the pass also does not read it again, should the filter and the read ever disagree (#1583).
     private func waitForUnavailableLocation(
         _ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState
     ) {
         rememberDeferredSource(entry)
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }
-        persist(
-            entry, from: oldState, to: entry.state, attempts: entry.attempts, lastError: entry.lastError,
-            updatedAt: entry.updatedAt)
+        guard let restored = queue.restoreClaimed(entry) else {
+            stopRequested = true
+            return
+        }
+        guard restored else { return }
+        adjustProgress(from: oldState, to: entry.state)
+        emitProgress()
     }
 
+    /// Stop/cancel path: put the row back where the next pass picks it up, without burning an
+    /// attempt (stopping the app is not a failure of the item).
     private func revert(_ entry: UploadBackupSyncQueueEntry, from oldState: UploadBackupSyncQueueState) {
         endActiveExecution(key: Self.key(entry), publish: false)
         if sourceWasRemoved(entry) { return }

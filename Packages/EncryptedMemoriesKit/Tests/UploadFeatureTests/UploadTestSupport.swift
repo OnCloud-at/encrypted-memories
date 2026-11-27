@@ -344,11 +344,20 @@ extension UploadBackupSyncQueueStore {
         claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: [])
     }
 
+    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry) -> Bool? {
+        updateState(
+            source: entry.source, revision: entry.revision, state: entry.state, attempts: entry.attempts,
+            lastError: entry.lastError, updatedAt: entry.updatedAt)
+    }
+
     /// A store without a local read failure list claims in the normal order and knows nothing about the rows.
     func claimRunnableOrderingLocalReadFailuresLast(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupClaimedEntry]? {
-        claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)?.map {
+        claimRunnable(
+            limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources, admittingFiles: files
+        )?.map {
             UploadBackupClaimedEntry(entry: $0, localReadFailure: .unknown)
         }
     }
