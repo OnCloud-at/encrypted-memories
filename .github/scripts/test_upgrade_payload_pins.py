@@ -86,9 +86,35 @@ RAW_STRING_SCAN_ROWS = (
     # An unterminated raw multi-line string is not Swift.
     ('let a = #"""\nx "# y\nlet b = ZzRawUnterminated()',
      (), True),
-    # A single-line raw string cannot span a newline: unterminated is not Swift.
-    ('let a = #"abc\nlet b = ZzRawSingleLineOpen()',
+    # A single-line raw string cannot span a newline: the scan stops closed at the
+    # newline, so this unterminated literal fails closed instead of hiding ZzSpan.
+    ('let a = #"abc\nlet b = ZzSpan()\nlet c = #"q"#',
      (), True),
+    # Extended regex-literal rows pin the documented regex gap: '//' inside a regex
+    # literal opens a line comment in this scan and hides the names that follow. A
+    # future regex-aware fix must flip this row deliberately.
+    ('#/https://x/#; let b = ZzRegexLineGap()',
+     (), False),
+    # '/*' inside the second regex literal opens a block comment in this scan that its
+    # own trailing */ closes; the net effect on THIS row is that the name after the
+    # literals is reported. Rows above and the docstring record where the same content
+    # hides names instead. Pin of the documented gap's mixed behavior; a future
+    # regex-aware fix must keep this row green.
+    ('#/a/*/# ... #/x*//#; let b = ZzRegexBlockMix()',
+     ('ZzRegexBlockMix',), False),
+    # A regex literal without comment-like content scans correctly: the name after it is
+    # reported. This row guards against a future gap fix overreaching.
+    ('#/a/#; let b = ZzRegexPlain()',
+     ('ZzRegexPlain',), False),
+    # An escaped slash before a slash reads as '//' in this scan and hides the name
+    # after it on that line. Pin of the documented gap.
+    ('#/x\\//#; let b = ZzRegexEscapedSlash()',
+     (), False),
+    # The scan reads the content of a regex literal as code, so a capitalized word
+    # inside it is reported as a missing name: the file fails closed, never silently
+    # passes. Pin of the documented behavior.
+    ('#/(\\/\\/ZzRegexContent)/#',
+     ('ZzRegexContent',), False),
 )
 
 
@@ -527,6 +553,41 @@ class OverlayApplicationTests(unittest.TestCase):
                 self.apply_v1_0_5(scratch, automation)
             self.assertIn('ZzAfterDirectiveComment', str(raised.exception))
             self.assertNotIn('ZzHid7', str(raised.exception))
+
+    def test_apply_overlay_reads_a_string_on_a_directive_line_as_a_string(self):
+        # A string on a directive line stays a string: it neither opens a comment nor
+        # lets the comment-opener scan see /* inside the quotes. The quote-skipping
+        # branch is what keeps ZzDirectiveStr reported; this input is degenerate Swift
+        # for the compiler but the scanner must still not treat the quotes as text.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '#if X "/*"\n'
+                                              'let b = ZzDirectiveStr()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzDirectiveStr'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_closes_a_raw_multiline_string_only_at_a_line_start(self):
+        # Swift closes a raw multi-line string on its delimiter only at the start of a
+        # line after optional blanks (the Swift lexer rule for raw multi-line closers);
+        # a delimiter in the middle of a line is content.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let a = #"""\n'
+                                              'mid """# still content\n'
+                                              '   """#\n'
+                                              'let b = ZzCloserLineStart()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzCloserLineStart'):
+                self.apply_v1_0_5(scratch, automation)
 
     def test_apply_overlay_reports_only_hashed_interpolations_in_a_raw_string(self):
         # The interpolation marker inside a raw string carries the delimiter hash count,

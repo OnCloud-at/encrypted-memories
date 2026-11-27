@@ -205,13 +205,16 @@ def _take_raw_string(text, quote_index, hashes, collect=None):
     leading '#'; return the end index (past the closing hashes) or None when unterminated.
     One scanner serves the file top level, interpolations and multi-line strings: n hashes
     followed by one quote open a single-line string that closes on any quote followed by
-    exactly the same hash count; n hashes followed by three quotes open a multi-line
-    string that closes on three quotes plus the same hash count at the start of a line
-    after optional blanks. Inside a single-line string every quote not followed by the
-    hash count is content, so #"a""# closes on the second quote. Backslash escapes do not
-    apply; only backslash plus the same hash count plus '(' interpolates, reported to the
-    optional `collect` callback (expression, close_index) which returns False when the
-    expression is unscannable."""
+    exactly the same hash count; a single-line raw string must not span a newline: the
+    scan stops closed at a newline, because a Swift single-line raw literal cannot hold
+    one, so unterminated or newline-spanning input fails the file closed. n hashes
+    followed by three quotes open a multi-line string that closes on three quotes plus
+    the same hash count at the start of a line after optional blanks. Inside a
+    single-line string every quote not followed by the hash count is content, so
+    #"a""# closes on the second quote. Backslash escapes do not apply; only backslash
+    plus the same hash count plus '(' interpolates, reported to the optional `collect`
+    callback (expression, close_index) which returns False when the expression is
+    unscannable."""
     length = len(text)
     multiline = text.startswith('"""', quote_index)
     cursor = quote_index + (3 if multiline else 1)
@@ -231,6 +234,11 @@ def _take_raw_string(text, quote_index, hashes, collect=None):
                 line_start = text.rfind('\n', 0, cursor) + 1
                 if not text[line_start:cursor].strip():
                     return cursor + 3 + hashes
+        elif text[cursor] == '\n':
+            # A Swift single-line raw literal cannot hold a newline. Stop closed so an
+            # unterminated or newline-spanning raw string fails the file closed instead
+            # of hiding the names that follow.
+            return None
         elif text[cursor] == '"':
             if text[cursor + 1:cursor + 1 + hashes] == '#' * hashes:
                 return cursor + 1 + hashes
@@ -291,10 +299,21 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
         Swift-compilable input; strip returns None so the caller reports that file as
         unscannable.
 
-        Not covered: regex literals that contain quote characters read as string
-        openings and can fail the file closed. The heuristic name scan itself sees
-        only capitalized names, bare capitalized identifiers, and `Capitalized.member`
-        / `).member` forms (see unbuildable_names).
+        Not covered: regex literals. An extended regex literal (#/…/# with matching hash
+        counts) containing '//' opens a line comment in this scan, so names between the
+        literal and the end of that line can hide; containing an unescaped '/*' opens a
+        block comment that swallows names until a real '*/' (which may sit inside the
+        literal's own content, making the net effect row-dependent). A regex literal
+        containing a quote character reads as a string opening and can fail the file
+        closed. An escaped slash before a slash (`\\//`) also reads as '//' and hides
+        the names after it on that line. Content without '//' and '/*' does not hide
+        the names after the literal, but the scan reads the content of a regex literal
+        as code, so a capitalized word inside it is reported as a missing name: the
+        file fails closed, never silently passes. These rows pin the documented
+        behavior: a future regex-aware fix must flip the hiding rows deliberately. The
+        heuristic name scan itself sees only capitalized names, bare capitalized
+        identifiers, and `Capitalized.member` / `).member` forms (see
+        unbuildable_names).
         """
         code = []
         interpolated = []
