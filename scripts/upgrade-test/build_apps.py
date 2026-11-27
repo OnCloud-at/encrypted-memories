@@ -116,13 +116,14 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                        'Task', 'Insecure', 'SHA1', 'SHA256', 'Data', 'Int', 'Int64', 'Double', 'Bool', 'URL'}
     framework_members = {'registerClass'}
     exemptions = {'self', 'init', 'some', 'utf8'}
-    # Preprocessor conditions are not Swift names: strip directive lines before scanning.
+    # Preprocessor conditions are not Swift names: drop whole directive lines before scanning.
     compile_conditions = {'ENCRYPTED_MEMORIES_UPGRADE_TEST'}
 
     def strip(text):
         text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-        text = re.sub(r'/#[^\n]*', '', text)
+        text = re.sub(r'(?m)^[ \t]*#[^\n]*', '', text)
         text = re.sub(r'//[^\n]*', '', text)
+        text = re.sub(r'"""(?:[^"\\]|\\.|"(?!""))*"""', '""', text, flags=re.S)
         text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
         return text
 

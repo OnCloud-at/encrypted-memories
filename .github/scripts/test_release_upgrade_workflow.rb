@@ -5,6 +5,7 @@ require "minitest/autorun"
 require "json"
 require "yaml"
 require "tmpdir"
+require "fileutils"
 require_relative "test_release_identity"
 
 class ReleaseUpgradeWorkflowTest < Minitest::Test
@@ -417,12 +418,20 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
         if [[ -f "$(dirname "$0")/bad-runtime" ]]; then
           echo '{"runtimes": []}'
         else
-          echo '{"runtimes": [{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-5","version":"26.5","buildversion":"23F77","isAvailable":true}]}'
+          echo '{"runtimes": [{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-5","version":"26.5","buildversion":"23F77","isAvailable":true,"bundlePath":"'"$HOME"'/iOS 26.5.simruntime"}]}'
         fi
       SH
       File.chmod(0755, File.join(bin, "xcodebuild"))
       File.chmod(0755, File.join(bin, "xcrun"))
-      env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "RUNNER_TEMP" => dir,
+      # The journey scrubs the environment before it asks simctl for the installed runtimes, so the
+      # fake bundle must live under one of the surviving variables: HOME.
+      bundle = File.join(dir, "iOS 26.5.simruntime", "Contents", "Resources", "RuntimeRoot",
+                          "System", "Library", "CoreServices")
+      FileUtils.mkdir_p(bundle)
+      File.binwrite(File.join(bundle, "SystemVersion.plist"),
+                    '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'\
+                    '<key>ProductBuildVersion</key><string>23F77</string></dict></plist>')
+      env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "RUNNER_TEMP" => dir, "HOME" => dir,
              "UPGRADE_RUNTIME_ID" => "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
              "UPGRADE_RUNTIME_VERSION" => "26.5", "UPGRADE_RUNTIME_BUILD" => "23F77"}
       assert system(env, "bash", "-c", provision, out: File::NULL, err: File::NULL), "matching runtime must pass"

@@ -106,13 +106,18 @@ class CandidateCompatibilityTests(unittest.TestCase):
 class OverlayApplicationTests(unittest.TestCase):
     """The overlay must apply to the real source era, not only to fixtures."""
 
-    def apply_v1_0_5(self, root, automation):
-        tag, commit = 'v1.0.5', json.loads((OVERLAYS / 'versions.json').read_text())['v1.0.5']['commit']
+    def v1_0_5_args(self, root, automation):
+        tag = 'v1.0.5'
+        commit = json.loads((OVERLAYS / 'versions.json').read_text())[tag]['commit']
         archive = str(Path(root) / 'source.tar')
         subprocess.run(['git', 'archive', '-o', archive, commit], cwd=REPO, check=True)
         source = Path(root) / 'source'
         with tarfile.open(archive) as tree:
             tree.extractall(source, filter='data')
+        return source, automation, tag, commit
+
+    def apply_v1_0_5(self, root, automation):
+        source, automation, tag, commit = self.v1_0_5_args(root, automation)
         build_apps.apply_overlay(source, automation, tag, commit)
         return source
 
@@ -154,6 +159,34 @@ class OverlayApplicationTests(unittest.TestCase):
             pinned.write_text(text)
             with self.assertRaisesRegex(JourneyError, 'MysteryFreeType'):
                 self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_ignores_names_that_only_appear_in_a_compilation_condition(self):
+        # A directive line is not Swift code; a future condition name is not an unbuildable
+        # type. The scan must drop directive lines, including their condition name.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('#if ENCRYPTED_MEMORIES_UPGRADE_TEST',
+                                              '#if ENCRYPTED_MEMORIES_UPGRADE_TEST\n'
+                                              '#if SOME_FUTURE_CONDITION')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_ignores_names_that_only_appear_in_a_multi_line_string(self):
+        # Names inside multi-line string literals are text, not code; the scan must strip
+        # triple-quoted literals before it collects names, including one on its own line.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let prose = """\n'
+                                              'A FailureCancellation mention is text.\n'
+                                              '"""')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
 
     def test_apply_overlay_fails_loudly_when_the_automation_history_cannot_read_the_tag(self):
         # A checkout without git history once made git grep fail for every word, so every

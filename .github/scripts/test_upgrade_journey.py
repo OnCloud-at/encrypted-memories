@@ -48,7 +48,13 @@ class UpgradeJourneyTests(unittest.TestCase):
         patcher = patch.object(run_journey, 'bundle_build',
                                side_effect=lambda path: Path(path).name[:-len('.simruntime')])
         self.addCleanup(patcher.stop)
+        self._bundle_build_stub = patcher
         patcher.start()
+
+    def without_bundle_build_stub(self):
+        """Temporarily restore the real bundle_build; tests of bundle_build itself need it."""
+        self._bundle_build_stub.stop()
+        return nullcontext()
     @unittest.skipUnless(sys.platform == 'darwin', 'Native Settings controls require macOS')
     def test_native_macos_settings_pane_retries_only_unacknowledged_clicks(self):
         repo = Path(__file__).resolve().parents[2]
@@ -646,6 +652,38 @@ with SigningIdentity(root) as signer:
                 run_journey.InstalledApp('iOS', Path(root))
             output.assert_called_once()
             command.assert_not_called()
+
+    def test_a_selected_runtime_without_a_bundle_path_fails_before_creation(self):
+        bare = dict(run_journey.IOS_RUNTIME, isAvailable=True)
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(run_journey, 'output', side_effect=[json.dumps({'runtimes': [bare]})]) as output, \
+                patch.object(run_journey, 'command') as command:
+            with self.assertRaisesRegex(JourneyError, 'does not report a bundle path'):
+                run_journey.InstalledApp('iOS', Path(root))
+            output.assert_called_once()
+            command.assert_not_called()
+
+    def test_a_selected_runtime_with_an_unreadable_bundle_fails_before_creation(self):
+        broken = dict(run_journey.IOS_RUNTIME, isAvailable=True, bundlePath='/nonexistent/broken.simruntime')
+        with self.without_bundle_build_stub(), tempfile.TemporaryDirectory() as root, \
+                patch.object(run_journey, 'output', side_effect=[json.dumps({'runtimes': [broken]})]) as output, \
+                patch.object(run_journey, 'command') as command:
+            with self.assertRaisesRegex(JourneyError, 'unreadable bundle'):
+                run_journey.InstalledApp('iOS', Path(root))
+            output.assert_called_once()
+            command.assert_not_called()
+
+    def test_bundle_build_reads_the_build_from_the_runtime_bundles_system_version_plist(self):
+        with self.without_bundle_build_stub(), tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch) / 'iOS 26.5.simruntime' / 'Contents/Resources/RuntimeRoot' \
+                / 'System/Library/CoreServices'
+            root.mkdir(parents=True)
+            (root / 'SystemVersion.plist').write_bytes(
+                plistlib.dumps({'ProductBuildVersion': '23F73'}))
+            self.assertEqual(run_journey.bundle_build(str(Path(scratch) / 'iOS 26.5.simruntime')), '23F73')
+            (root / 'SystemVersion.plist').write_bytes(b'not a plist')
+            with self.assertRaises(ValueError):
+                run_journey.bundle_build(str(Path(scratch) / 'iOS 26.5.simruntime'))
 
     def test_unknown_device_fails_before_simulator_creation(self):
         runtime = json.dumps({'runtimes': [dict(run_journey.IOS_RUNTIME, isAvailable=True,

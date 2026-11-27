@@ -16,6 +16,7 @@ import uuid
 import time
 
 from build_apps import build_app, clean_environment, command, output, release_metadata, verify_bundle_metadata
+from runtime_pin import requested_runtime
 from journey import JourneyError, run_cases
 from server import FixtureServer
 
@@ -34,11 +35,10 @@ LIMITATION = ('macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau
 CONSENT_LIMITATION = ('The backup journey requires consent already saved on disk. The immediate v1.0.5 '
                      'Enable-to-SIGKILL case is a known historical limit and is not tested here.')
 
-# The local default is the configuration that sets `newest_runtime` (exactly one does; the planner module checks it).
-_default_pin = PINS[next(key for key in CONFIGURATIONS if key[0] == 'iOS' and PINS[key]['newest_runtime'])]
-IOS_RUNTIME = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-' + _default_pin['runtime_version'].replace('.', '-'),
-               'version': _default_pin['runtime_version'], 'buildversion': _default_pin['runtime_build'],
-               'buildversions': sorted({_default_pin['runtime_build'], *_default_pin.get('runtime_build_alternatives', [])})}
+# The local default runtime pin comes from the single requested_runtime implementation in
+# runtime_pin (no environment set = the newest_runtime configuration). Every expected-runtime
+# dictionary, default or env-selected, is built there from the reviewed config.
+IOS_RUNTIME = requested_runtime(environ={})
 
 # xcodebuild needs its own time to start the UI runner before XCTest starts a test case. On the loaded hosted
 # runner this startup took 160 s, nearly the whole former preparation budget, and the UI test never ran. The
@@ -143,14 +143,12 @@ def verify_selected_runtime(runtime, expected):
 def requested_ios_runtime():
     keys = ('UPGRADE_RUNTIME_ID', 'UPGRADE_RUNTIME_VERSION', 'UPGRADE_RUNTIME_BUILD')
     supplied = [os.environ.get(key) for key in keys]
-    if any(value is not None for value in supplied):
-        if not all(supplied):
-            raise JourneyError('The Simulator runtime identifier, version and build must all be supplied')
-        try:
-            return requested_runtime()
-        except ValueError as error:
-            raise JourneyError(str(error)) from error
-    return IOS_RUNTIME
+    if not any(value is not None for value in supplied):
+        return IOS_RUNTIME
+    try:
+        return requested_runtime()
+    except ValueError as error:
+        raise JourneyError(str(error)) from error
 
 
 def summary(message):
@@ -605,7 +603,9 @@ def verify_macos_host(expected_os, actual_os):
 
 def main():
     if sys.argv[1:] == ['--check-runtime']:
-        select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'], requested_ios_runtime())
+        expected = requested_ios_runtime()
+        verify_selected_runtime(select_ios_runtime(
+            json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'], expected), expected)
         return
     if sys.argv[1:] == ['--list-points']:
         # The one list of interruption points. The release workflow builds its job matrix from this output.
