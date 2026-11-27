@@ -47,6 +47,51 @@ def git_bytes(ref, path):
     return subprocess.check_output(['git', 'show', f'{ref}:{path}'], cwd=REPO)
 
 
+# One row per raw-string scanner behavior. Each row replaces the pinned payload file's
+# 'import CryptoKit' line with 'import CryptoKit' plus the row's source, then expects the
+# test-entry guard to report exactly the listed Zz names, or to fail closed on input no
+# Swift compiler accepts. New scanner cases are new rows.
+RAW_STRING_SCAN_ROWS = (
+    # A raw string can open with content hashes; the opening delimiter is not content.
+    ('let a = #"#tag"#\nlet b = ZzHashOpen()\nlet c = "\\""',
+     ('ZzHashOpen',), False),
+    # Two-hash delimiter with hash content.
+    ('let a = ##"##x"##\nlet b = ZzDoubleHash()',
+     ('ZzDoubleHash',), False),
+    # The code after an empty raw string stays in the scan.
+    ('let empty = ##""##\nlet b = ZzAfterEmpty()',
+     ('ZzAfterEmpty',), False),
+    # A second adjacent quote still closes the literal: #"a""# holds a".
+    ('let a = #"a""#\nlet b = ZzQuoteRun()',
+     ('ZzQuoteRun',), False),
+    # A quote run inside a nested raw string closes it; the interpolation stays scannable.
+    ('let s = "\\(#"a""#)"\nlet b = ZzNestedQuote()\nlet t = "\\(#"q"#)"',
+     ('ZzNestedQuote',), False),
+    # A raw multi-line string: content quotes and hashes do not close it early.
+    ('let a = #"""\nx "# y\n"""#\nlet b = ZzRawMulti()\n// a """ in a comment\nlet c = 1',
+     ('ZzRawMulti',), False),
+    # Raw multi-line strings take any hash count.
+    ('let a = ##"""\ny "# z\n"""##\nlet b = ZzRawMultiHash2()',
+     ('ZzRawMultiHash2',), False),
+    # A bare triple quote at a line start inside a raw multi-line string is content: the
+    # closer needs the delimiter hash count.
+    ('let a = #"""\n"""\n"""#\nlet b = ZzRawFewerQuotes()',
+     ('ZzRawFewerQuotes',), False),
+    # A hashed interpolation inside a raw multi-line string stays in the scan.
+    ('let a = #"""\nq \\#(ZzInRawMulti()) w\n"""#\nlet b = ZzAfterRawInterp()',
+     ('ZzInRawMulti', 'ZzAfterRawInterp'), False),
+    # A plain backslash-parenthesis marker is literal text in a raw string (SE-0200).
+    ('let plain = #"value \\(ZzNeverDefined) tail"#\nlet other = #"x"#',
+     (), False),
+    # An unterminated raw multi-line string is not Swift.
+    ('let a = #"""\nx "# y\nlet b = ZzRawUnterminated()',
+     (), True),
+    # A single-line raw string cannot span a newline: unterminated is not Swift.
+    ('let a = #"abc\nlet b = ZzRawSingleLineOpen()',
+     (), True),
+)
+
+
 def source_has_own_test_entry(tag):
     sentinel = 'Packages/EncryptedMemoriesKit/Sources/PhotosCore/UpgradeTestProbe.swift'
     return subprocess.run(['git', 'cat-file', '-e', f'{tag}:{sentinel}'], cwd=REPO,
@@ -426,6 +471,62 @@ class OverlayApplicationTests(unittest.TestCase):
             pinned.write_text(text)
             with self.assertRaisesRegex(JourneyError, 'ZzAfterEmpty'):
                 self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_every_raw_string_table_row(self):
+        for source, expected_names, fail_closed in RAW_STRING_SCAN_ROWS:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as scratch:
+                    automation = self.history_sharing_automation(scratch)
+                    pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                        'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+                    pinned.write_text(pinned.read_text().replace('import CryptoKit',
+                                                                'import CryptoKit\n' + source))
+                    if fail_closed:
+                        with self.assertRaisesRegex(JourneyError, 'is not valid Swift'):
+                            self.apply_v1_0_5(scratch, automation)
+                    elif expected_names:
+                        with self.assertRaises(JourneyError) as raised:
+                            self.apply_v1_0_5(scratch, automation)
+                        for name in expected_names:
+                            self.assertIn(name, str(raised.exception))
+                    else:
+                        self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_consumes_escapes_in_a_multiline_string_nested_in_an_interpolation(self):
+        # A \\" inside a multi-line string that itself sits inside an interpolation does
+        # not close that string; the scan continues and reports the name after it.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let s = "\\(f("""\n'
+                                              'first \\""" second\n'
+                                              '"""))"\n'
+                                              'let b = ZzAfterEscapedTriple()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzAfterEscapedTriple'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_keeps_a_block_comment_opened_by_a_directive_line(self):
+        # A directive line can open a block comment in its condition area: the comment
+        # opener survives the dropped directive tokens and hides the names inside.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '#if DEBUG /*\n'
+                                              'let b = ZzHid7()\n'
+                                              '*/\n'
+                                              'let c = ZzAfterDirectiveComment()')
+            pinned.write_text(text)
+            with self.assertRaises(JourneyError) as raised:
+                self.apply_v1_0_5(scratch, automation)
+            self.assertIn('ZzAfterDirectiveComment', str(raised.exception))
+            self.assertNotIn('ZzHid7', str(raised.exception))
 
     def test_apply_overlay_reports_only_hashed_interpolations_in_a_raw_string(self):
         # The interpolation marker inside a raw string carries the delimiter hash count,

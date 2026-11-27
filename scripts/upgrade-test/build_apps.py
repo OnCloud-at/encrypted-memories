@@ -200,24 +200,40 @@ def _take_multiline_string(text, index):
     return cursor + 3
 
 
-def _take_raw_string(text, quote_index, hashes):
-    """Consume a raw string whose opening quote sits at `quote_index` with `hashes` leading
-    '#'; return the end index (past the closing hashes) or None when unterminated."""
-    cursor = quote_index + 1
+def _take_raw_string(text, quote_index, hashes, collect=None):
+    """Consume a raw string whose opening delimiter sits at `quote_index` with `hashes`
+    leading '#'; return the end index (past the closing hashes) or None when unterminated.
+    One scanner serves the file top level, interpolations and multi-line strings: n hashes
+    followed by one quote open a single-line string that closes on any quote followed by
+    exactly the same hash count; n hashes followed by three quotes open a multi-line
+    string that closes on three quotes plus the same hash count at the start of a line
+    after optional blanks. Inside a single-line string every quote not followed by the
+    hash count is content, so #"a""# closes on the second quote. Backslash escapes do not
+    apply; only backslash plus the same hash count plus '(' interpolates, reported to the
+    optional `collect` callback (expression, close_index) which returns False when the
+    expression is unscannable."""
     length = len(text)
+    multiline = text.startswith('"""', quote_index)
+    cursor = quote_index + (3 if multiline else 1)
+    marker = '\\' + '#' * hashes + '('
+    closer = '"""' + '#' * hashes
     while cursor < length:
-        if text[cursor] == '"':
-            run = 0
-            while cursor + run < length and text[cursor + run] == '"':
-                run += 1
-            # A raw delimiter is one quote followed by the opening hash count. More
-            # adjacent quotes can never close the literal; a bare quote inside a raw
-            # string is ordinary content.
-            suffix = text[cursor + 1:cursor + 1 + hashes]
-            if suffix == '#' * hashes and run == 1:
-                return cursor + 1 + hashes
-            cursor += run
+        if text.startswith(marker, cursor):
+            expression, close = _take_interpolation(text, cursor + 1 + hashes)
+            if close is None:
+                return None
+            if collect is not None and not collect(expression, close):
+                return None
+            cursor = close
             continue
+        if multiline:
+            if text.startswith(closer, cursor):
+                line_start = text.rfind('\n', 0, cursor) + 1
+                if not text[line_start:cursor].strip():
+                    return cursor + 3 + hashes
+        elif text[cursor] == '"':
+            if text[cursor + 1:cursor + 1 + hashes] == '#' * hashes:
+                return cursor + 1 + hashes
         cursor += 1
     return None
 
@@ -255,25 +271,30 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
         drops non-code. Returns the scan text plus the interpolated expressions.
 
         States: code, line comment (ends at newline), block comment (nesting counted),
-        string (double-quoted), multi-line string, raw string (#"-quoted, # count must
-        match). Conditional-compilation directive lines (#if/#elseif/#else/#endif) are
-        dropped only in code state, at the start of a line after optional blanks, so a
-        directive-looking line inside a multi-line string stays string content. Backslash
-        escapes are consumed inside strings, including multi-line strings; a \\"" inside a
-        multi-line string does not close it. In a raw string with n delimiter hashes, only
-        backslash plus n hashes plus '(' interpolates (SE-0200); a plain \\( is literal
-        text. An interpolation holds balanced parentheses and can itself contain strings,
-        raw strings and comments; its collected expression is lexed again so nested string
-        contents carry no names. Unterminated strings, unterminated interpolations and
-        unterminated block comments are not Swift-compilable input; strip returns None so
-        the caller reports that file as unscannable.
+        string (double-quoted), multi-line string, raw string. One raw-string scanner
+        (_take_raw_string) serves the file top level, interpolations and multi-line
+        strings: n hashes plus one quote open a single-line raw string closed by any
+        quote plus the same hash count, and n hashes plus three quotes open a raw
+        multi-line string closed by three quotes plus the same hash count at the start
+        of a line after optional blanks. Conditional-compilation directive lines
+        (#if/#elseif/#else/#endif) are dropped only in code state, at the start of a
+        line after optional blanks, so a directive-looking line inside a multi-line
+        string stays string content; only the directive token and its condition are
+        dropped, so a block or line comment opener that follows keeps its meaning.
+        Backslash escapes are consumed inside strings, including multi-line strings; a
+        \\"" inside a multi-line string does not close it. In a raw string with n
+        delimiter hashes, only backslash plus n hashes plus '(' interpolates (SE-0200);
+        a plain \\( is literal text. An interpolation holds balanced parentheses and can
+        itself contain strings, raw strings, raw multi-line strings and comments; its
+        collected expression is lexed again so nested string contents carry no names.
+        Unterminated strings, interpolations and block comments are not
+        Swift-compilable input; strip returns None so the caller reports that file as
+        unscannable.
 
         Not covered: regex literals that contain quote characters read as string
-        openings and can fail the file closed. A multi-line string nested inside an
-        interpolation consumes escapes since the escape fix, so its \\"" no longer
-        fails closed. The heuristic name scan itself sees only capitalized names, bare
-        capitalized identifiers, and `Capitalized.member` / `).member` forms (see
-        unbuildable_names).
+        openings and can fail the file closed. The heuristic name scan itself sees
+        only capitalized names, bare capitalized identifiers, and `Capitalized.member`
+        / `).member` forms (see unbuildable_names).
         """
         code = []
         interpolated = []
@@ -284,14 +305,14 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
 
         def collect(expression, close):
             # Lex the interpolation expression again: its string contents are text and
-            # its own interpolations stay in the scan. Returns `close`, or None when the
-            # expression is not scannable.
+            # its own interpolations stay in the scan. Returns False when the expression
+            # is not scannable.
             inner, inner_interpolated = strip(expression)
             if inner is None:
-                return None
+                return False
             interpolated.append(inner)
             interpolated.extend(inner_interpolated)
-            return close
+            return True
 
         while index < length:
             char = text[index]
@@ -313,13 +334,29 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
             if at_line_start:
                 # A directive line starts with optional blanks, then #if/#elseif/#else/#endif.
                 # The check runs only in code state: directive-looking lines inside
-                # comments or strings keep their meaning. The newline stays so line
-                # tracking holds.
-                if re.match(r'[ \t]*#[ \t]*(?:if|elseif|else|endif)\b', text[index:]):
-                    skip_to = text.find('\n', index)
-                    if skip_to < 0:
-                        break
-                    index = skip_to
+                # comments or strings keep their meaning. Only the directive token and its
+                # condition are dropped; a block or line comment opener that follows on the
+                # line keeps its meaning, so #if DEBUG /* opens a comment that spans lines.
+                # The newline stays so line tracking holds.
+                directive = re.match(r'[ \t]*#[ \t]*(?:if|elseif|else|endif)\b', text[index:])
+                if directive:
+                    line_end = text.find('\n', index)
+                    if line_end < 0:
+                        line_end = length
+                    cursor = index + directive.end()
+                    comment_start = None
+                    while cursor < line_end:
+                        if text[cursor] == '"':
+                            cursor += 1
+                            while cursor < line_end and text[cursor] != '"':
+                                cursor += 2 if text[cursor] == '\\' else 1
+                            cursor += 1
+                            continue
+                        if text.startswith('/*', cursor) or text.startswith('//', cursor):
+                            comment_start = cursor
+                            break
+                        cursor += 1
+                    index = line_end if comment_start is None else comment_start
                     continue
             if char == '/' and nxt == '/':
                 index = text.find('\n', index)
@@ -328,33 +365,12 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                 continue
             hash_run = hash_run + 1 if char == '#' else 0
             if hash_run and nxt == '"':
-                # Raw string literal: '#'*'"' ... '"'*'#' with the same counts. Backslash
-                # escapes do not apply, and only backslash plus the same hash count
-                # interpolates (SE-0200); a plain \( marker is literal text.
-                hashes = hash_run
-                index += 2  # Past the last '#' and the opening quote: content starts
-                # right after, so a content '#' before any quote is never mistaken
-                # for the delimiter by the scan below (only a quote can close it).
-                while index < length:
-                    if text.startswith('\\' + '#' * hashes + '(', index):
-                        expression, close = _take_interpolation(text, index + 1 + hashes)
-                        if close is None:
-                            return None, None
-                        index = collect(expression, close)
-                        if index is None:
-                            return None, None
-                        continue
-                    if text[index] == '"':
-                        # The closing delimiter is one quote followed by the opening hash
-                        # count; other quotes are content.
-                        if (index + 1 + hashes <= length
-                                and text[index + 1:index + 1 + hashes] == '#' * hashes):
-                            index += 1 + hashes
-                            break
-                        index += 1
-                        continue
-                    index += 1
-                else:
+                # Raw string literal, single-line or multi-line: the single scanner
+                # decides by the quote count after the hashes, so a plain \( marker is
+                # literal text and only backslash plus the same hash count interpolates
+                # (SE-0200).
+                index = _take_raw_string(text, index + 1, hash_run, collect)
+                if index is None:
                     return None, None
                 code.append(' ')
                 continue
@@ -366,11 +382,9 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                     while index < length and not text.startswith('"""', index):
                         if text.startswith('\\(', index):
                             expression, close = _take_interpolation(text, index + 1)
-                            if close is None:
+                            if close is None or not collect(expression, close):
                                 return None, None
-                            index = collect(expression, close)
-                            if index is None:
-                                return None, None
+                            index = close
                         elif text[index] == '\\' and index + 1 < length:
                             index += 2
                         else:
@@ -383,11 +397,9 @@ def unbuildable_names(source, tag, payload=PAYLOAD, git_repo=None):
                     while index < length and text[index] != '"':
                         if text.startswith('\\(', index):
                             expression, close = _take_interpolation(text, index + 1)
-                            if close is None:
+                            if close is None or not collect(expression, close):
                                 return None, None
-                            index = collect(expression, close)
-                            if index is None:
-                                return None, None
+                            index = close
                         elif text[index] == '\\' and index + 1 < length:
                             index += 2
                         else:
