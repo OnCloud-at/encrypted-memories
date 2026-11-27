@@ -124,10 +124,12 @@ public struct PendingSourceMetadataAnswer: Sendable, Equatable {
         self.unknown = unknown
     }
 
-    /// Joins the answers of separate providers; the first answer keeps a key that both list.
+    /// Joins the answers of separate providers; the first answer keeps a key that both list, as metadata or as a
+    /// failed read.
     public mutating func merge(_ other: PendingSourceMetadataAnswer) {
-        metadata.merge(other.metadata) { current, _ in current }
-        unknown.formUnion(other.unknown.filter { metadata[$0] == nil })
+        let answered = unknown.union(metadata.keys)
+        metadata.merge(other.metadata.filter { !answered.contains($0.key) }) { current, _ in current }
+        unknown.formUnion(other.unknown.subtracting(answered))
     }
 }
 

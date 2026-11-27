@@ -447,7 +447,7 @@ final class UploadDedupePipelineTests: XCTestCase {
         }
     }
 
-    func testFailedNameProbePreservesTrustedActiveAdoptionButCancellationPropagates() async throws {
+    func testFailedNameProbeAdoptsNoTrustedActiveCopyAndCancellationPropagates() async throws {
         let errors: [any Error] = [
             UploadError.backend("unavailable"), URLError(.cancelled), UploadError.cancelled,
             UploadError.transport(code: URLError.cancelled.rawValue, message: "cancelled"),
@@ -463,19 +463,49 @@ final class UploadDedupePipelineTests: XCTestCase {
                 active, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "active")
             localChecker.findError = error
             let attempts = localChecker.nameLookupAttemptCount
+            let copy = descriptor(digest: digest)
             do {
-                let result = try await localPipeline.resolve(descriptor(digest: digest))
-                if index == 0 {
-                    XCTAssertEqual(result.decision, .skip(.knownFromManifest, remoteLinkID: "active"))
-                } else {
-                    XCTFail("cancellation cannot fall through to cached adoption")
-                }
+                let result = try await localPipeline.resolve(copy)
+                XCTFail("a failed name check can neither adopt nor upload: \(result.decision)")
             } catch {
-                XCTAssertNotEqual(index, 0, "ordinary evidence failure preserves the existing trusted proof")
+                if index == 0 {
+                    XCTAssertEqual(error as? UploadError, .backend("unavailable"))
+                } else {
+                    XCTAssertTrue(UploadError.isCancellation(error), "\(error)")
+                }
                 XCTAssertFalse(Task.isCancelled)
             }
-            XCTAssertEqual(localChecker.nameLookupAttemptCount, attempts + 1)
+            XCTAssertNil(localStore.record(for: copy.source)?.remoteLinkID, "nothing proves this copy yet")
+            // An ordinary failure checks the name once more, as an uncached source does; a cancellation stops.
+            XCTAssertEqual(localChecker.nameLookupAttemptCount, attempts + (index == 0 ? 2 : 1))
         }
+    }
+
+    func testAFailedNameCheckCannotHideTheTrashOfTheSameNameBehindACachedActiveCopy() async throws {
+        let digest = Data(repeating: 7, count: 20)
+        let active = descriptor(path: "/other/active.HEIC", digest: digest)
+        let first = try await pipeline.resolve(active)
+        try await pipeline.recordUploaded(
+            active, identity: first.identity, remoteVolumeID: "vol", remoteLinkID: "active")
+        let copy = descriptor(digest: digest)
+        checker.remoteItemsByNameHash["nh(IMG_1.HEIC)"] = [
+            .init(
+                nameHash: "nh(IMG_1.HEIC)", contentHash: first.identity.contentHash, linkState: .trashed,
+                linkID: "trash")
+        ]
+        // The first name check fails; the next one answers.
+        let lookups = Restore829ReadCount()
+        checker.nameLookupGate = { [weak checker = self.checker] in
+            checker?.findError = lookups.next() == 1 ? UploadError.backend("unavailable") : nil
+        }
+
+        let result = try await pipeline.resolve(copy)
+
+        XCTAssertEqual(
+            result.decision, .skip(.trashedDuplicate, remoteLinkID: "trash"),
+            "the person deleted this photo in Proton; another source's active copy must not count as its backup")
+        XCTAssertEqual(store.record(for: copy.source)?.remoteLinkID, "trash")
+        XCTAssertFalse(try XCTUnwrap(store.record(for: copy.source)).provesUpload)
     }
 
     func testKnownTrashCannotAdoptCachedActiveProofWhenNameEvidenceFails() async throws {

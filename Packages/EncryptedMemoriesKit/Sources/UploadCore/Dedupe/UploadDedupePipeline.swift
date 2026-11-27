@@ -332,8 +332,10 @@ public actor UploadDedupePipeline: UploadIdentityResolving {
                 } catch {
                     try Task.checkCancellation()
                     if UploadError.isCancellation(error) { throw error }
+                    // Without the name rows, a trash of this photo stays unknown: another source's active copy
+                    // could count a photo that the person deleted in Proton as backed up. The check below decides.
                     PhotoDiagnostics.shared.increment("upload.cachedAdoptionNameUnavailable")
-                    allowsAdoption = true
+                    allowsAdoption = false
                 }
                 if allowsAdoption {
                     try validateRestoredCheck(restoring, for: descriptor)
