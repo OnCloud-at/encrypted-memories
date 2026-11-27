@@ -5,6 +5,7 @@ require "minitest/autorun"
 require "json"
 require "yaml"
 require "tmpdir"
+require "fileutils"
 require_relative "test_release_identity"
 
 class ReleaseUpgradeWorkflowTest < Minitest::Test
@@ -14,7 +15,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
   end
 
   def test_upgrade_script_behavior
-    %w[test_release_upgrade.py test_keychain_entitlements.py test_upgrade_journey.py test_upgrade_metadata.py test_upgrade_metal.py].each do |script|
+    %w[test_release_upgrade.py test_keychain_entitlements.py test_upgrade_journey.py test_upgrade_metadata.py test_upgrade_metal.py test_upgrade_payload_pins.py].each do |script|
       assert system("python3", File.expand_path(script, __dir__)), "#{script} failed"
     end
   end
@@ -382,6 +383,7 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
 
   def test_runtime_provisioning_rejects_wrong_export_or_unavailable_runtime
     provision = @jobs.fetch("upgrade").fetch("steps").find { |step| step["id"] == "ios26-runtime" }.fetch("run")
+    root = File.expand_path("../..", __dir__)
     Dir.mktmpdir do |dir|
       bin = File.join(dir, "bin")
       Dir.mkdir(bin)
@@ -417,18 +419,26 @@ class ReleaseUpgradeWorkflowTest < Minitest::Test
         if [[ -f "$(dirname "$0")/bad-runtime" ]]; then
           echo '{"runtimes": []}'
         else
-          echo '{"runtimes": [{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-5","version":"26.5","buildversion":"23F77","isAvailable":true}]}'
+          echo '{"runtimes": [{"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-5","version":"26.5","buildversion":"23F77","isAvailable":true,"bundlePath":"'"$HOME"'/iOS 26.5.simruntime"}]}'
         fi
       SH
       File.chmod(0755, File.join(bin, "xcodebuild"))
       File.chmod(0755, File.join(bin, "xcrun"))
-      env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "RUNNER_TEMP" => dir,
+      # The journey scrubs the environment before it asks simctl for the installed runtimes, so the
+      # fake bundle must live under one of the surviving variables: HOME.
+      bundle = File.join(dir, "iOS 26.5.simruntime", "Contents", "Resources", "RuntimeRoot",
+                          "System", "Library", "CoreServices")
+      FileUtils.mkdir_p(bundle)
+      File.binwrite(File.join(bundle, "SystemVersion.plist"),
+                    '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'\
+                    '<key>ProductBuildVersion</key><string>23F77</string></dict></plist>')
+      env = {"PATH" => "#{bin}:#{ENV.fetch('PATH')}", "RUNNER_TEMP" => dir, "HOME" => dir,
              "UPGRADE_RUNTIME_ID" => "com.apple.CoreSimulator.SimRuntime.iOS-26-5",
              "UPGRADE_RUNTIME_VERSION" => "26.5", "UPGRADE_RUNTIME_BUILD" => "23F77"}
-      assert system(env, "bash", "-c", provision, out: File::NULL, err: File::NULL), "matching runtime must pass"
+      assert system(env, "bash", "-c", provision, chdir: root, out: File::NULL, err: File::NULL), "matching runtime must pass"
       %w[DOWNLOAD_FAIL BAD_BUILD BAD_EXPORT EXTRA_IMAGE EXTRA_BUNDLE IMPORT_FAIL BAD_RUNTIME].each do |failure|
         File.write(File.join(bin, "bad-runtime"), "") if failure == "BAD_RUNTIME"
-        refute system(env.merge(failure => "1"), "bash", "-c", provision, out: File::NULL, err: File::NULL),
+        refute system(env.merge(failure => "1"), "bash", "-c", provision, chdir: root, out: File::NULL, err: File::NULL),
                "#{failure} must block the journey"
       end
     end

@@ -346,7 +346,14 @@ Each source runs its own `scripts/update-proton-sdk.sh` in separate source and S
 The `v1.0.5` overlay is pinned to its published commit and must apply cleanly.
 A source without its own test entry also receives the candidate's five test-entry files. Each of these files must compile
 against that source's protocols. When a candidate file needs a type that the source lacks, pin the older file as
-`scripts/upgrade-test/overlays/<tag>.payload/<path below Sources>`. `v1.0.5` pins `UpgradeTestBackend.swift` from before #711.
+`scripts/upgrade-test/overlays/<tag>.payload/<path below Sources>`. `v1.0.5` pins `ProtonDriveBackend/UpgradeTestBackend.swift`,
+`MLSearchAppleAdapter/UpgradeTestSmartSearch.swift` and `PhotoLibraryBackupAdapter/UpgradeTestPhotoLibrary.swift`, byte-exact
+from their recorded commits.
+After the overlay applies, a guard scans all five installed test-entry files (the pinned ones too) against that source and
+names the symbols of the recognized forms that the old release cannot provide, so the failure names the missing symbol instead
+of breaking the build. The scan is a heuristic: it covers capitalized names, bare capitalized identifiers, and
+`Capitalized.member` / `).member` forms. Implicit members, lowercase receivers, and argument labels are not covered; a payload
+file can still fail to compile through them. The local rehearsal, which builds every source, is the proof that a release builds.
 The build fails for a pinned file outside the five paths and for a pin on a release with its own test entry.
 Later releases carry their inactive test entry and require no overlay, with one exception:
 `v1.1.0-beta.3` predates the hosted Metal admission, so its pinned overlay adds only that test-only admission.
@@ -435,6 +442,14 @@ It never removes the app or resets its data between the old and new phases.
 The release matrix supplies an exact Simulator runtime identifier, version and build for each iOS configuration.
 Without a supplied pin, a local journey uses `IOS_RUNTIME` in `run_journey.py`, the iOS 27 pin of the configuration file (iOS 27.2, build 24B8117).
 A missing, ambiguous, unavailable, or different runtime fails before a device exists; the message names the expected and the installed build.
+The pin names an accepted build set: the canonical build plus the recorded sibling builds Apple serves for the same OS version.
+With the canonical build installed exactly once, the journey selects it; that selection holds even when accepted sibling
+builds are installed beside it, including duplicate entries of one sibling build. Without a single canonical entry, two
+entries of one sibling build, two entries of the canonical build, or entries of two different accepted sibling builds fail
+as ambiguous before a device exists.
+Any installed runtime entry that shares the pinned identifier but carries a build outside the accepted set fails the journey
+before a device exists. `simctl create` follows the system runtime policy and cannot prove which build a created device boots,
+so a device may never be created while such a sibling is installed.
 The new phase does not seed a session: loss of the real simulator Keychain entry fails the journey.
 The seed marker records both the loopback server URL and the case-specific account UID.
 A validated case identifier contains exactly 32 ASCII hexadecimal characters (`0-9`, `a-f`, `A-F`); its maximum length is 32.

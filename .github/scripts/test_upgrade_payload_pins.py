@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""Guard the pins that keep the upgrade gate buildable and its runtime checks honest.
+
+Three guards, one per failure class of hosted run 45890080546:
+
+1. Payload provenance. A pinned test-entry file records the commit its bytes come from.
+   Without the record, a pin silently drifts from history and nobody can tell which
+   source era it matches.
+2. Candidate compatibility. A source without its own test entry receives the candidate's
+   five test-entry files. Each unpinned file must only use names that the source tree
+   defines, that another payload file declares, or that a framework supplies. The
+   hosted failures of run 45890080546 came from names added after v1.0.5 shipped:
+   FailureCancellation, UploadError.internalFailure and SHA256.Digest.lowercaseHexString.
+3. Runtime build set. xcodebuild -downloadPlatform selects an iOS version, never a
+   build. Apple can serve more than one build for the same version within one run:
+   shards of 45890080546 received 23F73 and 23F77 for iOS 26.5. The pin therefore
+   names an accepted build set, with one canonical build, and the exported bundle
+   check plus the installed-runtime lookup both compare against that set.
+"""
+import json
+import os
+from pathlib import Path
+import plistlib
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+
+REPO = Path(__file__).resolve().parents[2]
+OVERLAYS = REPO / 'scripts/upgrade-test/overlays'
+KIT = 'Packages/EncryptedMemoriesKit/Sources'
+
+sys.path.insert(0, str(REPO / 'scripts/upgrade-test'))
+sys.path.insert(0, str(REPO / '.github/scripts'))
+import build_apps  # noqa: E402
+import release_upgrade  # noqa: E402
+import run_journey  # noqa: E402
+from journey import JourneyError  # noqa: E402
+
+
+def git(*args):
+    return subprocess.check_output(['git', *args], cwd=REPO, text=True)
+
+
+def git_bytes(ref, path):
+    return subprocess.check_output(['git', 'show', f'{ref}:{path}'], cwd=REPO)
+
+
+# One row per raw-string scanner behavior. Each row replaces the pinned payload file's
+# 'import CryptoKit' line with 'import CryptoKit' plus the row's source, then expects the
+# test-entry guard to report exactly the listed Zz names, or to fail closed on input no
+# Swift compiler accepts. New scanner cases are new rows.
+RAW_STRING_SCAN_ROWS = (
+    # A raw string can open with content hashes; the opening delimiter is not content.
+    ('let a = #"#tag"#\nlet b = ZzHashOpen()\nlet c = "\\""',
+     ('ZzHashOpen',), False),
+    # Two-hash delimiter with hash content.
+    ('let a = ##"##x"##\nlet b = ZzDoubleHash()',
+     ('ZzDoubleHash',), False),
+    # The code after an empty raw string stays in the scan.
+    ('let empty = ##""##\nlet b = ZzAfterEmpty()',
+     ('ZzAfterEmpty',), False),
+    # A second adjacent quote still closes the literal: #"a""# holds a".
+    ('let a = #"a""#\nlet b = ZzQuoteRun()',
+     ('ZzQuoteRun',), False),
+    # A quote run inside a nested raw string closes it; the interpolation stays scannable.
+    ('let s = "\\(#"a""#)"\nlet b = ZzNestedQuote()\nlet t = "\\(#"q"#)"',
+     ('ZzNestedQuote',), False),
+    # A raw multi-line string: content quotes and hashes do not close it early.
+    ('let a = #"""\nx "# y\n"""#\nlet b = ZzRawMulti()\n// a """ in a comment\nlet c = 1',
+     ('ZzRawMulti',), False),
+    # Raw multi-line strings take any hash count.
+    ('let a = ##"""\ny "# z\n"""##\nlet b = ZzRawMultiHash2()',
+     ('ZzRawMultiHash2',), False),
+    # A bare triple quote at a line start inside a raw multi-line string is content: the
+    # closer needs the delimiter hash count.
+    ('let a = #"""\n"""\n"""#\nlet b = ZzRawFewerQuotes()',
+     ('ZzRawFewerQuotes',), False),
+    # A hashed interpolation inside a raw multi-line string stays in the scan.
+    ('let a = #"""\nq \\#(ZzInRawMulti()) w\n"""#\nlet b = ZzAfterRawInterp()',
+     ('ZzInRawMulti', 'ZzAfterRawInterp'), False),
+    # A plain backslash-parenthesis marker is literal text in a raw string (SE-0200).
+    ('let plain = #"value \\(ZzNeverDefined) tail"#\nlet other = #"x"#',
+     (), False),
+    # An unterminated raw multi-line string is not Swift.
+    ('let a = #"""\nx "# y\nlet b = ZzRawUnterminated()',
+     (), True),
+    # A single-line raw string cannot span a newline: the scan stops closed at the
+    # newline, so this unterminated literal fails closed instead of hiding ZzSpan.
+    ('let a = #"abc\nlet b = ZzSpan()\nlet c = #"q"#',
+     (), True),
+    # Extended regex-literal rows pin the documented regex gap: '//' inside a regex
+    # literal opens a line comment in this scan and hides the names that follow. A
+    # future regex-aware fix must flip this row deliberately.
+    ('#/https://x/#; let b = ZzRegexLineGap()',
+     (), False),
+    # '/*' inside the second regex literal opens a block comment in this scan that its
+    # own trailing */ closes; the net effect on THIS row is that the name after the
+    # literals is reported. Rows above and the docstring record where the same content
+    # hides names instead. Pin of the documented gap's mixed behavior; a future
+    # regex-aware fix must keep this row green.
+    ('#/a/*/# ... #/x*//#; let b = ZzRegexBlockMix()',
+     ('ZzRegexBlockMix',), False),
+    # A regex literal without comment-like content scans correctly: the name after it is
+    # reported. This row guards against a future gap fix overreaching.
+    ('#/a/#; let b = ZzRegexPlain()',
+     ('ZzRegexPlain',), False),
+    # An escaped slash before a slash reads as '//' in this scan and hides the name
+    # after it on that line. Pin of the documented gap.
+    ('#/x\\//#; let b = ZzRegexEscapedSlash()',
+     (), False),
+    # The scan reads the content of a regex literal as code, so a capitalized word
+    # inside it is reported as a missing name: the file fails closed, never silently
+    # passes. Pin of the documented behavior.
+    ('#/(\\/\\/ZzRegexContent)/#',
+     ('ZzRegexContent',), False),
+)
+
+
+def source_has_own_test_entry(tag):
+    sentinel = 'Packages/EncryptedMemoriesKit/Sources/PhotosCore/UpgradeTestProbe.swift'
+    return subprocess.run(['git', 'cat-file', '-e', f'{tag}:{sentinel}'], cwd=REPO,
+                          capture_output=True).returncode == 0
+
+
+class PayloadProvenanceTests(unittest.TestCase):
+    manifest = json.loads((OVERLAYS / 'versions.json').read_text())
+
+    def test_every_pinned_payload_file_records_a_source_commit(self):
+        for tag, record in sorted(self.manifest.items()):
+            pinned = OVERLAYS / (tag + '.payload')
+            on_disk = {str(path.relative_to(pinned)) for path in pinned.rglob('*') if path.is_file()}
+            recorded = set(record.get('payload', {}))
+            self.assertEqual(on_disk, recorded,
+                             f'{tag}: pinned files and recorded payload provenance must match')
+
+    def test_every_payload_pin_byte_matches_its_recorded_commit(self):
+        for tag, record in sorted(self.manifest.items()):
+            for relative, commit in sorted(record.get('payload', {}).items()):
+                self.assertNotIn(relative, ('',), msg=tag)
+                expected = git_bytes(commit, f'{KIT}/{relative}')
+                actual = (OVERLAYS / (tag + '.payload') / relative).read_bytes()
+                self.assertEqual(expected, actual,
+                                 f'{tag}: payload pin {relative} differs from {commit}')
+
+    def test_a_payload_pin_stays_inside_the_test_entry_payload(self):
+        for tag, record in sorted(self.manifest.items()):
+            outside = sorted(set(record.get('payload', {})) - set(build_apps.PAYLOAD))
+            self.assertEqual(outside, [], msg=f'{tag}: pins outside the test entry payload')
+
+
+class CandidateCompatibilityTests(unittest.TestCase):
+    manifest = json.loads((OVERLAYS / 'versions.json').read_text())
+
+    def test_unpinned_candidate_files_use_only_names_the_source_defines(self):
+        # The production scanner decides; this test only feeds it the candidate's payload
+        # files at HEAD and requires an empty result against every earlier release.
+        for tag in sorted(self.manifest):
+            if source_has_own_test_entry(tag):
+                continue
+            pinned = {str(path.relative_to(OVERLAYS / (tag + '.payload')))
+                      for path in (OVERLAYS / (tag + '.payload')).rglob('*') if path.is_file()}
+            scanned = [name for name in build_apps.PAYLOAD if name not in pinned]
+            self.assertTrue(scanned, msg=f'{tag}: every payload file is pinned, none to check')
+            with tempfile.TemporaryDirectory() as scratch:
+                source = Path(scratch)
+                for name in scanned:
+                    target = source / KIT / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(git_bytes('HEAD', KIT + '/' + name))
+                unknown = build_apps.unbuildable_names(source, tag, payload=scanned, git_repo=REPO)
+                self.assertEqual({}, unknown,
+                                 msg=f'{tag}: candidate test-entry files use names the source never defines')
+
+
+class OverlayApplicationTests(unittest.TestCase):
+    """The overlay must apply to the real source era, not only to fixtures."""
+
+    def v1_0_5_args(self, root, automation):
+        tag = 'v1.0.5'
+        commit = json.loads((OVERLAYS / 'versions.json').read_text())[tag]['commit']
+        archive = str(Path(root) / 'source.tar')
+        subprocess.run(['git', 'archive', '-o', archive, commit], cwd=REPO, check=True)
+        source = Path(root) / 'source'
+        with tarfile.open(archive) as tree:
+            tree.extractall(source, filter='data')
+        return source, automation, tag, commit
+
+    def apply_v1_0_5(self, root, automation):
+        source, automation, tag, commit = self.v1_0_5_args(root, automation)
+        build_apps.apply_overlay(source, automation, tag, commit)
+        return source
+
+    def history_sharing_automation(self, root):
+        # The real automation checkout is a git checkout whose history holds the release tag;
+        # a shared clone gives the test the same discrimination instead of a bare file copy.
+        automation = Path(root) / 'automation'
+        subprocess.run(['git', 'clone', '--quiet', '--shared', str(REPO), str(automation)], check=True)
+        return automation
+
+    def test_apply_overlay_installs_the_pinned_files_into_a_v1_0_5_source(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            source = self.apply_v1_0_5(scratch, REPO)
+            for relative in build_apps.PAYLOAD:
+                pinned = OVERLAYS / ('v1.0.5.payload') / relative
+                expected = pinned if pinned.is_file() else (REPO / KIT / relative)
+                self.assertEqual((source / KIT / relative).read_bytes(), expected.read_bytes(),
+                                 msg=f'v1.0.5: {relative} not overlaid from its pin')
+
+    def test_apply_overlay_fails_when_a_test_file_uses_an_unknown_name(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('SHA256.hash(data: payload)', 'UnknownType.hash(data: payload)')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_fails_when_a_test_file_mentions_an_unknown_type_without_a_member(self):
+        # A bare type reference (constructor, cast, conformance) compiles only when the release
+        # defines it. The run 45890080546 failure class includes names that never take a member.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\nlet evidence = MysteryFreeType()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'MysteryFreeType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_ignores_names_that_only_appear_in_a_compilation_condition(self):
+        # A directive line is not Swift code; a future condition name is not an unbuildable
+        # type. The scan must drop directive lines, including their condition name.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('#if ENCRYPTED_MEMORIES_UPGRADE_TEST',
+                                              '#if ENCRYPTED_MEMORIES_UPGRADE_TEST\n'
+                                              '#if SOME_FUTURE_CONDITION')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_ignores_names_that_only_appear_in_a_multi_line_string(self):
+        # Names inside multi-line string literals are text, not code; the scan must strip
+        # triple-quoted literals before it collects names, including one on its own line.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let prose = """\n'
+                                              'A FailureCancellation mention is text.\n'
+                                              '"""')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_consumes_escapes_in_a_multiline_string(self):
+        # Inside """...""" a backslash starts an escape: \\ is a backslash (so \\( is not
+        # an interpolation), \" is a quote, \""" does not close the string; the capitalised
+        # text after them stays string content.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let prose = """\n'
+                                              'escaped quote \\" keeps going\n'
+                                              'doubled \\\\(ZzNotInterpolated) stays text\n'
+                                              'trio \\""" does not close\n'
+                                              'final ZzProseOnly words\n'
+                                              '"""')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_drops_indented_directive_lines(self):
+        # Directives nest inside types; their lines can start with blanks. An indented
+        # directive line stays a directive; its condition name is not an unbuildable name.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'do {\n'
+                                              '    #if ZzCondition\n'
+                                              '    let inner = 1\n'
+                                              '    #else\n'
+                                              '    let other = 2\n'
+                                              '    #endif\n'
+                                              '}\n'
+                                              'let plain = 3')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_keeps_a_multiline_string_whose_last_line_starts_like_a_directive(self):
+        # The directive check runs only in code state: a string line that starts with
+        # #endif is string content, and the string closes on its triple quote.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let prose = """\n'
+                                              'text ZzProseOnly here\n'
+                                              '#endif"""\n'
+                                              'let after = 1')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_flags_a_name_hidden_behind_a_line_comment_marker_in_a_string(self):
+        # A "//" inside a string literal is text; the scan must not treat the rest of the
+        # line as a comment and drop the code after the string.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let url = "http://example.invalid"; UnknownType.register()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_names_inside_a_string_interpolation(self):
+        # Interpolated expressions are compiled code; hiding them inside a string literal
+        # must not hide them from the scan.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let label = "\\(UnknownType.title())"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_does_not_skip_macro_lines_like_expect(self):
+        # A line starting with # is only a directive when it is a conditional-compilation
+        # keyword; macro calls such as #expect(...) are code and must be scanned.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '#expect(UnknownType.exists == nil)')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UnknownType'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_a_string_nested_inside_an_interpolation(self):
+        # An interpolation can itself contain string literals: the string pieces carry no
+        # names, and the code parts of the expression stay in the scan.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let joined = "\\(ZzMissingB.join(\", \"))"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzMissingB'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_ignores_string_contents_nested_inside_an_interpolation(self):
+        # Words inside a nested string literal of an interpolation are text: a fallback
+        # label made of words the release does not define must not make the guard report
+        # a missing symbol.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let shown = "\\(status ?? "ZzFallbackLabel Text")"')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_keeps_a_nested_raw_string_inside_an_interpolation_scannable(self):
+        # A raw string nested inside an interpolation must not terminate at its inner
+        # quotes: the file stays scannable.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let shown = "\\(pick ?? #"a"b"#)"')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_scans_code_after_a_string_that_contains_a_line_comment_marker(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let cut = "text // not a comment"; ZzHiddenRoot.tick()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzHiddenRoot'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_a_block_comment_marker_inside_a_string(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let wrapped = "/* not a comment */"; ZzStarRoot.tick()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzStarRoot'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_drops_a_line_comment_that_ends_the_line(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '// ZzCommentRoot.tick() is a comment\n'
+                                              'let plain = 1')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_treats_a_plain_interpolation_marker_in_a_raw_string_as_text(self):
+        # SE-0200: inside a raw string only backslash-plus-hashes interpolates. A plain
+        # \( marker is literal text, and an empty raw literal must not swallow the file.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace(
+                'import CryptoKit',
+                'import CryptoKit\n'
+                'let raw = #"say \\(ZzRawText)" and "ZzQuoted" kept"#\n'
+                'let empty = ##""##\n'
+                'let second = ##"also "ZzDeepRaw" here"##')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_scans_the_code_after_a_raw_string_that_opens_with_hashes(self):
+        # A raw literal can start its content with '#' characters: #"#tag"#. The opening
+        # quote must not be read as a closing delimiter, and the code after the literal
+        # stays in the scan.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace(
+                'import CryptoKit',
+                'import CryptoKit\n'
+                'let a = #"#tag"#\n'
+                'let b = ZzHashOpen.tick()\n'
+                'let c = "\\""\n')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzHashOpen'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_the_code_after_a_double_hash_raw_string(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace(
+                'import CryptoKit',
+                'import CryptoKit\n'
+                'let a = ##"##x"##\n'
+                'let b = ZzDoubleHash.tick()\n'
+                'let c = "\\""\n')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzDoubleHash'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_a_name_after_an_empty_raw_string(self):
+        # An empty raw literal has no name of its own; the lexer must resume normal
+        # code scanning right after it.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace(
+                'import CryptoKit',
+                'import CryptoKit\n'
+                'let empty = ##""##\n'
+                'let b = ZzAfterEmpty.tick()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzAfterEmpty'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_scans_every_raw_string_table_row(self):
+        for source, expected_names, fail_closed in RAW_STRING_SCAN_ROWS:
+            with self.subTest(source=source):
+                with tempfile.TemporaryDirectory() as scratch:
+                    automation = self.history_sharing_automation(scratch)
+                    pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                        'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+                    pinned.write_text(pinned.read_text().replace('import CryptoKit',
+                                                                'import CryptoKit\n' + source))
+                    if fail_closed:
+                        with self.assertRaisesRegex(JourneyError, 'is not valid Swift'):
+                            self.apply_v1_0_5(scratch, automation)
+                    elif expected_names:
+                        with self.assertRaises(JourneyError) as raised:
+                            self.apply_v1_0_5(scratch, automation)
+                        for name in expected_names:
+                            self.assertIn(name, str(raised.exception))
+                    else:
+                        self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_consumes_escapes_in_a_multiline_string_nested_in_an_interpolation(self):
+        # A \\" inside a multi-line string that itself sits inside an interpolation does
+        # not close that string; the scan continues and reports the name after it.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let s = "\\(f("""\n'
+                                              'first \\""" second\n'
+                                              '"""))"\n'
+                                              'let b = ZzAfterEscapedTriple()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzAfterEscapedTriple'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_keeps_a_block_comment_opened_by_a_directive_line(self):
+        # A directive line can open a block comment in its condition area: the comment
+        # opener survives the dropped directive tokens and hides the names inside.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '#if DEBUG /*\n'
+                                              'let b = ZzHid7()\n'
+                                              '*/\n'
+                                              'let c = ZzAfterDirectiveComment()')
+            pinned.write_text(text)
+            with self.assertRaises(JourneyError) as raised:
+                self.apply_v1_0_5(scratch, automation)
+            self.assertIn('ZzAfterDirectiveComment', str(raised.exception))
+            self.assertNotIn('ZzHid7', str(raised.exception))
+
+    def test_apply_overlay_reads_a_string_on_a_directive_line_as_a_string(self):
+        # A string on a directive line stays a string: it neither opens a comment nor
+        # lets the comment-opener scan see /* inside the quotes. The quote-skipping
+        # branch is what keeps ZzDirectiveStr reported; this input is degenerate Swift
+        # for the compiler but the scanner must still not treat the quotes as text.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '#if X "/*"\n'
+                                              'let b = ZzDirectiveStr()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzDirectiveStr'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_closes_a_raw_multiline_string_only_at_a_line_start(self):
+        # Swift closes a raw multi-line string on its delimiter only at the start of a
+        # line after optional blanks (the Swift lexer rule for raw multi-line closers);
+        # a delimiter in the middle of a line is content.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let a = #"""\n'
+                                              'mid """# still content\n'
+                                              '   """#\n'
+                                              'let b = ZzCloserLineStart()')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzCloserLineStart'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_reports_only_hashed_interpolations_in_a_raw_string(self):
+        # The interpolation marker inside a raw string carries the delimiter hash count,
+        # so \\#( ... ) in #"..."# and \\##( ... ) in ##"..."## are code; a plain \\( is not.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace(
+                'import CryptoKit',
+                'import CryptoKit\n'
+                'let hit = #"\\#(ZzRawEscaped) kept"#\n'
+                'let deep = ##"\\##(ZzDeepEscaped) kept"##')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzRawEscaped'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_keeps_a_macro_line_and_ignores_its_string_arguments(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let config = "literal \\(ZzMacroInString) here"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'ZzMacroInString'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_ignores_an_interpolation_inside_a_line_comment(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '// "\\(ZzInComment)" never runs')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_hides_names_inside_block_comments(self):
+        # Block comments are not code, and block comments nest in Swift: names in an
+        # outer comment stay hidden after an inner comment has closed.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              '/* ZzHiddenBlock.tick() */\n'
+                                              '/* outer /* ZzHiddenNested.tick() */ ZzStillHidden here */\n'
+                                              'let plain = 1')
+            pinned.write_text(text)
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_fails_closed_on_an_unterminated_string(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let broken = "unterminated')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift is not valid Swift'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_fails_closed_on_an_unterminated_interpolation(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            text = pinned.read_text().replace('import CryptoKit',
+                                              'import CryptoKit\n'
+                                              'let broken = "\\(ZzUnterminated.foo"')
+            pinned.write_text(text)
+            with self.assertRaisesRegex(JourneyError, 'UpgradeTestSmartSearch.swift is not valid Swift'):
+                self.apply_v1_0_5(scratch, automation)
+
+    def test_apply_overlay_handles_an_empty_file(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = self.history_sharing_automation(scratch)
+            pinned = automation / 'scripts/upgrade-test/overlays' / 'v1.0.5.payload' / \
+                'MLSearchAppleAdapter' / 'UpgradeTestSmartSearch.swift'
+            pinned.write_text('')
+            build_apps.apply_overlay(*self.v1_0_5_args(scratch, automation))
+
+    def test_apply_overlay_fails_loudly_when_the_automation_history_cannot_read_the_tag(self):
+        # A checkout without git history once made git grep fail for every word, so every
+        # name looked unknown and the guard blocked for the wrong reason. That state must
+        # now fail as an infrastructure error instead of impersonating an unknown name.
+        with tempfile.TemporaryDirectory() as scratch:
+            automation = Path(scratch) / 'automation'
+            automation.mkdir()
+            for item in ('scripts', KIT.split('/')[0]):
+                subprocess.run(['cp', '-R', str(REPO / item), str(automation / item)])
+            with self.assertRaisesRegex(JourneyError, 'Cannot read the tagged sources of v1.0.5'):
+                self.apply_v1_0_5(scratch, automation)
+
+
+class RuntimePinTests(unittest.TestCase):
+    PIN = {'runtime_version': '26.5', 'runtime_build': '23F77',
+           'runtime_build_alternatives': ['23F73']}
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        location = REPO / 'scripts/upgrade-test/runtime_pin.py'
+        spec = importlib.util.spec_from_file_location('runtime_pin', location)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cls.runtime_pin = module
+
+    def test_the_accepted_build_set_spans_pin_and_alternatives(self):
+        self.assertEqual(self.runtime_pin.accepted_builds('23F77', ['23F73']),
+                         ['23F73', '23F77'])
+        self.assertEqual(self.runtime_pin.accepted_builds('23F77', []),
+                         ['23F77'])
+
+    def test_exported_bundle_check_accepts_any_accepted_build(self):
+        accepted = ['23F73', '23F77']
+        for build in ('23F73', '23F77'):
+            with tempfile.TemporaryDirectory() as scratch:
+                directory = Path(scratch) / 'export'
+                bundle = directory / 'runtime.exportedBundle' / 'Restore'
+                bundle.mkdir(parents=True)
+                (bundle / 'runtime.dmg').write_bytes(b'image-' + build.encode())
+                metadata = bundle.parent / 'ExportedMetadata.plist'
+                metadata.write_bytes(plistlib.dumps({'MobileAssetProperties': {
+                    'SimulatorVersion': '26.5', 'Build': build}}))
+                image = self.runtime_pin.select_image(directory, {'version': '26.5', 'buildversions': accepted})
+                self.assertEqual(image.read_bytes(), b'image-' + build.encode())
+                excluding_self = [value for value in accepted if value != build]
+                with self.assertRaisesRegex(ValueError, 'differs from the accepted builds'):
+                    self.runtime_pin.select_image(directory, {'version': '26.5', 'buildversions': excluding_self})
+                with self.assertRaisesRegex(ValueError, 'differs from the accepted builds 27.0'):
+                    self.runtime_pin.select_image(directory, {'version': '27.0', 'buildversions': accepted})
+
+    def test_the_installed_lookup_accepts_an_alternative_build(self):
+        runtimes = [{'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                     'version': '26.5', 'buildversion': build, 'isAvailable': True}
+                    for build in ('23F73',)]
+        expected = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                    'version': '26.5', 'buildversion': '23F77',
+                    'buildversions': ['23F73', '23F77']}
+        selected = run_journey.select_ios_runtime(runtimes, expected)
+        self.assertEqual(selected['buildversion'], '23F73')
+
+    def test_the_installed_lookup_prefers_the_canonical_build_when_both_are_installed(self):
+        runtimes = [{'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                     'version': '26.5', 'buildversion': build, 'isAvailable': True}
+                    for build in ('23F73', '23F77')]
+        expected = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                    'version': '26.5', 'buildversion': '23F77',
+                    'buildversions': ['23F73', '23F77']}
+        selected = run_journey.select_ios_runtime(runtimes, expected)
+        self.assertEqual(selected['buildversion'], '23F77')
+
+    def test_the_installed_lookup_rejects_a_build_outside_the_accepted_set(self):
+        runtimes = [{'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                     'version': '26.5', 'buildversion': '23X99', 'isAvailable': True}]
+        expected = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                    'version': '26.5', 'buildversion': '23F77',
+                    'buildversions': ['23F73', '23F77']}
+        with self.assertRaisesRegex(JourneyError, 'differs from the accepted builds'):
+            run_journey.select_ios_runtime(runtimes, expected)
+
+    def test_an_environment_pin_takes_its_accepted_set_from_the_config(self):
+        environment = {'UPGRADE_RUNTIME_ID': 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+                        'UPGRADE_RUNTIME_VERSION': '26.5', 'UPGRADE_RUNTIME_BUILD': '23F77'}
+        saved = {key: os.environ.get(key) for key in environment}
+        try:
+            os.environ.update(environment)
+            expected = run_journey.requested_ios_runtime()
+            self.assertEqual(expected['buildversions'], ['23F73', '23F77'])
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_a_pin_without_alternatives_accepts_only_its_canonical_build(self):
+        environment = {'UPGRADE_RUNTIME_ID': 'com.apple.CoreSimulator.SimRuntime.iOS-27-2',
+                        'UPGRADE_RUNTIME_VERSION': '27.2', 'UPGRADE_RUNTIME_BUILD': '24B8117'}
+        saved = {key: os.environ.get(key) for key in environment}
+        try:
+            os.environ.update(environment)
+            expected = run_journey.requested_ios_runtime()
+            self.assertEqual(expected['buildversions'], ['24B8117'])
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_a_partial_runtime_environment_is_rejected(self):
+        saved = os.environ.pop('UPGRADE_RUNTIME_BUILD', None)
+        try:
+            os.environ['UPGRADE_RUNTIME_ID'] = 'com.apple.CoreSimulator.SimRuntime.iOS-26-5'
+            with self.assertRaisesRegex(JourneyError, 'must all be supplied'):
+                run_journey.requested_ios_runtime()
+        finally:
+            if saved is None:
+                os.environ.pop('UPGRADE_RUNTIME_ID', None)
+
+    def test_alternative_builds_keep_the_config_shaped_and_evidenced(self):
+        self.assertEqual(release_upgrade.PINS[('iOS', '26', 'iPhone')]['runtime_build_alternatives'],
+                         ['23F73'])
+        self.assertIn('45890080546', release_upgrade.PINS[('iOS', '26', 'iPhone')]['pin_evidence'])
+
+    def test_invalid_alternatives_fail_the_planner_at_import_time(self):
+        pins = {key: dict(value) for key, value in run_journey.PINS.items()}
+        pins[('iOS', '26', 'iPhone')]['runtime_build_alternatives'] = ['23F73', '23F73']
+        with self.assertRaisesRegex(release_upgrade.UpgradeError, 'distinct non-empty builds'):
+            release_upgrade.validate_pins(pins)
+
+    def test_each_invalid_alternative_shape_fails_the_planner(self):
+        key = ('iOS', '26', 'iPhone')
+        shapes = [
+            # A dict passes the string-element, whitespace, duplicate and canonical-repeat
+            # checks (key iteration yields one clean string that is not the build); only the
+            # list guard rejects it.
+            ('not a list', {'23F73': 1}, 'distinct non-empty builds'),
+            ('element not a string', [23], 'distinct non-empty builds'),
+            ('empty', [''], 'distinct non-empty builds'),
+            ('whitespace', [' 23F73 '], 'distinct non-empty builds'),
+            ('canonical repeat', ['23F77'], 'must not repeat the canonical build'),
+            ('no evidence', None, 'requires pin_evidence'),
+        ]
+        for name, alternatives, message in shapes:
+            with self.subTest(name):
+                pins = {k: dict(v) for k, v in run_journey.PINS.items()}
+                if alternatives is None:
+                    del pins[key]['pin_evidence']
+                else:
+                    pins[key]['runtime_build_alternatives'] = alternatives
+                with self.assertRaisesRegex(release_upgrade.UpgradeError, message):
+                    release_upgrade.validate_pins(pins)
+
+    def test_a_pin_without_alternatives_needs_no_evidence(self):
+        pins = {key: dict(value) for key, value in run_journey.PINS.items()}
+        del pins[('iOS', '26', 'iPhone')]['runtime_build_alternatives']
+        del pins[('iOS', '26', 'iPhone')]['pin_evidence']
+        release_upgrade.validate_pins(pins)
+
+
+if __name__ == '__main__':
+    unittest.main()

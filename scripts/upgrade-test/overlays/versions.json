@@ -1,6 +1,11 @@
 {
   "v1.0.5": {
-    "commit": "79d55a3fb5e3537f429808c19cfc44b6ee4d3647"
+    "commit": "79d55a3fb5e3537f429808c19cfc44b6ee4d3647",
+    "payload": {
+      "ProtonDriveBackend/UpgradeTestBackend.swift": "c81fc1ae6afd0af263e72da9239cf0e526e94768",
+      "PhotoLibraryBackupAdapter/UpgradeTestPhotoLibrary.swift": "c81fc1ae6afd0af263e72da9239cf0e526e94768",
+      "MLSearchAppleAdapter/UpgradeTestSmartSearch.swift": "c81fc1ae6afd0af263e72da9239cf0e526e94768"
+    }
   },
   "v1.1.0-beta.3": {
     "commit": "059b1001591cac5a31d858bace98d23482950510"

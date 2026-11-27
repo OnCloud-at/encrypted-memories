@@ -945,22 +945,7 @@ jobs:
           set -euo pipefail
           runtime_dir="$(mktemp -d "$RUNNER_TEMP/upgrade-runtime.XXXXXX")"
           xcodebuild -downloadPlatform iOS -exportPath "$runtime_dir" -buildVersion "$UPGRADE_RUNTIME_VERSION" -architectureVariant arm64
-          image="$(python3 - "$runtime_dir" <<'PYTHON'
-          import os, pathlib, plistlib, sys
-          root = pathlib.Path(sys.argv[1])
-          bundles = list(root.glob('*.exportedBundle'))
-          if len(bundles) != 1:
-              sys.exit('Expected exactly one exported Simulator runtime bundle')
-          with (bundles[0] / 'ExportedMetadata.plist').open('rb') as stream:
-              metadata = plistlib.load(stream)['MobileAssetProperties']
-          if metadata.get('SimulatorVersion') != os.environ['UPGRADE_RUNTIME_VERSION'] or metadata.get('Build') != os.environ['UPGRADE_RUNTIME_BUILD']:
-              sys.exit('Exported Simulator runtime differs from the selected pin')
-          images = list((bundles[0] / 'Restore').glob('*.dmg'))
-          if len(images) != 1:
-              sys.exit('Expected exactly one Simulator runtime image')
-          print(images[0])
-          PYTHON
-          )"
+          image="$(python3 scripts/upgrade-test/runtime_pin.py "$runtime_dir")"
           xcodebuild -importPlatform "$image"
           python3 scripts/upgrade-test/run_journey.py --check-runtime
 

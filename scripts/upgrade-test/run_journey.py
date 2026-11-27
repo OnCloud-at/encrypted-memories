@@ -21,6 +21,8 @@ from server import FixtureServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 from release_upgrade import CONFIGURATIONS, DEVICE_NAMES, PINS
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runtime_pin import requested_runtime
 
 BUNDLE = 'at.oncloud.encryptedmemories.upgrade-test'
 POINTS = ['backup.claimed', 'backup.remoteReceipt', 'backup.localRecord',
@@ -32,10 +34,10 @@ LIMITATION = ('macOS-Keychain-Persistenz über das Update wird nicht im Prüfbau
 CONSENT_LIMITATION = ('The backup journey requires consent already saved on disk. The immediate v1.0.5 '
                      'Enable-to-SIGKILL case is a known historical limit and is not tested here.')
 
-# The local default is the configuration that sets `newest_runtime` (exactly one does; the planner module checks it).
-_default_pin = PINS[next(key for key in CONFIGURATIONS if key[0] == 'iOS' and PINS[key]['newest_runtime'])]
-IOS_RUNTIME = {'identifier': 'com.apple.CoreSimulator.SimRuntime.iOS-' + _default_pin['runtime_version'].replace('.', '-'),
-               'version': _default_pin['runtime_version'], 'buildversion': _default_pin['runtime_build']}
+# The local default runtime pin comes from the single requested_runtime implementation in
+# runtime_pin (no environment set = the newest_runtime configuration). Every expected-runtime
+# dictionary, default or env-selected, is built there from the reviewed config.
+IOS_RUNTIME = requested_runtime(environ={})
 
 # xcodebuild needs its own time to start the UI runner before XCTest starts a test case. On the loaded hosted
 # runner this startup took 160 s, nearly the whole former preparation budget, and the UI test never ran. The
@@ -53,8 +55,19 @@ METADATA_SCOPE = ('The gate requires installed CFBundleShortVersionString and CF
 
 
 def select_ios_runtime(runtimes, expected=IOS_RUNTIME, require_newest=False):
-    """Return the pinned runtime; fail before any device exists when it is missing, ambiguous or different."""
+    """Return the pinned runtime; fail before any device exists when it is missing, ambiguous or different.
+
+    The accepted build set spans the canonical build and its alternatives: Apple serves
+    more than one build for the same iOS version. When an installed runtime entry shares
+    the pinned identifier but carries a build outside the accepted set, selection fails:
+    a device created for that identifier can boot a build outside the set, and create
+    cannot prove otherwise (simctl create has no verified build flag). The canonical
+    build wins among the accepted builds."""
+    accepted = expected['buildversions']
     name = f"{expected['identifier']} ({expected['version']}, build {expected['buildversion']})"
+    others = sorted(value for value in accepted if value != expected['buildversion'])
+    if others:
+        name += ' or build ' + ', build '.join(others)
     matches = [r for r in runtimes if r.get('identifier') == expected['identifier']]
     if not matches:
         installed = [f"{r.get('identifier')} ({r.get('version')}, build {r.get('buildversion')}, "
@@ -62,11 +75,30 @@ def select_ios_runtime(runtimes, expected=IOS_RUNTIME, require_newest=False):
                      if str(r.get('identifier', '')).startswith('com.apple.CoreSimulator.SimRuntime.iOS-')]
         raise JourneyError('The pinned iOS Simulator runtime is not installed: expected ' + name + ', installed '
                            + (', '.join(installed) or 'no iOS runtime'))
-    if len(matches) != 1:
-        raise JourneyError('Ambiguous Simulator runtime identifier: ' + expected['identifier'] + ' is installed '
-                           + str(len(matches)) + ' times with builds '
-                           + ', '.join(str(r.get('buildversion')) for r in matches) + '; expected ' + name)
-    runtime = matches[0]
+    candidates = [r for r in matches if r.get('buildversion') in accepted
+                  and r.get('version') == expected['version']]
+    if not candidates:
+        installed = f"{matches[0].get('version')}, build {matches[0].get('buildversion')}"
+        raise JourneyError('The installed iOS Simulator runtime differs from the accepted builds: expected '
+                           + name + ', installed ' + installed + '. Update the runtime pin deliberately.')
+    strays = sorted({str(r.get('buildversion')) for r in matches
+                     if r.get('buildversion') not in accepted})
+    if strays:
+        # simctl create without a build flag follows the system runtime policy, so a device
+        # created while a sibling build is installed can boot that build. The runtime set
+        # must contain only accepted builds, and the canonical build wins among them.
+        raise JourneyError('The installed iOS Simulator runtime ' + expected['identifier']
+                           + ' has build ' + ', build '.join(strays) + ' outside the accepted builds '
+                           + ', '.join(sorted(accepted)) + '. A device created for this runtime can boot '
+                           'that build. Update the runtime pin deliberately.')
+    if len(candidates) > 1:
+        canonical = [r for r in candidates if r.get('buildversion') == expected['buildversion']]
+        if len(canonical) != 1:
+            raise JourneyError('Ambiguous Simulator runtime identifier: ' + expected['identifier'] + ' is installed '
+                               + str(len(candidates)) + ' times with builds '
+                               + ', '.join(str(r.get('buildversion')) for r in candidates) + '; expected ' + name)
+        candidates = canonical
+    runtime = candidates[0]
     if require_newest:
         available = [r for r in runtimes if r.get('isAvailable') is True and
                      str(r.get('identifier', '')).startswith('com.apple.CoreSimulator.SimRuntime.iOS-') and
@@ -76,23 +108,62 @@ def select_ios_runtime(runtimes, expected=IOS_RUNTIME, require_newest=False):
             raise JourneyError('Cannot establish the newest available iOS runtime')
         if any(tuple(map(int, v.split('.'))) > tuple(map(int, expected['version'].split('.'))) for v in versions):
             raise JourneyError('The pinned iOS runtime is not the newest available runtime')
-    installed = f"{runtime.get('version')}, build {runtime.get('buildversion')}"
-    if runtime.get('version') != expected['version'] or runtime.get('buildversion') != expected['buildversion']:
-        raise JourneyError('The installed iOS Simulator runtime differs from the pin: expected ' + name
-                           + ', installed ' + installed + '. Update the runtime pin deliberately.')
     if not runtime.get('isAvailable'):
         raise JourneyError('The pinned iOS Simulator runtime is installed but unavailable: ' + name)
     return runtime
 
 
+def bundle_build(bundle_path):
+    """Return the build that a Simulator runtime bundle states about itself.
+
+    Every runtime bundle writes its build into SystemVersion.plist under its RuntimeRoot;
+    two installed builds of one iOS version share the identifier but never this content.
+    """
+    plist = (Path(bundle_path) / 'Contents/Resources/RuntimeRoot/System/Library/CoreServices/'
+             'SystemVersion.plist')
+    with plist.open('rb') as stream:
+        return plistlib.load(stream)['ProductBuildVersion']
+
+
+def verify_selected_runtime(runtime, expected):
+    """Stop before any device exists when the bundle on disk contradicts the accepted set.
+
+    simctl create receives only a runtime argument, and one identifier can name two installed
+    builds (iOS 26.5 shipped as 23F73 and 23F77). create receives the selected entry's
+    bundle path so the device uses that bundle's runtime contents; simctl does not promise,
+    and this check cannot prove, which build a created device boots. That proof comes from
+    selection refusing any sibling build outside the accepted set. The bundle's stated build
+    must still lie inside the accepted set: a registered entry whose bundle states a build
+    outside it proves the registry entry wrong for this pin, and a registered entry without a
+    readable bundle cannot prove which build a device would run. Both fail here.
+    """
+    bundle = runtime.get('bundlePath')
+    stated = None
+    if bundle:
+        try:
+            stated = bundle_build(bundle)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise JourneyError('The selected iOS Simulator runtime ' + str(runtime.get('identifier'))
+                               + ' has an unreadable bundle ' + str(bundle) + ': ' + str(error)) from error
+    if stated is None:
+        raise JourneyError('The selected iOS Simulator runtime ' + str(runtime.get('identifier'))
+                           + ' does not report a bundle path')
+    accepted = expected['buildversions']
+    if stated not in accepted:
+        raise JourneyError('The selected iOS Simulator runtime bundle ' + bundle + ' (build ' + stated
+                           + ') differs from the accepted builds ' + ', '.join(sorted(accepted)) + ' of '
+                           + expected['identifier'] + '. Update the runtime pin deliberately.')
+
+
 def requested_ios_runtime():
     keys = ('UPGRADE_RUNTIME_ID', 'UPGRADE_RUNTIME_VERSION', 'UPGRADE_RUNTIME_BUILD')
     supplied = [os.environ.get(key) for key in keys]
-    if any(value is not None for value in supplied):
-        if not all(supplied):
-            raise JourneyError('The Simulator runtime identifier, version and build must all be supplied')
-        return dict(zip(('identifier', 'version', 'buildversion'), supplied))
-    return IOS_RUNTIME
+    if not any(value is not None for value in supplied):
+        return IOS_RUNTIME
+    try:
+        return requested_runtime()
+    except ValueError as error:
+        raise JourneyError(str(error)) from error
 
 
 def summary(message):
@@ -323,6 +394,7 @@ class InstalledApp:
             # Only the configuration that sets `newest_runtime` must run on the newest runtime of its major version.
             require_newest = bool(PINS.get(('iOS', expected_os, device), {}).get('newest_runtime'))
             runtime = select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'], expected, require_newest=require_newest)
+            verify_selected_runtime(runtime, expected)
             types = json.loads(output(['xcrun', 'simctl', 'list', 'devicetypes', '--json']))['devicetypes']
             names = DEVICE_NAMES
             if device not in names:
@@ -330,7 +402,7 @@ class InstalledApp:
             matches = [d for d in types if d['name'] == names[device]]
             if len(matches) != 1:
                 raise JourneyError(f'Expected one Simulator device type {names[device]}, found {len(matches)}')
-            self.simulator = output(['xcrun', 'simctl', 'create', 'EncryptedMemoriesUpgrade-' + self.case_id, matches[0]['identifier'], runtime['identifier']])
+            self.simulator = output(['xcrun', 'simctl', 'create', 'EncryptedMemoriesUpgrade-' + self.case_id, matches[0]['identifier'], runtime['bundlePath']])
             try:
                 (directory / 'simulator.txt').write_text(self.simulator + '\n')
                 (directory / 'simulator-runtime.json').write_text(json.dumps(runtime) + '\n')
@@ -546,7 +618,9 @@ def verify_macos_host(expected_os, actual_os):
 
 def main():
     if sys.argv[1:] == ['--check-runtime']:
-        select_ios_runtime(json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'], requested_ios_runtime())
+        expected = requested_ios_runtime()
+        verify_selected_runtime(select_ios_runtime(
+            json.loads(output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes'], expected), expected)
         return
     if sys.argv[1:] == ['--list-points']:
         # The one list of interruption points. The release workflow builds its job matrix from this output.
