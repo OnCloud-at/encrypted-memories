@@ -413,6 +413,7 @@ private actor PerUIDControlledLateLoader: ThumbnailBatchLoader {
     }
 
     func requestCount() -> Int { requested.count }
+    func requestCount(for uid: PhotoUID) -> Int { requested.filter { $0 == uid }.count }
     func finishedBatches() -> Int { finishedBatchCount }
 }
 
@@ -3262,7 +3263,10 @@ struct ThumbnailFeedCoreTests {
             let payload = Self.pngData(width: 8, height: 8)
             let cache = Self.cache("growth-stop-coverage")
             for uid in seeded { cache.storeToDisk(payload, for: uid) }
-            let loader = RecordingLoader(payloads: [later: payload], unreportedAlways: [grown])
+            // The newcomer has no payload, so each request delivers nothing and reports nothing. Its first request
+            // waits until the test releases it; the later photo answers at once.
+            let loader = PerUIDControlledLateLoader(payloads: [later: payload])
+            await loader.release(later)
             // One photo per request and one download at a time, so a photo queued twice is requested twice.
             let feed = ThumbnailFeedCore(
                 cache: cache, loader: loader,
@@ -3277,12 +3281,16 @@ struct ThumbnailFeedCoreTests {
             try await Self.waitUntil { await feed.coverageRefreshStartCountForTesting() >= 1 }
             try await Self.waitForCrawl(feed)
 
-            // The library grows and the crawl stops before its coverage settles.
+            // The library grows and the crawl stops before its coverage settles: the only worker waits in the
+            // newcomer's held request, so no coverage check can run before the stop.
             let second = Self.visibleScope(in: graph, uids: seeded + [grown])
             _ = await feed.reconcile(
                 selected: second.selectedScope, analysis: second.analysisScope,
                 retention: second.thumbnailRetentionScope)
+            try await Self.waitUntil { await loader.requestCount(for: grown) == 1 }
+            #expect(await feed.coverageSettledForTesting() == false, "the stop must come before the settle")
             await feed.stopPrefetch()
+            await loader.release(grown)
             try await Task.sleep(for: .milliseconds(300))
             let beforeGrowth = await loader.requestCount(for: grown)
 
