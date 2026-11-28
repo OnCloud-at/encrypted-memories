@@ -2750,12 +2750,12 @@ public actor BackupSyncRunner {
         }
     }
 
-    /// A read of a local file failed: the file system answered for it. A cancellation is none: it reaches the
-    /// cancellation path.
+    /// A read of a local file failed: the file system answered for it, so the caller checks the folder. A Cocoa error
+    /// counts in full, also `NSUserCancelledError`, for example of a cloud file whose download stopped: it is no
+    /// cancellation of the pass (`UploadError.isCancellation`), so it takes the usual retry while its folder is there.
     static func isLocalReadFailure(_ error: any Error) -> Bool {
         if case UploadError.fileMissing = error { return true }
         let error = error as NSError
-        if error.domain == NSCocoaErrorDomain, error.code == NSUserCancelledError { return false }
         return error.domain == NSCocoaErrorDomain || error.domain == NSPOSIXErrorDomain
     }
 

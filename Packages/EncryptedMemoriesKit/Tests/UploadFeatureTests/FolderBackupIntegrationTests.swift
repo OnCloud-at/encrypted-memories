@@ -75,10 +75,11 @@ final class FolderBackupIntegrationTests: XCTestCase {
         )
     }
 
-    /// Runs `beforeUpload`, a drive that is unplugged during the upload, and then fails the upload with the error of a
-    /// file read that found no file.
+    /// Runs `beforeUpload`, a drive that is unplugged during the upload, and then fails the upload with `error`, by
+    /// default the error of a file read that found no file.
     private struct UnpluggingUploader: PhotoUploading {
         let inner: MockUploader
+        var error = NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
         let beforeUpload: @Sendable () -> Void
 
         var capabilities: UploadBackendCapabilities { inner.capabilities }
@@ -91,7 +92,7 @@ final class FolderBackupIntegrationTests: XCTestCase {
             _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
         ) async throws -> PhotoUID {
             beforeUpload()
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+            throw error
         }
 
         func cancel(token: UUID) async { await inner.cancel(token: token) }
@@ -130,10 +131,13 @@ final class FolderBackupIntegrationTests: XCTestCase {
 
     /// Runs one pass. A pass that does not end within `seconds`, for example one that keeps waking for a row that no
     /// claim may take, fails the test and is cancelled.
-    private func runBounded(_ runner: BackupSyncRunner, seconds: TimeInterval = 15) async {
+    private func runBounded(
+        _ runner: BackupSyncRunner, mode: BackupSyncRunner.DrainMode = .waitForScheduledRetries,
+        seconds: TimeInterval = 15
+    ) async {
         let ended = PassEnd()
         let pass = Task {
-            await runner.runUntilDrained()
+            await runner.runUntilDrained(mode: mode)
             ended.mark()
         }
         let deadline = Date().addingTimeInterval(seconds)
@@ -428,14 +432,14 @@ final class FolderBackupIntegrationTests: XCTestCase {
         XCTAssertEqual(try queueStore.entry(for: source, revision: stored.revision), stored)
     }
 
-    /// A read error counts as a local one, and so as a reason to check the folder, only when the file system answered;
-    /// a cancellation goes its own way (#1583).
+    /// A read error counts as a local one, and so as a reason to check the folder, only when the file system answered
+    /// (#1583).
     func testOnlyAFileSystemErrorCountsAsALocalReadFailure() {
         XCTAssertTrue(BackupSyncRunner.isLocalReadFailure(UploadError.fileMissing("IMG.jpg")))
         XCTAssertTrue(BackupSyncRunner.isLocalReadFailure(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))))
         XCTAssertTrue(
             BackupSyncRunner.isLocalReadFailure(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)))
-        XCTAssertFalse(
+        XCTAssertTrue(
             BackupSyncRunner.isLocalReadFailure(NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)))
         XCTAssertFalse(BackupSyncRunner.isLocalReadFailure(UploadError.backend("transient")))
     }
@@ -507,6 +511,46 @@ final class FolderBackupIntegrationTests: XCTestCase {
         XCTAssertEqual(queueStore.removeFileSources(outside: registryScope(removed)), 2)
         XCTAssertNil(try queueStore.entry(for: sent.source, revision: sent.revision))
         XCTAssertNil(try queueStore.entry(for: new.source, revision: new.revision))
+    }
+
+    /// The download of a cloud file in a watched folder stops during its upload (`NSUserCancelledError`). While the
+    /// drive of the folder goes away at the same point, the row waits as it was stored; while the folder stays, the row
+    /// takes the usual retry with one more attempt, as before #1583. The pass takes only the work that is due now, so it
+    /// makes one attempt.
+    func testAStoppedDownloadOfAFolderFileWaitsOnlyWhileItsFolderIsAway() async throws {
+        let file = folder.appendingPathComponent("cloud.jpg")
+        let scope = WatchedFolderScope(readable: [folder], registered: [folder.path])
+        let away = tempDir.appendingPathComponent("Unplugged", isDirectory: true)
+        let folder = self.folder!
+        for unplugs in [true, false] {
+            try Data("cloud".utf8).write(to: file)
+            _ = try await engine.scan(FolderBackupCatalog(folder: folder))
+            let source = UploadSourceIdentity.file(file)
+            let row = try XCTUnwrap(
+                try queueStore.decisionRows(kind: .fileURL, identifiers: [source.identifier]).first)
+            let stored = try XCTUnwrap(try queueStore.entry(for: source, revision: row.revision))
+            let stopping = UnpluggingUploader(
+                inner: uploader, error: NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)
+            ) {
+                if unplugs { try? FileManager.default.moveItem(at: folder, to: away) }
+            }
+
+            await runBounded(
+                makeRunner(resolver: FileBackupResourceResolver(scope: { scope }), uploader: stopping),
+                mode: .eligibleOnly)
+
+            let after = try XCTUnwrap(try queueStore.entry(for: source, revision: stored.revision))
+            if unplugs {
+                XCTAssertEqual(after, stored)
+                try FileManager.default.moveItem(at: away, to: folder)
+                try FileManager.default.removeItem(at: file)
+                XCTAssertTrue(queueStore.remove(source: source, revision: stored.revision))
+            } else {
+                XCTAssertEqual(after.state, .discovered)
+                XCTAssertEqual(after.attempts, stored.attempts + 1)
+                XCTAssertNotNil(after.lastError)
+            }
+        }
     }
 
     /// A row of a drive that is away sets no time in the waiting status: its wait ends only when the drive is back
