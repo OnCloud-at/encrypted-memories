@@ -1651,6 +1651,8 @@ public actor ThumbnailFeedCore {
         sequential.removeAll()
         withheldRetry.removeAll()
         withheldRequeues.removeAll()
+        // The additions belong to the emptied crawl list; a later growth would otherwise queue them twice.
+        growthAddedSinceSettle.removeAll()
         startupAuthenticationPending = false
         for flight in directDecodeFlights.values {
             flight.task.cancel()
@@ -2009,14 +2011,16 @@ public actor ThumbnailFeedCore {
     /// crawl per scope change downloaded every missing thumbnail, this one must not sit on the newcomer.
     /// At the settle, every addition that is still missing and carries no refusal or withheld answer gets
     /// exactly one further request. Bounded: the additions are appended once, a photo that keeps failing
-    /// gets no second retry, and the refused and withheld paths keep governing their own photos.
+    /// gets no second retry, and the refused and withheld paths keep governing their own photos. A withheld
+    /// photo keeps its requeue count after its retries drain or reach their limit, so the count, not the
+    /// retry list, marks it.
     private func requeueGrowthAfterCoverageSettled() {
         guard prefetchEnabled, !growthAddedSinceSettle.isEmpty else { return }
         let additions = growthAddedSinceSettle
         growthAddedSinceSettle.removeAll()
         let retry = additions.filter { uid in
             !uid.isLocalPending && readAllowed(uid) && !unfetchable.contains(uid)
-                && !withheldRetry.contains(uid) && !diskPresence.isPresent(uid)
+                && withheldRequeues[uid] == nil && !diskPresence.isPresent(uid)
         }
         guard !retry.isEmpty else { return }
         sequential.append(contentsOf: retry)

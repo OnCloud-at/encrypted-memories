@@ -241,6 +241,8 @@ actor RecordingLoader: ThumbnailBatchLoader {
     private var unreportedOnce: Set<PhotoUID>
     /// Delivers nothing and reports nothing on every request, as a stuck endpoint does.
     private var unreportedAlways: Set<PhotoUID>
+    /// Withheld on every request, as while the authorization keeps changing during each download.
+    private let withheldAlways: Set<PhotoUID>
 
     init(
         payloads: [PhotoUID: Data] = [:],
@@ -251,7 +253,8 @@ actor RecordingLoader: ThumbnailBatchLoader {
         withheldOnce: Set<PhotoUID> = [],
         refusedOnce: [PhotoUID: String] = [:],
         unreportedOnce: Set<PhotoUID> = [],
-        unreportedAlways: Set<PhotoUID> = []
+        unreportedAlways: Set<PhotoUID> = [],
+        withheldAlways: Set<PhotoUID> = []
     ) {
         self.payloads = payloads
         self.itemErrors = itemErrors
@@ -262,6 +265,7 @@ actor RecordingLoader: ThumbnailBatchLoader {
         self.refusedOnce = refusedOnce
         self.unreportedOnce = unreportedOnce
         self.unreportedAlways = unreportedAlways
+        self.withheldAlways = withheldAlways
     }
 
     func loadThumbnails(
@@ -283,7 +287,7 @@ actor RecordingLoader: ThumbnailBatchLoader {
                 continue  // a transient transport failure: no bytes, no reason, retried later
             } else if let reason = refusedOnce.removeValue(forKey: uid) {
                 errors[uid] = reason
-            } else if withheldOnce.remove(uid) != nil {
+            } else if withheldAlways.contains(uid) || withheldOnce.remove(uid) != nil {
                 withheld.insert(uid)
             } else if let data = payloads[uid] {
                 onLoaded(uid, data)
@@ -3207,6 +3211,91 @@ struct ThumbnailFeedCoreTests {
             try await Self.waitForCrawl(feed)
             try await Task.sleep(for: .milliseconds(300))
             #expect(await loader.requestCount(for: grown) == 1, "the refused newcomer keeps its one request")
+            await feed.stopPrefetch()
+        }
+
+        @Test func aGrownLibraryDoesNotRetryANewcomerTheBackendKeepsWithholding() async throws {
+            // A withheld newcomer has its own bounded retry: three requeues, then the next crawl or a visible
+            // request loads it. Its retry list is empty again when the coverage settles, and the growth requeue
+            // must not add a request past that limit.
+            let seeded = (0..<300).map { Self.uid("growth-withheld-\($0)") }
+            let grown = Self.uid("growth-withheld-new")
+            let payload = Self.pngData(width: 8, height: 8)
+            let cache = Self.cache("growth-withheld-coverage")
+            for uid in seeded { cache.storeToDisk(payload, for: uid) }
+            let loader = RecordingLoader(withheldAlways: [grown])
+            let feed = ThumbnailFeedCore(
+                cache: cache, loader: loader, configuration: Self.configuration())
+
+            let graph = LibrarySourceGraph()
+            let first = Self.visibleScope(in: graph, uids: seeded)
+            #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+            _ = await feed.reconcile(
+                selected: first.selectedScope, analysis: first.analysisScope,
+                retention: first.thumbnailRetentionScope)
+            try await Self.waitUntil { await feed.coverageRefreshStartCountForTesting() >= 1 }
+            try await Self.waitForCrawl(feed)
+
+            let second = Self.visibleScope(in: graph, uids: seeded + [grown])
+            _ = await feed.reconcile(
+                selected: second.selectedScope, analysis: second.analysisScope,
+                retention: second.thumbnailRetentionScope)
+
+            // The first request and its three withheld requeues.
+            try await Self.waitUntil { await loader.requestCount(for: grown) >= 4 }
+            try await Self.waitUntil { await feed.coverageSettledForTesting() }
+            try await Self.waitForCrawl(feed)
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(await loader.requestCount(for: grown) == 4, "the withheld limit holds after the settle")
+            await feed.stopPrefetch()
+        }
+
+        @Test func aStopForgetsTheGrowthAdditionsOfTheStoppedCrawl() async throws {
+            // A stop empties the crawl list. A later growth refills it with the whole scope, so an addition that
+            // the stopped crawl remembered would be queued twice and request a newcomer that keeps failing twice
+            // after the settle instead of once.
+            let seeded = (0..<300).map { Self.uid("growth-stop-\($0)") }
+            let grown = Self.uid("growth-stop-new")
+            let later = Self.uid("growth-stop-later")
+            let payload = Self.pngData(width: 8, height: 8)
+            let cache = Self.cache("growth-stop-coverage")
+            for uid in seeded { cache.storeToDisk(payload, for: uid) }
+            let loader = RecordingLoader(payloads: [later: payload], unreportedAlways: [grown])
+            // One photo per request and one download at a time, so a photo queued twice is requested twice.
+            let feed = ThumbnailFeedCore(
+                cache: cache, loader: loader,
+                configuration: Self.configuration(downloadConcurrencyLimit: 1, batchSize: 1))
+
+            let graph = LibrarySourceGraph()
+            let first = Self.visibleScope(in: graph, uids: seeded)
+            #expect(await feed.bindDerivedDataEpoch(graph.runtimeEpoch))
+            _ = await feed.reconcile(
+                selected: first.selectedScope, analysis: first.analysisScope,
+                retention: first.thumbnailRetentionScope)
+            try await Self.waitUntil { await feed.coverageRefreshStartCountForTesting() >= 1 }
+            try await Self.waitForCrawl(feed)
+
+            // The library grows and the crawl stops before its coverage settles.
+            let second = Self.visibleScope(in: graph, uids: seeded + [grown])
+            _ = await feed.reconcile(
+                selected: second.selectedScope, analysis: second.analysisScope,
+                retention: second.thumbnailRetentionScope)
+            await feed.stopPrefetch()
+            try await Task.sleep(for: .milliseconds(300))
+            let beforeGrowth = await loader.requestCount(for: grown)
+
+            // The next growth refills the stopped crawl list with the whole scope.
+            let third = Self.visibleScope(in: graph, uids: seeded + [grown, later])
+            _ = await feed.reconcile(
+                selected: third.selectedScope, analysis: third.analysisScope,
+                retention: third.thumbnailRetentionScope)
+            try await Self.waitUntil { cache.hasUsableDiskData(later) }
+            try await Self.waitUntil { await feed.coverageSettledForTesting() }
+            try await Self.waitForCrawl(feed)
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(
+                await loader.requestCount(for: grown) == beforeGrowth + 2,
+                "the refilled crawl requests the newcomer once and the settle once more")
             await feed.stopPrefetch()
         }
 

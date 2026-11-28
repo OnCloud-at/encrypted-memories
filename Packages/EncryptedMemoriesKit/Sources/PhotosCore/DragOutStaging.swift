@@ -47,7 +47,10 @@ public actor DragOutStager {
     /// The still of each Live Photo motion of this session, by the motion's UID; the motion takes the name that its
     /// still received (`OriginalFileNaming.livePhotoMotionFilename`).
     private var stillOfMotion: [PhotoUID: PhotoUID] = [:]
-    private let stillNames = OutboundStillNames()
+    /// The still names of the current session. Every job answers and asks the store of the session that started it,
+    /// and a cleanup starts a new store: a job that ends after the cleanup still finds its session's names, and the
+    /// next session of a reused stager starts without them.
+    private var stillNames = OutboundStillNames()
 
     public init(
         fileProvider: any OriginalFileProvider,
@@ -113,6 +116,7 @@ public actor DragOutStager {
             }
             // A preflight-failed item never stages, so no job ever records the result its Live Photo
             // motion waits for. Record the nil result directly, as every other session item does.
+            let stillNames = self.stillNames
             for item in refused {
                 await stillNames.record(nil, for: item.uid)
             }
@@ -198,7 +202,7 @@ public actor DragOutStager {
         deliveredUIDs.removeAll()
         removeOrphanDownloadFiles()
         // Last: this await lets finishing jobs into the actor, and the registry is already empty then.
-        await stillNames.abandonAll()
+        await endStillNameSession()
     }
 
     /// Cancel everything (drag cancelled) and delete all staged files.
@@ -217,10 +221,18 @@ public actor DragOutStager {
         queue.removeAll()
         removeOrphanDownloadFiles()
         // Last: this await lets finishing jobs into the actor, and the registry is already empty then.
-        await stillNames.abandonAll()
+        await endStillNameSession()
     }
 
     // MARK: - Internals
+
+    /// Ends every still-name wait of this session and gives the next session a new store. A job of the ended
+    /// session keeps its own store, so its motion still gets the name its still recorded before the stop.
+    private func endStillNameSession() async {
+        let ended = stillNames
+        stillNames = OutboundStillNames()
+        await ended.abandonAll()
+    }
 
     /// Looks up a size via `OriginalFileProvider`'s sibling metadata when the concrete provider
     /// also conforms to `PhotoMetadataProvider`; the stager itself stays provider-agnostic.
@@ -241,17 +253,18 @@ public actor DragOutStager {
                 continue
             }
             runningCount += 1
-            jobs[uid] = .running(Task { await runJob(uid: uid, destination: destination) })
+            let stillNames = self.stillNames
+            jobs[uid] = .running(Task { await runJob(uid: uid, destination: destination, stillNames: stillNames) })
         }
     }
 
-    private func runJob(uid: PhotoUID, destination: URL) async {
-        let staged = await stage(uid: uid, destination: destination)
+    private func runJob(uid: PhotoUID, destination: URL, stillNames: OutboundStillNames) async {
+        let staged = await stage(uid: uid, destination: destination, stillNames: stillNames)
         await stillNames.record(staged?.lastPathComponent, for: uid)
     }
 
     /// Stages one item and returns its file, or nil when it failed or was cancelled.
-    private func stage(uid: PhotoUID, destination: URL) async -> URL? {
+    private func stage(uid: PhotoUID, destination: URL, stillNames: OutboundStillNames) async -> URL? {
         let activity = runtimeState.beginActivity(.userTransfer)
         defer { activity.end() }
         do {
@@ -261,7 +274,7 @@ public actor DragOutStager {
             }
             let removesLocation = removeLocationWhenSharing()
             let finalURL = await self.reserveFinalName(
-                for: uid, downloadURL: destination, removesLocation: removesLocation)
+                for: uid, downloadURL: destination, removesLocation: removesLocation, stillNames: stillNames)
             do {
                 try? FileManager.default.removeItem(at: finalURL)
                 let deliveredURL: URL
@@ -297,7 +310,9 @@ public actor DragOutStager {
     }
 
     /// Atomic same-volume rename `X.download` → final unique name, reserving the target first.
-    private func reserveFinalName(for uid: PhotoUID, downloadURL: URL, removesLocation: Bool) async -> URL {
+    private func reserveFinalName(
+        for uid: PhotoUID, downloadURL: URL, removesLocation: Bool, stillNames: OutboundStillNames
+    ) async -> URL {
         var original = await Self.desiredFilename(for: uid, provider: fileProvider)
         if let still = stillOfMotion[uid], let stillName = await stillNames.name(of: still) {
             original = OriginalFileNaming.livePhotoMotionFilename(original, stillName: stillName)

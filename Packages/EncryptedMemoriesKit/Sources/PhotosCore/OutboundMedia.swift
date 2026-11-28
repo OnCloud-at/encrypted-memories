@@ -71,15 +71,13 @@ actor OutboundStillNames {
         return await withCheckedContinuation { waiters[still, default: []].append($0) }
     }
 
-    /// Ends every wait without a name, for an export that stops, and forgets every recorded name: the
-    /// first answer counts, so a stager reused after its cleanup must not carry the answers of the
-    /// stopped session, e.g. the nil a preflight-failed still recorded, into its next one.
+    /// Ends every wait without a name, for an export that stops.
     func abandonAll() {
-        for (_, list) in waiters {
+        for (still, list) in waiters {
+            names[still] = .some(nil)
             for waiter in list { waiter.resume(returning: nil) }
         }
         waiters.removeAll()
-        names.removeAll()
     }
 }
 

@@ -378,13 +378,42 @@ final class DragOutTests: XCTestCase {
         try await assertAStopEndsTheWaitOfAMotion { await $0.finishAndCleanup() }
     }
 
+    /// The still stages before the stop; the motion's download ignores the stop, so the motion asks for the
+    /// still's name only after the cleanup. It must get the answer its still recorded and end its transfer,
+    /// instead of waiting for a still that answered before the cleanup.
+    func testAMotionThatAsksForItsStillNameAfterTheCleanupEndsItsTransfer() async throws {
+        let directory = stagingDirectory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let items = OutboundMedia.files(for: [livePair("late")]).map(\.item)
+        let provider = HeldWriteProvider(holding: items[1].uid)
+        let runtimeState = LibraryRuntimeState()
+        let stager = DragOutStager(
+            fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0, runtimeState: runtimeState,
+            removeLocationWhenSharing: { false })
+        _ = await stager.beginPrefetch(items: items)
+        guard case .success = await stager.awaitStaged(uid: items[0].uid) else {
+            return XCTFail("the still stages before the stop")
+        }
+        await provider.waitUntilBothStarted()
+
+        await stager.finishAndCleanup()
+        XCTAssertEqual(runtimeState.snapshot().activeUserTransferCount, 1, "only the held motion still transfers")
+        provider.release()
+        for _ in 0..<400 where runtimeState.snapshot().activeUserTransferCount > 0 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(runtimeState.snapshot().activeUserTransferCount, 0, "the late motion ends its transfer")
+        XCTAssertEqual(
+            stagedFiles(in: directory).filter { !$0.hasSuffix(".download") }, Set<String>(), "no file after the stop")
+    }
+
     /// The still's download ignores cancellation, so only the stop can release its waiting motion. The motion then
     /// stages nothing and ends its transfer.
     private func assertAStopEndsTheWaitOfAMotion(stop: (DragOutStager) async -> Void) async throws {
         let directory = stagingDirectory
         defer { try? FileManager.default.removeItem(at: directory) }
         let items = OutboundMedia.files(for: [livePair("held")]).map(\.item)
-        let provider = HeldStillProvider(still: items[0].uid)
+        let provider = HeldWriteProvider(holding: items[0].uid)
         let runtimeState = LibraryRuntimeState()
         let stager = DragOutStager(
             fileProvider: provider, stagingDirectory: directory, safetyMarginBytes: 0, runtimeState: runtimeState,
@@ -603,22 +632,22 @@ private final class CancellingFileProvider: OriginalFileProvider, @unchecked Sen
     }
 }
 
-/// Holds the download of one still until `release`, ignoring cancellation; every other file downloads at once.
-private final class HeldStillProvider: OriginalFileProvider, @unchecked Sendable {
-    private let still: PhotoUID
+/// Holds the download of one item until `release`, ignoring cancellation; every other file downloads at once.
+private final class HeldWriteProvider: OriginalFileProvider, @unchecked Sendable {
+    private let heldUID: PhotoUID
     private let lock = NSLock()
     private var started = 0
     private var held: CheckedContinuation<Void, Never>?
     private var released = false
 
-    init(still: PhotoUID) { self.still = still }
+    init(holding uid: PhotoUID) { heldUID = uid }
 
     func writeOriginal(
         for uid: PhotoUID, to destination: URL, onProgress: @escaping @Sendable (Double) -> Void
     ) async throws {
         try Data(uid.nodeID.utf8).write(to: destination)
         lock.withLock { started += 1 }
-        guard uid == still else { return }
+        guard uid == heldUID else { return }
         await withCheckedContinuation { continuation in
             let resumeNow = lock.withLock { () -> Bool in
                 if released { return true }
@@ -631,7 +660,7 @@ private final class HeldStillProvider: OriginalFileProvider, @unchecked Sendable
 
     func waitUntilBothStarted() async {
         for _ in 0..<400 where lock.withLock({ started < 2 }) { try? await Task.sleep(for: .milliseconds(5)) }
-        // The motion downloads at once and then waits for its still's name.
+        // The item that is not held downloads at once and goes on staging.
         try? await Task.sleep(for: .milliseconds(50))
     }
 
