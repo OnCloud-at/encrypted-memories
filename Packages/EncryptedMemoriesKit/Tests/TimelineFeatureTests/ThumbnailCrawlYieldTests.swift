@@ -168,6 +168,8 @@ struct ThumbnailCrawlYieldTests {
         await feed.requestPriority(uid, priority: .visibleNow)
         try await Self.waitUntil { await loader.fetched(uid) }
         #expect(await loader.fetched(uid))  // fetched from the loader despite the corrupt blob
+        // The loader counts a request when it starts; the feed stores the delivered bytes afterwards.
+        try await Self.waitUntil { cache.hasUsableDiskData(uid) }
         #expect(cache.hasUsableDiskData(uid) == true)  // and replaced it with a decryptable blob
     }
 

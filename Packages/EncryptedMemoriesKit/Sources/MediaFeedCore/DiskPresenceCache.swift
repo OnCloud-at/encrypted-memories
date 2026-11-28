@@ -51,6 +51,12 @@ final class DiskPresenceCache: @unchecked Sendable {
         }
     }
 
+    /// Whether tracking positively saw the thumbnail on disk. Unknown reads as absent; callers use it only
+    /// for photos their crawl has visited, so a missing entry is a genuinely missing thumbnail.
+    func isPresent(_ uid: PhotoUID) -> Bool {
+        lock.withLock { values[uid] == true }
+    }
+
     func coverage() -> (present: Int, total: Int, percent: Double) {
         lock.withLock {
             guard trackedTotal > 0 else { return (0, 0, 1) }
