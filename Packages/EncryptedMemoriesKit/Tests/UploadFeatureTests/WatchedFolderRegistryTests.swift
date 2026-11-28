@@ -511,6 +511,30 @@ final class WatchedFolderRegistryTests: XCTestCase {
         XCTAssertEqual(registry.folders.map(\.notice), [nil], "the line goes once the folder is read again")
     }
 
+    /// The list sorts its folders by the path that it shows, also a folder whose drive was away at launch.
+    func testTheListSortsByTheShownPath() throws {
+        let readable = "/Volumes/M-1583/DCIM"
+        for recorded in ["/Volumes/A-1583/DCIM", "/Volumes/Z-1583/DCIM"] {
+            let registry = WatchedFolderRegistry(
+                savedBookmarks: [driveBookmark, diskBookmark],
+                resolve: { $0 == self.driveBookmark ? .unresolved : .resolved(path: readable, isStale: false) },
+                lastKnownPath: { $0 == self.driveBookmark ? recorded : nil })
+            XCTAssertEqual(registry.folders.map(\.shownPath), [recorded, readable].sorted(), recorded)
+        }
+    }
+
+    /// A resolution without a recorded path keeps the one that the folder knows, so the list still shows it.
+    func testAResolutionWithoutARecordedPathKeepsTheKnownOne() throws {
+        var registry = WatchedFolderRegistry(
+            savedBookmarks: [driveBookmark], resolve: { _ in .unresolved }, lastKnownPath: { _ in self.drive })
+        let id = try XCTUnwrap(registry.folders.first?.id)
+
+        registry.apply(.unresolved, to: id)
+
+        XCTAssertEqual(registry.folders.map(\.path), [nil])
+        XCTAssertEqual(registry.folders.map(\.shownPath), [drive])
+    }
+
     /// The scan maps a failed use of a bookmark to a resolution: no resolution means the drive went away, a stale
     /// bookmark or a refused access needs a new one, and so does a folder that the app may not read; a missing folder
     /// is one whose drive went away.

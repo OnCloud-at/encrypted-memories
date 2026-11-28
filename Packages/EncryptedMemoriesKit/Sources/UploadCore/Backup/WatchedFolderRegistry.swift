@@ -228,8 +228,7 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
                 bookmark: bookmark, path: path, needsRenewal: false,
                 formerPaths: Self.formerPaths(
                     replaced.flatMap(\.formerPaths), besides: path,
-                    keeping: replaced.compactMap { lastKnownPath($0.bookmark) }),
-                recordedPath: lastKnownPath(bookmark)))
+                    keeping: replaced.compactMap { lastKnownPath($0.bookmark) })))
         listIsKnown = true
         sort()
     }
@@ -310,7 +309,8 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
 
     private static func pathKey(of bookmark: Data) -> String { bookmark.base64EncodedString() }
 
+    /// Sorts the folders by the path that the list shows.
     private mutating func sort() {
-        folders.sort { $0.displayPath.localizedCaseInsensitiveCompare($1.displayPath) == .orderedAscending }
+        folders.sort { $0.shownPath.localizedCaseInsensitiveCompare($1.shownPath) == .orderedAscending }
     }
 }
