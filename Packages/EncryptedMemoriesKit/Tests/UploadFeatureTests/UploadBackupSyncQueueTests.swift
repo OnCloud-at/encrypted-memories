@@ -826,6 +826,232 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(store.makeRetryableWorkEligible(updatedAt: Date(timeIntervalSince1970: 300)), 0)
     }
 
+    /// A dismissal acts only on a permanent failure that is still stored as one. A problem list row that went stale
+    /// while its queue row moved on, for example to a saved upload receipt, leaves that row unchanged (#1583).
+    func testDismissingAStaleProblemLeavesARowThatMovedOnUnchanged() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        func row(
+            _ id: String, _ state: UploadBackupSyncQueueState, _ lastError: String?
+        ) -> UploadBackupSyncQueueEntry {
+            UploadBackupSyncQueueEntry(
+                source: source(id), revision: revision(1), originalFilename: "\(id).heic", state: state, attempts: 3,
+                lastError: lastError, updatedAt: Date(timeIntervalSince1970: 100))
+        }
+        let receiptRow = row("receipt", .finalizing, nil)
+        XCTAssertTrue(store.upsert(receiptRow))
+        let receipt = UploadRemoteCommitReconciliation(
+            source: receiptRow.source,
+            identity: UploadIdentity(
+                correctedName: "receipt.heic", nameHash: "name-hash", sha1Hex: String(repeating: "ab", count: 20),
+                sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+        XCTAssertTrue(
+            store.markNeedsRemoteReconciliation(
+                source: receiptRow.source, revision: receiptRow.revision, reconciliation: receipt,
+                lastError: "manifest unavailable", updatedAt: Date(timeIntervalSince1970: 101)))
+        let decision = BackupIssueRecord(kind: .deletedElsewhere, detail: "Removed").persistedValue
+        var finalWithReceipt = row("final-receipt", .failedPermanent, "kept")
+        finalWithReceipt.remoteCommitReconciliation = receipt
+        // A dismissed photo whose check runs again, and a row that the runner holds, are not the item the person saw.
+        let missing = BackupIssueRecord(kind: .sourceMissing, detail: "missing").persistedValue
+        let unsupported = BackupIssueRecord(kind: .unsupported, detail: "unsupported").persistedValue
+        let unchanged = [
+            row("completed", .completed, nil), row("retryable", .failed, "network"),
+            row("waiting", .discovered, "network"), row("decision", .failedPermanent, decision),
+            row("dismissed", .dismissedFailure, "kept"), finalWithReceipt,
+            row("recheck-waiting", .discovered, missing), row("recheck-claimed", .checking, missing),
+            row("claimed", .checking, unsupported),
+        ]
+        XCTAssertTrue(store.upsertBatch(unchanged))
+        let storedReceiptRow = try XCTUnwrap(try store.entry(for: receiptRow.source, revision: receiptRow.revision))
+        XCTAssertEqual(storedReceiptRow.remoteCommitReconciliation, receipt)
+
+        for stored in [storedReceiptRow] + unchanged {
+            XCTAssertFalse(
+                store.dismissPermanentFailure(
+                    source: stored.source, revision: stored.revision, updatedAt: Date(timeIntervalSince1970: 200)),
+                stored.source.identifier)
+            XCTAssertEqual(
+                try store.entry(for: stored.source, revision: stored.revision), stored, stored.source.identifier)
+        }
+
+        // A permanent failure is dismissed by the rule of the problem list and keeps its record, also when it has none.
+        for permanent in [
+            row("final", .failedPermanent, nil), row("missing", .sourceMissing, "missing reason"),
+            row("unsupported", .failed, unsupported),
+        ] {
+            XCTAssertTrue(store.upsert(permanent))
+            XCTAssertTrue(
+                store.dismissPermanentFailure(
+                    source: permanent.source, revision: permanent.revision, updatedAt: Date(timeIntervalSince1970: 200)
+                ), permanent.source.identifier)
+            let dismissed = try XCTUnwrap(try store.entry(for: permanent.source, revision: permanent.revision))
+            XCTAssertEqual(dismissed.state, .dismissedFailure)
+            XCTAssertEqual(dismissed.lastError, permanent.lastError)
+            XCTAssertEqual(dismissed.attempts, permanent.attempts)
+            XCTAssertEqual(dismissed.updatedAt, Date(timeIntervalSince1970: 200))
+        }
+    }
+
+    /// A claim with a folder filter takes a folder file only in a readable folder that is still there, or outside every
+    /// registered folder; the date of the next runnable row and the earliest runnable row count only those rows.
+    /// Photo-library rows are not affected. The SQL claim, `admits(path:)` and the file read give the same answer for
+    /// every case, nested folders included: the read refuses a missing file that the filter does not admit, and reads a
+    /// missing admitted file as deleted (#1583).
+    func testAClaimTakesOnlyTheFolderFilesThatItsFilterAdmits() async throws {
+        let present = tempDir.appendingPathComponent("present", isDirectory: true)
+        try FileManager.default.createDirectory(at: present, withIntermediateDirectories: true)
+        let vanished = tempDir.appendingPathComponent("vanished", isDirectory: true)
+        let locked = tempDir.appendingPathComponent("locked", isDirectory: true)
+        let readable = UploadSourceIdentity.file(present.appendingPathComponent("a.jpg"))
+        let gone = UploadSourceIdentity.file(vanished.appendingPathComponent("b.jpg"))
+        let unreadable = UploadSourceIdentity.file(locked.appendingPathComponent("c.jpg"))
+        let outside = UploadSourceIdentity.file(tempDir.appendingPathComponent("elsewhere/d.jpg"))
+        // A nested watched folder that was deleted while the folder around it stays.
+        let presentInner = present.appendingPathComponent("inner", isDirectory: true)
+        let inner = UploadSourceIdentity.file(presentInner.appendingPathComponent("e.jpg"))
+        let photoLibrarySource = source("photo-library")
+        let dates: [UploadSourceIdentity: TimeInterval] = [
+            gone: 50, unreadable: 60, outside: 95, readable: 100, inner: 110, photoLibrarySource: 130,
+        ]
+        let cases: [(String, WatchedFolderScope, [UploadSourceIdentity], TimeInterval)] = [
+            (
+                "every folder known",
+                WatchedFolderScope(
+                    readable: [present, vanished], registered: [present.path, vanished.path, locked.path]),
+                [outside, readable, inner, photoLibrarySource], 95
+            ),
+            (
+                "a folder without a known path",
+                WatchedFolderScope(readable: [present, vanished], registered: [present.path, vanished.path, "?"]),
+                [readable, inner, photoLibrarySource], 100
+            ),
+            (
+                "a readable folder that the folder list does not hold",
+                WatchedFolderScope(readable: [present, vanished], registered: [present.path, locked.path]),
+                [outside, readable, inner, photoLibrarySource], 95
+            ),
+            (
+                "nested folders",
+                WatchedFolderScope(
+                    readable: [present, presentInner, vanished],
+                    registered: [present.path, presentInner.path, vanished.path, locked.path]),
+                [outside, readable, inner, photoLibrarySource], 95
+            ),
+        ]
+        for (index, (name, scope, expected, nextDate)) in cases.enumerated() {
+            let store = try XCTUnwrap(
+                UploadBackupSyncQueueManifestStore(url: tempDir.appendingPathComponent("claim-\(index).sqlite")))
+            defer { store.close() }
+            XCTAssertTrue(
+                store.upsertBatch(
+                    dates.map { source, date in
+                        UploadBackupSyncQueueEntry(
+                            source: source, revision: revision(1), originalFilename: source.identifier,
+                            updatedAt: Date(timeIntervalSince1970: date))
+                    }))
+            let filter = scope.claimFilter()
+            let resolver = FileBackupResourceResolver(scope: { scope })
+            for source in dates.keys where source.kind == .fileURL {
+                XCTAssertEqual(filter.admits(path: source.identifier), expected.contains(source), name)
+                let entry = try XCTUnwrap(try store.entry(for: source, revision: revision(1)))
+                do {
+                    let read = try await resolver.resolve(entry)
+                    XCTAssertNil(read, "\(name): \(source.identifier)")
+                    XCTAssertTrue(expected.contains(source), "\(name): the read takes \(source.identifier) as deleted")
+                } catch is BackupSourceLocationUnavailableError {
+                    XCTAssertFalse(expected.contains(source), "\(name): the read refuses \(source.identifier)")
+                }
+            }
+            XCTAssertEqual(
+                try store.decisionEarliestRunnableEntry(admittingFiles: filter)?.updatedAt,
+                Date(timeIntervalSince1970: nextDate), name)
+
+            XCTAssertEqual(
+                try store.decisionNextRunnableDate(excludingSourcesOf: [], admittingFiles: filter),
+                Date(timeIntervalSince1970: nextDate), name)
+            let claimed = try XCTUnwrap(
+                store.claimRunnable(
+                    limit: 10, claimedAt: Date(timeIntervalSince1970: 200), excludingSourcesOf: [],
+                    admittingFiles: filter), name)
+            XCTAssertEqual(Set(claimed.map(\.source)), Set(expected), name)
+            for source in dates.keys where !expected.contains(source) {
+                XCTAssertEqual(try store.entry(for: source, revision: revision(1))?.state, .discovered, name)
+            }
+            XCTAssertTrue(store.isOperational(), name)
+        }
+    }
+
+    /// A claimed row returns exactly as it was stored, receipt included, while it is still claimed; a row that moved on
+    /// stays as it is (#1583).
+    func testARestoredClaimKeepsTheStoredRowAndLeavesARowThatMovedOn() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let committed = UploadSourceIdentity.file(tempDir.appendingPathComponent("committed.jpg"))
+        XCTAssertTrue(
+            store.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: committed, revision: revision(1), originalFilename: "committed.jpg",
+                    updatedAt: Date(timeIntervalSince1970: 100))))
+        XCTAssertTrue(
+            store.markNeedsRemoteReconciliation(
+                source: committed, revision: revision(1), reconciliation: uploadReceipt(for: committed),
+                lastError: "saved reason", updatedAt: Date(timeIntervalSince1970: 101)))
+        let stored = try XCTUnwrap(try store.entry(for: committed, revision: revision(1)))
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 200))?.count, 1)
+
+        XCTAssertEqual(store.restoreClaimed(stored, whileIn: .checking), true)
+        XCTAssertEqual(try store.entry(for: committed, revision: revision(1)), stored)
+        XCTAssertEqual(
+            store.restoreClaimed(stored, whileIn: .checking), false, "a row that is not claimed stays as it is")
+        XCTAssertEqual(try store.entry(for: committed, revision: revision(1)), stored)
+    }
+
+    /// A row is restored while it is in the state of its run, also a later one than `checking`, and only while it holds
+    /// a receipt exactly when the claimed row did (#1583).
+    func testARestoredClaimMatchesTheStateOfItsRunAndItsReceipt() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let source = UploadSourceIdentity.file(tempDir.appendingPathComponent("uploading.jpg"))
+        XCTAssertTrue(
+            store.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: revision(1), originalFilename: "uploading.jpg",
+                    updatedAt: Date(timeIntervalSince1970: 100))))
+        let stored = try XCTUnwrap(try store.entry(for: source, revision: revision(1)))
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 200))?.count, 1)
+        XCTAssertTrue(
+            store.updateState(
+                source: source, revision: revision(1), state: .uploading, attempts: 0, lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 201)))
+
+        XCTAssertEqual(store.restoreClaimed(stored, whileIn: .checking), false, "the run is in another state")
+        XCTAssertEqual(store.restoreClaimed(stored, whileIn: .uploading), true)
+        XCTAssertEqual(try store.entry(for: source, revision: revision(1)), stored)
+
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 300))?.count, 1)
+        XCTAssertTrue(
+            store.markNeedsRemoteReconciliation(
+                source: source, revision: revision(1), reconciliation: uploadReceipt(for: source), lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 301)))
+        let withReceipt = try XCTUnwrap(try store.entry(for: source, revision: revision(1)))
+
+        XCTAssertEqual(
+            store.restoreClaimed(stored, whileIn: .needsRemoteReconciliation), false,
+            "a row that gained a receipt is never written back")
+        XCTAssertEqual(try store.entry(for: source, revision: revision(1)), withReceipt)
+    }
+
+    private func uploadReceipt(for source: UploadSourceIdentity) -> UploadRemoteCommitReconciliation {
+        UploadRemoteCommitReconciliation(
+            source: source,
+            identity: UploadIdentity(
+                correctedName: "committed.jpg", nameHash: "name-hash", sha1Hex: String(repeating: "ab", count: 20),
+                sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+    }
+
     func testSQLiteQueueListsEntriesInOneStateOldestFirst() throws {
         let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
         let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
@@ -943,15 +1169,79 @@ final class UploadBackupSyncQueueTests: XCTestCase {
                     )))
         }
 
-        XCTAssertEqual(store.removeFileSources(outsideRootPaths: [activeRoot.path]), 2)
+        XCTAssertEqual(
+            store.removeFileSources(outside: WatchedFolderScope(readable: [], registered: [activeRoot.path])), 2)
         XCTAssertNotNil(try store.entry(for: activeSource, revision: revision(1)))
         XCTAssertNil(try store.entry(for: removedSource, revision: revision(1)))
         XCTAssertNil(try store.entry(for: prefixSiblingSource, revision: revision(1)))
         XCTAssertNotNil(try store.entry(for: photoLibrarySource, revision: revision(1)))
 
-        XCTAssertEqual(store.removeFileSources(outsideRootPaths: []), 1)
+        XCTAssertEqual(store.removeFileSources(outside: WatchedFolderScope(readable: [], registered: [])), 1)
         XCTAssertEqual(store.count(), 1)
         XCTAssertNotNil(try store.entry(for: photoLibrarySource, revision: revision(1)))
+    }
+
+    /// A folder whose bookmark gives no path, for example on a drive that is not mounted, may hold any file. While
+    /// such a folder is registered, or while the folder list cannot be read, no row is proven outside (#1583).
+    func testFolderQueueReconciliationRemovesNothingWhileAFolderHasNoKnownPath() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let knownRoot = tempDir.appendingPathComponent("known", isDirectory: true)
+        let known = UploadSourceIdentity.file(knownRoot.appendingPathComponent("a.jpg"))
+        let unmounted = UploadSourceIdentity.file(URL(fileURLWithPath: "/Volumes/Unmounted-1583/b.jpg"))
+        let rows = [known, unmounted].map {
+            UploadBackupSyncQueueEntry(
+                source: $0, revision: revision(1), originalFilename: $0.identifier, state: .discovered,
+                lastError: "kept decision", updatedAt: Date(timeIntervalSince1970: 100))
+        }
+        XCTAssertTrue(store.upsertBatch(rows))
+
+        let scopes: [(String, WatchedFolderScope)] = [
+            (
+                "a folder without a known path",
+                WatchedFolderScope(readable: [knownRoot], registered: [knownRoot.path, "?"])
+            ),
+            ("only folders without a known path", WatchedFolderScope(readable: [], registered: ["?"])),
+            ("a folder list that cannot be read", WatchedFolderScope(readable: [], registered: nil)),
+            ("no folder known at all", .unavailable),
+        ]
+        for (name, scope) in scopes {
+            XCTAssertEqual(store.removeFileSources(outside: scope), 0, name)
+            for row in rows {
+                XCTAssertEqual(try store.entry(for: row.source, revision: row.revision), row, name)
+            }
+        }
+        XCTAssertTrue(store.isOperational())
+    }
+
+    /// The person removed a folder: its rows leave the queue, also a row with an upload receipt, because the item
+    /// already exists in Proton. While any folder has no known path, nothing leaves and every receipt stays (#1583).
+    func testFolderQueueReconciliationRemovesAReceiptRowOnlyWhileEveryFolderIsKnown() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let removedRoot = tempDir.appendingPathComponent("removed", isDirectory: true)
+        let settled = UploadSourceIdentity.file(removedRoot.appendingPathComponent("settled.jpg"))
+        let committed = UploadSourceIdentity.file(removedRoot.appendingPathComponent("committed.jpg"))
+        for source in [settled, committed] {
+            XCTAssertTrue(
+                store.upsert(
+                    UploadBackupSyncQueueEntry(
+                        source: source, revision: revision(1), originalFilename: source.identifier,
+                        state: source == settled ? .completed : .finalizing, updatedAt: Date(timeIntervalSince1970: 100)
+                    )))
+        }
+        XCTAssertTrue(
+            store.markNeedsRemoteReconciliation(
+                source: committed, revision: revision(1), reconciliation: uploadReceipt(for: committed),
+                lastError: nil, updatedAt: Date(timeIntervalSince1970: 101)))
+        let kept = try XCTUnwrap(try store.entry(for: committed, revision: revision(1)))
+
+        XCTAssertEqual(store.removeFileSources(outside: WatchedFolderScope(readable: [], registered: ["?"])), 0)
+        XCTAssertEqual(try store.entry(for: committed, revision: revision(1)), kept)
+
+        XCTAssertEqual(store.removeFileSources(outside: WatchedFolderScope(readable: [], registered: [])), 2)
+        XCTAssertNil(try store.entry(for: settled, revision: revision(1)))
+        XCTAssertNil(try store.entry(for: committed, revision: revision(1)))
     }
 
     func testTypedIssueRoundTripsAndEarliestEligibilityIgnoresExecutionPriority() throws {

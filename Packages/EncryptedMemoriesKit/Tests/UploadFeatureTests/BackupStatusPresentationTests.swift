@@ -363,6 +363,19 @@ final class BackupStatusPresentationTests: XCTestCase {
         XCTAssertNil(BackupStatusPresentation(status).localizedSystemIssue)
     }
 
+    /// While items need attention, a failed index preparation keeps its retry date but names no cause of its own.
+    func testAFailedIndexPreparationKeepsItsRetryDateButNoCauseWhileItemsNeedAttention() {
+        let retryAt = Date(timeIntervalSince1970: 1_000)
+        var raw = progress(total: 10, alreadyBackedUp: 8, failed: 2, attention: 2)
+        raw.remoteIndexPreparationFailed = true
+        raw.remoteIndexPreparationIssue = BackupIssueRecord(kind: .network, detail: "offline", nextAttemptAt: retryAt)
+        let presentation = BackupStatusPresentation(BackupStatus(progress: raw, isScanning: false))
+
+        XCTAssertEqual(presentation.headlineKey, "backup.phase_attention")
+        XCTAssertEqual(presentation.nextAttemptAt, retryAt)
+        XCTAssertNil(presentation.localizedSystemIssue)
+    }
+
     func testPausedKeepsProgressButIsNotActive() {
         let s = status(progress(total: 10, checking: 1, uploaded: 3, isRunning: true, isPausedByPolicy: true))
         XCTAssertEqual(s.phase, .paused)

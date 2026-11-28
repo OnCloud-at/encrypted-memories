@@ -238,9 +238,14 @@ public protocol BackupResourceResolving: Sendable {
         readAdmission: @escaping BackupResourceReadAdmission,
         omittingMissingPairedVideo: Bool
     ) async throws -> BackupResolvedResource?
+    /// The folder files that a backup pass may claim now. Nil admits every row; only a resolver that refuses files of an
+    /// unreachable folder returns a filter, so that the pass never claims them (#1583).
+    func fileClaimFilter() -> BackupFileClaimFilter?
 }
 
 public extension BackupResourceResolving {
+    func fileClaimFilter() -> BackupFileClaimFilter? { nil }
+
     /// A resolver without Live Photo videos resolves the whole entry and never leaves anything out.
     func resolve(
         _ entry: UploadBackupSyncQueueEntry,
@@ -268,26 +273,46 @@ public extension BackupResourceResolving {
     }
 }
 
+/// A file whose watched folder the app cannot reach now, for example on a drive that is not mounted. A missing file
+/// there proves nothing, so the backup keeps its row and tries it again in a later pass (#1583).
+public struct BackupSourceLocationUnavailableError: Error, Sendable, Equatable {
+    public init() {}
+}
+
 /// The file-URL resolver shared by every platform's folder/file backup path. Reads current
 /// attributes so a file edited after the scan is backed up as it exists now. Security-scoped
 /// access (macOS sandbox bookmarks) is session-scoped by the platform layer around the whole
 /// sync pass - this resolver only touches the file system.
 public struct FileBackupResourceResolver: BackupResourceResolving {
-    public init() {}
+    /// The watched folders now. Without it every missing file counts as deleted.
+    private let scope: (@Sendable () -> WatchedFolderScope)?
+
+    public init(scope: (@Sendable () -> WatchedFolderScope)? = nil) {
+        self.scope = scope
+    }
+
+    public func fileClaimFilter() -> BackupFileClaimFilter? {
+        scope?().claimFilter()
+    }
 
     public func resolve(_ entry: UploadBackupSyncQueueEntry) async throws -> BackupResolvedResource? {
         guard entry.source.kind == .fileURL else {
             throw UploadError.internalFailure(.backupResolverUnsupportedSource(kind: entry.source.kind))
         }
         let url = URL(fileURLWithPath: entry.source.identifier)
+        // A file that may lie in a folder the app cannot reach now is not read at all (#1227). The rule is the one of
+        // the claim, so a claim and this read never disagree.
+        if fileClaimFilter()?.admits(path: url.path) == false { throw BackupSourceLocationUnavailableError() }
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         } catch let error as NSError
-            where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError
+            where (error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError)
+            || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
         {
-            return nil
-        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            // A missing file proves a deletion only while its folder is still there: the drive can go away during the
+            // read.
+            if fileClaimFilter()?.admits(path: url.path) == false { throw BackupSourceLocationUnavailableError() }
             return nil
         }
 

@@ -938,7 +938,7 @@ public final class PhotoLibraryBackupController {
     /// shows. A row that is gone needs no dismissal and stays silent.
     @discardableResult
     public func dismissFailedItem(_ item: BackupFailedItem) -> Bool {
-        guard item.isPermanent, item.issue != .deletedElsewhere,
+        guard item.isDismissable,
             let source = item.source,
             let revision = item.revision, let queueStore
         else { return false }
@@ -951,10 +951,12 @@ public final class PhotoLibraryBackupController {
             lastMessage = UploadError.InternalFailure.localStateMessage
             refreshFromQueue()
             return false
-        case .found(let current):
-            guard BackupIssueRecord.decode(current.lastError)?.kind != .deletedElsewhere,
-                queueStore.dismissPermanentFailure(source: source, revision: revision, updatedAt: Date()) == true
-            else { return false }
+        case .found:
+            // The store dismisses only a stored row that the list would show as dismissable, and only while the row is
+            // unchanged since that read and holds no receipt.
+            guard queueStore.dismissPermanentFailure(source: source, revision: revision, updatedAt: Date()) else {
+                return false
+            }
             noteProblemListChange()
             refreshFromQueue()
             return true

@@ -172,14 +172,19 @@ private struct BackupSettingsTab: View {
                 ForEach(backup.folders) { folder in
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(folder.displayPath)
+                            Text(folder.shownPath)
                                 .font(.system(size: 12))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            if folder.needsRenewal {
-                                Text("settings.backup_folder_stale")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.orange)
+                            if let notice = folder.notice {
+                                Group {
+                                    switch notice {
+                                    case .driveNotConnected: Text("settings.backup_folder_not_connected")
+                                    case .mustBeAddedAgain: Text("settings.backup_folder_stale")
+                                    }
+                                }
+                                .font(.system(size: 11))
+                                .foregroundStyle(.orange)
                             }
                         }
                         Spacer()

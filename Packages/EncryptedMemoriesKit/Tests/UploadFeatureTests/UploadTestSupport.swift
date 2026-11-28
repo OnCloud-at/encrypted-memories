@@ -327,7 +327,7 @@ extension UploadBackupSyncQueueStore {
     var restoredCompoundReopener: (@Sendable (UploadBackupSyncQueueEntry, Date) -> Bool?)? { nil }
 
     func updateDismissedSourceRecheck(
-        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
     ) -> Bool? { nil }
 
     func removeMissingSource(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
@@ -346,9 +346,12 @@ extension UploadBackupSyncQueueStore {
 
     /// A store without a local read failure list claims in the normal order and knows nothing about the rows.
     func claimRunnableOrderingLocalReadFailuresLast(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupClaimedEntry]? {
-        claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)?.map {
+        claimRunnable(
+            limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources, admittingFiles: files
+        )?.map {
             UploadBackupClaimedEntry(entry: $0, localReadFailure: .unknown)
         }
     }

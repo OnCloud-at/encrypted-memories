@@ -64,7 +64,7 @@ final class QueueTypedDecisionReadTests: XCTestCase {
     }
 
     func testDismissingAProblemRefusesAnUnknownRowAndKeepsItsRecord() throws {
-        let stored = row(state: .failed)
+        let stored = row(state: .failedPermanent)
         XCTAssertTrue(queue.upsert(stored))
         let wrapper = SpyQueueStore(inner: queue, log: BackupEventLog(), unknownEntryReads: 1)
         let later = Date(timeIntervalSince1970: 1_720_000_100)
@@ -79,5 +79,34 @@ final class QueueTypedDecisionReadTests: XCTestCase {
         XCTAssertFalse(
             wrapper.dismissPermanentFailure(source: missing, revision: revision, updatedAt: later),
             "a missing row is not dismissed")
+    }
+
+    /// A row that moves on between the read and the write of a dismissal, here to a saved upload receipt, keeps the
+    /// state it moved to and its receipt (#1583).
+    func testADismissalThatRacesASavedReceiptLeavesTheReceipt() throws {
+        let stored = row(state: .failedPermanent)
+        XCTAssertTrue(queue.upsert(stored))
+        let receipt = UploadRemoteCommitReconciliation(
+            source: source,
+            identity: UploadIdentity(
+                correctedName: "photo.heic", nameHash: "name-hash", sha1Hex: String(repeating: "ab", count: 20),
+                sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+        let wrapper = SpyQueueStore(inner: queue, log: BackupEventLog())
+        let store = queue!
+        let source = source
+        let revision = revision
+        wrapper.beforeConditionalWrite = {
+            XCTAssertTrue(
+                store.markNeedsRemoteReconciliation(
+                    source: source, revision: revision, reconciliation: receipt, lastError: "manifest unavailable",
+                    updatedAt: Date(timeIntervalSince1970: 1_720_000_050)))
+        }
+        XCTAssertFalse(
+            wrapper.dismissPermanentFailure(
+                source: source, revision: revision, updatedAt: Date(timeIntervalSince1970: 1_720_000_100)))
+        let kept = try XCTUnwrap(try queue.entry(for: source, revision: revision))
+        XCTAssertEqual(kept.state, .needsRemoteReconciliation)
+        XCTAssertEqual(kept.remoteCommitReconciliation, receipt)
     }
 }

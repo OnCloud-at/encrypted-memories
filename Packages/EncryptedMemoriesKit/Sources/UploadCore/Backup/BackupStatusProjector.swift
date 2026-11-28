@@ -90,6 +90,8 @@ public actor BackupStatusProjector {
     }
 
     private let queue: any UploadBackupSyncQueueStore
+    /// The folder filter of the backup's claims; nil for a backup without folders.
+    private let fileClaimFilter: (@Sendable () -> BackupFileClaimFilter?)?
     private let firstBackupGuide: BackupFirstBackupGuideStore?
     private let coalescingInterval: TimeInterval
     private let now: @Sendable () -> Date
@@ -141,13 +143,17 @@ public actor BackupStatusProjector {
 
     /// The photo library backup passes its guide store, so the guide follows every status even while the backup
     /// settings are closed (#275). Other backups pass none.
+    /// The folder backup passes the folder filter of its claims, so a row of a drive that is away sets no time in the
+    /// waiting status (#1583).
     public init(
         queue: any UploadBackupSyncQueueStore,
         firstBackupGuide: BackupFirstBackupGuideStore? = nil,
+        fileClaimFilter: (@Sendable () -> BackupFileClaimFilter?)? = nil,
         coalescingInterval: TimeInterval = 0.15,
         now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.queue = queue
+        self.fileClaimFilter = fileClaimFilter
         self.firstBackupGuide = firstBackupGuide
         self.coalescingInterval = max(0, coalescingInterval)
         self.now = now
@@ -320,11 +326,10 @@ public actor BackupStatusProjector {
             isUserPaused: context.isUserPaused,
             executionOpportunityIssue: context.executionOpportunityIssue
         )
-        if Self.sendsBytes(rawStatus.phase) {
-            speedEstimator.record(bytes: event.progress.transferredByteCount, at: now())
-        } else {
-            speedEstimator.reset()
-        }
+        // The counter never goes back within one runner, so a sample while nothing is sent adds no speed. Only the
+        // published status, which follows the controller's run and not the end of one short runner pass, resets the
+        // speed (#1583).
+        speedEstimator.record(bytes: event.progress.transferredByteCount, at: now())
         let phaseChanged = rawStatus.phase != lastRawPhase
         lastRawPhase = rawStatus.phase
         let issueChanged =
@@ -412,7 +417,8 @@ public actor BackupStatusProjector {
             progress.remoteIndexPreparationIssue = stored
         }
         progress.remoteIndexPreparationFailed = progress.remoteIndexPreparationIssue != nil
-        progress.outstanding = outstandingSnapshot(summary: summary, isRunning: context.isRunning)
+        progress.outstanding = outstandingSnapshot(
+            summary: summary, isRunning: context.isRunning, files: await fileClaimFilterOffActor())
         if let issue = progress.remoteIndexPreparationIssue {
             progress.outstanding = BackupOutstandingSnapshot(
                 count: max(1, progress.outstanding.count),
@@ -470,9 +476,15 @@ public actor BackupStatusProjector {
         phase == .checking || phase == .uploading
     }
 
+    /// The filter checks that each readable folder still exists, so it runs off this actor.
+    private nonisolated func fileClaimFilterOffActor() async -> BackupFileClaimFilter? {
+        fileClaimFilter?()
+    }
+
     private func outstandingSnapshot(
         summary: UploadBackupSyncQueueSummary,
-        isRunning: Bool
+        isRunning: Bool,
+        files: BackupFileClaimFilter?
     ) -> BackupOutstandingSnapshot {
         let count = summary.waiting + summary.active + summary.blocked + summary.pendingSourceRechecks
         guard count > 0 else { return BackupOutstandingSnapshot() }
@@ -480,7 +492,10 @@ public actor BackupStatusProjector {
 
         var candidates: [(Date, BackupIssueKind)] = []
         // A row that cannot be read leaves out its candidate: the status then names no time or reason for it (#1154).
-        if case .found(let entry) = StoreLookup(catching: { try queue.decisionEarliestRunnableEntry() }) {
+        // A row that no claim may take now, for example of a drive that is away, sets no time (#1583).
+        if case .found(let entry) = StoreLookup(catching: {
+            try queue.decisionEarliestRunnableEntry(admittingFiles: files)
+        }) {
             let record = BackupIssueRecord.decode(entry.lastError)
             candidates.append(
                 (

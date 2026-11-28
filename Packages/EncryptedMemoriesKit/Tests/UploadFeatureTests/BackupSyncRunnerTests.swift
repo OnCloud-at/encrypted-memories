@@ -571,6 +571,8 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
     /// operational and records no store failure, so a test can tell an unknown read from a broken store.
     private var unknownContainsAnyReads: Int
     var refusesMissingRemoval = false
+    /// Runs before a conditional write reaches the store, so a test can change the row between a read and the write.
+    var beforeConditionalWrite: (() -> Void)?
     /// True: the removal of the settled earlier revisions of a replaced photo fails, as a failed write does.
     var refusesSettledRevisionRemoval = false
     /// The bounded row reads of these states answer unknown, as a failed statement does.
@@ -662,27 +664,35 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         return value
     }
 
-    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
-        try healthy { try inner.decisionEarliestRunnableEntry() }
+    func decisionEarliestRunnableEntry(
+        admittingFiles files: BackupFileClaimFilter?
+    ) throws -> UploadBackupSyncQueueEntry? {
+        try healthy { try inner.decisionEarliestRunnableEntry(admittingFiles: files) }
     }
 
     func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
         try healthy { try inner.decisionEarliestEntry(in: state) }
     }
 
-    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
+    func decisionNextRunnableDate(
+        excludingSourcesOf excludedSources: [UploadSourceIdentity], admittingFiles files: BackupFileClaimFilter?
+    ) throws -> Date? {
         if failsRunnableDateRead {
             lock.withLock { readFailed = true }
             throw SQLiteStoreUnknownReadError()
         }
-        return try healthy { try inner.decisionNextRunnableDate(excludingSourcesOf: excludedSources) }
+        return try healthy {
+            try inner.decisionNextRunnableDate(excludingSourcesOf: excludedSources, admittingFiles: files)
+        }
     }
 
     func claimRunnable(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupSyncQueueEntry]? {
         log.append("queue.claimRunnable")
-        return inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
+        return inner.claimRunnable(
+            limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources, admittingFiles: files)
     }
 
     func addLocalReadFailureHints(_ sources: [UploadSourceIdentity]) -> Bool { acceptsLocalReadFailureHints }
@@ -714,6 +724,18 @@ final class SpyQueueStore: UploadBackupSyncQueueStore, @unchecked Sendable {
         return inner.updateState(
             source: source, revision: revision, state: state,
             attempts: attempts, lastError: lastError, updatedAt: updatedAt)
+    }
+
+    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry, whileIn state: UploadBackupSyncQueueState) -> Bool? {
+        inner.restoreClaimed(entry, whileIn: state)
+    }
+
+    func updateDismissedSourceRecheck(
+        _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
+    ) -> Bool? {
+        beforeConditionalWrite?()
+        return inner.updateDismissedSourceRecheck(
+            entry, matchingState: matchingState, matchingLastError: matchingLastError)
     }
 
     func remove(source: UploadSourceIdentity, revision: UploadBackupRevision) -> Bool {
@@ -799,19 +821,25 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
         try inner.containsAny(in: states)
     }
 
-    func decisionEarliestRunnableEntry() throws -> UploadBackupSyncQueueEntry? {
-        try inner.decisionEarliestRunnableEntry()
+    func decisionEarliestRunnableEntry(
+        admittingFiles files: BackupFileClaimFilter?
+    ) throws -> UploadBackupSyncQueueEntry? {
+        try inner.decisionEarliestRunnableEntry(admittingFiles: files)
     }
     func decisionEarliestEntry(in state: UploadBackupSyncQueueState) throws -> UploadBackupSyncQueueEntry? {
         try inner.decisionEarliestEntry(in: state)
     }
-    func decisionNextRunnableDate(excludingSourcesOf excludedSources: [UploadSourceIdentity]) throws -> Date? {
-        try inner.decisionNextRunnableDate(excludingSourcesOf: excludedSources)
+    func decisionNextRunnableDate(
+        excludingSourcesOf excludedSources: [UploadSourceIdentity], admittingFiles files: BackupFileClaimFilter?
+    ) throws -> Date? {
+        try inner.decisionNextRunnableDate(excludingSourcesOf: excludedSources, admittingFiles: files)
     }
     func claimRunnable(
-        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity]
+        limit: Int, claimedAt: Date, excludingSourcesOf excludedSources: [UploadSourceIdentity],
+        admittingFiles files: BackupFileClaimFilter?
     ) -> [UploadBackupSyncQueueEntry]? {
-        inner.claimRunnable(limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources)
+        inner.claimRunnable(
+            limit: limit, claimedAt: claimedAt, excludingSourcesOf: excludedSources, admittingFiles: files)
     }
     func decisionEntries(
         in state: UploadBackupSyncQueueState, updatedBefore: Date, limit: Int
@@ -820,6 +848,9 @@ final class ReenqueueOnFirstRetryQueueStore: UploadBackupSyncQueueStore, @unchec
     }
     func requeueStaleActive(before cutoff: Date, updatedAt: Date) -> Int? {
         inner.requeueStaleActive(before: cutoff, updatedAt: updatedAt)
+    }
+    func restoreClaimed(_ entry: UploadBackupSyncQueueEntry, whileIn state: UploadBackupSyncQueueState) -> Bool? {
+        inner.restoreClaimed(entry, whileIn: state)
     }
     func updateState(
         source: UploadSourceIdentity,

@@ -84,6 +84,54 @@ final class UploadBackupSyncQueueManifestRecoveryTests: XCTestCase {
         store!.close()
     }
 
+    /// Writes a state that this build does not know into the stored row of `id`.
+    private func storeUnknownState(file: String, id: String) throws {
+        var handle: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_open_v2(tempDir.appendingPathComponent(file).path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        XCTAssertEqual(
+            sqlite3_exec(
+                handle, "UPDATE backup_sync_queue SET state='aaaFutureState' WHERE source_id='\(id)';", nil, nil, nil),
+            SQLITE_OK)
+    }
+
+    /// A keyed read of a row in a state this build does not know answers unknown, never a failed row (#1583).
+    func testAKeyedReadOfAnUnknownStateIsUnknownAndNotAFailedRow() throws {
+        store = try makeStore(file: "unknown-keyed.sqlite")
+        let row = entry("future", state: .failedPermanent)
+        XCTAssertTrue(store!.upsert(row))
+        try storeUnknownState(file: "unknown-keyed.sqlite", id: "future")
+        guard case .unknown = try store!.decisionEntry(for: row.source, revision: row.revision) else {
+            return XCTFail("an unknown state must not read as a known row")
+        }
+        XCTAssertFalse(store!.isOperational(), "an unknown state is a lasting failure, as in summary()")
+        store!.close()
+    }
+
+    /// The receipt scan stops at a row in a state this build does not know instead of reading it as failed (#1583).
+    func testTheReceiptScanRefusesAnUnknownState() throws {
+        store = try makeStore(file: "unknown-receipt.sqlite")
+        let row = entry("future", state: .finalizing)
+        XCTAssertTrue(store!.upsert(row))
+        let receipt = UploadRemoteCommitReconciliation(
+            source: row.source,
+            identity: UploadIdentity(
+                correctedName: row.originalFilename, nameHash: "name-hash", sha1Hex: String(repeating: "ab", count: 20),
+                sha1Digest: Data(repeating: 0xAB, count: 20), contentHash: "content-hash"),
+            receipt: UploadRemoteCommitReceipt(remoteVolumeID: "volume", remoteLinkID: "link"))
+        XCTAssertTrue(
+            store!.markNeedsRemoteReconciliation(
+                source: row.source, revision: row.revision, reconciliation: receipt, lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 101)))
+        try storeUnknownState(file: "unknown-receipt.sqlite", id: "future")
+        XCTAssertThrowsError(try store!.entriesWithRemoteCommitReconciliation(limit: 10)) { error in
+            XCTAssertEqual(error as? UploadRemoteCommitRecoveryError, .storeUnavailable)
+        }
+        XCTAssertFalse(store!.isOperational())
+        store!.close()
+    }
+
     func testEveryOptionalReaderReportsItsOwnFailedStatementAsUnknown() throws {
         let source = entry("known").source
         let readers: [(String, (UploadBackupSyncQueueManifestStore) -> Bool)] = [

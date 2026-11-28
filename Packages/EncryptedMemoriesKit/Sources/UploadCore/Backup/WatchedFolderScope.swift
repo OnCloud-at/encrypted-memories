@@ -18,7 +18,7 @@ public struct WatchedFolderScope: Sendable, Equatable {
     private let readableRoots: [String]
     /// Root paths of every registered folder, each with a trailing slash. Nil when a registered
     /// folder has no known path or the registry is not loaded, so no path is proven outside.
-    private let registeredRoots: [String]?
+    let registeredRoots: [String]?
 
     /// No folder is readable and no folder is known.
     public static let unavailable = WatchedFolderScope(readableRoots: [], registeredRoots: nil)
@@ -33,11 +33,11 @@ public struct WatchedFolderScope: Sendable, Equatable {
         self.init(readableRoots: readable.map { Self.root($0.path) }, registeredRoots: registeredRoots)
     }
 
-    /// The registered folder bookmarks in a stored value. No stored value is a known empty list. A
-    /// value of another type is damaged and gives nil, so no registered folder is known.
+    /// The registered folder bookmarks in a stored value. Only a saved list is known; the app saves an empty list
+    /// when the person removes the last folder. No stored value, for example after the settings were reset, and a
+    /// value of another type give nil, so no registered folder is known (#1583).
     public static func registeredBookmarks(storedValue: Any?) -> [Data]? {
-        guard let storedValue else { return [] }
-        return storedValue as? [Data]
+        storedValue as? [Data]
     }
 
     private init(readableRoots: [String], registeredRoots: [String]?) {
@@ -58,8 +58,39 @@ public struct WatchedFolderScope: Sendable, Equatable {
         return registeredRoots.contains(where: { path.hasPrefix($0) }) ? .unavailable : .outside
     }
 
+    /// The folder files that a backup pass may claim now (#1583). `rootExists` tells whether a readable folder is still
+    /// there; a drive that went away leaves its folder readable in the scope until the next folder scan.
+    public func claimFilter(
+        rootExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> BackupFileClaimFilter {
+        BackupFileClaimFilter(
+            presentRoots: readableRoots.filter(rootExists), readableRoots: readableRoots,
+            registeredRoots: registeredRoots)
+    }
+
     private static func root(_ path: String) -> String {
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
         return standardized.hasSuffix("/") ? standardized : standardized + "/"
+    }
+}
+
+/// The folder files that a backup pass may claim: a file in a readable folder that is still there, and a file that no
+/// registered folder holds. Every other folder file may lie in a folder that the app cannot reach now, for example on a
+/// drive that is not mounted: it stays unclaimed and unchanged until its folder is back (#1583). The claim in SQL mirrors
+/// `admits(path:)`, and `FileBackupResourceResolver` refuses exactly the files that it does not admit. With nested
+/// folders, any readable folder that holds the path and is still there admits it. Other source kinds are not affected.
+public struct BackupFileClaimFilter: Sendable, Equatable {
+    /// Readable roots that exist now, each with a trailing slash.
+    let presentRoots: [String]
+    /// Every readable root, also one whose folder went away.
+    let readableRoots: [String]
+    /// Nil when no path is proven outside the registered folders.
+    let registeredRoots: [String]?
+
+    /// True when a backup pass may claim the folder file at `path`.
+    public func admits(path: String) -> Bool {
+        if presentRoots.contains(where: { path.hasPrefix($0) }) { return true }
+        guard let registeredRoots, !readableRoots.contains(where: { path.hasPrefix($0) }) else { return false }
+        return !registeredRoots.contains(where: { path.hasPrefix($0) })
     }
 }

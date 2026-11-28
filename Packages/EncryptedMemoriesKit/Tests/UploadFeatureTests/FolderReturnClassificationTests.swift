@@ -311,12 +311,14 @@ import UploadCore
             scope.location(ofPath: "/Volumes/A/photo.heic") == .readable(URL(fileURLWithPath: "/Volumes/A/photo.heic")))
     }
 
-    /// Issue #1227: no saved folder list is a known empty registry, but a saved value of another
-    /// type is damaged and leaves the registry unknown.
-    @Test func aDamagedFolderListLeavesTheRegistryUnknown() {
+    /// Issue #1227 and #1583: only a saved empty list is a known empty registry, which the app saves when the person
+    /// removes the last folder. A missing value, for example after the settings were reset, and a saved value of
+    /// another type leave the registry unknown.
+    @Test func aDamagedOrMissingFolderListLeavesTheRegistryUnknown() {
         let bookmark = Data("bookmark".utf8)
 
-        #expect(WatchedFolderScope.registeredBookmarks(storedValue: nil) == [])
+        #expect(WatchedFolderScope.registeredBookmarks(storedValue: nil) == nil)
+        #expect(WatchedFolderScope.registeredBookmarks(storedValue: [Data]()) == [])
         #expect(WatchedFolderScope.registeredBookmarks(storedValue: [bookmark]) == [bookmark])
         #expect(WatchedFolderScope.registeredBookmarks(storedValue: "damaged") == nil)
         #expect(WatchedFolderScope.registeredBookmarks(storedValue: [bookmark, "damaged"] as [Any]) == nil)

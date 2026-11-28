@@ -311,10 +311,12 @@ public struct BackupStatusPresentation: Sendable, Equatable {
         return L10n.string("backup.progress_waiting \(waitingCount)")
     }
 
-    /// The one line under the backup status that the person can act on. A failed index preparation and the scheduling
-    /// problems that iOS and the app retry on their own show no line. The index failure carries its own cause headline
-    /// and retry date. A scheduler issue sets neither: the app submits the work again on the next background entry, at
-    /// the end of a task and in the next refresh window.
+    /// The one line under the backup status that the person can act on: the two permission cases share one text, and a
+    /// failed task registration keeps its restart text. A failed index preparation and the scheduling problems that
+    /// iOS and the app retry on their own show no line. The index failure names no cause of its own: a waiting status
+    /// and a needs-attention status show its stored retry date, and only a waiting status takes the headline of its
+    /// stored kind, when that kind has one. A scheduler issue sets neither; the app submits the work again on the next
+    /// background entry, at the end of a task and in the next refresh window.
     public var localizedSystemIssue: String? {
         switch executionOpportunityIssue {
         case .backgroundRefreshUnavailable, .backgroundLaunchNotPermitted:
