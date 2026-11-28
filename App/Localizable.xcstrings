@@ -126,9 +126,17 @@
         "de": { "stringUnit": { "state": "translated", "value": "Beim ersten Klick werden die Einstellungen für Festplattenvollzugriff geöffnet. Erteile den Zugriff, kehre hierher zurück und klicke erneut auf Ordner hinzufügen." } }
       }
     },
+    "settings.backup_folder_not_connected": {
+      "extractionState": "manual",
+      "comment": "Shown under a watched folder whose bookmark does not resolve, for example because its drive is not connected.",
+      "localizations": {
+        "en": { "stringUnit": { "state": "translated", "value": "Drive not connected" } },
+        "de": { "stringUnit": { "state": "translated", "value": "Laufwerk nicht verbunden" } }
+      }
+    },
     "settings.backup_folder_stale": {
       "extractionState": "manual",
-      "comment": "Shown under a folder whose sandbox bookmark no longer resolves.",
+      "comment": "Shown under a watched folder whose bookmark resolves but must be renewed before the app may read the folder.",
       "localizations": {
         "en": { "stringUnit": { "state": "translated", "value": "Access must be renewed - please add this folder again" } },
         "de": { "stringUnit": { "state": "translated", "value": "Zugriff muss erneuert werden - bitte Ordner erneut hinzufügen" } }

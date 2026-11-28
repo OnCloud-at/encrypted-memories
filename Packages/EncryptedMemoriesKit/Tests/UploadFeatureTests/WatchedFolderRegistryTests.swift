@@ -473,6 +473,59 @@ final class WatchedFolderRegistryTests: XCTestCase {
         XCTAssertEqual(scope(registry).location(ofPath: file(in: disk)), .outside)
     }
 
+    /// A folder whose bookmark does not resolve shows its last known path and "Drive not connected"; without any known
+    /// path it shows "?". A folder whose bookmark resolves but must be renewed keeps asking to be added again, and a
+    /// readable folder shows no line.
+    func testTheFolderListShowsTheLastKnownPathAndWhyAFolderIsNotRead() throws {
+        let renamed = "/Volumes/Drive-1583 1/Photos"
+        let recordedOnly = WatchedFolderRegistry(
+            savedBookmarks: [driveBookmark], resolve: { _ in .unresolved }, lastKnownPath: { _ in self.drive })
+        XCTAssertEqual(recordedOnly.folders.map(\.shownPath), [drive])
+        XCTAssertEqual(recordedOnly.folders.map(\.displayPath), ["?"], "the scope still treats its place as unknown")
+        XCTAssertEqual(recordedOnly.folders.map(\.notice), [.driveNotConnected])
+
+        let saved = WatchedFolderRegistry(
+            savedBookmarks: [driveBookmark], savedPaths: [driveBookmark.base64EncodedString(): [drive, renamed]],
+            resolve: { _ in .unresolved }, lastKnownPath: { _ in self.drive })
+        XCTAssertEqual(saved.folders.map(\.shownPath), [renamed], "the newest saved path comes first")
+
+        let unknown = WatchedFolderRegistry(savedBookmarks: [driveBookmark]) { _ in .unresolved }
+        XCTAssertEqual(unknown.folders.map(\.shownPath), ["?"])
+        XCTAssertEqual(unknown.folders.map(\.notice), [.driveNotConnected])
+
+        var registry = WatchedFolderRegistry(savedBookmarks: [driveBookmark]) { _ in
+            .resolved(path: self.drive, isStale: false)
+        }
+        let id = try XCTUnwrap(registry.folders.first?.id)
+        XCTAssertEqual(registry.folders.map(\.notice), [nil])
+        XCTAssertEqual(registry.folders.map(\.shownPath), [drive])
+
+        registry.apply(.unresolved, to: id)
+        XCTAssertEqual(registry.folders.map(\.shownPath), [drive], "a drive that goes away keeps its path")
+        XCTAssertEqual(registry.folders.map(\.notice), [.driveNotConnected])
+
+        registry.apply(.resolved(path: drive, isStale: true), to: id)
+        XCTAssertEqual(registry.folders.map(\.notice), [.mustBeAddedAgain])
+
+        registry.apply(.resolved(path: drive, isStale: false), to: id)
+        XCTAssertEqual(registry.folders.map(\.notice), [nil], "the line goes once the folder is read again")
+    }
+
+    /// The scan maps a failed use of a bookmark to a resolution: no resolution means the drive went away, a stale
+    /// bookmark or a refused access needs a new one, and so does a folder that the app may not read; a missing folder
+    /// is one whose drive went away.
+    func testAFailedScanOfAFolderTellsADriveThatWentAwayFromAnAccessToRenew() {
+        XCTAssertEqual(WatchedFolderBookmarkResolution.afterFailedAccess(resolvedPath: nil), .unresolved)
+        XCTAssertEqual(
+            WatchedFolderBookmarkResolution.afterFailedAccess(resolvedPath: drive),
+            .resolved(path: drive, isStale: true))
+        XCTAssertEqual(
+            WatchedFolderBookmarkResolution.afterRootReadFailure(.missing, rootPath: drive), .unresolved)
+        XCTAssertEqual(
+            WatchedFolderBookmarkResolution.afterRootReadFailure(.permissionDenied, rootPath: drive),
+            .resolved(path: drive, isStale: true))
+    }
+
     /// A missing saved list knows no folder, so no file counts as outside; adding or removing a folder saves a list.
     func testAMissingListIsUnknownUntilTheAppSavesOne() throws {
         var registry = WatchedFolderRegistry(savedBookmarks: nil) { _ in .unresolved }

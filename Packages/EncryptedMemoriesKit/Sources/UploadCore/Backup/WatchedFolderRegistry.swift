@@ -14,20 +14,47 @@ public struct WatchedFolder: Identifiable, Equatable, Sendable {
     /// saves them with the folder list (`WatchedFolderRegistry.pathsToSave`) and keeps the newest
     /// `WatchedFolderRegistry.formerPathLimit`.
     public var formerPaths: [String]
+    /// True while the last resolution of the bookmark failed, for example because its drive is not mounted; false while
+    /// it resolved, also to a stale bookmark.
+    public var isDisconnected: Bool
+    /// The path that the bookmark recorded, also while its drive is not mounted.
+    public var recordedPath: String?
 
     public init(
-        id: UUID = UUID(), bookmark: Data, path: String?, needsRenewal: Bool, formerPaths: [String] = []
+        id: UUID = UUID(), bookmark: Data, path: String?, needsRenewal: Bool, formerPaths: [String] = [],
+        isDisconnected: Bool = false, recordedPath: String? = nil
     ) {
         self.id = id
         self.bookmark = bookmark
         self.path = path
         self.needsRenewal = needsRenewal
         self.formerPaths = formerPaths
+        self.isDisconnected = isDisconnected
+        self.recordedPath = recordedPath
     }
 
-    /// The path in the folder list. "?" is no absolute path, so `WatchedFolderScope` treats the folder as one whose
-    /// location is unknown: none of its rows count as outside or as deleted.
+    /// The path of the folder for the scope. "?" is no absolute path, so `WatchedFolderScope` treats the folder as one
+    /// whose location is unknown: none of its rows count as outside or as deleted.
     public var displayPath: String { path ?? "?" }
+
+    /// The path that the folder list shows: the current path, or else the last path that the app knows for the folder
+    /// (the newest saved path, then the path that the bookmark recorded), or else "?".
+    public var shownPath: String { path ?? formerPaths.last ?? recordedPath ?? "?" }
+
+    /// The line that the folder list shows under the folder, nil while the app reads the folder.
+    public var notice: WatchedFolderNotice? {
+        guard needsRenewal else { return nil }
+        return isDisconnected ? .driveNotConnected : .mustBeAddedAgain
+    }
+}
+
+/// Why the app does not read a registered folder, as the folder list tells the person.
+public enum WatchedFolderNotice: Sendable, Equatable {
+    /// The bookmark did not resolve, for example because the drive is not connected. The folder is read again once the
+    /// bookmark resolves.
+    case driveNotConnected
+    /// The bookmark resolved, but the app may not read the folder with it: the person adds the folder again.
+    case mustBeAddedAgain
 }
 
 /// What the app learned when it resolved one bookmark.
@@ -37,6 +64,18 @@ public enum WatchedFolderBookmarkResolution: Sendable, Equatable {
     case resolved(path: String, isStale: Bool)
     /// The bookmark did not resolve, for example because its drive is not mounted.
     case unresolved
+
+    /// The scan of a pass could not use the bookmark: `resolvedPath` is the path that it resolved to, nil when it did
+    /// not resolve. A bookmark that resolved but was stale, or whose folder the app may not open, needs a new one.
+    public static func afterFailedAccess(resolvedPath: String?) -> Self {
+        resolvedPath.map { .resolved(path: $0, isStale: true) } ?? .unresolved
+    }
+
+    /// The scan could not read the folder at `rootPath` itself: a missing folder is one whose drive went away, and a
+    /// folder that the app may not read needs a new bookmark.
+    public static func afterRootReadFailure(_ failure: FolderEnumerationError.FailureClass, rootPath: String) -> Self {
+        failure == .missing ? .unresolved : .resolved(path: rootPath, isStale: true)
+    }
 }
 
 /// The registered watched folders and the rule that turns bookmark resolutions into them (#1583). The Mac app owns the
@@ -189,7 +228,8 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
                 bookmark: bookmark, path: path, needsRenewal: false,
                 formerPaths: Self.formerPaths(
                     replaced.flatMap(\.formerPaths), besides: path,
-                    keeping: replaced.compactMap { lastKnownPath($0.bookmark) })))
+                    keeping: replaced.compactMap { lastKnownPath($0.bookmark) }),
+                recordedPath: lastKnownPath(bookmark)))
         listIsKnown = true
         sort()
     }
@@ -211,16 +251,20 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
         _ folder: inout WatchedFolder, with resolution: WatchedFolderBookmarkResolution,
         lastKnownPath: (Data) -> String?
     ) {
+        let recordedPath = lastKnownPath(folder.bookmark)
+        if let recordedPath { folder.recordedPath = recordedPath }
         switch resolution {
         case .resolved(let path, let isStale):
+            folder.isDisconnected = false
             // The path that the bookmark recorded is its oldest one; the path until now is the newest.
-            let recorded = [lastKnownPath(folder.bookmark)].compactMap { $0 }
+            let recorded = [recordedPath].compactMap { $0 }
             let earlier = recorded + folder.formerPaths + [folder.path].compactMap { $0 }
             folder.formerPaths = formerPaths(earlier, besides: path, keeping: recorded)
             folder.path = path
             folder.needsRenewal = isStale
         case .unresolved:
             folder.needsRenewal = true
+            folder.isDisconnected = true
         }
     }
 

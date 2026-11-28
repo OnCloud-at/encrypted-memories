@@ -334,19 +334,18 @@ final class FolderBackupController {
                     return
                 }
                 var stale = false
-                guard
-                    let url = try? URL(
-                        resolvingBookmarkData: folder.bookmark,
-                        options: [.withSecurityScope, .withoutUI],
-                        relativeTo: nil,
-                        bookmarkDataIsStale: &stale
-                    ), !stale, url.startAccessingSecurityScopedResource()
-                else {
-                    self?.applyResolution(.unresolved, to: folder.id)
+                let resolved = try? URL(
+                    resolvingBookmarkData: folder.bookmark,
+                    options: [.withSecurityScope, .withoutUI],
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &stale
+                )
+                guard let url = resolved, !stale, url.startAccessingSecurityScopedResource() else {
+                    self?.applyResolution(.afterFailedAccess(resolvedPath: resolved?.path), to: folder.id)
                     self?.recordFolderEnumerationFailure(
                         Self.localizedFolderError(
                             failureClass: .missing,
-                            name: folder.displayPath
+                            name: folder.shownPath
                         )
                     )
                     continue
@@ -376,7 +375,7 @@ final class FolderBackupController {
                     self?.recordFolderEnumerationFailure(
                         Self.localizedFolderError(
                             failureClass: .transient,
-                            name: folder.displayPath
+                            name: folder.shownPath
                         )
                     )
                 }
@@ -429,9 +428,9 @@ final class FolderBackupController {
         root: URL
     ) {
         if error.requiresRootAccessRenewal(for: root) {
-            applyResolution(.unresolved, to: folder.id)
+            applyResolution(.afterRootReadFailure(error.failureClass, rootPath: root.path), to: folder.id)
         }
-        let name = error.url.lastPathComponent.isEmpty ? folder.displayPath : error.url.lastPathComponent
+        let name = error.url.lastPathComponent.isEmpty ? folder.shownPath : error.url.lastPathComponent
         recordFolderEnumerationFailure(
             Self.localizedFolderError(failureClass: error.failureClass, name: name)
         )
