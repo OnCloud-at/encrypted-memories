@@ -63,14 +63,42 @@ final class FolderBackupIntegrationTests: XCTestCase {
         return makeRunner(resolver: reads)
     }
 
-    private func makeRunner(resolver: any BackupResourceResolving) -> BackupSyncRunner {
+    private func makeRunner(
+        resolver: any BackupResourceResolving, uploader: (any PhotoUploading)? = nil
+    ) -> BackupSyncRunner {
         BackupSyncRunner(
             queue: queueStore,
             preflight: preflight,
             resolver: resolver,
             identityResolver: pipeline,
-            uploader: uploader
+            uploader: uploader ?? self.uploader
         )
+    }
+
+    /// Runs `beforeUpload`, a drive that is unplugged during the upload, and then fails the upload with the error of a
+    /// file read that found no file.
+    private struct UnpluggingUploader: PhotoUploading {
+        let inner: MockUploader
+        let beforeUpload: @Sendable () -> Void
+
+        var capabilities: UploadBackendCapabilities { inner.capabilities }
+
+        func reserveNetwork(allowsExpensiveNetwork: Bool) async throws -> UploadNetworkReservation {
+            try await inner.reserveNetwork(allowsExpensiveNetwork: allowsExpensiveNetwork)
+        }
+
+        func upload(
+            _ request: PhotoUploadRequest, onProgress: @Sendable @escaping (UploadProgress) -> Void
+        ) async throws -> PhotoUID {
+            beforeUpload()
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+        }
+
+        func cancel(token: UUID) async { await inner.cancel(token: token) }
+
+        func ensureRemoteCapacity(forBytes bytes: Int64, filename: String) async throws {
+            try await inner.ensureRemoteCapacity(forBytes: bytes, filename: filename)
+        }
     }
 
     /// Counts the reads of each file. A second read of a file in the same pass finds it deleted, so a pass that reads a
@@ -379,6 +407,66 @@ final class FolderBackupIntegrationTests: XCTestCase {
                 XCTAssertNil(try queueStore.entry(for: source, revision: stored.revision))
             }
         }
+    }
+
+    /// The drive is unplugged during the upload, a later state of the run than its claim: the row returns as stored
+    /// (#1583).
+    func testAFileWhoseDriveGoesAwayDuringItsUploadKeepsItsRow() async throws {
+        let file = folder.appendingPathComponent("uploading.jpg")
+        try Data("uploading".utf8).write(to: file)
+        _ = try await engine.scan(FolderBackupCatalog(folder: folder))
+        let source = UploadSourceIdentity.file(file)
+        let row = try XCTUnwrap(try queueStore.decisionRows(kind: .fileURL, identifiers: [source.identifier]).first)
+        let stored = try XCTUnwrap(try queueStore.entry(for: source, revision: row.revision))
+        let scope = WatchedFolderScope(readable: [folder], registered: [folder.path])
+        let folder = self.folder!
+        let away = tempDir.appendingPathComponent("Unplugged", isDirectory: true)
+        let unplugging = UnpluggingUploader(inner: uploader) { try? FileManager.default.moveItem(at: folder, to: away) }
+
+        await runBounded(makeRunner(resolver: FileBackupResourceResolver(scope: { scope }), uploader: unplugging))
+
+        XCTAssertEqual(try queueStore.entry(for: source, revision: stored.revision), stored)
+    }
+
+    /// A read error counts as a local one, and so as a reason to check the folder, only when the file system answered;
+    /// a cancellation goes its own way (#1583).
+    func testOnlyAFileSystemErrorCountsAsALocalReadFailure() {
+        XCTAssertTrue(BackupSyncRunner.isLocalReadFailure(UploadError.fileMissing("IMG.jpg")))
+        XCTAssertTrue(BackupSyncRunner.isLocalReadFailure(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))))
+        XCTAssertTrue(
+            BackupSyncRunner.isLocalReadFailure(NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)))
+        XCTAssertFalse(
+            BackupSyncRunner.isLocalReadFailure(NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)))
+        XCTAssertFalse(BackupSyncRunner.isLocalReadFailure(UploadError.backend("transient")))
+    }
+
+    /// The drive is mounted under another name ("Photos 1"): the reconcile keeps the rows of the old path, receipts
+    /// included, and the pass does not take them; they leave the queue when the person removes the folder and every
+    /// folder is known (#1583).
+    func testADriveMountedUnderAnotherNameKeepsTheRowsOfItsEarlierPath() async throws {
+        let (new, sent) = try await queueNewAndSentFiles()
+        let oldPath = folder.path
+        let renamed = tempDir.appendingPathComponent("Photos 1", isDirectory: true)
+        try FileManager.default.moveItem(at: folder, to: renamed)
+        let bookmark = Data("folder".utf8)
+        var registry = WatchedFolderRegistry(savedBookmarks: [bookmark]) { _ in
+            .resolved(path: oldPath, isStale: false)
+        }
+        let id = try XCTUnwrap(registry.folders.first?.id)
+        XCTAssertTrue(registry.refresh(resolve: { _ in .resolved(path: renamed.path, isStale: false) }))
+        let scope = ScopeBox(registryScope(registry))
+
+        XCTAssertEqual(queueStore.removeFileSources(outside: scope.scope), 0)
+        await runBounded(makeRunner(scope: scope))
+
+        XCTAssertTrue(uploader.requests.isEmpty)
+        XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision), new)
+        XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
+        XCTAssertEqual([reads.reads(of: new.source), reads.reads(of: sent.source)], [0, 0])
+
+        registry.remove(id)
+        XCTAssertEqual(queueStore.removeFileSources(outside: registryScope(registry)), 2)
+        XCTAssertNil(try queueStore.entry(for: sent.source, revision: sent.revision))
     }
 
     /// A row of a drive that is away sets no time in the waiting status: its wait ends only when the drive is back

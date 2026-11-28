@@ -2750,11 +2750,13 @@ public actor BackupSyncRunner {
         }
     }
 
-    /// A read of a local file failed: the file system answered for it.
-    private static func isLocalReadFailure(_ error: any Error) -> Bool {
+    /// A read of a local file failed: the file system answered for it. A cancellation is none: it reaches the
+    /// cancellation path.
+    static func isLocalReadFailure(_ error: any Error) -> Bool {
         if case UploadError.fileMissing = error { return true }
-        let domain = (error as NSError).domain
-        return domain == NSCocoaErrorDomain || domain == NSPOSIXErrorDomain
+        let error = error as NSError
+        if error.domain == NSCocoaErrorDomain, error.code == NSUserCancelledError { return false }
+        return error.domain == NSCocoaErrorDomain || error.domain == NSPOSIXErrorDomain
     }
 
     /// A file whose folder went away after its claim, for example a drive that was unplugged during the pass, waits for

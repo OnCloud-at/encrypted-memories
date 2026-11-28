@@ -1008,6 +1008,41 @@ final class UploadBackupSyncQueueTests: XCTestCase {
         XCTAssertEqual(try store.entry(for: committed, revision: revision(1)), stored)
     }
 
+    /// A row is restored while it is in the state of its run, also a later one than `checking`, and only while it holds
+    /// a receipt exactly when the claimed row did (#1583).
+    func testARestoredClaimMatchesTheStateOfItsRunAndItsReceipt() throws {
+        let url = tempDir.appendingPathComponent(UploadBackupSyncQueueManifestStore.databaseFileName)
+        let store = try XCTUnwrap(UploadBackupSyncQueueManifestStore(url: url))
+        let source = UploadSourceIdentity.file(tempDir.appendingPathComponent("uploading.jpg"))
+        XCTAssertTrue(
+            store.upsert(
+                UploadBackupSyncQueueEntry(
+                    source: source, revision: revision(1), originalFilename: "uploading.jpg",
+                    updatedAt: Date(timeIntervalSince1970: 100))))
+        let stored = try XCTUnwrap(try store.entry(for: source, revision: revision(1)))
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 200))?.count, 1)
+        XCTAssertTrue(
+            store.updateState(
+                source: source, revision: revision(1), state: .uploading, attempts: 0, lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 201)))
+
+        XCTAssertEqual(store.restoreClaimed(stored, whileIn: .checking), false, "the run is in another state")
+        XCTAssertEqual(store.restoreClaimed(stored, whileIn: .uploading), true)
+        XCTAssertEqual(try store.entry(for: source, revision: revision(1)), stored)
+
+        XCTAssertEqual(store.claimRunnable(limit: 1, claimedAt: Date(timeIntervalSince1970: 300))?.count, 1)
+        XCTAssertTrue(
+            store.markNeedsRemoteReconciliation(
+                source: source, revision: revision(1), reconciliation: uploadReceipt(for: source), lastError: nil,
+                updatedAt: Date(timeIntervalSince1970: 301)))
+        let withReceipt = try XCTUnwrap(try store.entry(for: source, revision: revision(1)))
+
+        XCTAssertEqual(
+            store.restoreClaimed(stored, whileIn: .needsRemoteReconciliation), false,
+            "a row that gained a receipt is never written back")
+        XCTAssertEqual(try store.entry(for: source, revision: revision(1)), withReceipt)
+    }
+
     private func uploadReceipt(for source: UploadSourceIdentity) -> UploadRemoteCommitReconciliation {
         UploadRemoteCommitReconciliation(
             source: source,

@@ -176,17 +176,31 @@ final class FolderBackupController {
         registry = WatchedFolderRegistry(
             savedBookmarks: WatchedFolderScope.registeredBookmarks(
                 storedValue: UserDefaults.standard.object(forKey: Self.foldersDefaultsKey)),
-            resolve: Self.resolve(bookmark:))
+            resolve: Self.resolve(bookmark:), lastKnownPath: Self.lastKnownPath(of:))
         refreshFolderAccess()
     }
 
-    /// Resolves every bookmark again before a pass: a folder whose drive was mounted meanwhile becomes readable before
-    /// the reconcile and the claims, and one that no longer resolves is marked (#1583).
-    private func refreshFolders() {
-        if registry.refresh(resolve: Self.resolve(bookmark:)) { refreshFolderAccess() }
+    /// Resolves every bookmark again before a pass, off the main actor: a resolution can wait for a network volume. A
+    /// folder whose drive was mounted meanwhile becomes readable before the reconcile and the claims, and one that no
+    /// longer resolves is marked (#1583).
+    private func refreshFolders() async {
+        let bookmarks = registry.bookmarks
+        let resolved = await Task.detached {
+            Dictionary(
+                bookmarks.map { ($0, (Self.resolve(bookmark: $0), Self.lastKnownPath(of: $0))) },
+                uniquingKeysWith: { first, _ in first })
+        }.value
+        let savedBefore = registry.bookmarks
+        guard
+            registry.refresh(
+                resolve: { resolved[$0]?.0 ?? .unresolved }, lastKnownPath: { resolved[$0]?.1 })
+        else { return }
+        // Two folders that resolve to one path became one entry.
+        if registry.bookmarks != savedBefore { persistFolders() }
+        refreshFolderAccess()
     }
 
-    private static func resolve(bookmark: Data) -> WatchedFolderBookmarkResolution {
+    private nonisolated static func resolve(bookmark: Data) -> WatchedFolderBookmarkResolution {
         var stale = false
         guard
             let url = try? URL(
@@ -200,7 +214,7 @@ final class FolderBackupController {
     }
 
     /// The path that a bookmark recorded, also while its drive is not mounted.
-    private static func lastKnownPath(of bookmark: Data) -> String? {
+    private nonisolated static func lastKnownPath(of bookmark: Data) -> String? {
         URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
     }
 
@@ -277,8 +291,6 @@ final class FolderBackupController {
 
     func syncNow() {
         guard !isShuttingDown, !isSyncing, runnerStopTask == nil, isAvailable, let engine, let runner else { return }
-        refreshFolders()
-        reconcileQueueWithRegisteredFolders()
         let runID = UUID()
         activeRunID = runID
         isSyncing = true
@@ -288,10 +300,13 @@ final class FolderBackupController {
         let skippedFiles = FolderBackupSkippedFiles()
         scanSkippedFiles = skippedFiles
         refreshFromQueue()
-        let snapshotFolders = folders
         let statusSetupTask = self.statusSetupTask
         syncTask = Task { [weak self, statusSetupTask] in
             await statusSetupTask?.value
+            // The folders as they are now come first: the reconcile, the scan and the claims all use them.
+            await self?.refreshFolders()
+            self?.reconcileQueueWithRegisteredFolders()
+            let snapshotFolders = self?.folders ?? []
             self?.refreshFromQueue()
             var accessedURLs: [URL] = []
             defer {
@@ -392,7 +407,10 @@ final class FolderBackupController {
     /// A folder that must be picked again is no longer readable for the pending grid or the backup either; one that
     /// resolves again is readable for both.
     private func applyResolution(_ resolution: WatchedFolderBookmarkResolution, to id: WatchedFolder.ID) {
-        if registry.apply(resolution, to: id) { refreshFolderAccess() }
+        let savedBefore = registry.bookmarks
+        guard registry.apply(resolution, to: id, lastKnownPath: Self.lastKnownPath(of:)) else { return }
+        if registry.bookmarks != savedBefore { persistFolders() }
+        refreshFolderAccess()
     }
 
     private func reportFolderEnumerationError(

@@ -298,9 +298,9 @@ public protocol UploadBackupSyncQueueStore: Sendable {
         _ entry: UploadBackupSyncQueueEntry, matchingState: UploadBackupSyncQueueState, matchingLastError: String?
     ) -> Bool?
     /// Puts a claimed row back exactly as `entry` was stored before the claim, while the row is still in `state`, the
-    /// active state of its run: same state, attempts, record and date, and its receipt stays. Observers hear of it as of
-    /// the claim; the support trail records nothing, because nothing changed for the person (#1583). Nil means a failed
-    /// write; false means the row moved on.
+    /// active state of its run and still holds a receipt exactly when `entry` does: same state, attempts, record and
+    /// date, and its receipt stays. Observers hear of it as of the claim; the support trail records nothing, because
+    /// nothing changed for the person (#1583). Nil means a failed write; false means the row moved on.
     func restoreClaimed(_ entry: UploadBackupSyncQueueEntry, whileIn state: UploadBackupSyncQueueState) -> Bool?
     /// The keyed read for a decision: found, absent, or unknown. A read that could not run (a closed store, a failed
     /// bind or statement, a row that does not decode) answers unknown and never proves the row absent (#1004). The

@@ -658,7 +658,7 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                                 UPDATE backup_sync_queue
                                 SET state=?, attempts=?, last_error=?, updated_at=?
                                 WHERE source_kind=? AND source_id=? AND resource=? AND revision_us=?
-                                  AND state=?;
+                                  AND state=? AND (remote_commit_reconciliation IS NULL) = ?;
                                 """, -1, &stmt, nil) == SQLITE_OK)
                     else { return nil }
                     defer { sqlite3_finalize(stmt) }
@@ -672,6 +672,8 @@ public final class UploadBackupSyncQueueManifestStore: UploadBackupSyncQueueStor
                         }
                         sqlite3_bind_int64(stmt, 8, entry.revision.rawValue)
                         try connection.bindText(stmt, 9, state.rawValue)
+                        // A row that gained or lost a receipt since the claim moved on: it is never written back.
+                        sqlite3_bind_int(stmt, 10, entry.remoteCommitReconciliation == nil ? 1 : 0)
                     } catch {
                         return nil
                     }
