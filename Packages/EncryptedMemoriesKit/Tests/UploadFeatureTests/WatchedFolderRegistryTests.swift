@@ -300,20 +300,126 @@ final class WatchedFolderRegistryTests: XCTestCase {
         XCTAssertEqual(registry.pathsToSave, [:])
     }
 
-    /// A folder keeps each earlier path once and at most the newest `formerPathLimit` of them.
+    /// The path that the bookmark recorded always stays, beside the newest eight others.
     func testAFolderKeepsTheNewestEarlierPathsOnce() throws {
-        var registry = WatchedFolderRegistry(savedBookmarks: [driveBookmark]) { _ in
-            .resolved(path: "/Volumes/D0/Photos", isStale: false)
-        }
+        let recorded = "/Volumes/Recorded/Photos"
+        var registry = WatchedFolderRegistry(
+            savedBookmarks: [driveBookmark], resolve: { _ in .resolved(path: "/Volumes/D0/Photos", isStale: false) },
+            lastKnownPath: { _ in recorded })
         let renames = (1...12).map { "/Volumes/D\($0)/Photos" } + ["/Volumes/D3/Photos", "/Volumes/D13/Photos"]
         for path in renames {
-            registry.refresh { _ in .resolved(path: path, isStale: false) }
+            registry.refresh(resolve: { _ in .resolved(path: path, isStale: false) }, lastKnownPath: { _ in recorded })
         }
 
-        let expected = (6...12).map { "/Volumes/D\($0)/Photos" } + ["/Volumes/D3/Photos"]
-        XCTAssertEqual(WatchedFolderRegistry.formerPathLimit, expected.count)
-        XCTAssertEqual(registry.folders.map(\.formerPaths), [expected])
+        let others = (6...12).map { "/Volumes/D\($0)/Photos" } + ["/Volumes/D3/Photos"]
+        XCTAssertEqual(WatchedFolderRegistry.formerPathLimit, others.count)
+        XCTAssertEqual(registry.folders.map(\.formerPaths), [[recorded] + others])
         XCTAssertEqual(registry.folders.map(\.path), ["/Volumes/D13/Photos"])
+
+        let relaunched = WatchedFolderRegistry(
+            savedBookmarks: registry.bookmarks, savedPaths: registry.pathsToSave,
+            resolve: { _ in .unresolved }, lastKnownPath: { _ in recorded })
+        XCTAssertEqual(relaunched.folders.first?.formerPaths.first, recorded, "also when the saved paths are loaded")
+    }
+
+    /// Three folders rotate their paths in one refresh: each keeps its bookmark and its own earlier path.
+    func testThreeFoldersThatRotateTheirPathsStayThree() throws {
+        let thirdBookmark = Data("third".utf8)
+        let bookmarks = [driveBookmark, diskBookmark, thirdBookmark]
+        let paths = ["/Volumes/A-1583/DCIM", "/Volumes/B-1583/DCIM", "/Volumes/C-1583/DCIM"]
+        func path(of bookmark: Data, shift: Int) -> String {
+            paths[(bookmarks.firstIndex(of: bookmark)! + shift) % paths.count]
+        }
+        var registry = WatchedFolderRegistry(savedBookmarks: bookmarks) {
+            .resolved(path: path(of: $0, shift: 0), isStale: false)
+        }
+
+        XCTAssertTrue(registry.refresh { .resolved(path: path(of: $0, shift: 1), isStale: false) })
+
+        XCTAssertEqual(registry.folders.count, 3)
+        for bookmark in bookmarks {
+            let folder = try XCTUnwrap(registry.folders.first { $0.bookmark == bookmark })
+            XCTAssertEqual(folder.path, path(of: bookmark, shift: 1))
+            XCTAssertEqual(folder.formerPaths, [path(of: bookmark, shift: 0)])
+        }
+    }
+
+    /// The access that the app holds follows the readable folders: a folder that a refresh gives another path, also one
+    /// whose drive came back under another name before the next pass, gets a new access at that path, so its files at
+    /// the new path are read and its rows at the old path wait. With a chain of renames (Old to New, Other to Old) the
+    /// old path becomes readable for the folder that lies there now.
+    func testTheHeldAccessFollowsTheCurrentPathOfEachFolder() throws {
+        let otherBookmark = Data("other".utf8)
+        let before = [driveBookmark: "/Users/Shared/Old-1583", otherBookmark: "/Users/Shared/Other-1583"]
+        let after = [driveBookmark: "/Users/Shared/New-1583", otherBookmark: "/Users/Shared/Old-1583"]
+        var registry = WatchedFolderRegistry(savedBookmarks: [driveBookmark, otherBookmark]) {
+            .resolved(path: before[$0]!, isStale: false)
+        }
+        let drive = try XCTUnwrap(registry.folders.first { $0.bookmark == driveBookmark }?.id)
+        let other = try XCTUnwrap(registry.folders.first { $0.bookmark == otherBookmark }?.id)
+        // The app's access loop: stop, then start at the folder's path.
+        var held: [WatchedFolder.ID: String] = [:]
+        func hold() {
+            let changes = registry.accessChanges(holding: held)
+            for id in changes.stop { held[id] = nil }
+            for folder in changes.start { held[folder.id] = folder.path }
+        }
+        hold()
+        XCTAssertEqual(held, [drive: before[driveBookmark]!, other: before[otherBookmark]!])
+        XCTAssertTrue(registry.accessChanges(holding: held).stop.isEmpty, "an unchanged folder keeps its access")
+        XCTAssertTrue(registry.accessChanges(holding: held).start.isEmpty)
+
+        XCTAssertTrue(registry.refresh { .resolved(path: after[$0]!, isStale: false) })
+        XCTAssertEqual(registry.accessChanges(holding: held).stop, [drive, other])
+        hold()
+
+        XCTAssertEqual(held, [drive: after[driveBookmark]!, other: after[otherBookmark]!])
+        let scope = registry.scope(readable: held.values.map(URL.init(fileURLWithPath:)))
+        let filter = scope.claimFilter(rootExists: { _ in true })
+        XCTAssertTrue(filter.admits(path: file(in: after[driveBookmark]!)), "the files at the new path are read")
+        XCTAssertTrue(filter.admits(path: file(in: after[otherBookmark]!)), "the old path is read for its new folder")
+        XCTAssertFalse(filter.admits(path: file(in: before[otherBookmark]!)), "the rows of a path that was left wait")
+
+        XCTAssertTrue(registry.apply(.unresolved, to: drive))
+        XCTAssertEqual(registry.accessChanges(holding: held).stop, [drive], "a marked folder is not read")
+        XCTAssertTrue(registry.accessChanges(holding: held).start.isEmpty)
+    }
+
+    /// The app saves the list after a change of its bookmarks or of the paths of a folder, and not after a change that
+    /// alters neither.
+    func testTheListNeedsSavingOnlyWhenItsSavedValuesChange() throws {
+        let registry = WatchedFolderRegistry(savedBookmarks: [driveBookmark]) { _ in
+            .resolved(path: self.drive, isStale: false)
+        }
+        let id = try XCTUnwrap(registry.folders.first?.id)
+
+        var marked = registry
+        XCTAssertTrue(marked.apply(.unresolved, to: id))
+        XCTAssertFalse(marked.needsSaving(since: registry), "a marked folder keeps its saved values")
+
+        var renamed = registry
+        XCTAssertTrue(renamed.apply(.resolved(path: "/Volumes/Drive-1583 1/Photos", isStale: false), to: id))
+        XCTAssertEqual(renamed.bookmarks, registry.bookmarks)
+        XCTAssertTrue(renamed.needsSaving(since: registry), "a new path is saved")
+
+        var added = registry
+        added.add(bookmark: diskBookmark, path: disk, lastKnownPath: { _ in nil })
+        XCTAssertTrue(added.needsSaving(since: registry))
+    }
+
+    /// Saved paths that a launch found damaged keep the list unknown, also after the person removes a folder, until the
+    /// app saved the paths again: no row counts as outside before.
+    func testDamagedSavedPathsKeepTheListUnknownUntilTheyAreSavedAgain() throws {
+        var registry = WatchedFolderRegistry(savedBookmarks: [driveBookmark, diskBookmark], savedPaths: 7) {
+            .resolved(path: $0 == self.driveBookmark ? self.drive : self.disk, isStale: false)
+        }
+        registry.remove(try XCTUnwrap(registry.folders.first { $0.bookmark == diskBookmark }?.id))
+        XCTAssertFalse(registry.isKnown)
+        XCTAssertEqual(scope(registry).location(ofPath: file(in: disk)), .unavailable)
+
+        registry.pathsWereSaved()
+        XCTAssertTrue(registry.isKnown)
+        XCTAssertEqual(scope(registry).location(ofPath: file(in: disk)), .outside)
     }
 
     /// A missing saved list knows no folder, so no file counts as outside; adding or removing a folder saves a list.

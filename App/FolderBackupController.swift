@@ -186,8 +186,9 @@ final class FolderBackupController {
     }
 
     /// Resolves every bookmark again before a pass, off the main actor: a resolution can wait for a network volume. A
-    /// folder whose drive was mounted meanwhile becomes readable before the reconcile and the claims, and one that no
-    /// longer resolves is marked (#1583). A folder that the person added during the resolution stays as it is.
+    /// folder whose drive was mounted meanwhile becomes readable at its current path before the reconcile and the claims,
+    /// also under another name, and one that no longer resolves is marked (#1583). A folder that the person added during
+    /// the resolution stays as it is.
     private func refreshFolders() async {
         let bookmarks = registry.bookmarks
         let resolved = await Task.detached {
@@ -202,12 +203,9 @@ final class FolderBackupController {
 
     /// Changes the folder list, saves it when its bookmarks or paths changed, and updates the folder access.
     private func updateRegistry(_ change: (inout WatchedFolderRegistry) -> Bool) {
-        let bookmarksBefore = registry.bookmarks
-        let pathsBefore = registry.pathsToSave
+        let before = registry
         guard change(&registry) else { return }
-        if registry.bookmarks != bookmarksBefore || registry.pathsToSave != pathsBefore {
-            persistFolders()
-        }
+        if registry.needsSaving(since: before) { persistFolders() }
         refreshFolderAccess()
     }
 
@@ -229,14 +227,16 @@ final class FolderBackupController {
         URL.resourceValues(forKeys: [.pathKey], fromBookmarkData: bookmark)?.path
     }
 
-    /// Keeps every registered folder readable, for pending thumbnails, the viewer and export.
+    /// Keeps every readable folder accessible at its current path, for pending thumbnails, the viewer, export and the
+    /// backup. An access to a folder that now has another path, for example a drive that came back as "Photos 1",
+    /// starts again at the new path.
     private func refreshFolderAccess() {
-        let registered = Set(registry.readableFolders.map(\.id))
-        for (id, url) in accessedFolders where !registered.contains(id) {
-            url.stopAccessingSecurityScopedResource()
+        let changes = registry.accessChanges(holding: accessedFolders.mapValues(\.path))
+        for id in changes.stop {
+            accessedFolders[id]?.stopAccessingSecurityScopedResource()
             accessedFolders[id] = nil
         }
-        for folder in folders where registered.contains(folder.id) && accessedFolders[folder.id] == nil {
+        for folder in changes.start {
             var stale = false
             guard
                 let url = try? URL(
@@ -291,6 +291,7 @@ final class FolderBackupController {
         // The saved list is now the registry, also an empty one after the last folder was removed.
         UserDefaults.standard.set(registry.bookmarks, forKey: Self.foldersDefaultsKey)
         UserDefaults.standard.set(registry.pathsToSave, forKey: Self.pathsDefaultsKey)
+        registry.pathsWereSaved()
     }
 
     /// The queue is a derived work index. The core removes only the rows that no registered folder
