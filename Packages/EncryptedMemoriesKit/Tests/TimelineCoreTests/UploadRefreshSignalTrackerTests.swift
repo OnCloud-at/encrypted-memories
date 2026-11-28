@@ -7,6 +7,20 @@ import Testing
         UploadRefreshSignalTracker(backupRevision: 0, manualRevision: 0, passIsRunning: passIsRunning)
     }
 
+    /// The Mac follows the running state of the pass on its own and asks the same rule as `observe`.
+    @Test func aPassEndsOnlyWhenARunningPassStops() {
+        #expect(UploadRefreshSignalTracker.passEnded(wasRunning: true, isRunning: false))
+        #expect(!UploadRefreshSignalTracker.passEnded(wasRunning: true, isRunning: true))
+        #expect(!UploadRefreshSignalTracker.passEnded(wasRunning: false, isRunning: true))
+        #expect(!UploadRefreshSignalTracker.passEnded(wasRunning: false, isRunning: false))
+        for (wasRunning, isRunning) in [(true, false), (true, true), (false, true), (false, false)] {
+            var signals = tracker(passIsRunning: wasRunning)
+            let outcome = signals.observe(backupRevision: 0, manualRevision: 0, passIsRunning: isRunning)
+            let expected = UploadRefreshSignalTracker.passEnded(wasRunning: wasRunning, isRunning: isRunning)
+            #expect(outcome.passEnded == expected)
+        }
+    }
+
     @Test func aBackupUploadDuringARunningPassWaitsForTheInterval() {
         var signals = tracker(passIsRunning: true)
         let outcome = signals.observe(backupRevision: 1, manualRevision: 0, passIsRunning: true)

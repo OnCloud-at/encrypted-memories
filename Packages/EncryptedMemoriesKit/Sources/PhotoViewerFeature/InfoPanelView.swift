@@ -142,8 +142,8 @@ struct InfoPanelView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(albumTitles, id: \.self) { title in
-                    Label(title, systemImage: "rectangle.stack")
+                ForEach(ViewerChipIdentity.forTitles(albumTitles), id: \.id) { chip in
+                    Label(chip.title, systemImage: "rectangle.stack")
                         .font(.subheadline)
                 }
             }

@@ -39,6 +39,18 @@ final class MobileSearchScopeBarLayoutTests: XCTestCase {
                 + "\(measurement.prePickerAnchor); found \(measurement.firstRowTop).")
     }
 
+    /// A grid that does not start at the top of its window measures the picker in its own coordinates: the
+    /// first row keeps the same gap below the picker as a grid at the window's top. Measuring the picker in
+    /// window coordinates against the grid's own safe-area top would push the first row down by the offset.
+    @MainActor func testAGridBelowTheWindowTopKeepsTheSameGapBelowTheScopeBar() async throws {
+        let atTop = try await measureProbe(presentsScopePicker: true)
+        let offset = try await measureProbe(presentsScopePicker: true, gridTopOffset: 40)
+        XCTAssertEqual(
+            offset.gapBelowReference, atTop.gapBelowReference, accuracy: 0.5,
+            "A grid 40 points below the window top must keep the gap \(atTop.gapBelowReference) below the "
+                + "picker; found \(offset.gapBelowReference).")
+    }
+
     /// Everything both tests need from one probe window: the reference bottom of the picker chrome,
     /// the first row's window-space top, and the row's position before issue #944's gap existed.
     private struct ProbeMeasurement {
@@ -54,7 +66,9 @@ final class MobileSearchScopeBarLayoutTests: XCTestCase {
     /// Mounts the probe window, enters text, waits for the layout to settle, and measures the first
     /// row. `presentsScopePicker` chooses whether the probe attaches the system scope picker; the
     /// grid always receives the gap request, exactly like the search tab does.
-    @MainActor private func measureProbe(presentsScopePicker: Bool) async throws -> ProbeMeasurement {
+    @MainActor private func measureProbe(
+        presentsScopePicker: Bool, gridTopOffset: CGFloat = 0
+    ) async throws -> ProbeMeasurement {
         let scene = try XCTUnwrap(UIApplication.shared.foregroundWindowScene)
         let cacheDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: cacheDirectory) }
@@ -72,7 +86,8 @@ final class MobileSearchScopeBarLayoutTests: XCTestCase {
         let window = hosted.window
         window.rootViewController = UIHostingController(
             rootView: SearchScopeProbeShell(
-                items: items, feed: feed, state: state, presentsScopePicker: presentsScopePicker))
+                items: items, feed: feed, state: state, presentsScopePicker: presentsScopePicker,
+                gridTopOffset: gridTopOffset))
         window.makeKeyAndVisible()
         window.layoutIfNeeded()
         defer {
@@ -213,6 +228,8 @@ struct SearchScopeProbeShell: View {
     /// False models a search placement whose scope picker never renders above the grid, for example
     /// the system's bottom search placement. The grid still receives the gap request.
     var presentsScopePicker = true
+    /// Moves the grid this far below the window's top, as a container above the grid would.
+    var gridTopOffset: CGFloat = 0
 
     var body: some View {
         NavigationStack {
@@ -229,14 +246,17 @@ struct SearchScopeProbeShell: View {
     }
 
     private var searchableGrid: some View {
-        UIKitTimelineGrid(
-            items: items,
-            thumbnailFeed: feed,
-            level: 0,
-            fillOrder: .topLeading,
-            selectionMode: false,
-            scopeBarGap: SquareTileGridEngine.standardOuterMargin
-        )
+        VStack(spacing: 0) {
+            Color.clear.frame(height: gridTopOffset)
+            UIKitTimelineGrid(
+                items: items,
+                thumbnailFeed: feed,
+                level: 0,
+                fillOrder: .topLeading,
+                selectionMode: false,
+                scopeBarGap: SquareTileGridEngine.standardOuterMargin
+            )
+        }
         .ignoresSafeArea()
         .navigationTitle("Suche")
         .searchable(

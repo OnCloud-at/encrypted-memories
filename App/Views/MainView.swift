@@ -206,23 +206,28 @@ struct MainView: View {
     }
 
     /// Opens a pending link or Shortcuts route once the shared gate allows it. The viewer, sheets, alerts and
-    /// dialogs block it; the gate is checked again until the route opens.
+    /// dialogs block it; the gate is checked again until the route opens. While App Lock closes the app, the wait
+    /// ends when the app opens instead of asking again on a timer.
     private func openPendingRoute() async {
         while AppRoutes.inbox.pending != nil, !Task.isCancelled {
+            let blockedByAppLock = !MacAppProtection.shared.gate.admits(.app)
             let libraryWindow = NSApp.windows.first { $0.identifier?.rawValue == "library" }
             let route = AppRoutes.inbox.open(
                 window: routeWindow,
                 isActiveWindow: true,
                 libraryReady: !timelineModel.initialLibraryLoadState.isLoading,
                 presentationBlocked: viewerModel != nil || duplicateViewerGroup != nil
-                    || libraryWindow?.attachedSheet != nil || NSApp.modalWindow != nil
-                    || !MacAppProtection.shared.gate.admits(.app)
+                    || libraryWindow?.attachedSheet != nil || NSApp.modalWindow != nil || blockedByAppLock
             )
             if let route {
                 selection = route.photoFilter
                 return
             }
-            try? await Task.sleep(for: .milliseconds(250))
+            if blockedByAppLock {
+                await MacAppProtection.shared.gate.waitUntilAdmitted(.app)
+            } else {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
         }
     }
 
@@ -400,7 +405,9 @@ struct MainView: View {
                 scheduleLibraryRefreshAfterBackupUpload()
             }
             .onChange(of: model.photoBackupController?.isSyncing ?? false) { wasRunning, isRunning in
-                if wasRunning && !isRunning { libraryRefresh.backupPassDidEnd() }
+                if UploadRefreshSignalTracker.passEnded(wasRunning: wasRunning, isRunning: isRunning) {
+                    libraryRefresh.backupPassDidEnd()
+                }
             }
             .sheet(isPresented: $uploadCoordinator.isDestinationSheetPresented) {
                 UploadDestinationSheet(coordinator: uploadCoordinator)
@@ -2034,10 +2041,12 @@ struct MainView: View {
     private func recommitSuggestionTitle() {
         let decision = searchDiscovery.commitDecision(
             for: searchText, content: searchDiscoveryContent, snapshot: model.smartSearch?.snapshot, scope: searchScope)
-        guard activeCommittedSuggestion != nil || decision != .text else { return }
+        let outcome = SmartSearchDiscoveryModel.scopeChangeCommit(
+            suggestionAnswersText: activeCommittedSuggestion != nil, decision: decision)
+        guard outcome.recommit else { return }
         // The scope change reran the title as text; a title that a suggestion owns must not run as a Smart Search
         // query while that suggestion is deferred.
-        if decision != .text { semanticQuery?.clear() }
+        if outcome.clearsSemanticQuery { semanticQuery?.clear() }
         scheduleSearchCommit(searchText)
     }
 

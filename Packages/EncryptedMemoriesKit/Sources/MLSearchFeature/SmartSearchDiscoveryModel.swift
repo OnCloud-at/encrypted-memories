@@ -68,6 +68,16 @@ public enum SmartSearchSuggestionCommitDecision: Equatable {
     case text
 }
 
+/// What a host does with the field's text after the search scope changed. A suggestion's result set answers only
+/// the Smart Search scope: another scope searches the shown title as text, and Smart Search returns to the
+/// suggestion.
+public struct SmartSearchScopeChangeCommit: Equatable, Sendable {
+    /// The field's text is committed again.
+    public let recommit: Bool
+    /// The semantic query is dropped before the commit runs.
+    public let clearsSemanticQuery: Bool
+}
+
 /// What a host does with a structured suggestion that was selected earlier.
 public enum SmartSearchSuggestionRebindResult: Equatable {
     /// The current version of the suggestion, with its current result set.
@@ -309,6 +319,41 @@ public final class SmartSearchDiscoveryModel {
             return .deferUntilRefresh
         }
         return .text
+    }
+
+    /// The selected suggestion while its result set answers `text`: it carries a result set and `text` shows its title.
+    /// The scope is not part of it; `commitDecision(selected:for:scope:)` adds it.
+    public nonisolated static func answeringSuggestion(
+        _ selected: TimelineSearchSuggestion?, for text: String
+    ) -> TimelineSearchSuggestion? {
+        guard let selected, selected.matchingUIDs != nil, selected.owns(searchText: text) else { return nil }
+        return selected
+    }
+
+    /// What to do with a search text when a suggestion is chosen explicitly rather than matched by its title: the
+    /// selected suggestion while it answers `text` in a scope its results answer, else plain text. This decision
+    /// never defers a title; only `commitDecision(for:content:snapshot:scope:)` waits for a refresh.
+    public nonisolated static func commitDecision(
+        selected: TimelineSearchSuggestion?, for text: String, scope: MLSearchScope
+    ) -> SmartSearchSuggestionCommitDecision {
+        guard usesSuggestionResults(in: scope), let suggestion = answeringSuggestion(selected, for: text) else {
+            return .text
+        }
+        return .structured(suggestion)
+    }
+
+    /// Whether the field's text is committed again after a scope change, and whether the semantic query is dropped
+    /// before that commit. `suggestionAnswersText` tells whether a suggestion answered the text before the change;
+    /// `decision` is the host's commit decision for the text in the new scope. The text is committed again while a
+    /// suggestion answered it, because another scope searches the title as text, and whenever a suggestion owns it in
+    /// the new scope. The semantic query is dropped whenever a suggestion owns the text in the new scope, so its title
+    /// never runs as a Smart Search query, also while that suggestion waits for a refresh.
+    public nonisolated static func scopeChangeCommit(
+        suggestionAnswersText: Bool, decision: SmartSearchSuggestionCommitDecision
+    ) -> SmartSearchScopeChangeCommit {
+        let suggestionOwnsText = decision != .text
+        return SmartSearchScopeChangeCommit(
+            recommit: suggestionAnswersText || suggestionOwnsText, clearsSemanticQuery: suggestionOwnsText)
     }
 
     /// What to do with a suggestion that was selected earlier, after the library or the search availability

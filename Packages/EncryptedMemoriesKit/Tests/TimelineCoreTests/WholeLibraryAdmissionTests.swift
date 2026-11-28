@@ -194,6 +194,118 @@ import Testing
     }
 
     #if DEBUG
+        @Test(.timeLimit(.minutes(1)))
+        func aTrashProjectionKeepsARouteEntryThatLoadedWhileItRan() async throws {
+            let fixture = try await AdmissionFixture(answers: [.accepted], photoCount: 3)
+            await fixture.timeline.load()
+            fixture.timeline.markInitialContentReady()
+
+            // While the trash projection is computing, a person opens another album, so that route's
+            // sections enter the cache before the projection writes.
+            let rival = PhotoFilter.album(id: "rival", title: "Rival")
+            var gated = true
+            fixture.timeline.afterProjectionComputedForTesting = {
+                guard gated else { return }
+                gated = false
+                await fixture.timeline.select(rival)
+            }
+
+            let victim = try #require(fixture.timeline.wholeLibraryUIDs.first)
+            await fixture.timeline.commitTrash(uids: [victim])
+
+            // The projection may only replace the routes it projected; the album the person opened keeps
+            // its cached entry.
+            #expect(fixture.timeline.filterCacheForTesting.routes.contains(rival))
+            await fixture.close()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aTrashProjectionKeepsARouteEntryThatARefreshStoredWhileItRan() async throws {
+            let fixture = try await AdmissionFixture(answers: [.accepted], photoCount: 3)
+            await fixture.timeline.load()
+            fixture.timeline.markInitialContentReady()
+            let album = PhotoFilter.album(id: "album", title: "Album")
+            let member = admissionItem("album-member")
+            await fixture.library.setItems([member], for: album)
+            await fixture.timeline.select(album)
+            #expect(fixture.timeline.filterCacheForTesting.snapshot(for: album)?.flatMap(\.items) == [member])
+
+            // While the trash projection is computing, a photo arrives in the open album and a refresh reads it.
+            let arriving = admissionItem("album-arrival")
+            var gated = true
+            fixture.timeline.afterProjectionComputedForTesting = {
+                guard gated else { return }
+                gated = false
+                await fixture.library.setItems([member, arriving], for: album)
+                await fixture.timeline.refreshLibrary()
+            }
+
+            let victim = try #require(fixture.timeline.wholeLibraryUIDs.first)
+            await fixture.timeline.commitTrash(uids: [victim])
+
+            // The projection removes the trashed photo from the refreshed entry instead of restoring the older one.
+            let cached = fixture.timeline.filterCacheForTesting.snapshot(for: album)?.flatMap(\.items).map(\.uid)
+            #expect(cached == [member.uid, arriving.uid])
+            await fixture.close()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aRestoreProjectionKeepsATrashEntryThatARefreshStoredWhileItRan() async throws {
+            let fixture = try await AdmissionFixture(answers: [.accepted], photoCount: 3)
+            await fixture.timeline.load()
+            fixture.timeline.markInitialContentReady()
+            let restored = admissionItem("trashed-restored")
+            let kept = admissionItem("trashed-kept")
+            await fixture.library.setItems([restored, kept], for: .trash)
+            await fixture.timeline.select(.trash)
+
+            // While the restore projection is computing, another photo arrives in Recently Deleted and a refresh
+            // reads it.
+            let arriving = admissionItem("trashed-arrival")
+            var gated = true
+            fixture.timeline.afterProjectionComputedForTesting = {
+                guard gated else { return }
+                gated = false
+                await fixture.library.setItems([restored, kept, arriving], for: .trash)
+                await fixture.timeline.refreshLibrary()
+            }
+
+            await fixture.timeline.commitRestore([restored])
+
+            // The projection removes the restored photo from the refreshed entry instead of restoring the older one.
+            let cached = fixture.timeline.filterCacheForTesting.snapshot(for: .trash)?.flatMap(\.items).map(\.uid)
+            #expect(cached.map(Set.init) == [kept.uid, arriving.uid])
+            await fixture.close()
+        }
+
+        @Test(.timeLimit(.minutes(1)))
+        func aTrashProjectionKeepsATrashThatWasEmptiedWhileItRan() async throws {
+            let fixture = try await AdmissionFixture(answers: [.accepted], photoCount: 3)
+            await fixture.timeline.load()
+            fixture.timeline.markInitialContentReady()
+            let emptied = admissionItem("trashed-emptied")
+            await fixture.library.setItems([emptied], for: .trash)
+            await fixture.timeline.select(.trash)
+
+            // While the trash projection is computing, the person empties Recently Deleted.
+            var gated = true
+            fixture.timeline.afterProjectionComputedForTesting = {
+                guard gated else { return }
+                gated = false
+                fixture.timeline.commitEmptyTrash([emptied.uid])
+            }
+
+            let victim = try #require(fixture.timeline.wholeLibraryUIDs.first)
+            await fixture.timeline.commitTrash(uids: [victim])
+
+            // Recently Deleted holds only the newly trashed photo; the emptied one does not come back.
+            let cached = fixture.timeline.filterCacheForTesting.snapshot(for: .trash)?.flatMap(\.items).map(\.uid)
+            #expect(cached == [victim])
+            await fixture.close()
+        }
+    #endif
+
+    #if DEBUG
         @Test func cancellingTheRuntimeStopsACrawlStartThatHasNotReachedTheFeed() async throws {
             let fixture = try await AdmissionFixture(answers: [], enablesCrawl: true)
             let timeline = fixture.timeline
@@ -371,7 +483,9 @@ private actor AdmissionLibrary: PhotosRepository, PhotoLibraryProvider, LibraryC
     func libraryChangeToken() async throws -> String { "validated" }
     func launchValidationToken(for snapshot: CachedTimelineSnapshot) async throws -> String { "validated" }
     func monitorBaseline(for token: String) async throws -> String { token }
-    func timeline(filter: PhotoFilter) async throws -> [TimelineSection] { [] }
+    private var routeItems: [PhotoFilter: [PhotoItem]] = [:]
+    func setItems(_ items: [PhotoItem], for route: PhotoFilter) { routeItems[route] = items }
+    func timeline(filter: PhotoFilter) async throws -> [TimelineSection] { admissionSections(routeItems[filter] ?? []) }
 
     var isHoldingListing: Bool { held != nil }
 

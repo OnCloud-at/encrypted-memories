@@ -169,20 +169,24 @@ struct MobileTimelineScreen: View {
                     semanticQuery?.setScope(scope)
                     // A suggestion's result set answers only the Smart Search scope. Commit its title again: another
                     // scope searches it as text, and Smart Search returns to the suggestion. Typed text needs nothing
-                    // here; the semantic coordinator reruns it in the new scope.
-                    if let activeSearchSuggestion, activeSearchSuggestion.matchingUIDs != nil,
-                        activeSearchSuggestion.owns(searchText: searchText)
-                    {
-                        scheduleSearchCommit(searchText)
-                    }
+                    // here; the semantic coordinator reruns it in the new scope. The shared rule decides it from this
+                    // screen's own commit decision, which commits only the selected suggestion.
+                    let outcome = SmartSearchDiscoveryModel.scopeChangeCommit(
+                        suggestionAnswersText: SmartSearchDiscoveryModel.answeringSuggestion(
+                            activeSearchSuggestion, for: searchText) != nil,
+                        decision: SmartSearchDiscoveryModel.commitDecision(
+                            selected: activeSearchSuggestion, for: searchText, scope: scope))
+                    if outcome.clearsSemanticQuery { semanticQuery?.clear() }
+                    if outcome.recommit { scheduleSearchCommit(searchText) }
                 }
                 .onChange(of: searchText) { _, value in scheduleSearchCommit(value) }
                 .onChange(of: activeSearchSuggestion) { _, suggestion in
                     // The search tab replaces the selected suggestion with its current version after a library
                     // change. The grid follows it while the committed text still shows its title.
-                    guard let suggestion, suggestion.matchingUIDs != nil,
-                        committedSuggestion?.id == suggestion.id,
-                        suggestion.owns(searchText: normalizedCommittedSearchText)
+                    guard
+                        let suggestion = SmartSearchDiscoveryModel.answeringSuggestion(
+                            suggestion, for: normalizedCommittedSearchText),
+                        committedSuggestion?.id == suggestion.id
                     else { return }
                     committedSuggestion = suggestion
                 }
@@ -780,15 +784,14 @@ struct MobileTimelineScreen: View {
             semanticQuery = nil
             semanticQueryLifecycle = nil
         }
-        if let activeSearchSuggestion, activeSearchSuggestion.matchingUIDs != nil,
-            activeSearchSuggestion.owns(searchText: normalizedValue),
-            SmartSearchDiscoveryModel.usesSuggestionResults(in: searchScope)
+        if case .structured(let suggestion) = SmartSearchDiscoveryModel.commitDecision(
+            selected: activeSearchSuggestion, for: normalizedValue, scope: searchScope)
         {
             // A selected suggestion already carries its result set. Commit it in the same update, without the
             // typing debounce, so the grid never shows the full library in between; a semantic query for its
             // title would only compete.
             semanticQuery?.clear()
-            committedSuggestion = activeSearchSuggestion
+            committedSuggestion = suggestion
             committedSearchText = value
             searchDebounceTask = nil
             return

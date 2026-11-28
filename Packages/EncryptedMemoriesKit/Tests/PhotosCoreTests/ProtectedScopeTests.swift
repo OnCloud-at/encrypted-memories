@@ -696,6 +696,78 @@ final class ProtectedScopeTests: XCTestCase {
         XCTAssertEqual(gate.state(of: Self.protectedArea), .locked)
     }
 
+    // MARK: - Admission waiter
+
+    func testTheAdmissionWaiterReturnsAtOnceForAnOpenGate() async {
+        let gate = makeGate()
+        await gate.waitUntilAdmitted(app)
+        XCTAssertTrue(gate.admits(app))
+    }
+
+    func testTheAdmissionWaiterSleepsWhileTheGateStaysClosedAndReturnsWhenItOpens() async {
+        defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
+        let gate = makeGate(ScriptedAuthenticator(results: [.failed, .success]))
+        let returned = AsyncTestSignal()
+        let waiter = Task {
+            await gate.waitUntilAdmitted(app)
+            returned.fire()
+        }
+        defer { waiter.cancel() }
+
+        await yieldToWaitingTasks()
+        XCTAssertFalse(returned.hasFired, "a closed gate keeps the waiter asleep")
+
+        _ = await gate.unlock(app, reason: "first try")
+        await yieldToWaitingTasks()
+        XCTAssertFalse(gate.admits(app))
+        XCTAssertFalse(returned.hasFired, "a failed attempt keeps the gate closed and the waiter asleep")
+
+        _ = await gate.unlock(app, reason: "second try")
+        let opened = await returned.wait(limit: .seconds(20))
+        XCTAssertTrue(opened, "the waiter returns when the gate opens")
+        XCTAssertTrue(gate.admits(app))
+    }
+
+    func testTheAdmissionWaiterFollowsAGateThatTheSystemLockClosedUntilTheNextUnlock() async {
+        defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
+        let gate = makeGate(ScriptedAuthenticator(results: [.success, .success]))
+        _ = await gate.unlock(app, reason: "first open")
+        XCTAssertTrue(gate.admits(app))
+        gate.systemDidLock()
+        XCTAssertFalse(gate.admits(app))
+
+        let returned = AsyncTestSignal()
+        let waiter = Task {
+            await gate.waitUntilAdmitted(app)
+            returned.fire()
+        }
+        defer { waiter.cancel() }
+        await yieldToWaitingTasks()
+        XCTAssertFalse(returned.hasFired, "the relocked gate keeps the waiter asleep")
+
+        _ = await gate.unlock(app, reason: "reopen")
+        let reopened = await returned.wait(limit: .seconds(20))
+        XCTAssertTrue(reopened, "the waiter returns at the next unlock")
+        XCTAssertTrue(gate.admits(app))
+    }
+
+    func testCancellingTheTaskEndsTheAdmissionWaiterWhileTheGateStaysClosed() async {
+        defaults.set(true, forKey: AppSettingsKey.appLockEnabled)
+        let gate = makeGate()
+        let returned = AsyncTestSignal()
+        let waiter = Task {
+            await gate.waitUntilAdmitted(app)
+            returned.fire()
+        }
+        await yieldToWaitingTasks()
+        XCTAssertFalse(returned.hasFired)
+
+        waiter.cancel()
+        let ended = await returned.wait(limit: .seconds(20))
+        XCTAssertTrue(ended, "a cancelled task ends the wait")
+        XCTAssertFalse(gate.admits(app), "the gate stays closed")
+    }
+
     // MARK: - Helpers
 
     private func makeGate(_ authenticator: ScriptedAuthenticator = ScriptedAuthenticator(results: [])) -> AccessGate {

@@ -179,6 +179,10 @@ public final class LibraryRuntimeState: @unchecked Sendable {
     private let lock = NSLock()
     private var current: LibraryRuntimeSnapshot
     private var activities: [UUID: LibraryRuntimeActivity] = [:]
+    /// Guards only `continuations`, and nothing holds it while it yields. A subscriber's stream ends inside its
+    /// task's cancellation, while a writer under `lock` may be resuming that same task; the end therefore takes only
+    /// this lock, never `lock`, so neither side waits for the other.
+    private let subscribersLock = NSLock()
     private var continuations: [UUID: AsyncStream<LibraryRuntimeSnapshot>.Continuation] = [:]
 
     public init(initial: LibraryRuntimeSnapshot = .initial) {
@@ -194,7 +198,9 @@ public final class LibraryRuntimeState: @unchecked Sendable {
         _ transform: (inout LibraryRuntimeSnapshot) -> Void
     ) -> LibraryRuntimeSnapshot {
         // Writers run on several threads (the network queue and the main actor). Yielding inside the lock keeps the
-        // subscribers in write order, so none ends on an older snapshot. A newest-only buffer never blocks a yield.
+        // subscribers in write order, so none ends on an older snapshot. The newest-only buffer never blocks, but a
+        // yield can wait briefly to resume the subscriber's task; writers therefore never hold `subscribersLock` while
+        // they yield.
         lock.withLock {
             var next = current
             transform(&next)
@@ -206,7 +212,7 @@ public final class LibraryRuntimeState: @unchecked Sendable {
             guard next != current else { return current }
             next.monotonicUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
             current = next
-            for continuation in continuations.values { continuation.yield(next) }
+            for continuation in subscribers() { continuation.yield(next) }
             return next
         }
     }
@@ -234,7 +240,7 @@ public final class LibraryRuntimeState: @unchecked Sendable {
                     generation: generation
                 )
                 : LibraryRuntimeSnapshot(generation: generation)
-            for continuation in continuations.values { continuation.yield(current) }
+            for continuation in subscribers() { continuation.yield(current) }
             return current
         }
     }
@@ -276,13 +282,18 @@ public final class LibraryRuntimeState: @unchecked Sendable {
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             // Same lock as the writers: a newer snapshot can never be overtaken by this first one.
             lock.withLock {
-                continuations[id] = continuation
+                subscribersLock.withLock { continuations[id] = continuation }
                 continuation.yield(current)
             }
             continuation.onTermination = { [weak self] _ in
-                self?.lock.withLock { self?.continuations[id] = nil }
+                guard let self else { return }
+                self.subscribersLock.withLock { self.continuations[id] = nil }
             }
         }
+    }
+
+    private func subscribers() -> [AsyncStream<LibraryRuntimeSnapshot>.Continuation] {
+        subscribersLock.withLock { Array(continuations.values) }
     }
 }
 

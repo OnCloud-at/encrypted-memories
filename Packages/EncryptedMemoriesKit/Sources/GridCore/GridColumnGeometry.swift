@@ -10,7 +10,7 @@ package enum GridApparentMetrics {
         if x >= CGFloat(last) { return side(last) }
         let lo = Int(x)
         let t = x - CGFloat(lo)
-        return side(lo) + (side(lo + 1) - side(lo)) * t * t * (3 - 2 * t)
+        return side(lo) + (side(lo + 1) - side(lo)) * gridSmoothstep(t)
     }
 
     /// The apparent gap for a continuous level position `x`: the gap of the bracketing detents, eased with the

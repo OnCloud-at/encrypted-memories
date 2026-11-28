@@ -363,24 +363,30 @@ private struct MobileMainTabView: View {
 
     /// Opens a pending link or Shortcuts route in this window once the shared gate allows it. Sheets, alerts and
     /// covers are presented view controllers; the gate is checked again until the route opens or another
-    /// window takes it.
+    /// window takes it. While App Lock closes the app, the wait ends when the app opens instead of asking again on
+    /// a timer.
     private func openPendingRoute() async {
         while let pending = AppRoutes.inbox.pending, !Task.isCancelled {
             // A link that another window received is that window's to open.
             if case .window(let target) = pending.target, target != sceneContext.id { return }
+            let blockedByAppLock = !MobileAppProtection.gate.admits(.app)
             let route = AppRoutes.inbox.open(
                 window: sceneContext.id,
                 isActiveWindow: scenePhase == .active && sceneContext.window?.isKeyWindow == true,
                 libraryReady: !libraryModel.loadState.isLoading && !libraryModel.isRecoveringScope,
                 presentationBlocked: viewerRouter.presentation != nil
                     || sceneContext.window?.rootViewController?.presentedViewController != nil
-                    || !MobileAppProtection.gate.admits(.app)
+                    || blockedByAppLock
             )
             if let route {
                 show(route)
                 return
             }
-            try? await Task.sleep(for: .milliseconds(250))
+            if blockedByAppLock {
+                await MobileAppProtection.gate.waitUntilAdmitted(.app)
+            } else {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
         }
     }
 
