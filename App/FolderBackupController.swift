@@ -56,6 +56,8 @@ final class FolderBackupController {
     private var skippedCount = FolderBackupSkippedCount()
 
     private static let foldersDefaultsKey = "backup.folderBookmarks.v1"
+    /// The paths of the folders, beside the bookmark list that older versions read unchanged (#1583).
+    private static let pathsDefaultsKey = "backup.folderPaths.v1"
 
     /// `pendingRecorder` is the photo backup's recorder, so one event stream serves the pending grid.
     init(
@@ -173,16 +175,19 @@ final class FolderBackupController {
     }
 
     private func loadFolders() {
+        let savedPaths = UserDefaults.standard.object(forKey: Self.pathsDefaultsKey)
         registry = WatchedFolderRegistry(
             savedBookmarks: WatchedFolderScope.registeredBookmarks(
                 storedValue: UserDefaults.standard.object(forKey: Self.foldersDefaultsKey)),
+            savedPaths: savedPaths,
             resolve: Self.resolve(bookmark:), lastKnownPath: Self.lastKnownPath(of:))
+        if registry.pathsNeedSaving(comparedTo: savedPaths) { persistFolders() }
         refreshFolderAccess()
     }
 
     /// Resolves every bookmark again before a pass, off the main actor: a resolution can wait for a network volume. A
     /// folder whose drive was mounted meanwhile becomes readable before the reconcile and the claims, and one that no
-    /// longer resolves is marked (#1583).
+    /// longer resolves is marked (#1583). A folder that the person added during the resolution stays as it is.
     private func refreshFolders() async {
         let bookmarks = registry.bookmarks
         let resolved = await Task.detached {
@@ -190,13 +195,19 @@ final class FolderBackupController {
                 bookmarks.map { ($0, (Self.resolve(bookmark: $0), Self.lastKnownPath(of: $0))) },
                 uniquingKeysWith: { first, _ in first })
         }.value
-        let savedBefore = registry.bookmarks
-        guard
-            registry.refresh(
-                resolve: { resolved[$0]?.0 ?? .unresolved }, lastKnownPath: { resolved[$0]?.1 })
-        else { return }
-        // Two folders that resolve to one path became one entry.
-        if registry.bookmarks != savedBefore { persistFolders() }
+        updateRegistry {
+            $0.refresh(resolve: { resolved[$0]?.0 }, lastKnownPath: { resolved[$0]?.1 })
+        }
+    }
+
+    /// Changes the folder list, saves it when its bookmarks or paths changed, and updates the folder access.
+    private func updateRegistry(_ change: (inout WatchedFolderRegistry) -> Bool) {
+        let bookmarksBefore = registry.bookmarks
+        let pathsBefore = registry.pathsToSave
+        guard change(&registry) else { return }
+        if registry.bookmarks != bookmarksBefore || registry.pathsToSave != pathsBefore {
+            persistFolders()
+        }
         refreshFolderAccess()
     }
 
@@ -279,6 +290,7 @@ final class FolderBackupController {
     private func persistFolders() {
         // The saved list is now the registry, also an empty one after the last folder was removed.
         UserDefaults.standard.set(registry.bookmarks, forKey: Self.foldersDefaultsKey)
+        UserDefaults.standard.set(registry.pathsToSave, forKey: Self.pathsDefaultsKey)
     }
 
     /// The queue is a derived work index. The core removes only the rows that no registered folder
@@ -407,10 +419,7 @@ final class FolderBackupController {
     /// A folder that must be picked again is no longer readable for the pending grid or the backup either; one that
     /// resolves again is readable for both.
     private func applyResolution(_ resolution: WatchedFolderBookmarkResolution, to id: WatchedFolder.ID) {
-        let savedBefore = registry.bookmarks
-        guard registry.apply(resolution, to: id, lastKnownPath: Self.lastKnownPath(of:)) else { return }
-        if registry.bookmarks != savedBefore { persistFolders() }
-        refreshFolderAccess()
+        updateRegistry { $0.apply(resolution, to: id, lastKnownPath: Self.lastKnownPath(of:)) }
     }
 
     private func reportFolderEnumerationError(

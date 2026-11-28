@@ -469,6 +469,46 @@ final class FolderBackupIntegrationTests: XCTestCase {
         XCTAssertNil(try queueStore.entry(for: sent.source, revision: sent.revision))
     }
 
+    /// A launch found the drive under another name ("Photos 1") and queued its files there; the next launch finds it
+    /// under its first name again. The saved paths keep the rows of "Photos 1", receipts included, also after the person
+    /// adds the folder again and the app starts once more; they leave the queue when the person removes the folder
+    /// (#1583).
+    func testTheRowsOfAnEarlierPathOutliveARelaunchAndLeaveWithTheFolder() async throws {
+        let (new, sent) = try await queueNewAndSentFiles()
+        let firstName = tempDir.appendingPathComponent("Original", isDirectory: true)
+        let bookmark = Data("folder".utf8)
+        let launch = WatchedFolderRegistry(
+            savedBookmarks: [bookmark], resolve: { _ in .resolved(path: self.folder.path, isStale: false) },
+            lastKnownPath: { _ in firstName.path })
+        XCTAssertTrue(launch.pathsNeedSaving(comparedTo: nil))
+        let savedAtLaunch = launch.pathsToSave
+        try FileManager.default.moveItem(at: folder, to: firstName)
+
+        var relaunch = WatchedFolderRegistry(
+            savedBookmarks: launch.bookmarks, savedPaths: savedAtLaunch,
+            resolve: { _ in .resolved(path: firstName.path, isStale: false) }, lastKnownPath: { _ in firstName.path })
+
+        XCTAssertEqual(queueStore.removeFileSources(outside: registryScope(relaunch)), 0)
+        XCTAssertEqual(try queueStore.entry(for: new.source, revision: new.revision), new)
+        XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
+
+        let addedAgain = Data("folder again".utf8)
+        relaunch.add(bookmark: addedAgain, path: firstName.path, lastKnownPath: { _ in nil })
+        XCTAssertEqual(queueStore.removeFileSources(outside: registryScope(relaunch)), 0)
+        let third = WatchedFolderRegistry(
+            savedBookmarks: relaunch.bookmarks, savedPaths: relaunch.pathsToSave,
+            resolve: { _ in .resolved(path: firstName.path, isStale: false) }, lastKnownPath: { _ in nil })
+        XCTAssertEqual(queueStore.removeFileSources(outside: registryScope(third)), 0)
+        XCTAssertEqual(try queueStore.entry(for: sent.source, revision: sent.revision), sent)
+
+        var removed = third
+        removed.remove(try XCTUnwrap(removed.folders.first?.id))
+        XCTAssertEqual(removed.pathsToSave, [:])
+        XCTAssertEqual(queueStore.removeFileSources(outside: registryScope(removed)), 2)
+        XCTAssertNil(try queueStore.entry(for: sent.source, revision: sent.revision))
+        XCTAssertNil(try queueStore.entry(for: new.source, revision: new.revision))
+    }
+
     /// A row of a drive that is away sets no time in the waiting status: its wait ends only when the drive is back
     /// (#1583).
     func testARowOfADriveThatIsAwaySetsNoTimeInTheWaitingStatus() async throws {

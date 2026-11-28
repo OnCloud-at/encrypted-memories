@@ -9,8 +9,10 @@ public struct WatchedFolder: Identifiable, Equatable, Sendable {
     /// True while the bookmark does not resolve cleanly: the app does not read the folder.
     public var needsRenewal: Bool
     /// Paths that the folder had before, for example the path its bookmark recorded before its drive was mounted under
-    /// another name ("Drive 1"). Its rows from then keep that path. While the folder is registered, none of them counts
-    /// as outside and none is read; they leave the queue when the person removes the folder (#1583).
+    /// another name ("Drive 1"), oldest first. Its rows from then keep that path. While the folder is registered, none of
+    /// them counts as outside and none is read; they leave the queue when the person removes the folder (#1583). The app
+    /// saves them with the folder list (`WatchedFolderRegistry.pathsToSave`) and keeps the newest
+    /// `WatchedFolderRegistry.formerPathLimit`.
     public var formerPaths: [String]
 
     public init(
@@ -41,33 +43,58 @@ public enum WatchedFolderBookmarkResolution: Sendable, Equatable {
 /// bookmark calls and passes their results in; this type decides the folder list and the scope. `lastKnownPath` gives
 /// the path that a bookmark recorded, also while its drive is not mounted.
 public struct WatchedFolderRegistry: Sendable, Equatable {
+    /// The most earlier paths that one folder keeps; an older one leaves first.
+    public static let formerPathLimit = 8
+
     public private(set) var folders: [WatchedFolder]
-    /// False while the saved folder list is missing or could not be read: then no folder is known.
+    /// False while the saved folder list, or the saved paths of its folders, is missing or could not be read: then no
+    /// folder is known.
     public private(set) var isKnown: Bool
 
-    /// `savedBookmarks` is the saved folder list, nil when it is missing or damaged.
+    /// `savedBookmarks` is the saved folder list, nil when it is missing or damaged. `savedPaths` is the saved value of
+    /// `pathsToSave`: each saved path of a folder counts as an earlier one until its bookmark resolves to it again. A
+    /// list that the app saved before it kept the paths has none, and a value of another type is damaged.
     public init(
         savedBookmarks: [Data]?,
+        savedPaths: Any? = nil,
         resolve: (Data) -> WatchedFolderBookmarkResolution,
         lastKnownPath: (Data) -> String? = { _ in nil }
     ) {
-        isKnown = savedBookmarks != nil
+        let saved: [String: [String]]? = savedPaths == nil ? [:] : savedPaths as? [String: [String]]
+        isKnown = savedBookmarks != nil && saved != nil
+        var resolvedIDs: Set<WatchedFolder.ID> = []
         folders = (savedBookmarks ?? []).map { bookmark in
-            switch resolve(bookmark) {
-            case .resolved(let path, let isStale):
-                WatchedFolder(
-                    bookmark: bookmark, path: path, needsRenewal: isStale,
-                    formerPaths: [lastKnownPath(bookmark)].compactMap { $0 }.filter { $0 != path })
-            case .unresolved:
-                WatchedFolder(bookmark: bookmark, path: nil, needsRenewal: true)
-            }
+            var folder = WatchedFolder(
+                bookmark: bookmark, path: nil, needsRenewal: true,
+                formerPaths: Self.formerPaths(saved?[Self.pathKey(of: bookmark)] ?? [], besides: nil))
+            let resolution = resolve(bookmark)
+            if case .resolved = resolution { resolvedIDs.insert(folder.id) }
+            Self.update(&folder, with: resolution, lastKnownPath: lastKnownPath)
+            return folder
         }
-        mergeFoldersWithTheSamePath()
+        mergeFolders(withTheSamePathAmong: resolvedIDs)
         sort()
     }
 
     /// The bookmarks to save.
     public var bookmarks: [Data] { folders.map(\.bookmark) }
+
+    /// The paths to save beside the bookmarks: a property list that maps the Base64 text of a bookmark to every path of
+    /// its folder, the current one last. After a relaunch the current path counts as an earlier one too, should the
+    /// bookmark then resolve to another path, so the rows from now keep a registered path. A folder without a path has
+    /// no entry.
+    public var pathsToSave: [String: [String]] {
+        folders.reduce(into: [:]) { saved, folder in
+            let paths = folder.formerPaths + [folder.path].compactMap { $0 }
+            if !paths.isEmpty { saved[Self.pathKey(of: folder.bookmark)] = paths }
+        }
+    }
+
+    /// True when the paths of a known folder list differ from `savedPaths`, the value that the app loaded: the launch
+    /// saves them, so a path that a bookmark resolved to at this launch counts as an earlier one at the next.
+    public func pathsNeedSaving(comparedTo savedPaths: Any?) -> Bool {
+        isKnown && pathsToSave != (savedPaths as? [String: [String]] ?? [:])
+    }
 
     /// The folders that the app may read now.
     public var readableFolders: [WatchedFolder] { folders.filter { !$0.needsRenewal && $0.path != nil } }
@@ -75,7 +102,8 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
     /// Applies a new resolution of one folder's bookmark. A bookmark that resolves cleanly again, for example after its
     /// drive was mounted, makes the folder readable with its current path; a path that it had before stays registered.
     /// One that no longer resolves keeps the last path, so its rows stay where they are, and marks the folder. Two
-    /// folders that resolve to the same path become one. Returns true when the folder list changed.
+    /// folders never become one here: another folder can still hold the path from before its own drive moved, so only
+    /// `refresh` joins folders. Returns true when the folder list changed.
     @discardableResult
     public mutating func apply(
         _ resolution: WatchedFolderBookmarkResolution, to id: WatchedFolder.ID,
@@ -83,31 +111,30 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
     ) -> Bool {
         guard let index = folders.firstIndex(where: { $0.id == id }) else { return false }
         let before = folders
-        switch resolution {
-        case .resolved(let path, let isStale):
-            let earlier = [folders[index].path, lastKnownPath(folders[index].bookmark)].compactMap { $0 }
-            folders[index].formerPaths = Self.unique(folders[index].formerPaths + earlier).filter { $0 != path }
-            folders[index].path = path
-            folders[index].needsRenewal = isStale
-        case .unresolved:
-            folders[index].needsRenewal = true
-        }
-        mergeFoldersWithTheSamePath()
+        Self.update(&folders[index], with: resolution, lastKnownPath: lastKnownPath)
         guard folders != before else { return false }
         sort()
         return true
     }
 
-    /// Resolves every folder again and applies the results. Returns true when the folder list changed.
+    /// Applies a new resolution of every folder, then joins the folders whose bookmarks resolved to the same path in
+    /// this refresh. A folder whose `resolve` gives nil stays as it is, for example one that the person added while the
+    /// bookmarks resolved. Returns true when the folder list changed.
     @discardableResult
     public mutating func refresh(
-        resolve: (Data) -> WatchedFolderBookmarkResolution, lastKnownPath: (Data) -> String? = { _ in nil }
+        resolve: (Data) -> WatchedFolderBookmarkResolution?, lastKnownPath: (Data) -> String? = { _ in nil }
     ) -> Bool {
-        var changed = false
-        for folder in folders where apply(resolve(folder.bookmark), to: folder.id, lastKnownPath: lastKnownPath) {
-            changed = true
+        let before = folders
+        var resolvedIDs: Set<WatchedFolder.ID> = []
+        for index in folders.indices {
+            guard let resolution = resolve(folders[index].bookmark) else { continue }
+            if case .resolved = resolution { resolvedIDs.insert(folders[index].id) }
+            Self.update(&folders[index], with: resolution, lastKnownPath: lastKnownPath)
         }
-        return changed
+        mergeFolders(withTheSamePathAmong: resolvedIDs)
+        guard folders != before else { return false }
+        sort()
+        return true
     }
 
     /// Adds the folder at `path`. It replaces a registered folder with the same path, and a folder whose bookmark does
@@ -123,7 +150,7 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
         folders.append(
             WatchedFolder(
                 bookmark: bookmark, path: path, needsRenewal: false,
-                formerPaths: Self.unique(replaced.flatMap(\.formerPaths)).filter { $0 != path }))
+                formerPaths: Self.formerPaths(replaced.flatMap(\.formerPaths), besides: path)))
         isKnown = true
         sort()
     }
@@ -141,26 +168,51 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
             readable: readable, registered: isKnown ? folders.flatMap { [$0.displayPath] + $0.formerPaths } : nil)
     }
 
-    /// Keeps one folder per path: the one that the app may read, or else the first one. It takes the others' earlier
-    /// paths.
-    private mutating func mergeFoldersWithTheSamePath() {
+    private static func update(
+        _ folder: inout WatchedFolder, with resolution: WatchedFolderBookmarkResolution,
+        lastKnownPath: (Data) -> String?
+    ) {
+        switch resolution {
+        case .resolved(let path, let isStale):
+            // The path that the bookmark recorded is its oldest one; the path until now is the newest.
+            let earlier = [lastKnownPath(folder.bookmark)].compactMap { $0 } + folder.formerPaths + [folder.path]
+            folder.formerPaths = formerPaths(earlier.compactMap { $0 }, besides: path)
+            folder.path = path
+            folder.needsRenewal = isStale
+        case .unresolved:
+            folder.needsRenewal = true
+        }
+    }
+
+    /// Keeps one folder per path among the folders in `ids`, whose bookmarks all resolved in one pass: the one that the
+    /// app may read, or else the first one. It takes the others' earlier paths. A folder outside `ids` keeps its entry,
+    /// also with the path of another folder: that path may be the one it had before its own drive moved.
+    private mutating func mergeFolders(withTheSamePathAmong ids: Set<WatchedFolder.ID>) {
         var merged: [WatchedFolder] = []
         for folder in folders {
-            guard let path = folder.path, let index = merged.firstIndex(where: { $0.path == path }) else {
+            guard ids.contains(folder.id), let path = folder.path,
+                let index = merged.firstIndex(where: { ids.contains($0.id) && $0.path == path })
+            else {
                 merged.append(folder)
                 continue
             }
             var kept = merged[index].needsRenewal && !folder.needsRenewal ? folder : merged[index]
             let other = kept.id == folder.id ? merged[index] : folder
-            kept.formerPaths = Self.unique(kept.formerPaths + other.formerPaths).filter { $0 != path }
+            kept.formerPaths = Self.formerPaths(kept.formerPaths + other.formerPaths, besides: path)
             merged[index] = kept
         }
         folders = merged
     }
 
-    private static func unique(_ paths: [String]) -> [String] {
-        paths.reduce(into: []) { if !$0.contains($1) { $0.append($1) } }
+    /// `paths` once each, oldest first, without the current path and with at most `formerPathLimit` of the newest. A path
+    /// that comes again counts at its newest place.
+    private static func formerPaths(_ paths: [String], besides current: String?) -> [String] {
+        var seen = Set([current].compactMap { $0 })
+        let newestFirst = paths.reversed().filter { seen.insert($0).inserted }
+        return Array(newestFirst.prefix(formerPathLimit).reversed())
     }
+
+    private static func pathKey(of bookmark: Data) -> String { bookmark.base64EncodedString() }
 
     private mutating func sort() {
         folders.sort { $0.displayPath.localizedCaseInsensitiveCompare($1.displayPath) == .orderedAscending }
