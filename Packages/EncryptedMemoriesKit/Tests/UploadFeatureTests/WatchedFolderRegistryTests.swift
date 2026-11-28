@@ -316,10 +316,60 @@ final class WatchedFolderRegistryTests: XCTestCase {
         XCTAssertEqual(registry.folders.map(\.formerPaths), [[recorded] + others])
         XCTAssertEqual(registry.folders.map(\.path), ["/Volumes/D13/Photos"])
 
-        let relaunched = WatchedFolderRegistry(
-            savedBookmarks: registry.bookmarks, savedPaths: registry.pathsToSave,
-            resolve: { _ in .unresolved }, lastKnownPath: { _ in recorded })
-        XCTAssertEqual(relaunched.folders.first?.formerPaths.first, recorded, "also when the saved paths are loaded")
+        // Two relaunches that find the folder at its path again, and one that finds the drive away, keep every path.
+        var saved = registry.pathsToSave
+        for _ in 0..<2 {
+            let relaunched = WatchedFolderRegistry(
+                savedBookmarks: registry.bookmarks, savedPaths: saved,
+                resolve: { _ in .resolved(path: "/Volumes/D13/Photos", isStale: false) },
+                lastKnownPath: { _ in recorded })
+            XCTAssertEqual(relaunched.folders.map(\.formerPaths), [[recorded] + others])
+            XCTAssertFalse(relaunched.pathsNeedSaving(comparedTo: saved))
+            saved = relaunched.pathsToSave
+        }
+        let away = WatchedFolderRegistry(
+            savedBookmarks: registry.bookmarks, savedPaths: saved, resolve: { _ in .unresolved },
+            lastKnownPath: { _ in recorded })
+        XCTAssertEqual(away.folders.map(\.formerPaths), [[recorded] + others + ["/Volumes/D13/Photos"]])
+    }
+
+    /// Two entries that become one keep the paths that both bookmarks recorded, also above the limit of the others.
+    func testJoinedFoldersKeepBothRecordedPaths() throws {
+        let shared = "/Volumes/Photos-1583/DCIM"
+        let others = (1...8).map { "/Volumes/P\($0)/DCIM" }
+        let recorded = [driveBookmark: "/Volumes/DriveRecorded/DCIM", diskBookmark: "/Volumes/DiskRecorded/DCIM"]
+        let saved = [
+            driveBookmark.base64EncodedString(): [recorded[driveBookmark]!] + others + [shared],
+            diskBookmark.base64EncodedString(): [recorded[diskBookmark]!, shared],
+        ]
+
+        let registry = WatchedFolderRegistry(
+            savedBookmarks: [driveBookmark, diskBookmark], savedPaths: saved,
+            resolve: { _ in .resolved(path: shared, isStale: false) }, lastKnownPath: { recorded[$0] })
+
+        XCTAssertEqual(registry.folders.count, 1)
+        let kept = try XCTUnwrap(registry.folders.first?.formerPaths)
+        XCTAssertEqual(Set(kept), Set(others + recorded.values))
+    }
+
+    /// A folder that the person adds again keeps the path that the replaced bookmark recorded, also above the limit of
+    /// the others.
+    func testAFolderAddedAgainKeepsTheRecordedPathOfTheOneItReplaces() throws {
+        let path = "/Volumes/Photos-1583/DCIM"
+        let recorded = "/Volumes/Recorded-1583/DCIM"
+        let others = (1...8).map { "/Volumes/P\($0)/DCIM" }
+        var registry = WatchedFolderRegistry(
+            savedBookmarks: [driveBookmark],
+            savedPaths: [driveBookmark.base64EncodedString(): [recorded] + others + [path]],
+            resolve: { _ in .resolved(path: path, isStale: true) }, lastKnownPath: { _ in recorded })
+        XCTAssertEqual(registry.folders.map(\.formerPaths), [[recorded] + others])
+        let newBookmark = Data("drive again".utf8)
+
+        registry.add(
+            bookmark: newBookmark, path: path, lastKnownPath: { $0 == self.driveBookmark ? recorded : nil })
+
+        XCTAssertEqual(registry.folders.map(\.bookmark), [newBookmark])
+        XCTAssertEqual(registry.folders.map(\.formerPaths), [[recorded] + others])
     }
 
     /// Three folders rotate their paths in one refresh: each keeps its bookmark and its own earlier path.
@@ -407,8 +457,9 @@ final class WatchedFolderRegistryTests: XCTestCase {
         XCTAssertTrue(added.needsSaving(since: registry))
     }
 
-    /// Saved paths that a launch found damaged keep the list unknown, also after the person removes a folder, until the
-    /// app saved the paths again: no row counts as outside before.
+    /// Saved paths that a launch found damaged keep the list unknown while the folders change, until
+    /// `pathsWereSaved()`: before, no row counts as outside. The app saves the list, and so calls it, right after each
+    /// change that it saves.
     func testDamagedSavedPathsKeepTheListUnknownUntilTheyAreSavedAgain() throws {
         var registry = WatchedFolderRegistry(savedBookmarks: [driveBookmark, diskBookmark], savedPaths: 7) {
             .resolved(path: $0 == self.driveBookmark ? self.drive : self.disk, isStale: false)

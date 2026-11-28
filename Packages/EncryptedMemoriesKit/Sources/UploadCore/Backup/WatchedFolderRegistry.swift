@@ -71,11 +71,13 @@ public struct WatchedFolderRegistry: Sendable, Equatable {
         savedPathsAreDamaged = saved == nil
         var resolvedIDs: Set<WatchedFolder.ID> = []
         folders = (savedBookmarks ?? []).map { bookmark in
+            // The last saved path is the one the folder had then; it is no earlier path yet, so it takes no place of the
+            // limit until the bookmark resolves elsewhere.
+            let paths = saved?[Self.pathKey(of: bookmark)] ?? []
             var folder = WatchedFolder(
                 bookmark: bookmark, path: nil, needsRenewal: true,
                 formerPaths: Self.formerPaths(
-                    saved?[Self.pathKey(of: bookmark)] ?? [], besides: nil,
-                    keeping: [lastKnownPath(bookmark)].compactMap { $0 }))
+                    paths, besides: nil, keeping: [lastKnownPath(bookmark), paths.last].compactMap { $0 }))
             let resolution = resolve(bookmark)
             if case .resolved = resolution { resolvedIDs.insert(folder.id) }
             Self.update(&folder, with: resolution, lastKnownPath: lastKnownPath)
